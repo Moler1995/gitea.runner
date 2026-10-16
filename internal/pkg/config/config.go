@@ -20,7 +20,6 @@ import (
 	"github.com/docker/go-units"
 	"github.com/joho/godotenv"
 	"go.yaml.in/yaml/v4"
-	"golang.org/x/net/http/httpguts"
 )
 
 // RequestTimeout bounds every RPC to Gitea, and with it runner.fetch_timeout.
@@ -530,7 +529,7 @@ func definedRunnerConfigKeys(root *yaml.Node) map[string]bool {
 func validateExtraHeaders(headers map[string]string) error {
 	seen := make(map[string]string, len(headers))
 	for name, value := range headers {
-		if !httpguts.ValidHeaderFieldName(name) || !httpguts.ValidHeaderFieldValue(value) {
+		if !validHeaderFieldName(name) || !validHeaderFieldValue(value) {
 			return fmt.Errorf("invalid runner.extra_headers entry %q", name)
 		}
 		key := strings.ToLower(name)
@@ -540,6 +539,25 @@ func validateExtraHeaders(headers map[string]string) error {
 		seen[key] = name
 	}
 	return nil
+}
+
+func validHeaderFieldName(name string) bool {
+	for _, char := range name {
+		if char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' || char >= '0' && char <= '9' || strings.ContainsRune("!#$%&'*+-.^_`|~", char) {
+			continue
+		}
+		return false
+	}
+	return name != ""
+}
+
+func validHeaderFieldValue(value string) bool {
+	for index := range len(value) {
+		if value[index] == 0x7f || value[index] < ' ' && value[index] != '\t' {
+			return false
+		}
+	}
+	return true
 }
 
 // resolveSecretFile reads key from key_file, so deployments can mount a secret instead of committing it.
