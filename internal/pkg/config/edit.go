@@ -312,7 +312,7 @@ func allScalars(nodes []*yaml.Node) bool {
 	return true
 }
 
-// encodeYAML never wraps lines, go-yaml wraps more-indented lines of folded scalars, which changes their value.
+// encodeYAML never wraps lines, go-yaml wraps more-indented lines of folded scalars until https://github.com/yaml/go-yaml/pull/441 is released.
 func encodeYAML(node *yaml.Node) ([]byte, error) {
 	return yaml.Dump(node, yaml.WithV3Defaults(), yaml.WithIndent(2), yaml.WithLineWidth(-1))
 }
