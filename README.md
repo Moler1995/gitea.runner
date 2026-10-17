@@ -4,6 +4,8 @@
 
 ### Prerequisites
 
+Gitea 1.27 or newer.
+
 On the runner:
 
 - `git` 2.34.1 or newer on `PATH`, to clone reusable workflows, and actions whose host serves no archive of them.

@@ -71,7 +71,6 @@ func TestJobLog_MirrorsUploadedRows(t *testing.T) {
 	assert.NotContains(t, job, "dyn4mic-value")
 	assert.NotContains(t, job, "add-mask", "the row carrying the secret never reaches the log")
 	assert.NotContains(t, job, "suppressed unless", "the file holds only what was sent")
-	assert.NotRegexp(t, `(?m)^\S+Z ?$`, job, "the empty row Gitea needs is not job output")
 	assert.Contains(t, job, "[runner] task 41 finished: failure")
 }
 

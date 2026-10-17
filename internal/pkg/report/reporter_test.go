@@ -724,12 +724,7 @@ func TestReporter_StateNotifyFlush(t *testing.T) {
 		"step transition should have triggered immediate state flush via stateNotify")
 }
 
-// Regression test for https://gitea.com/gitea/runner/issues/950: Close() must
-// always send a final UpdateLog with NoMore=true carrying at least one row,
-// otherwise the server's len(Rows)==0 short-circuit skips TransferLogs.
-// TODO: Remove after https://github.com/go-gitea/gitea/pull/37631 is in all
-// supported branches, e.g. v1.28+.
-func TestReporter_CloseAlwaysSendsRowsWithNoMore(t *testing.T) {
+func TestReporter_CloseSendsNoMoreWithEmptyLogBuffer(t *testing.T) {
 	var lastReq atomic.Pointer[runnerv1.UpdateLogRequest]
 	var noMoreCalls atomic.Int64
 
@@ -756,7 +751,6 @@ func TestReporter_CloseAlwaysSendsRowsWithNoMore(t *testing.T) {
 	taskCtx, err := structpb.NewStruct(map[string]any{})
 	require.NoError(t, err)
 
-	// Intervals large enough that no daemon-driven flush fires during the test.
 	cfg, _ := config.LoadDefault("")
 	cfg.Runner.LogReportInterval = 10 * time.Second
 	cfg.Runner.LogReportMaxLatency = 10 * time.Second
@@ -764,17 +758,11 @@ func TestReporter_CloseAlwaysSendsRowsWithNoMore(t *testing.T) {
 	cfg.Runner.LogReportBatchSize = 1000
 
 	reporter := NewReporter(ctx, cancel, client, &runnerv1.Task{Context: taskCtx}, cfg)
-	reporter.ResetSteps(newTestSteps(1))
 	reporter.RunDaemon()
 
-	// Simulate a successful job whose log buffer was already drained by the
-	// daemon (logOffset > 0, logRows empty, terminal Result set). This is the
-	// state Close() lands in for the typical successful job under #819.
 	reporter.stateMu.Lock()
 	reporter.logOffset = 5
 	reporter.state.Result = runnerv1.Result_RESULT_SUCCESS
-	reporter.state.Steps[0].Result = runnerv1.Result_RESULT_SUCCESS
-	reporter.state.StoppedAt = timestamppb.Now()
 	reporter.stateMu.Unlock()
 
 	require.NoError(t, reporter.Close(""))
@@ -782,8 +770,9 @@ func TestReporter_CloseAlwaysSendsRowsWithNoMore(t *testing.T) {
 	require.Equal(t, int64(1), noMoreCalls.Load(), "Close must send exactly one UpdateLog with NoMore=true")
 	final := lastReq.Load()
 	require.NotNil(t, final)
-	assert.True(t, final.NoMore, "final UpdateLog must carry NoMore=true")
-	assert.NotEmpty(t, final.Rows, "final UpdateLog must carry at least one row")
+	assert.True(t, final.NoMore)
+	assert.Empty(t, final.Rows)
+	assert.Equal(t, int64(5), final.Index)
 }
 
 // TestReporter_StateHeartbeat verifies that ReportState sends a heartbeat
