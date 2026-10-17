@@ -1606,33 +1606,33 @@ func (rc *RunContext) withGithubEnv(ctx context.Context, github *model.GithubCon
 	if _, ok := env["CI"]; !ok {
 		env["CI"] = "true"
 	}
-	env["GITHUB_WORKFLOW"] = github.Workflow
-	env["GITHUB_RUN_ID"] = github.RunID
-	env["GITHUB_RUN_NUMBER"] = github.RunNumber
-	env["GITHUB_ACTION"] = github.Action
-	env["GITHUB_ACTION_PATH"] = github.ActionPath
-	env["GITHUB_ACTION_REPOSITORY"] = github.ActionRepository
-	env["GITHUB_ACTION_REF"] = github.ActionRef
-	env["GITHUB_ACTIONS"] = "true"
-	env["GITHUB_ACTOR"] = github.Actor
-	env["GITHUB_REPOSITORY"] = github.Repository
-	env["GITHUB_EVENT_NAME"] = github.EventName
-	env["GITHUB_EVENT_PATH"] = github.EventPath
-	env["GITHUB_WORKSPACE"] = github.Workspace
-	env["GITHUB_SHA"] = github.Sha
-	env["GITHUB_REF"] = github.Ref
-	env["GITHUB_REF_NAME"] = github.RefName
-	env["GITHUB_REF_TYPE"] = github.RefType
-	env["GITHUB_REF_PROTECTED"] = strconv.FormatBool(github.RefProtected)
-	env["GITHUB_JOB"] = github.Job
-	env["GITHUB_REPOSITORY_OWNER"] = github.RepositoryOwner
-	env["GITHUB_RETENTION_DAYS"] = github.RetentionDays
+	setGiteaAndGithubEnv(env, "WORKFLOW", github.Workflow)
+	setGiteaAndGithubEnv(env, "RUN_ID", github.RunID)
+	setGiteaAndGithubEnv(env, "RUN_NUMBER", github.RunNumber)
+	setGiteaAndGithubEnv(env, "ACTION", github.Action)
+	setGiteaAndGithubEnv(env, "ACTION_PATH", github.ActionPath)
+	setGiteaAndGithubEnv(env, "ACTION_REPOSITORY", github.ActionRepository)
+	setGiteaAndGithubEnv(env, "ACTION_REF", github.ActionRef)
+	setGiteaAndGithubEnv(env, "ACTIONS", "true")
+	setGiteaAndGithubEnv(env, "ACTOR", github.Actor)
+	setGiteaAndGithubEnv(env, "REPOSITORY", github.Repository)
+	setGiteaAndGithubEnv(env, "EVENT_NAME", github.EventName)
+	setGiteaAndGithubEnv(env, "EVENT_PATH", github.EventPath)
+	setGiteaAndGithubEnv(env, "WORKSPACE", github.Workspace)
+	setGiteaAndGithubEnv(env, "SHA", github.Sha)
+	setGiteaAndGithubEnv(env, "REF", github.Ref)
+	setGiteaAndGithubEnv(env, "REF_NAME", github.RefName)
+	setGiteaAndGithubEnv(env, "REF_TYPE", github.RefType)
+	setGiteaAndGithubEnv(env, "REF_PROTECTED", strconv.FormatBool(github.RefProtected))
+	setGiteaAndGithubEnv(env, "JOB", github.Job)
+	setGiteaAndGithubEnv(env, "REPOSITORY_OWNER", github.RepositoryOwner)
+	setGiteaAndGithubEnv(env, "RETENTION_DAYS", github.RetentionDays)
 	env["RUNNER_PERFLOG"] = github.RunnerPerflog
 	env["RUNNER_TRACKING_ID"] = github.RunnerTrackingID
-	env["GITHUB_BASE_REF"] = github.BaseRef
-	env["GITHUB_HEAD_REF"] = github.HeadRef
-	env["GITHUB_SERVER_URL"] = github.ServerURL
-	env["GITHUB_API_URL"] = github.APIURL
+	setGiteaAndGithubEnv(env, "BASE_REF", github.BaseRef)
+	setGiteaAndGithubEnv(env, "HEAD_REF", github.HeadRef)
+	setGiteaAndGithubEnv(env, "SERVER_URL", github.ServerURL)
+	setGiteaAndGithubEnv(env, "API_URL", github.APIURL)
 	for name, value := range map[string]string{
 		"GITHUB_WORKFLOW_REF":        github.WorkflowRef,
 		"GITHUB_WORKFLOW_SHA":        github.WorkflowSha,
@@ -1643,17 +1643,19 @@ func (rc *RunContext) withGithubEnv(ctx context.Context, github *model.GithubCon
 	} {
 		if value != "" { // a context without them keeps what the environment set
 			env[name] = value
+			env["GITEA_"+strings.TrimPrefix(name, "GITHUB_")] = value
 		}
 	}
 
 	for _, name := range []string{"GITHUB_SERVER_URL", "GITHUB_API_URL"} {
 		if env[name] == "" {
 			delete(env, name)
+			delete(env, "GITEA_"+strings.TrimPrefix(name, "GITHUB_"))
 		}
 	}
 
-	env["GITHUB_GRAPHQL_URL"] = ""
-	env["GITHUB_RUN_ATTEMPT"] = github.RunAttempt
+	setGiteaAndGithubEnv(env, "GRAPHQL_URL", "")
+	setGiteaAndGithubEnv(env, "RUN_ATTEMPT", github.RunAttempt)
 
 	env["RUNNER_NAME"] = rc.Config.RunnerName
 	env["RUNNER_ENVIRONMENT"] = "self-hosted"
@@ -1734,4 +1736,10 @@ func registryCredentials(credentials map[string]string, prefix string) (string, 
 		}
 	}
 	return credentials["username"], credentials["password"], nil
+}
+
+// Keep Gitea names in sync with the GitHub-compatible names used by existing actions.
+func setGiteaAndGithubEnv(env map[string]string, suffix, value string) {
+	env["GITHUB_"+suffix] = value
+	env["GITEA_"+suffix] = value
 }

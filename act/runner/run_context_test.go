@@ -886,20 +886,22 @@ func TestGetGitHubContext(t *testing.T) {
 	assert.Equal(t, "job1", ghc.Job)
 	env := map[string]string{}
 	rc.withGithubEnv(t.Context(), ghc, env)
-	for name, value := range map[string]string{
-		"GITHUB_ACTOR_ID":            "12",
-		"GITHUB_TRIGGERING_ACTOR":    "triggerer",
-		"GITHUB_REPOSITORY_ID":       "34",
-		"GITHUB_REPOSITORY_OWNER_ID": "56",
-		"GITHUB_WORKFLOW_REF":        "owner/repo/.gitea/workflows/test.yml@refs/heads/main",
-		"GITHUB_WORKFLOW_SHA":        "workflow-sha",
-		"GITHUB_REF_PROTECTED":       "true",
+	for suffix, value := range map[string]string{
+		"ACTOR_ID":            "12",
+		"TRIGGERING_ACTOR":    "triggerer",
+		"REPOSITORY_ID":       "34",
+		"REPOSITORY_OWNER_ID": "56",
+		"WORKFLOW_REF":        "owner/repo/.gitea/workflows/test.yml@refs/heads/main",
+		"WORKFLOW_SHA":        "workflow-sha",
+		"REF_PROTECTED":       "true",
 	} {
-		assert.Equal(t, value, env[name], name)
+		assert.Equal(t, value, env["GITHUB_"+suffix], suffix)
+		assert.Equal(t, value, env["GITEA_"+suffix], suffix)
 	}
 	ghc.RefProtected = false
 	rc.withGithubEnv(t.Context(), ghc, env)
 	assert.Equal(t, "false", env["GITHUB_REF_PROTECTED"])
+	assert.Equal(t, "false", env["GITEA_REF_PROTECTED"])
 
 	preset := &model.GithubContext{ServerURL: "https://preset.test", APIURL: "https://preset.test/api/v1"}
 	for _, testcase := range []struct {
@@ -922,12 +924,15 @@ func TestGetGitHubContext(t *testing.T) {
 			github := rc.getGithubContext(t.Context())
 			assert.Equal(t, testcase.serverURL, github.ServerURL)
 			assert.Equal(t, testcase.apiURL, github.APIURL)
-			env := map[string]string{}
+			env := map[string]string{"GITEA_SERVER_URL": "stale", "GITEA_API_URL": "stale", "GITHUB_CUSTOM": "custom"}
 			rc.withGithubEnv(t.Context(), github, env)
 			_, exported := env["GITHUB_SERVER_URL"]
 			assert.Equal(t, testcase.serverURL != "", exported)
-			assert.Equal(t, testcase.serverURL, env["GITHUB_SERVER_URL"])
-			assert.Equal(t, testcase.apiURL, env["GITHUB_API_URL"])
+			assert.Equal(t, testcase.serverURL, env["GITEA_SERVER_URL"])
+			assert.Equal(t, testcase.apiURL, env["GITEA_API_URL"])
+			_, aliasExported := env["GITEA_SERVER_URL"]
+			assert.Equal(t, exported, aliasExported)
+			assert.NotContains(t, env, "GITEA_CUSTOM")
 		})
 	}
 }

@@ -5,5 +5,8 @@ inputs:
 runs:
   using: composite
   steps:
-    - run: test -e "$GITHUB_ACTION_PATH/${{ inputs.revision }}"
+    - run: |
+        test -n "$GITEA_ACTION_PATH"
+        test "$GITEA_ACTION_PATH" = "$GITHUB_ACTION_PATH"
+        test -e "$GITEA_ACTION_PATH/${{ inputs.revision }}"
       shell: sh

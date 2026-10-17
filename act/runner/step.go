@@ -139,16 +139,16 @@ func runStepExecutor(step step, stage stepStage, executor common.Executor) commo
 		actPath := rc.JobContainer.GetActPath()
 
 		outputFileCommand := path.Join("workflow", "outputcmd.txt")
-		(*step.getEnv())["GITHUB_OUTPUT"] = path.Join(actPath, outputFileCommand)
+		setGiteaAndGithubEnv(*step.getEnv(), "OUTPUT", path.Join(actPath, outputFileCommand))
 
 		stateFileCommand := path.Join("workflow", "statecmd.txt")
-		(*step.getEnv())["GITHUB_STATE"] = path.Join(actPath, stateFileCommand)
+		setGiteaAndGithubEnv(*step.getEnv(), "STATE", path.Join(actPath, stateFileCommand))
 
 		pathFileCommand := path.Join("workflow", "pathcmd.txt")
-		(*step.getEnv())["GITHUB_PATH"] = path.Join(actPath, pathFileCommand)
+		setGiteaAndGithubEnv(*step.getEnv(), "PATH", path.Join(actPath, pathFileCommand))
 
 		envFileCommand := path.Join("workflow", "envs.txt")
-		(*step.getEnv())["GITHUB_ENV"] = path.Join(actPath, envFileCommand)
+		setGiteaAndGithubEnv(*step.getEnv(), "ENV", path.Join(actPath, envFileCommand))
 
 		// Per-step summary file. Composite sub-steps share the outer job step's index
 		// via the Parent chain so all writes from within a composite action accumulate
@@ -156,16 +156,7 @@ func runStepExecutor(step step, stage stepStage, executor common.Executor) commo
 		topRC := rc.topLevelRunContext()
 		stepSummaryIndex := topRC.CurrentStepIndex
 		summaryFileCommand := path.Join("workflow", "step-summary-"+strconv.Itoa(stepSummaryIndex)+".md")
-		(*step.getEnv())["GITHUB_STEP_SUMMARY"] = path.Join(actPath, summaryFileCommand)
-
-		{
-			// For Gitea
-			(*step.getEnv())["GITEA_OUTPUT"] = (*step.getEnv())["GITHUB_OUTPUT"]
-			(*step.getEnv())["GITEA_STATE"] = (*step.getEnv())["GITHUB_STATE"]
-			(*step.getEnv())["GITEA_PATH"] = (*step.getEnv())["GITHUB_PATH"]
-			(*step.getEnv())["GITEA_ENV"] = (*step.getEnv())["GITHUB_ENV"]
-			(*step.getEnv())["GITEA_STEP_SUMMARY"] = (*step.getEnv())["GITHUB_STEP_SUMMARY"]
-		}
+		setGiteaAndGithubEnv(*step.getEnv(), "STEP_SUMMARY", path.Join(actPath, summaryFileCommand))
 
 		// Reset the per-phase file-command files. GITHUB_STEP_SUMMARY is intentionally
 		// excluded here and initialized below at most once per step so writes from later

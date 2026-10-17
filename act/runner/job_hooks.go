@@ -77,15 +77,13 @@ func (rc *RunContext) runJobHook(ctx context.Context, hookPath, name string) err
 	return err
 }
 
-// setupHookFileCommands points the hook at its GITHUB_ENV and GITHUB_PATH files, so it can
-// export to the job's steps, and truncates them so the second hook does not re-read what
-// the first one wrote.
+// setupHookFileCommands points the hook at its ENV and PATH file commands (GITHUB_* and the
+// GITEA_* aliases), so it can export to the job's steps, and truncates them so the second
+// hook does not re-read what the first one wrote.
 func (rc *RunContext) setupHookFileCommands(ctx context.Context, env map[string]string) error {
 	actPath := rc.JobContainer.GetActPath()
-	env["GITHUB_ENV"] = path.Join(actPath, hookEnvFileCommand)
-	env["GITHUB_PATH"] = path.Join(actPath, hookPathFileCommand)
-	env["GITEA_ENV"] = env["GITHUB_ENV"]
-	env["GITEA_PATH"] = env["GITHUB_PATH"]
+	setGiteaAndGithubEnv(env, "ENV", path.Join(actPath, hookEnvFileCommand))
+	setGiteaAndGithubEnv(env, "PATH", path.Join(actPath, hookPathFileCommand))
 
 	return rc.JobContainer.Copy(actPath,
 		&container.FileEntry{Name: hookEnvFileCommand, Mode: 0o666},
