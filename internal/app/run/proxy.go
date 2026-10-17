@@ -4,7 +4,6 @@
 package run
 
 import (
-	"cmp"
 	"context"
 	"net/url"
 	"os"
@@ -13,17 +12,13 @@ import (
 
 	"gitea.com/gitea/runner/act/common/logging"
 	"gitea.com/gitea/runner/act/container"
+
+	"golang.org/x/net/http/httpproxy"
 )
 
-type proxyConfig struct{ HTTPProxy, HTTPSProxy, NoProxy string }
-
 // proxyFromEnv returns the runner's own proxy configuration, or nil when it has none.
-func proxyFromEnv() *proxyConfig {
-	cfg := &proxyConfig{
-		HTTPProxy:  cmp.Or(os.Getenv("http_proxy"), os.Getenv("HTTP_PROXY")),
-		HTTPSProxy: cmp.Or(os.Getenv("https_proxy"), os.Getenv("HTTPS_PROXY")),
-		NoProxy:    cmp.Or(os.Getenv("no_proxy"), os.Getenv("NO_PROXY")),
-	}
+func proxyFromEnv() *httpproxy.Config {
+	cfg := httpproxy.FromEnvironment()
 	if cfg.HTTPProxy == "" && cfg.HTTPSProxy == "" {
 		return nil
 	}

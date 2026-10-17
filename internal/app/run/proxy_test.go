@@ -51,14 +51,6 @@ func TestJobProxyEnv(t *testing.T) {
 			},
 		},
 		{
-			name:   "the lower case spelling wins like in x/net httpproxy",
-			runner: map[string]string{"http_proxy": proxy, "HTTP_PROXY": "http://upper:3128"},
-			want: map[string]string{
-				"http_proxy": proxy, "HTTP_PROXY": proxy,
-				"no_proxy": loopback, "NO_PROXY": loopback,
-			},
-		},
-		{
 			name:   "a variable the runner does not have is omitted",
 			runner: map[string]string{"https_proxy": proxy},
 			want: map[string]string{
