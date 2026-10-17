@@ -214,6 +214,9 @@ func (c *dockerConfig) allAuthConfigs(ctx context.Context) (map[string]registry.
 		auths = map[string]registry.AuthConfig{}
 	}
 	maps.Copy(auths, c.env)
+	if c.CredsStore == "" {
+		c.Auths = maps.Clone(auths) // docker's file store holds the DOCKER_AUTH_CONFIG entries after listing, and credHelpers set to "" read it
+	}
 	for address := range c.CredHelpers {
 		auth, err := c.authConfig(ctx, registryAuthConfigKey(address))
 		if err != nil {

@@ -36,8 +36,9 @@ func dialCommand(name string, args ...string) (net.Conn, error) {
 	conn := &commandConn{cmd: exec.Command(name, args...)}
 	conn.cmd.SysProcAttr = sshSysProcAttr() // a session of its own like docker's, so a ProxyCommand never reads the runner's terminal: https://github.com/docker/cli/issues/1707
 	conn.cmd.Stderr = &conn.stderr
+	conn.cmd.WaitDelay = time.Second // a ProxyCommand child keeping stderr open would otherwise block Wait after ssh exits
 	conn.wait = sync.OnceValue(func() error {
-		if err := conn.cmd.Wait(); err != nil {
+		if err := conn.cmd.Wait(); err != nil && !errors.Is(err, exec.ErrWaitDelay) {
 			return fmt.Errorf("%s: %w: %s", strings.Join(conn.cmd.Args, " "), err, strings.TrimSpace(conn.stderr.String()))
 		}
 		return nil

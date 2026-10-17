@@ -11,7 +11,7 @@ import (
 )
 
 func hardlinkInode(info fs.FileInfo) (uint64, bool) {
-	if stat, ok := info.Sys().(*syscall.Stat_t); ok && info.Mode().IsRegular() && stat.Nlink > 1 {
+	if stat, ok := info.Sys().(*syscall.Stat_t); ok && !info.IsDir() && stat.Nlink > 1 {
 		return stat.Ino, true
 	}
 	return 0, false

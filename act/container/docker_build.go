@@ -229,7 +229,7 @@ func addBuildContextEntry(ctx context.Context, tw *tar.Writer, file, rel string,
 		}
 		defer content.Close()
 	}
-	if linked && header.Typeflag == tar.TypeReg {
+	if linked && header.Typeflag != tar.TypeLink {
 		hardlinks[inode] = header.Name
 	}
 	if info.IsDir() {

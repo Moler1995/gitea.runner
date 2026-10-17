@@ -43,7 +43,7 @@ func TestDialCommandStreamsStdioAndReportsExit(t *testing.T) {
 	assert.Equal(t, "ping", string(echoed))
 	require.NoError(t, conn.Close())
 
-	conn, err = dialCommand("sh", "-c", "echo 'no route to host' >&2; exit 255")
+	conn, err = dialCommand("sh", "-c", "exec 3<&0; cat <&3 >/dev/null & echo 'no route to host' >&2; exit 255")
 	require.NoError(t, err)
 	_, err = io.ReadAll(conn)
 	require.ErrorContains(t, err, "no route to host")

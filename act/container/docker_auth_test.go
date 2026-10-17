@@ -21,9 +21,9 @@ func TestLoadDockerAuthConfigFromFileHelpersAndEnv(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "docker-credential-fake"), []byte("#!/bin/sh\nread -r server\n[ \"$1\" = get ] && [ \"$server\" = helper.example.com ] && exec echo '{\"Username\":\"helped\",\"Secret\":\"pw\"}'\necho 'credentials not found in native keychain'\nexit 1\n"), 0o755))
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	auth := func(credentials string) string { return base64.StdEncoding.EncodeToString([]byte(credentials)) }
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{"auths": {"https://legacy.example.com/v1/": {"auth": "`+auth("legacy:pw")+`"}}, "credHelpers": {"helper.example.com": "fake", "gone.example.com": "fake"}}`), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{"auths": {"https://legacy.example.com/v1/": {"auth": "`+auth("legacy:pw")+`"}}, "credHelpers": {"helper.example.com": "fake", "gone.example.com": "fake", "env-legacy.example.com": ""}}`), 0o600))
 	t.Setenv("DOCKER_CONFIG", dir)
-	t.Setenv("DOCKER_AUTH_CONFIG", `{"auths": {"env.example.com": {"auth": "`+auth("env:pw")+`"}}}`)
+	t.Setenv("DOCKER_AUTH_CONFIG", `{"auths": {"env.example.com": {"auth": "`+auth("env:pw")+`"}, "https://env-legacy.example.com/v1/": {"auth": "`+auth("env:pw")+`"}}}`)
 
 	for image, want := range map[string]registry.AuthConfig{
 		"legacy.example.com/app": {Username: "legacy", Password: "pw", ServerAddress: "https://legacy.example.com/v1/"},
@@ -36,9 +36,11 @@ func TestLoadDockerAuthConfigFromFileHelpersAndEnv(t *testing.T) {
 		assert.Equal(t, want, got, image)
 	}
 	assert.Equal(t, map[string]registry.AuthConfig{
-		"https://legacy.example.com/v1/": {Username: "legacy", Password: "pw", ServerAddress: "https://legacy.example.com/v1/"},
-		"helper.example.com":             {Username: "helped", Password: "pw", ServerAddress: "helper.example.com"},
-		"gone.example.com":               {},
-		"env.example.com":                {Username: "env", Password: "pw", ServerAddress: "env.example.com"},
+		"https://legacy.example.com/v1/":     {Username: "legacy", Password: "pw", ServerAddress: "https://legacy.example.com/v1/"},
+		"helper.example.com":                 {Username: "helped", Password: "pw", ServerAddress: "helper.example.com"},
+		"gone.example.com":                   {},
+		"env.example.com":                    {Username: "env", Password: "pw", ServerAddress: "env.example.com"},
+		"https://env-legacy.example.com/v1/": {Username: "env", Password: "pw", ServerAddress: "https://env-legacy.example.com/v1/"},
+		"env-legacy.example.com":             {Username: "env", Password: "pw", ServerAddress: "https://env-legacy.example.com/v1/"},
 	}, LoadDockerAuthConfigs(t.Context()))
 }
