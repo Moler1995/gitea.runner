@@ -104,11 +104,11 @@ func kubernetesServiceName(id string) string {
 	return strings.TrimRight(name[:min(63, len(name))], "-")
 }
 
-// KubernetesServiceHostnames returns the hostnames of service id, its container name and, where hostAliases accept it as a DNS subdomain, id itself.
+// KubernetesServiceHostnames returns the hostnames of service id, its container name and, where hostAliases accept it as a DNS subdomain, id lowercased.
 func KubernetesServiceHostnames(id string) []string {
-	name := kubernetesServiceName(id)
-	if id != name && len(id) <= 253 && dnsSubdomain.MatchString(id) { // https://github.com/kubernetes/apimachinery/blob/v0.35.1/pkg/util/validation/validation.go#L198-L207
-		return []string{name, id}
+	name, host := kubernetesServiceName(id), strings.ToLower(id)
+	if host != name && len(host) <= 253 && dnsSubdomain.MatchString(host) { // https://github.com/kubernetes/apimachinery/blob/v0.35.1/pkg/util/validation/validation.go#L198-L207
+		return []string{name, host}
 	}
 	return []string{name}
 }
@@ -143,7 +143,7 @@ func (p *KubernetesPod) create(ctx context.Context) error {
 		return err
 	}
 	for _, service := range p.services {
-		if !slices.Contains(KubernetesServiceHostnames(service.id), service.id) {
+		if !slices.ContainsFunc(KubernetesServiceHostnames(service.id), func(hostname string) bool { return strings.EqualFold(hostname, service.id) }) { // glibc and Go match /etc/hosts case-insensitively
 			common.Logger(ctx).Warnf("Service %s is reachable as %s or localhost, as a Kubernetes hostname cannot be %q", service.id, service.name, service.id)
 		}
 	}

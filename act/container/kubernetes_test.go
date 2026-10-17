@@ -134,7 +134,7 @@ func TestKubernetesServiceHostnames(t *testing.T) {
 		"db":                             {"db"},
 		"My_DB":                          {"my-db"},
 		"devstoreaccount1.azurite.local": {"devstoreaccount1-azurite-local", "devstoreaccount1.azurite.local"},
-		"DB.Local":                       {"db-local"},
+		"DB.Local":                       {"db-local", "db.local"},
 		strings.Repeat("a", 64):          {strings.Repeat("a", 63), strings.Repeat("a", 64)},
 		strings.Repeat("a", 254):         {strings.Repeat("a", 63)},
 	} {
