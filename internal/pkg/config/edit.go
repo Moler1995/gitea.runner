@@ -312,7 +312,7 @@ func allScalars(nodes []*yaml.Node) bool {
 	return true
 }
 
-// encodeYAML never wraps lines, an edit must not reflow the user's long values.
+// encodeYAML never wraps lines, re-encoding must not reflow long values.
 func encodeYAML(node *yaml.Node) ([]byte, error) {
 	return yaml.Dump(node, yaml.WithV3Defaults(), yaml.WithIndent(2), yaml.WithLineWidth(-1))
 }
