@@ -1,7 +1,7 @@
-connectrpc.com/connect v1.21.0 h1:LhqSJt7jHf5NJBo9Jq/t/9FjcYAideif0mg+qe2jCUs=
-connectrpc.com/connect v1.21.0/go.mod h1:A2ygJrukXwWy32vkCAAHNVguZrqZ+jeZ9rGRnGR4dN4=
-gitea.dev/actionslib v1.4.1 h1:DWlUnzDfuuMArQWS6yZ+vwJu9av7sZVMOox7li/kyu4=
-gitea.dev/actionslib v1.4.1/go.mod h1:RbXaZudZ04YndjBBxZJF9rZAqU6SKGkaSD1sob5lQbE=
+connectrpc.com/connect/v2 v2.0.1 h1:WTAycxe87UqxSM5oxS30d1dalZ+C5xz8Ec8O6zVYkHQ=
+connectrpc.com/connect/v2 v2.0.1/go.mod h1:N32OLrstcPUzkykFynnefFro3+xzSdOrZlK2jHmS/xo=
+gitea.dev/actionslib v1.4.2-0.20261019014634-1fd849368a92 h1:qjj0mqRCwZ269pJo4LH8e4ePMVK/iWMA0tO6Dxiey+M=
+gitea.dev/actionslib v1.4.2-0.20261019014634-1fd849368a92/go.mod h1:NWzFSnEG5EEXaq66Ql3moZ31g4H7+sAmSCyBirjj2R4=
 github.com/Microsoft/go-winio v0.6.2 h1:F2VQgta7ecxGYO8k3ZZz3RS8fVIXVxONVUPlNERoyfY=
 github.com/Microsoft/go-winio v0.6.2/go.mod h1:yd8OoFMLzJbo9gZq8j5qaps8bJ9aShtEA8Ipt1oGCvU=
 github.com/aws/aws-sdk-go-v2 v1.41.5 h1:dj5kopbwUsVUVFgO4Fi5BIT3t4WyqIDjGKCangnV/yY=
