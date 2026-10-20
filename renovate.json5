@@ -3,4 +3,11 @@
   "extends": [
     "local>gitea/renovate-config"
   ],
+  "packageRules": [
+    {
+      "description": "quay.io serves no release timestamps",
+      "matchPackageNames": ["quay.io/containers/podman"],
+      "minimumReleaseAge": null,
+    },
+  ],
 }
