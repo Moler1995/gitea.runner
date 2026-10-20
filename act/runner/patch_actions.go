@@ -9,7 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"strings"
+	"slices"
 
 	"gitea.com/gitea/runner/act/common"
 
@@ -83,11 +83,16 @@ func quoted(pattern string) string {
 	return "(?:'" + pattern + "'|\"" + pattern + "\"|`" + pattern + "`)"
 }
 
-// actionScriptPaths returns the entrypoints of a node action, the only kind with a bundle. Only
+// actionScriptPaths returns the scripts of a node action, the only kind with a bundle: its
+// entrypoints and the chunks a bundler split out next to them, where the toolkit can sit. Only
 // remote actions get here: a local one lives in the user's checkout, which the runner does not
 // rewrite.
 func actionScriptPaths(dir string, action *model.Action) []string {
 	if action == nil || !action.Runs.Using.IsNode() {
+		return nil
+	}
+	root, err := filepath.EvalSymlinks(dir)
+	if err != nil {
 		return nil
 	}
 	var paths []string
@@ -95,14 +100,25 @@ func actionScriptPaths(dir string, action *model.Action) []string {
 		if script == "" {
 			continue
 		}
-		path := filepath.Join(dir, script)
-		// `runs` is the action's own yaml, and a key pointing outside its directory is not ours.
-		if rel, err := filepath.Rel(dir, path); err != nil || strings.HasPrefix(rel, "..") {
+		path, err := filepath.EvalSymlinks(filepath.Join(dir, script))
+		if err != nil {
+			continue
+		}
+		// `runs` is the action's own yaml, and a key resolving outside its directory is not ours.
+		bundleDir := filepath.Dir(path)
+		if rel, err := filepath.Rel(root, bundleDir); err != nil || !filepath.IsLocal(rel) {
 			continue
 		}
 		paths = append(paths, path)
+		entries, _ := os.ReadDir(bundleDir)
+		for _, entry := range entries {
+			if entry.Type().IsRegular() && slices.Contains([]string{".js", ".cjs", ".mjs"}, filepath.Ext(entry.Name())) {
+				paths = append(paths, filepath.Join(bundleDir, entry.Name()))
+			}
+		}
 	}
-	return paths
+	slices.Sort(paths)
+	return slices.Compact(paths)
 }
 
 // patchActions returns a restore: the tree is shared, so a job with patching off gets no edits.
