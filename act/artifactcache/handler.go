@@ -34,6 +34,7 @@ import (
 
 	"github.com/timshannon/bolthold"
 	"go.etcd.io/bbolt"
+	berrors "go.etcd.io/bbolt/errors"
 )
 
 const (
@@ -44,6 +45,8 @@ const (
 	// Short enough that a leaked URL is near-worthless; long enough to let the
 	// @actions/cache client download a big blob that was returned from /cache.
 	artifactURLTTL = 10 * time.Minute
+
+	dbOpenTimeout = 5 * time.Second
 )
 
 type credKey struct{}
@@ -85,7 +88,7 @@ type Handler struct {
 	server   *http.Server
 	logger   *logging.Logger
 
-	dbMu sync.Mutex
+	dbLock chan struct{} // held while a store is open, so waiters queue here instead of polling bolt's file lock
 
 	gcing atomic.Bool
 	gcAt  time.Time
@@ -144,6 +147,7 @@ func StartHandler(opts Options) (*Handler, error) {
 		internalSecret: opts.InternalSecret,
 		policy:         opts.Policy.withDefaults(),
 		freeDisk:       disk.FreeBytes,
+		dbLock:         make(chan struct{}, 1),
 	}
 
 	if logger == nil {
@@ -430,22 +434,26 @@ func (db *cacheDB) Close() error {
 }
 
 func (h *Handler) openDB() (*cacheDB, error) {
-	h.dbMu.Lock()
+	select {
+	case h.dbLock <- struct{}{}:
+	case <-time.After(dbOpenTimeout):
+		return nil, berrors.ErrTimeout
+	}
 	db, err := bolthold.Open(filepath.Join(h.dir, "bolt.db"), 0o644, &bolthold.Options{
 		Encoder: func(value any) ([]byte, error) { return json.Marshal(value) },
 		Decoder: func(data []byte, value any) error { return json.Unmarshal(data, value) },
 		Options: &bbolt.Options{
-			Timeout:      5 * time.Second,
+			Timeout:      dbOpenTimeout,
 			NoGrowSync:   bbolt.DefaultOptions.NoGrowSync,
 			FreelistType: bbolt.DefaultOptions.FreelistType,
 		},
 	})
 	if err != nil {
-		h.dbMu.Unlock()
+		<-h.dbLock
 		return nil, err
 	}
 	return &cacheDB{Store: db, close: sync.OnceValue(func() error {
-		defer h.dbMu.Unlock()
+		defer func() { <-h.dbLock }()
 		return db.Close()
 	})}, nil
 }

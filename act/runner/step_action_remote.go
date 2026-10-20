@@ -53,6 +53,10 @@ func (sar *stepActionRemote) fetchAction(ctx context.Context, remote *remoteActi
 	}, token))
 }
 
+func (sar *stepActionRemote) skipsLocalCheckout(remote *remoteAction, github *model.GithubContext) bool {
+	return remote.IsCheckout() && isLocalCheckout(github, sar.Step) && !sar.RunContext.Config.NoSkipCheckout
+}
+
 func (sar *stepActionRemote) prepareActionExecutor() common.Executor {
 	return func(ctx context.Context) error {
 		if sar.remoteAction != nil && sar.action != nil {
@@ -75,7 +79,7 @@ func (sar *stepActionRemote) prepareActionExecutor() common.Executor {
 			return err
 		}
 
-		if sar.remoteAction.IsCheckout() && isLocalCheckout(github, sar.Step) && !sar.RunContext.Config.NoSkipCheckout {
+		if sar.skipsLocalCheckout(sar.remoteAction, github) {
 			common.Logger(ctx).Debugf("Skipping local actions/checkout because workdir was already copied")
 			return nil
 		}
@@ -151,7 +155,7 @@ func (sar *stepActionRemote) main() common.Executor {
 			defer rawLogger.Infof("::endgroup::")
 
 			github := sar.getGithubContext(ctx)
-			if sar.remoteAction.IsCheckout() && isLocalCheckout(github, sar.Step) && !sar.RunContext.Config.NoSkipCheckout {
+			if sar.skipsLocalCheckout(sar.remoteAction, github) {
 				if sar.RunContext.Config.BindWorkdir {
 					common.Logger(ctx).Debugf("Skipping local actions/checkout because you bound your workspace")
 					return nil
@@ -202,7 +206,7 @@ func (sar *stepActionRemote) getIfExpression(ctx context.Context, stage stepStag
 	switch stage {
 	case stepStagePre:
 		github := sar.getGithubContext(ctx)
-		if sar.remoteAction.IsCheckout() && isLocalCheckout(github, sar.Step) && !sar.RunContext.Config.NoSkipCheckout {
+		if sar.skipsLocalCheckout(sar.remoteAction, github) {
 			// skip local checkout pre step
 			return "false"
 		}

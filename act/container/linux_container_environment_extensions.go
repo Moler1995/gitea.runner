@@ -10,7 +10,6 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
-	"sync/atomic"
 
 	"gitea.com/gitea/runner/act/common/logging"
 )
@@ -77,22 +76,29 @@ func WithRunnerArch(ctx context.Context) context.Context {
 	if ctx.Value(runnerArchKey{}) != nil {
 		return ctx
 	}
-	return context.WithValue(ctx, runnerArchKey{}, &atomic.Value{})
+	return context.WithValue(ctx, runnerArchKey{}, &runnerArchCache{lock: make(chan struct{}, 1)})
+}
+
+type runnerArchCache struct {
+	lock chan struct{} // a channel, so a cancelled job stops waiting for another job's lookup
+	arch string
 }
 
 func cachedRunnerArch(ctx context.Context) string {
-	cache, ok := ctx.Value(runnerArchKey{}).(*atomic.Value)
+	cache, ok := ctx.Value(runnerArchKey{}).(*runnerArchCache)
 	if !ok {
 		return RunnerArch(ctx)
 	}
-	if arch, ok := cache.Load().(string); ok {
-		return arch
+	select {
+	case cache.lock <- struct{}{}:
+		defer func() { <-cache.lock }()
+	case <-ctx.Done():
+		return ""
 	}
-	arch := RunnerArch(ctx)
-	if arch != "" {
-		cache.Store(arch)
+	if cache.arch == "" {
+		cache.arch = RunnerArch(ctx)
 	}
-	return arch
+	return cache.arch
 }
 
 func (*LinuxContainerEnvironmentExtensions) GetRunnerContext(ctx context.Context) map[string]any {

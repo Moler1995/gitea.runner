@@ -112,7 +112,7 @@ func printPrepareActions(rc *RunContext, preparers []actionPreparer) common.Exec
 			}
 			github := action.getGithubContext(common.WithLogger(ctx, logging.New(logging.DiscardHandler)))
 			remote, err := newRemoteAction(action.Step.Uses, github, action.RunContext.Config.GitHubInstance)
-			if err != nil || remote.IsCheckout() && isLocalCheckout(github, action.Step) && !action.RunContext.Config.NoSkipCheckout {
+			if err != nil || action.skipsLocalCheckout(remote, github) {
 				continue
 			}
 			key := remote.CloneURL(action.RunContext.Config.DefaultActionURL()) + "@" + remote.Ref

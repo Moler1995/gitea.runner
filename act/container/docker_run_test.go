@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -490,9 +491,11 @@ func TestRunnerArchCachedPerRun(t *testing.T) {
 	t.Setenv("DOCKER_HOST", daemon.URL)
 	extensions := &LinuxContainerEnvironmentExtensions{}
 	run := WithRunnerArch(t.Context())
-	for range 2 {
-		assert.Equal(t, "ARM64", extensions.GetRunnerContext(run)["arch"])
+	var lookups sync.WaitGroup
+	for range 4 {
+		lookups.Go(func() { assert.Equal(t, "ARM64", extensions.GetRunnerContext(run)["arch"]) })
 	}
+	lookups.Wait()
 	assert.Equal(t, "ARM64", extensions.GetRunnerContext(t.Context())["arch"])
 	assert.EqualValues(t, 2, infos.Load())
 }
