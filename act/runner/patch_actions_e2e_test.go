@@ -213,6 +213,7 @@ func TestPatchedBundleAcrossActions(t *testing.T) {
 		{"Swatinem/rust-cache", "v2.9.1", "dist/restore/index.js", true},
 		{"Swatinem/rust-cache", "v2.9.2", "dist/cache-CTfQoCTL.js", true},
 		{"docker/build-push-action", "v7.3.0", "dist/index.cjs", true},
+		{"gradle/actions", "v6.4.0", "dist/setup-gradle/main/index.js", true},
 		// The artifact toolkit, where the gate is a refusal and there is nothing to redirect.
 		// v4.4.0 is the first release whose gate carries the localhost test this matches; the
 		// releases before it refuse in a shape the runner leaves alone.
@@ -400,7 +401,7 @@ func TestCodeSplitActionFindsTheCacheService(t *testing.T) {
 	const token = "split-runtime-token"
 	defer handler.RegisterJob(token, artifactcache.JobCredential{Repo: "testuser/testrepo"})()
 
-	defer patchActions(t.Context(), actionScriptPaths(dir, action))()
+	defer patchActions(t.Context(), actionScriptPaths(dir, dir, action))()
 	out := runActionEntrypoint(t, filepath.Join(dir, action.Runs.Main), jobEnv{
 		workspace:  tempDirPath(t),
 		runnerTemp: tempDirPath(t),

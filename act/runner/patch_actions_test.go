@@ -230,22 +230,24 @@ func TestActionScriptPaths(t *testing.T) {
 		chunks = append(chunks, filepath.Join(dist, name))
 	}
 	node := &model.Action{Runs: model.ActionRuns{Using: "node20", Pre: "pre.js", Main: "dist/restore.js", Post: "dist/save.js"}}
-	assert.Equal(t, append(slices.Clone(chunks), filepath.Join(dir, "pre.js")), actionScriptPaths(dir, node))
+	assert.Equal(t, append(slices.Clone(chunks), filepath.Join(dir, "pre.js")), actionScriptPaths(dir, dir, node))
 
 	// Only a node action has a bundle to patch.
-	assert.Nil(t, actionScriptPaths(dir, &model.Action{Runs: model.ActionRuns{Using: "docker", Image: "alpine"}}))
-	assert.Nil(t, actionScriptPaths(dir, nil))
+	assert.Nil(t, actionScriptPaths(dir, dir, &model.Action{Runs: model.ActionRuns{Using: "docker", Image: "alpine"}}))
+	assert.Nil(t, actionScriptPaths(dir, dir, nil))
 
 	// An action naming a file outside its own directory does not get it rewritten.
 	require.NoError(t, os.Symlink(outside, filepath.Join(dir, "linked")))
 	escaping, err := filepath.Rel(dir, filepath.Join(outside, "index.js"))
 	require.NoError(t, err)
 	for _, main := range []string{"../../elsewhere/index.js", escaping, "dist/linked.js", "linked/index.js"} {
-		assert.Nil(t, actionScriptPaths(dir, &model.Action{Runs: model.ActionRuns{Using: "node20", Main: main}}), main)
+		assert.Nil(t, actionScriptPaths(dir, dir, &model.Action{Runs: model.ActionRuns{Using: "node20", Main: main}}), main)
 	}
 
 	require.NoError(t, os.Symlink("dist", filepath.Join(dir, "build")))
-	assert.Equal(t, chunks, actionScriptPaths(dir, &model.Action{Runs: model.ActionRuns{Using: "node20", Main: "build/restore.js"}}))
+	assert.Equal(t, chunks, actionScriptPaths(dir, dir, &model.Action{Runs: model.ActionRuns{Using: "node20", Main: "build/restore.js"}}))
+
+	assert.Equal(t, chunks, actionScriptPaths(dir, filepath.Join(dir, "setup"), &model.Action{Runs: model.ActionRuns{Using: "node20", Main: "../dist/restore.js"}}))
 }
 
 func TestPatchActionsAtTheContainerCopy(t *testing.T) {
@@ -256,14 +258,14 @@ func TestPatchActionsAtTheContainerCopy(t *testing.T) {
 		sar := &stepActionRemote{
 			Step:         &model.Step{Uses: "owner/repo/sub@v1"},
 			remoteAction: &remoteAction{Org: "owner", Repo: "repo", Path: "sub", Ref: "v1"},
-			action:       &model.Action{Runs: model.ActionRuns{Using: "node20", Main: "index.js"}},
+			action:       &model.Action{Runs: model.ActionRuns{Using: "node20", Main: "../dist/index.js"}},
 			actionDir:    t.TempDir(),
 			RunContext: &RunContext{
 				Config:       &Config{ActionCacheDir: t.TempDir(), NoActionPatch: noPatch},
 				JobContainer: cm,
 			},
 		}
-		script := filepath.Join(sar.actionDir, "sub", "cache.js")
+		script := filepath.Join(sar.actionDir, "dist", "cache.js")
 		require.NoError(t, os.MkdirAll(filepath.Dir(script), 0o755))
 		require.NoError(t, os.WriteFile(filepath.Join(filepath.Dir(script), "index.js"), []byte("require('./cache.js')"), 0o600))
 		require.NoError(t, os.WriteFile(script, []byte(gateTSC), 0o600))

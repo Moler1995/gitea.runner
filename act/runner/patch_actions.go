@@ -86,12 +86,13 @@ func quoted(pattern string) string {
 // actionScriptPaths returns the scripts of a node action, the only kind with a bundle: its
 // entrypoints and the chunks a bundler split out next to them, where the toolkit can sit. Only
 // remote actions get here: a local one lives in the user's checkout, which the runner does not
-// rewrite.
-func actionScriptPaths(dir string, action *model.Action) []string {
+// rewrite. dir holds the action's yaml, inside the checkout of its repository, which its scripts
+// may reach into, as gradle/actions/setup-gradle does with ../dist.
+func actionScriptPaths(checkout, dir string, action *model.Action) []string {
 	if action == nil || !action.Runs.Using.IsNode() {
 		return nil
 	}
-	root, err := filepath.EvalSymlinks(dir)
+	root, err := filepath.EvalSymlinks(checkout)
 	if err != nil {
 		return nil
 	}
@@ -104,7 +105,7 @@ func actionScriptPaths(dir string, action *model.Action) []string {
 		if err != nil {
 			continue
 		}
-		// `runs` is the action's own yaml, and a key resolving outside its directory is not ours.
+		// `runs` is the action's own yaml, and a key resolving outside its checkout is not ours.
 		bundleDir := filepath.Dir(path)
 		if rel, err := filepath.Rel(root, bundleDir); err != nil || !filepath.IsLocal(rel) {
 			continue
