@@ -85,6 +85,21 @@ func TestPatchedBundleLeavesTrustworthyURLCheckAlone(t *testing.T) {
 	assert.True(t, gateOpened(string(out)))
 }
 
+func TestPatchedBundleOpensOnlyTheIsGhesTest(t *testing.T) {
+	const unrelated = `function isLocalName(h){return h.toUpperCase().endsWith('.LOCALHOST')}`
+
+	for _, bundle := range []string{unrelated + "\n" + gateTSC, gateTSC + "\n" + unrelated} {
+		out, patched := patchedBundle([]byte(bundle))
+		require.True(t, patched)
+		assert.Contains(t, string(out), unrelated)
+		assert.Contains(t, string(out), "!h.endsWith('')")
+	}
+
+	apart := strings.Replace(gateTSC, "&&!h.endsWith('.LOCALHOST')", "&&"+strings.Repeat(" ", 200)+"!h.endsWith('.LOCALHOST')", 1)
+	_, patched := patchedBundle([]byte(apart))
+	assert.False(t, patched)
+}
+
 // The artifact toolkit puts the same gate in front of a plain refusal, with no URL to move, so
 // opening it is what lets the stock upload-artifact work against Gitea instead of aborting.
 func TestPatchedBundleOpensTheArtifactRefusal(t *testing.T) {

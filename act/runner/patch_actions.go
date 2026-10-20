@@ -40,8 +40,9 @@ const (
 	cacheURLEnv       = "ACTIONS_CACHE_URL"
 	resultsURLEnv     = "ACTIONS_RESULTS_URL"
 
-	// localhostHost is the suffix isGhes accepts.
+	// localhostHost is the suffix isGhes accepts, and gheHost the one it tests just before.
 	localhostHost = ".LOCALHOST"
+	gheHost       = ".GHE.COM"
 
 	// artifactRefusal is the only thing the gate guards in @actions/artifact, which is what makes
 	// such a bundle safe to open. A bundle carrying neither toolkit uses isGhes for something this
@@ -57,8 +58,11 @@ var (
 	// testing it, while undici, bundled into all of these actions, tests a lowercase ".localhost"
 	// in isURLPotentiallyTrustworthy. Opening that one would tell its HTTP client that every URL
 	// is trustworthy. Uppercase, the literal occurs nowhere but this test, across 118 bundles
-	// covering every major version of sixteen actions.
-	localhostTest = regexp.MustCompile(`endsWith\s*\(\s*` + quoted(regexp.QuoteMeta(localhostHost)) + `\s*\)`)
+	// covering every major version of sixteen actions. The .GHE.COM test before it, 5 bytes
+	// ahead minified and 35 not, is part of the match so that another library's uppercase test
+	// is never taken for this one.
+	localhostTest = regexp.MustCompile(`endsWith\s*\(\s*` + quoted(regexp.QuoteMeta(gheHost)) + `\s*\)(?s:.{0,128}?)` +
+		`endsWith\s*\(\s*` + quoted(regexp.QuoteMeta(localhostHost)) + `\s*\)`)
 
 	// serviceURLBranches matches both branches of getCacheServiceURL at once: the v1 branch reads
 	// the cache URL and falls back to the results URL, the v2 branch just below reads the results
@@ -181,7 +185,8 @@ func patchedBundle(data []byte) ([]byte, bool) {
 	opened := localhostTest.ReplaceAllFunc(data, func(test []byte) []byte {
 		// Drop the hostname from the test rather than rewriting the call, so the bundle's own
 		// quoting survives and the result stays valid even inside a string literal.
-		return bytes.Replace(test, []byte(localhostHost), nil, 1)
+		before, after, _ := bytes.CutLast(test, []byte(localhostHost))
+		return slices.Concat(before, after)
 	})
 	if cache {
 		opened = serviceURLBranches.ReplaceAll(opened, cacheURLFirst)
