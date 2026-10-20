@@ -251,7 +251,7 @@ func TestActionScriptPaths(t *testing.T) {
 	assert.Nil(t, actionScriptPaths(dir, dir, &model.Action{Runs: model.ActionRuns{Using: "docker", Image: "alpine"}}))
 	assert.Nil(t, actionScriptPaths(dir, dir, nil))
 
-	// An action naming a file outside its own directory does not get it rewritten.
+	// An action naming a file outside its checkout does not get it rewritten.
 	require.NoError(t, os.Symlink(outside, filepath.Join(dir, "linked")))
 	escaping, err := filepath.Rel(dir, filepath.Join(outside, "index.js"))
 	require.NoError(t, err)

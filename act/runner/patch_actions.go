@@ -58,9 +58,8 @@ var (
 	// testing it, while undici, bundled into all of these actions, tests a lowercase ".localhost"
 	// in isURLPotentiallyTrustworthy. Opening that one would tell its HTTP client that every URL
 	// is trustworthy. Uppercase, the literal occurs nowhere but this test, across 118 bundles
-	// covering every major version of sixteen actions. The .GHE.COM test before it, 5 bytes
-	// ahead minified and 35 not, is part of the match so that another library's uppercase test
-	// is never taken for this one.
+	// covering every major version of sixteen actions. Anchoring on the .GHE.COM test, 5 to 35
+	// bytes before it, keeps any other library's uppercase test out.
 	localhostTest = regexp.MustCompile(`endsWith\s*\(\s*` + quoted(regexp.QuoteMeta(gheHost)) + `\s*\)(?s:.{0,128}?)` +
 		`endsWith\s*\(\s*` + quoted(regexp.QuoteMeta(localhostHost)) + `\s*\)`)
 
@@ -87,11 +86,9 @@ func quoted(pattern string) string {
 	return "(?:'" + pattern + "'|\"" + pattern + "\"|`" + pattern + "`)"
 }
 
-// actionScriptPaths returns the scripts of a node action, the only kind with a bundle: its
-// entrypoints and the chunks a bundler split out next to them, where the toolkit can sit. Only
+// actionScriptPaths returns a node action's entrypoints and the chunks bundled beside them. Only
 // remote actions get here: a local one lives in the user's checkout, which the runner does not
-// rewrite. dir holds the action's yaml, inside the checkout of its repository, which its scripts
-// may reach into, as gradle/actions/setup-gradle does with ../dist.
+// rewrite. Scripts may leave dir for the rest of the checkout, as setup-gradle's ../dist does.
 func actionScriptPaths(checkout, dir string, action *model.Action) []string {
 	if action == nil || !action.Runs.Using.IsNode() {
 		return nil
