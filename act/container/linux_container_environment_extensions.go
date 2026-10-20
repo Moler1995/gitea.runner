@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"sync/atomic"
 
 	"gitea.com/gitea/runner/act/common/logging"
 )
@@ -69,10 +70,35 @@ func (*LinuxContainerEnvironmentExtensions) JoinPathVariable(paths ...string) st
 // DefaultToolCache is where the runner mounts the tool cache inside job containers.
 const DefaultToolCache = "/opt/hostedtoolcache"
 
+type runnerArchKey struct{}
+
+// WithRunnerArch makes the runner context ask the daemon for its architecture once per run.
+func WithRunnerArch(ctx context.Context) context.Context {
+	if ctx.Value(runnerArchKey{}) != nil {
+		return ctx
+	}
+	return context.WithValue(ctx, runnerArchKey{}, &atomic.Value{})
+}
+
+func cachedRunnerArch(ctx context.Context) string {
+	cache, ok := ctx.Value(runnerArchKey{}).(*atomic.Value)
+	if !ok {
+		return RunnerArch(ctx)
+	}
+	if arch, ok := cache.Load().(string); ok {
+		return arch
+	}
+	arch := RunnerArch(ctx)
+	if arch != "" {
+		cache.Store(arch)
+	}
+	return arch
+}
+
 func (*LinuxContainerEnvironmentExtensions) GetRunnerContext(ctx context.Context) map[string]any {
 	return map[string]any{
 		"os":         "Linux",
-		"arch":       RunnerArch(ctx),
+		"arch":       cachedRunnerArch(ctx),
 		"temp":       "/tmp",
 		"tool_cache": DefaultToolCache,
 	}

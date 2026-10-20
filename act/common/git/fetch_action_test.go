@@ -6,6 +6,7 @@ package git
 import (
 	"archive/tar"
 	"bytes"
+	"context"
 	"encoding/base64"
 	"fmt"
 	"net/http"
@@ -101,6 +102,72 @@ func TestFetchAction(t *testing.T) {
 	newInput := func(ref string) NewGitCloneExecutorInput {
 		return NewGitCloneExecutorInput{URL: server.URL + "/org/action", Ref: ref, Dir: t.TempDir(), Token: "secret"}
 	}
+
+	t.Run("shares identical fetches and isolates cancellation and differing inputs", func(t *testing.T) {
+		for _, scenario := range []string{"shared", "leader cancelled", "different token"} {
+			t.Run(scenario, func(t *testing.T) {
+				serve("prefixed", 0)
+				input := newInput("main")
+				expectedSha := gitRevParse(t, remote, "main")
+				started, release := make(chan struct{}), make(chan struct{})
+				t.Cleanup(func() {
+					select {
+					case <-release:
+					default:
+						close(release)
+					}
+				})
+				var once sync.Once
+				transport := actionFetchTransport(func(request *http.Request) (*http.Response, error) {
+					once.Do(func() { close(started) })
+					select {
+					case <-request.Context().Done():
+						return nil, request.Context().Err()
+					case <-release:
+						return http.DefaultTransport.RoundTrip(request)
+					}
+				})
+				input.Transport = &transport
+				leaderCtx, cancelLeader := context.WithCancel(t.Context())
+				defer cancelLeader()
+				followerCtx, cancelFollower := context.WithCancel(t.Context())
+				defer cancelFollower()
+				waiting := &actionFetchContext{Context: followerCtx, waiting: make(chan struct{})}
+				followerInput := input
+				expectedRequests := 1
+				if scenario == "different token" {
+					followerInput.Token, expectedRequests = "other", 2
+				}
+				leaderDone, followerDone := make(chan error, 1), make(chan error, 1)
+				fetch := func(ctx context.Context, input NewGitCloneExecutorInput, done chan<- error) {
+					tree, sha, err := FetchAction(ctx, input)
+					if err == nil {
+						assert.Equal(t, expectedSha, sha)
+						assert.Equal(t, filepath.Join(input.Dir, sha), tree)
+					}
+					done <- err
+				}
+				go fetch(leaderCtx, input, leaderDone)
+				<-started
+				go fetch(waiting, followerInput, followerDone)
+				<-waiting.waiting
+				if scenario == "leader cancelled" {
+					cancelLeader()
+					require.ErrorIs(t, <-leaderDone, context.Canceled)
+				}
+				close(release)
+				if scenario != "leader cancelled" {
+					require.NoError(t, <-leaderDone)
+				}
+				require.NoError(t, <-followerDone)
+				_, headers := served()
+				assert.Len(t, headers, expectedRequests)
+				if scenario == "different token" {
+					assert.NotEqual(t, headers[0].Get("Authorization"), headers[1].Get("Authorization"))
+				}
+			})
+		}
+	})
 
 	t.Run("downloads, revalidates and follows a moved tag", func(t *testing.T) {
 		serve("prefixed", 0)
@@ -198,6 +265,23 @@ func TestFetchAction(t *testing.T) {
 		assert.Len(t, headers, 1)
 		assert.NoDirExists(t, filepath.Join(input.Dir, "git"))
 	})
+}
+
+type actionFetchTransport func(*http.Request) (*http.Response, error)
+
+func (transport actionFetchTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	return transport(request)
+}
+
+type actionFetchContext struct {
+	context.Context
+	waiting chan struct{}
+	once    sync.Once
+}
+
+func (ctx *actionFetchContext) Done() <-chan struct{} {
+	ctx.once.Do(func() { close(ctx.waiting) })
+	return ctx.Context.Done()
 }
 
 func TestExtractTreeConfinesEntries(t *testing.T) {

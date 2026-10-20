@@ -14,13 +14,17 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"gitea.com/gitea/runner/act/common"
+	"gitea.com/gitea/runner/act/common/git"
 	"gitea.com/gitea/runner/act/common/logging"
 	"gitea.com/gitea/runner/act/common/logging/logtest"
 	"gitea.com/gitea/runner/act/container"
@@ -151,6 +155,71 @@ func TestPrintPrepareActionsGolden(t *testing.T) {
 		"",
 	}, "\n")
 	assert.Equal(t, want, buf.String())
+}
+
+func TestPrintPrepareActionsFetchesConcurrently(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		buf := &bytes.Buffer{}
+		ctx := common.WithLogger(t.Context(), logging.New(logging.NewLevelHandler(newJobLogHandler(buf, cyan), logging.LevelInfo)).With("job", "j1"))
+		rc := newPrefetchRunContext(t)
+		started, release := make(chan string), make(chan struct{})
+		var fetched atomic.Int32
+		setFetch(t, func(_ctx context.Context, input git.NewGitCloneExecutorInput) (string, string, error) {
+			fetched.Add(1)
+			started <- input.Ref
+			<-release
+			return filepath.Join(input.Dir, "commit"), "sha-" + input.Ref, nil
+		})
+		preparers := newRemotePreparers(rc, nil, "org/repo@v1", "org/repo/sub@v1", "org/repo@v2", "org/repo@v3", "org/repo@v4", "org/repo@v5")
+		finished := make(chan error)
+		go func() { finished <- printPrepareActions(rc, preparers)(ctx) }()
+		for range 4 {
+			<-started
+		}
+		synctest.Wait()
+		assert.EqualValues(t, 4, fetched.Load())
+		close(release)
+		<-started
+		require.NoError(t, <-finished)
+		assert.EqualValues(t, 5, fetched.Load())
+		lines := []string{"[j1]   | Prepare all required actions"}
+		for _, ref := range []string{"v1", "v2", "v3", "v4", "v5"} {
+			lines = append(lines, fmt.Sprintf("[j1]   | Download action repository 'org/repo@%s' (SHA:sha-%s)", ref, ref))
+		}
+		assert.Equal(t, strings.Join(append(lines, ""), "\n"), buf.String())
+	})
+}
+
+func TestPrintPrepareActionsReportsFailureWithoutWaitingForLaterDownloads(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		rc := newPrefetchRunContext(t)
+		setFetch(t, func(ctx context.Context, input git.NewGitCloneExecutorInput) (string, string, error) {
+			if input.Ref == "v2" {
+				<-ctx.Done()
+				return "", "", ctx.Err()
+			}
+			return filepath.Join(input.Dir, "commit"), "sha", nil
+		})
+		ctx := common.WithJobErrorContainer(common.WithLogger(t.Context(), logging.New(logging.DiscardHandler)))
+		require.ErrorIs(t, printPrepareActions(rc, newRemotePreparers(rc, assert.AnError, "org/repo@v1", "org/repo@v2"))(ctx), assert.AnError)
+	})
+}
+
+func newPrefetchRunContext(t *testing.T) *RunContext {
+	return &RunContext{
+		Config: &Config{ActionCacheDir: t.TempDir(), PresetGitHubContext: &model.GithubContext{Repository: "org/workflow", Ref: "refs/heads/main", Sha: strings.Repeat("a", 40)}},
+		Run:    &model.Run{JobID: "1", Workflow: &model.Workflow{Jobs: map[string]*model.Job{"1": {}}}},
+	}
+}
+
+func newRemotePreparers(rc *RunContext, readErr error, uses ...string) []actionPreparer {
+	preparers := make([]actionPreparer, 0, len(uses))
+	for _, use := range uses {
+		preparers = append(preparers, &stepActionRemote{Step: &model.Step{Uses: use}, RunContext: rc, readAction: func(_ctx context.Context, _step *model.Step, _actionDir, _actionPath string, _readFile actionYamlReader, _writeFile fileWriter) (*model.Action, error) {
+			return &model.Action{}, readErr
+		}})
+	}
+	return preparers
 }
 
 func TestPrintPrepareActionsSkipsWithoutActions(t *testing.T) {

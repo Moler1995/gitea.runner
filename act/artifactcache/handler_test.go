@@ -114,6 +114,21 @@ func TestHandler(t *testing.T) {
 
 	base := fmt.Sprintf("%s%s", handler.ExternalURL(), apiPath)
 
+	t.Run("database open recovers from failure and close is idempotent", func(t *testing.T) {
+		handler := &Handler{dir: t.TempDir()}
+		require.NoError(t, os.Mkdir(filepath.Join(handler.dir, "bolt.db"), 0o755))
+		_, err := handler.openDB()
+		require.Error(t, err)
+		require.NoError(t, os.Remove(filepath.Join(handler.dir, "bolt.db")))
+		first, err := handler.openDB()
+		require.NoError(t, err)
+		require.NoError(t, first.Close())
+		require.NoError(t, first.Close())
+		second, err := handler.openDB()
+		require.NoError(t, err)
+		require.NoError(t, second.Close())
+	})
+
 	defer func() {
 		t.Run("inpect db", func(t *testing.T) {
 			db, err := handler.openDB()

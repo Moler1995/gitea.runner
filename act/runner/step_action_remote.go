@@ -31,15 +31,27 @@ type stepActionRemote struct {
 	env                 map[string]string
 	remoteAction        *remoteAction
 	actionDir           string // the repository at the resolved commit, shared by the job's actions in it
-	resolvedSha         string // set on the step that made the job's download of the repository
+	resolvedSha         string // set on the first step preparing the repository
 }
 
 type actionDownload struct {
-	dir string
-	err error
+	dir, sha string
+	err      error
+	fetched  chan struct{} // closed when a prefetch finishes
 }
 
 var stepActionRemoteFetch = git.FetchAction
+
+func (sar *stepActionRemote) fetchAction(ctx context.Context, remote *remoteAction, token string) (string, string, error) {
+	cloneURL := remote.CloneURL(sar.RunContext.Config.DefaultActionURL())
+	return stepActionRemoteFetch(ctx, sar.RunContext.Config.withInstanceAuth(git.NewGitCloneExecutorInput{
+		URL:         cloneURL,
+		Ref:         remote.Ref,
+		Dir:         filepath.Join(sar.RunContext.ActionCacheDir(), model.UsesHash(cloneURL+"@"+remote.Ref)),
+		OfflineMode: sar.RunContext.Config.ActionOfflineMode,
+		Depth:       sar.RunContext.Config.ActionCloneDepth,
+	}, token))
+}
 
 func (sar *stepActionRemote) prepareActionExecutor() common.Executor {
 	return func(ctx context.Context) error {
@@ -70,22 +82,24 @@ func (sar *stepActionRemote) prepareActionExecutor() common.Executor {
 		cloneURL := sar.remoteAction.CloneURL(sar.RunContext.Config.DefaultActionURL())
 		job := sar.RunContext.topLevelRunContext()
 		key := cloneURL + "@" + sar.remoteAction.Ref
-		download, ok := job.actionDownloads[key]
-		if !ok {
+		download := job.actionDownloads[key]
+		if download == nil {
+			download = &actionDownload{}
 			// For Gitea
 			// github.Token, unlike Config.GetToken, survives the composite config copy, which nils Config.Secrets.
-			download.dir, sar.resolvedSha, download.err = stepActionRemoteFetch(ctx, sar.RunContext.Config.withInstanceAuth(git.NewGitCloneExecutorInput{
-				URL:         cloneURL,
-				Ref:         sar.remoteAction.Ref,
-				Dir:         filepath.Join(sar.RunContext.ActionCacheDir(), model.UsesHash(key)),
-				OfflineMode: sar.RunContext.Config.ActionOfflineMode,
-				Depth:       sar.RunContext.Config.ActionCloneDepth,
-			}, github.Token))
+			download.dir, download.sha, download.err = sar.fetchAction(ctx, sar.remoteAction, github.Token)
 			if job.actionDownloads == nil {
-				job.actionDownloads = map[string]actionDownload{}
+				job.actionDownloads = map[string]*actionDownload{}
 			}
 			job.actionDownloads[key] = download
+		} else if download.fetched != nil {
+			select {
+			case <-download.fetched:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 		}
+		sar.resolvedSha, download.sha = download.sha, ""
 		var refErr *git.Error
 		switch {
 		case errors.As(download.err, &refErr) && errors.Is(download.err, git.ErrShortRef):

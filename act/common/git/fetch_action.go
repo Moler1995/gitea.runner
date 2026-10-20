@@ -16,13 +16,24 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"gitea.com/gitea/runner/act/common"
 )
+
+var actionFetches sync.Map
+
+type actionFetch struct {
+	done      chan struct{}
+	dir, sha  string
+	err       error
+	cancelled bool
+}
 
 var archiveRetryDelay = func(retryAfter string) time.Duration { // as actions/runner backs off
 	if seconds, err := strconv.Atoi(retryAfter); err == nil {
@@ -32,6 +43,35 @@ var archiveRetryDelay = func(retryAfter string) time.Duration { // as actions/ru
 }
 
 func FetchAction(ctx context.Context, input NewGitCloneExecutorInput) (string, string, error) { // input.Dir is one clone URL and ref's, holding a directory per commit
+	if !reflect.ValueOf(input).Comparable() {
+		return fetchAction(ctx, input)
+	}
+	for ctx.Err() == nil {
+		call := &actionFetch{done: make(chan struct{})}
+		previous, loaded := actionFetches.LoadOrStore(input, call)
+		if !loaded {
+			call.dir, call.sha, call.err = fetchAction(ctx, input)
+			call.cancelled = ctx.Err() != nil
+			actionFetches.Delete(input)
+			close(call.done)
+			if call.cancelled {
+				continue
+			}
+			return call.dir, call.sha, call.err
+		}
+		call, _ = previous.(*actionFetch)
+		select {
+		case <-ctx.Done():
+		case <-call.done:
+			if !call.cancelled && ctx.Err() == nil {
+				return call.dir, call.sha, call.err
+			}
+		}
+	}
+	return "", "", ctx.Err()
+}
+
+func fetchAction(ctx context.Context, input NewGitCloneExecutorInput) (string, string, error) {
 	unlock, err := AcquireCloneLock(ctx, input.Dir)
 	if err != nil {
 		return "", "", err

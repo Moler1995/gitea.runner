@@ -165,11 +165,11 @@ func runStepExecutor(step step, stage stepStage, executor common.Executor) commo
 		if topRC.summaryFileInitialized == nil {
 			topRC.summaryFileInitialized = map[int]bool{}
 		}
-		_ = rc.JobContainer.Copy(actPath, files...)(ctx)
 		if !topRC.summaryFileInitialized[stepSummaryIndex] {
-			_ = rc.JobContainer.Copy(actPath, &container.FileEntry{Name: summaryFileCommand, Mode: 0o666})(ctx)
+			files = append(files, &container.FileEntry{Name: summaryFileCommand, Mode: 0o666})
 			topRC.summaryFileInitialized[stepSummaryIndex] = true
 		}
+		_ = rc.JobContainer.Copy(actPath, files...)(ctx)
 
 		// The command handler needs the step's env to judge ACTIONS_ALLOW_UNSECURE_COMMANDS.
 		// Cloned: the step executor keeps writing to its own env map after this point, on a
