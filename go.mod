@@ -6,8 +6,8 @@ toolchain go1.27.3
 
 require (
 	connectrpc.com/connect/v2 v2.0.1
-	gitea.dev/actionslib v1.4.2-0.20261019014634-1fd849368a92
-	github.com/bmatcuk/doublestar/v4 v4.10.2
+	gitea.dev/actionslib v1.5.0
+	github.com/bmatcuk/doublestar/v4 v4.10.3
 	github.com/coder/websocket v1.8.15
 	github.com/containerd/errdefs v1.0.0
 	github.com/creack/pty v1.1.24
