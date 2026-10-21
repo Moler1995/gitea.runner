@@ -102,6 +102,7 @@ type Reporter struct {
 	stateNotify chan struct{} // signal: step transition (start/stop)
 
 	debugOutputEnabled  bool
+	echoCommands        bool
 	stopCommandEndToken string
 
 	jobLog *jobLog // this task's rows on the runner's own disk, nil when log.job.dir is unset
@@ -158,6 +159,7 @@ func NewReporter(ctx context.Context, cancel context.CancelFunc, client client.C
 
 	if task.Secrets["ACTIONS_STEP_DEBUG"] == "true" {
 		rv.debugOutputEnabled = true
+		rv.echoCommands = true
 	}
 
 	return rv
@@ -487,6 +489,7 @@ func (r *Reporter) Handle(_ context.Context, entry logging.Record) error {
 		// The runner's own handler is per step, so an unresumed ::stop-commands:: must not
 		// leave the reporter suppressed, and no longer registering masks, for the whole job.
 		r.stopCommandEndToken = ""
+		r.echoCommands = r.debugOutputEnabled
 	}
 
 	// Force reporting log errors as raw output to prevent silent failures
@@ -1004,6 +1007,14 @@ func (r *Reporter) parseResult(result any) (runnerv1.Result, bool) {
 // the property list at the first '::' as GitHub does; greedily would swallow a '::' message.
 var cmdRegex = regexp.MustCompile(`^::([^ :]+)( [^:]*)?::(.*)$`)
 
+var legacyCmdRegex = regexp.MustCompile(`^##\[([^ \]]+)( [^\]]*)?](.*)$`)
+
+// echoGatedCommands are shown, like on GitHub, only under step debug or ::echo::on.
+var echoGatedCommands = map[string]bool{
+	"set-output": true, "save-state": true, "set-env": true, "add-path": true,
+	"add-matcher": true, "remove-matcher": true, "echo": true,
+}
+
 // handleCommand takes value still escaped, so that the web UI decodes it exactly once. Only
 // the branches that consume the payload here decode it.
 func (r *Reporter) handleCommand(originalContent, command, properties, value string) *string {
@@ -1039,6 +1050,21 @@ func (r *Reporter) handleCommand(originalContent, command, properties, value str
 		return &originalContent
 	case "stop-commands":
 		r.stopCommandEndToken = runner.UnescapeCommandData(value)
+		return nil
+	}
+	if echoGatedCommands[command] {
+		echoed := r.echoCommands
+		if command == "echo" {
+			switch strings.ToLower(strings.TrimSpace(runner.UnescapeCommandData(value))) {
+			case "on":
+				r.echoCommands = true
+			case "off":
+				r.echoCommands = false
+			}
+		}
+		if echoed {
+			return &originalContent
+		}
 		return nil
 	}
 	return &originalContent
@@ -1114,6 +1140,9 @@ func (r *Reporter) parseLogRow(entry logging.Record) *runnerv1.LogRow {
 	}
 
 	matches := cmdRegex.FindStringSubmatch(content)
+	if legacy := legacyCmdRegex.FindStringSubmatch(content); legacy != nil && echoGatedCommands[strings.ToLower(legacy[1])] {
+		matches = legacy
+	}
 	if matches != nil {
 		if output := r.handleCommand(content, matches[1], matches[2], matches[3]); output != nil {
 			content = *output

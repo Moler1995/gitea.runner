@@ -79,10 +79,12 @@ func TestReporter_parseLogRow(t *testing.T) {
 				"::debug::GitHub Actions runtime token access controls",
 				// Left escaped: the web UI decodes it, and a real newline would not survive storage.
 				"::debug::first%0Asecond",
+				"::set-output name=a::b",
 			},
 			[]string{
 				"::debug::GitHub Actions runtime token access controls",
 				"::debug::first%0Asecond",
+				"::set-output name=a::b",
 			},
 		},
 		{
@@ -199,12 +201,46 @@ func TestReporter_parseLogRow(t *testing.T) {
 				"::set-mask::foo",
 			},
 		},
+		{
+			"applied commands hidden unless echoed", false,
+			[]string{
+				"::set-output name=a::b",
+				"::save-state name=a::b",
+				"::set-env name=A::b",
+				"::add-path::/b",
+				"::add-matcher::m.json",
+				"::remove-matcher owner=m::",
+				"##[set-output name=a]b",
+				"::echo::On%0A",
+				"::set-output name=a::b",
+				"::echo::bogus",
+				"##[set-output name=a]b",
+				"::echo::off",
+				"::set-output name=a::b",
+			},
+			[]string{
+				"<nil>",
+				"<nil>",
+				"<nil>",
+				"<nil>",
+				"<nil>",
+				"<nil>",
+				"<nil>",
+				"<nil>",
+				"::set-output name=a::b",
+				"::echo::bogus",
+				"##[set-output name=a]b",
+				"::echo::off",
+				"<nil>",
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			r := &Reporter{
 				logReplacer:        strings.NewReplacer(),
 				debugOutputEnabled: tt.debugOutputEnabled,
+				echoCommands:       tt.debugOutputEnabled,
 			}
 			for idx, arg := range tt.args {
 				rv := r.parseLogRow(logging.Record{Message: arg})
@@ -270,6 +306,7 @@ func TestReporter_Handle(t *testing.T) {
 		require.NoError(t, fire(reporter, logEntry{Message: "::debug::debug log line", Data: dataStep0}))
 		require.NoError(t, fire(reporter, logEntry{Message: "::debug::debug log line", Data: dataStep0}))
 		require.NoError(t, fire(reporter, logEntry{Message: "regular log line", Data: dataStep0}))
+		require.NoError(t, fire(reporter, logEntry{Message: "::echo::on", Data: dataStep0}))
 		require.NoError(t, fire(reporter, logEntry{Message: "composite step result", Data: map[string]any{
 			"stage":      "Main",
 			"stepID":     []string{"0", "0"},
@@ -287,6 +324,13 @@ func TestReporter_Handle(t *testing.T) {
 		assert.Equal(t, runnerv1.Result_RESULT_SUCCESS, reporter.state.Steps[0].Result)
 
 		assert.Equal(t, int64(5), reporter.state.Steps[0].LogLength)
+
+		require.NoError(t, fire(reporter, logEntry{Message: "::set-output name=a::b", Data: map[string]any{
+			"stage":      "Main",
+			"stepNumber": 1,
+			"raw_output": true,
+		}}))
+		assert.Zero(t, reporter.state.Steps[1].LogLength)
 	})
 }
 
@@ -1123,6 +1167,7 @@ func TestReporter_DebugSettingsAreNotMasked(t *testing.T) {
 	defer deregisterGlobalMasks(reporter)
 
 	assert.True(t, reporter.debugOutputEnabled)
+	assert.True(t, reporter.echoCommands)
 	assert.Equal(t, "debug is true", reporter.mask("debug is true"))
 	assert.Equal(t, "***", reporter.mask("s3cr3t"))
 
