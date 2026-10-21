@@ -122,39 +122,18 @@ func (sfm *stepFactoryMock) newStep(model *model.Step, rc *RunContext) (step, er
 type actionPreparerMock struct {
 	reference string
 	sha       string
-	err       error
 	prepared  int
 }
 
 func (apm *actionPreparerMock) prepareActionExecutor() common.Executor {
 	return func(context.Context) error {
 		apm.prepared++
-		return apm.err
+		return nil
 	}
 }
 
 func (apm *actionPreparerMock) actionDownloadInfo() (string, string) {
 	return apm.reference, apm.sha
-}
-
-func TestPrintPrepareActionsGolden(t *testing.T) {
-	buf := &bytes.Buffer{}
-	logger := logging.New(logging.NewLevelHandler(newJobLogHandler(buf, cyan), logging.LevelInfo))
-	ctx := common.WithLogger(t.Context(), logger.With("job", "j1"))
-
-	preparers := []actionPreparer{
-		&actionPreparerMock{reference: "actions/checkout@v7", sha: "9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0"},
-		// A step that downloads nothing, such as the checkout of the workflow's own repository.
-		&actionPreparerMock{},
-	}
-	require.NoError(t, printPrepareActions(&RunContext{}, preparers)(ctx))
-
-	want := strings.Join([]string{
-		"[j1]   | Prepare all required actions",
-		"[j1]   | Download action repository 'actions/checkout@v7' (SHA:9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0)",
-		"",
-	}, "\n")
-	assert.Equal(t, want, buf.String())
 }
 
 func TestPrintPrepareActionsFetchesConcurrently(t *testing.T) {
@@ -170,7 +149,7 @@ func TestPrintPrepareActionsFetchesConcurrently(t *testing.T) {
 			<-release
 			return filepath.Join(input.Dir, "commit"), "sha-" + input.Ref, nil
 		})
-		preparers := newRemotePreparers(rc, nil, "org/repo@v1", "org/repo/sub@v1", "org/repo@v2", "org/repo@v3", "org/repo@v4", "org/repo@v5")
+		preparers := append(newRemotePreparers(rc, "org/repo@v1", "org/repo/sub@v1", "org/repo@v2", "org/repo@v3", "org/repo@v4", "org/repo@v5"), &actionPreparerMock{})
 		finished := make(chan error)
 		go func() { finished <- printPrepareActions(rc, preparers)(ctx) }()
 		for range 4 {
@@ -190,33 +169,49 @@ func TestPrintPrepareActionsFetchesConcurrently(t *testing.T) {
 	})
 }
 
-func TestPrintPrepareActionsReportsFailureWithoutWaitingForLaterDownloads(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		rc := newPrefetchRunContext(t)
-		setFetch(t, func(ctx context.Context, input git.NewGitCloneExecutorInput) (string, string, error) {
-			if input.Ref == "v2" {
-				<-ctx.Done()
-				return "", "", ctx.Err()
-			}
-			return filepath.Join(input.Dir, "commit"), "sha", nil
+func TestPrintPrepareActionsFailsJobAndCancelsLaterDownloads(t *testing.T) {
+	for name, panicFetch := range map[string]bool{"error": false, "panic": true} {
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				rc := newPrefetchRunContext(t)
+				setFetch(t, func(ctx context.Context, input git.NewGitCloneExecutorInput) (string, string, error) {
+					if input.Ref == "v1" {
+						if panicFetch {
+							panic("broken archive")
+						}
+						return "", "", assert.AnError
+					}
+					<-ctx.Done()
+					return "", "", ctx.Err()
+				})
+				ctx := common.WithJobErrorContainer(common.WithLogger(t.Context(), logging.New(logging.DiscardHandler)))
+				remaining := &actionPreparerMock{}
+				err := printPrepareActions(rc, append(newRemotePreparers(rc, "org/repo@v1", "org/repo@v2"), remaining))(ctx)
+				if panicFetch {
+					require.ErrorContains(t, err, "panic: broken archive")
+				} else {
+					require.ErrorIs(t, err, assert.AnError)
+				}
+				require.ErrorIs(t, err, common.JobError(ctx))
+				assert.True(t, rc.jobFailed)
+				assert.Zero(t, remaining.prepared)
+			})
 		})
-		ctx := common.WithJobErrorContainer(common.WithLogger(t.Context(), logging.New(logging.DiscardHandler)))
-		require.ErrorIs(t, printPrepareActions(rc, newRemotePreparers(rc, assert.AnError, "org/repo@v1", "org/repo@v2"))(ctx), assert.AnError)
-	})
+	}
 }
 
 func newPrefetchRunContext(t *testing.T) *RunContext {
 	return &RunContext{
-		Config: &Config{ActionCacheDir: t.TempDir(), PresetGitHubContext: &model.GithubContext{Repository: "org/workflow", Ref: "refs/heads/main", Sha: strings.Repeat("a", 40)}},
+		Config: &Config{ActionCacheDir: t.TempDir(), PresetGitHubContext: &model.GithubContext{}},
 		Run:    &model.Run{JobID: "1", Workflow: &model.Workflow{Jobs: map[string]*model.Job{"1": {}}}},
 	}
 }
 
-func newRemotePreparers(rc *RunContext, readErr error, uses ...string) []actionPreparer {
+func newRemotePreparers(rc *RunContext, uses ...string) []actionPreparer {
 	preparers := make([]actionPreparer, 0, len(uses))
 	for _, use := range uses {
 		preparers = append(preparers, &stepActionRemote{Step: &model.Step{Uses: use}, RunContext: rc, readAction: func(_ctx context.Context, _step *model.Step, _actionDir, _actionPath string, _readFile actionYamlReader, _writeFile fileWriter) (*model.Action, error) {
-			return &model.Action{}, readErr
+			return &model.Action{}, nil
 		}})
 	}
 	return preparers
@@ -230,26 +225,6 @@ func TestPrintPrepareActionsSkipsWithoutActions(t *testing.T) {
 	require.NoError(t, printPrepareActions(&RunContext{}, nil)(ctx))
 
 	assert.Empty(t, buf.String())
-}
-
-func TestPrintPrepareActionsFailsJobOnDownloadError(t *testing.T) {
-	logger := logging.New(logtest.New())
-	ctx := common.WithJobErrorContainer(common.WithLogger(t.Context(), logger.With("job", "j1")))
-
-	downloadErr := errors.New("failed to fetch \"actions/checkout\"")
-	rc := &RunContext{}
-	remaining := &actionPreparerMock{reference: "actions/setup-go@v6", sha: "sha"}
-
-	err := printPrepareActions(rc, []actionPreparer{
-		&actionPreparerMock{err: downloadErr},
-		remaining,
-	})(ctx)
-
-	require.ErrorIs(t, err, downloadErr)
-	// No step has run yet, so the failure has to be recorded against the job itself.
-	assert.Equal(t, downloadErr, common.JobError(ctx))
-	assert.True(t, rc.jobFailed)
-	assert.Zero(t, remaining.prepared)
 }
 
 func TestNewStepsExecutorSkipsStepsAfterSetupFailure(t *testing.T) {

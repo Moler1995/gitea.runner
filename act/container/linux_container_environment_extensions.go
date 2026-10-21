@@ -71,8 +71,7 @@ const DefaultToolCache = "/opt/hostedtoolcache"
 
 type runnerArchKey struct{}
 
-// WithRunnerArch makes the runner context ask the daemon for its architecture once per run.
-func WithRunnerArch(ctx context.Context) context.Context {
+func WithRunnerArch(ctx context.Context) context.Context { // shares one architecture lookup per run
 	if ctx.Value(runnerArchKey{}) != nil {
 		return ctx
 	}
@@ -80,7 +79,7 @@ func WithRunnerArch(ctx context.Context) context.Context {
 }
 
 type runnerArchCache struct {
-	lock chan struct{} // a channel, so a cancelled job stops waiting for another job's lookup
+	lock chan struct{} // lets cancelled jobs stop waiting for the cache
 	arch string
 }
 

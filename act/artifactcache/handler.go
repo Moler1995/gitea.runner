@@ -88,7 +88,7 @@ type Handler struct {
 	server   *http.Server
 	logger   *logging.Logger
 
-	dbLock chan struct{} // held while a store is open, so waiters queue here instead of polling bolt's file lock
+	dbLock chan struct{} // queues store openers without polling bolt's file lock
 
 	gcing atomic.Bool
 	gcAt  time.Time
@@ -433,12 +433,17 @@ func (db *cacheDB) Close() error {
 	return db.close()
 }
 
-func (h *Handler) openDB() (*cacheDB, error) {
+func (h *Handler) openDB() (store *cacheDB, err error) {
 	select {
 	case h.dbLock <- struct{}{}:
 	case <-time.After(dbOpenTimeout):
 		return nil, berrors.ErrTimeout
 	}
+	defer func() {
+		if store == nil { // only an opened store hands the lock to Close, even when Open panics
+			<-h.dbLock
+		}
+	}()
 	db, err := bolthold.Open(filepath.Join(h.dir, "bolt.db"), 0o644, &bolthold.Options{
 		Encoder: func(value any) ([]byte, error) { return json.Marshal(value) },
 		Decoder: func(data []byte, value any) error { return json.Unmarshal(data, value) },
@@ -449,7 +454,6 @@ func (h *Handler) openDB() (*cacheDB, error) {
 		},
 	})
 	if err != nil {
-		<-h.dbLock
 		return nil, err
 	}
 	return &cacheDB{Store: db, close: sync.OnceValue(func() error {

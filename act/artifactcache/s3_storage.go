@@ -25,6 +25,8 @@ import (
 	"strings"
 	"time"
 
+	"gitea.com/gitea/runner/act/common"
+
 	"golang.org/x/sync/errgroup"
 )
 
@@ -71,7 +73,7 @@ func newS3Storage(staging *Storage, opts S3Options) (*s3Storage, error) {
 	}
 	transport, _ := http.DefaultTransport.(*http.Transport)
 	transport = transport.Clone()
-	transport.MaxIdleConnsPerHost = 4
+	transport.MaxIdleConnsPerHost = 32            // 4 parts each for the 8 jobs a runner commonly runs
 	transport.ResponseHeaderTimeout = time.Minute // a stalled endpoint must not hold the store forever
 	pathStyle := !strings.HasSuffix(endpoint.Hostname(), ".amazonaws.com")
 	if opts.PathStyle != nil {
@@ -239,7 +241,8 @@ func (s *s3Storage) upload(ctx context.Context, key string, file io.ReaderAt, si
 	workers, workerCtx := errgroup.WithContext(ctx)
 	workers.SetLimit(4)
 	for part := range completion.Parts {
-		workers.Go(func() error {
+		workers.Go(func() (err error) {
+			defer common.RecoverPanic(&err)
 			offset := int64(part) * partSize
 			header, err := s.call(workerCtx, http.MethodPut, key, url.Values{"partNumber": {strconv.Itoa(part + 1)}, "uploadId": {created.UploadID}}, io.NewSectionReader(file, offset, min(partSize, size-offset)), nil)
 			completion.Parts[part] = s3Part{part + 1, header.Get("ETag")}

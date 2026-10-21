@@ -78,7 +78,7 @@ func NewDockerProxy(ctx context.Context, job string) *DockerProxy {
 	key := [3]string{cli.DaemonHost(), workdir, os.TempDir()}
 	cached, _ := dockerProxyDirectories.Load(key)
 	directory, seen := cached.(dockerProxyDirectory)
-	seen = seen && os.SameFile(directory.socket, socket) // a replaced daemon may see other directories
+	seen = seen && os.SameFile(directory.socket, socket) // daemon replacement invalidates cached paths
 	dir, daemonDir := directory.dir, directory.daemonDir
 	if !seen {
 		dir, daemonDir = runnerContainerWorkdir(probeCtx, cli)

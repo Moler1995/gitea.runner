@@ -9,6 +9,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"testing/synctest"
@@ -567,6 +568,12 @@ func TestRunStepExecutorParity(t *testing.T) {
 		summary, err := os.ReadFile(step.env["GITHUB_STEP_SUMMARY"])
 		require.NoError(t, err)
 		assert.Equal(t, "report", string(summary))
+	})
+
+	t.Run("a broken summary path still resets the command files", func(t *testing.T) {
+		step := newStep(t, &model.Step{ID: "noop"})
+		require.NoError(t, os.MkdirAll(filepath.Join(step.RunContext.JobContainer.GetActPath(), "workflow", "step-summary-0.md"), 0o700))
+		require.NoError(t, runStepExecutor(step, stepStageMain, noopExecutor)(t.Context()))
 	})
 
 	t.Run("file commands survive a job timeout", func(t *testing.T) {

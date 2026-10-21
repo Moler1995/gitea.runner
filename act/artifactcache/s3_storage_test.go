@@ -8,7 +8,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -25,11 +24,11 @@ func TestHandler_S3SharesEntriesAndDropsExpiredOnes(t *testing.T) {
 	require.NoError(t, backend.CreateBucket("cache"))
 	var uploads atomic.Int32
 	handler := gofakes3.New(backend).Server()
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.Contains(r.URL.Path, "/blobs/") && (r.Method == http.MethodPut || r.Method == http.MethodPost) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if strings.Contains(request.URL.Path, "/blobs/") && (request.Method == http.MethodPut || request.Method == http.MethodPost) {
 			uploads.Add(1)
 		}
-		handler.ServeHTTP(w, r)
+		handler.ServeHTTP(writer, request)
 	}))
 	t.Cleanup(server.Close)
 	opts := Options{S3: &S3Options{Endpoint: server.URL, Bucket: "cache", Prefix: "runners", AccessKey: "key", SecretKey: "secret"}}
@@ -57,11 +56,6 @@ func (transport s3TestTransport) RoundTrip(req *http.Request) (*http.Response, e
 }
 
 func TestS3StorageUploadsLargeObjectsInPartsAndAbortsOnFailure(t *testing.T) {
-	file, err := os.CreateTemp(t.TempDir(), "cache")
-	require.NoError(t, err)
-	t.Cleanup(func() { assert.NoError(t, file.Close()) })
-	size := 2*int64(s3PartSize) + 1
-	require.NoError(t, file.Truncate(size))
 	for _, failingPart := range []string{"", "2"} {
 		var parts, aborts atomic.Int32
 		var completion struct {
@@ -87,7 +81,7 @@ func TestS3StorageUploadsLargeObjectsInPartsAndAbortsOnFailure(t *testing.T) {
 			}
 			return response, nil
 		})}
-		err := storage.upload(t.Context(), "blobs/1", file, size)
+		err := storage.upload(t.Context(), "blobs/1", strings.NewReader(""), 2*int64(s3PartSize)+1)
 		assert.EqualValues(t, 3, parts.Load())
 		if failingPart == "" {
 			require.NoError(t, err)

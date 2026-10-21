@@ -29,10 +29,10 @@ import (
 var actionFetches sync.Map
 
 type actionFetch struct {
-	done      chan struct{}
-	dir, sha  string
-	err       error
-	cancelled bool
+	done     chan struct{}
+	dir, sha string
+	err      error
+	retry    bool // the leader was cancelled or panicked, so followers fetch themselves
 }
 
 var archiveRetryDelay = func(retryAfter string) time.Duration { // as actions/runner backs off
@@ -47,14 +47,15 @@ func FetchAction(ctx context.Context, input NewGitCloneExecutorInput) (string, s
 		return fetchAction(ctx, input)
 	}
 	for ctx.Err() == nil {
-		call := &actionFetch{done: make(chan struct{})}
+		call := &actionFetch{done: make(chan struct{}), retry: true}
 		previous, loaded := actionFetches.LoadOrStore(input, call)
 		if !loaded {
-			call.dir, call.sha, call.err = fetchAction(ctx, input)
-			call.cancelled = ctx.Err() != nil
-			actionFetches.Delete(input)
-			close(call.done)
-			if call.cancelled {
+			func() {
+				defer func() { actionFetches.Delete(input); close(call.done) }()
+				call.dir, call.sha, call.err = fetchAction(ctx, input)
+				call.retry = ctx.Err() != nil
+			}()
+			if call.retry {
 				continue
 			}
 			return call.dir, call.sha, call.err
@@ -63,7 +64,7 @@ func FetchAction(ctx context.Context, input NewGitCloneExecutorInput) (string, s
 		select {
 		case <-ctx.Done():
 		case <-call.done:
-			if !call.cancelled && ctx.Err() == nil {
+			if !call.retry && ctx.Err() == nil {
 				return call.dir, call.sha, call.err
 			}
 		}

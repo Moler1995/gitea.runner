@@ -17,8 +17,11 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"gitea.com/gitea/runner/act/common"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -103,36 +106,33 @@ func TestFetchAction(t *testing.T) {
 		return NewGitCloneExecutorInput{URL: server.URL + "/org/action", Ref: ref, Dir: t.TempDir(), Token: "secret"}
 	}
 
-	t.Run("shares identical fetches and isolates cancellation and differing inputs", func(t *testing.T) {
-		for _, scenario := range []string{"shared", "leader cancelled", "different token"} {
+	t.Run("shares identical fetches and isolates cancellation, panics and differing inputs", func(t *testing.T) {
+		expectedSha := gitRevParse(t, remote, "main")
+		for _, scenario := range []string{"shared", "leader cancelled", "leader panics", "different token"} {
 			t.Run(scenario, func(t *testing.T) {
 				serve("prefixed", 0)
 				input := newInput("main")
-				expectedSha := gitRevParse(t, remote, "main")
 				started, release := make(chan struct{}), make(chan struct{})
-				t.Cleanup(func() {
-					select {
-					case <-release:
-					default:
-						close(release)
-					}
-				})
+				releaseFetches := sync.OnceFunc(func() { close(release) })
+				t.Cleanup(releaseFetches)
 				var once sync.Once
+				var panicked atomic.Bool
 				transport := actionFetchTransport(func(request *http.Request) (*http.Response, error) {
 					once.Do(func() { close(started) })
 					select {
 					case <-request.Context().Done():
 						return nil, request.Context().Err()
 					case <-release:
-						return http.DefaultTransport.RoundTrip(request)
 					}
+					if scenario == "leader panics" && panicked.CompareAndSwap(false, true) {
+						panic("broken archive")
+					}
+					return http.DefaultTransport.RoundTrip(request)
 				})
 				input.Transport = &transport
 				leaderCtx, cancelLeader := context.WithCancel(t.Context())
 				defer cancelLeader()
-				followerCtx, cancelFollower := context.WithCancel(t.Context())
-				defer cancelFollower()
-				waiting := &actionFetchContext{Context: followerCtx, waiting: make(chan struct{})}
+				waiting := &actionFetchContext{Context: t.Context(), waiting: make(chan struct{})}
 				followerInput := input
 				expectedRequests := 1
 				if scenario == "different token" {
@@ -140,12 +140,14 @@ func TestFetchAction(t *testing.T) {
 				}
 				leaderDone, followerDone := make(chan error, 1), make(chan error, 1)
 				fetch := func(ctx context.Context, input NewGitCloneExecutorInput, done chan<- error) {
-					tree, sha, err := FetchAction(ctx, input)
-					if err == nil {
+					var err error
+					defer func() { done <- err }()
+					defer common.RecoverPanic(&err)
+					var tree, sha string
+					if tree, sha, err = FetchAction(ctx, input); err == nil {
 						assert.Equal(t, expectedSha, sha)
 						assert.Equal(t, filepath.Join(input.Dir, sha), tree)
 					}
-					done <- err
 				}
 				go fetch(leaderCtx, input, leaderDone)
 				<-started
@@ -155,8 +157,12 @@ func TestFetchAction(t *testing.T) {
 					cancelLeader()
 					require.ErrorIs(t, <-leaderDone, context.Canceled)
 				}
-				close(release)
-				if scenario != "leader cancelled" {
+				releaseFetches()
+				switch scenario {
+				case "leader cancelled":
+				case "leader panics":
+					require.ErrorContains(t, <-leaderDone, "panic: broken archive")
+				default:
 					require.NoError(t, <-leaderDone)
 				}
 				require.NoError(t, <-followerDone)

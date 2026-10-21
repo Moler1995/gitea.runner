@@ -37,7 +37,7 @@ type stepActionRemote struct {
 type actionDownload struct {
 	dir, sha string
 	err      error
-	fetched  chan struct{} // closed when a prefetch finishes
+	fetched  chan struct{}
 }
 
 var stepActionRemoteFetch = git.FetchAction
@@ -47,7 +47,7 @@ func (sar *stepActionRemote) fetchAction(ctx context.Context, remote *remoteActi
 	return stepActionRemoteFetch(ctx, sar.RunContext.Config.withInstanceAuth(git.NewGitCloneExecutorInput{
 		URL:         cloneURL,
 		Ref:         remote.Ref,
-		Dir:         filepath.Join(sar.RunContext.ActionCacheDir(), model.UsesHash(cloneURL+"@"+remote.Ref)),
+		Dir:         filepath.Join(sar.RunContext.ActionCacheDir(), model.UsesHash(remote.downloadKey(sar.RunContext.Config.DefaultActionURL()))),
 		OfflineMode: sar.RunContext.Config.ActionOfflineMode,
 		Depth:       sar.RunContext.Config.ActionCloneDepth,
 	}, token))
@@ -83,9 +83,8 @@ func (sar *stepActionRemote) prepareActionExecutor() common.Executor {
 			common.Logger(ctx).Debugf("Skipping local actions/checkout because workdir was already copied")
 			return nil
 		}
-		cloneURL := sar.remoteAction.CloneURL(sar.RunContext.Config.DefaultActionURL())
 		job := sar.RunContext.topLevelRunContext()
-		key := cloneURL + "@" + sar.remoteAction.Ref
+		key := sar.remoteAction.downloadKey(sar.RunContext.Config.DefaultActionURL())
 		download := job.actionDownloads[key]
 		if download == nil {
 			download = &actionDownload{}
@@ -260,6 +259,10 @@ type remoteAction struct {
 	Repo string
 	Path string
 	Ref  string
+}
+
+func (ra *remoteAction) downloadKey(defaultURL string) string {
+	return ra.CloneURL(defaultURL) + "@" + ra.Ref
 }
 
 func (ra *remoteAction) CloneURL(u string) string {

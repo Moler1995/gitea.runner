@@ -9,7 +9,6 @@ import (
 	"fmt"
 	maps0 "maps"
 	"path"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -168,10 +167,12 @@ func runStepExecutor(step step, stage stepStage, executor common.Executor) commo
 		}
 		initialFiles := files
 		if !topRC.summaryFileInitialized[stepSummaryIndex] {
-			initialFiles = append(slices.Clip(files), &container.FileEntry{Name: summaryFileCommand, Mode: 0o666})
+			initialFiles = append([]*container.FileEntry{{Name: summaryFileCommand, Mode: 0o666}}, files...)
 			topRC.summaryFileInitialized[stepSummaryIndex] = true
 		}
-		_ = rc.JobContainer.Copy(actPath, initialFiles...)(ctx)
+		if err := rc.JobContainer.Copy(actPath, initialFiles...)(ctx); err != nil && len(initialFiles) > len(files) {
+			_ = rc.JobContainer.Copy(actPath, files...)(ctx) // the summary goes first and the resets retry alone, so neither failure blocks the other
+		}
 
 		// The command handler needs the step's env to judge ACTIONS_ALLOW_UNSECURE_COMMANDS.
 		// Cloned: the step executor keeps writing to its own env map after this point, on a

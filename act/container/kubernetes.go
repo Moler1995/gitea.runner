@@ -535,9 +535,7 @@ func (c *kubernetesContainer) Remove() common.Executor {
 		if c != c.pod.job {
 			return nil
 		}
-		deleted := make(chan error, 1)
-		go func() { deleted <- c.pod.client.delete(ctx, "secrets", c.pod.secretName) }()
-		return errors.Join(c.pod.client.delete(ctx, "pods", c.pod.name), <-deleted)
+		return errors.Join(c.pod.client.delete(ctx, "pods", c.pod.name), c.pod.client.delete(ctx, "secrets", c.pod.secretName))
 	}
 }
 

@@ -99,7 +99,7 @@ func printPrepareActions(rc *RunContext, preparers []actionPreparer) common.Exec
 
 		fetchCtx, cancelFetches := context.WithCancel(ctx)
 		var fetches sync.WaitGroup
-		defer func() { cancelFetches(); fetches.Wait() }() // a failed preparation stops the remaining downloads
+		defer func() { cancelFetches(); fetches.Wait() }()
 		slots := make(chan struct{}, 4)
 		job := rc.topLevelRunContext()
 		if job.actionDownloads == nil {
@@ -115,7 +115,7 @@ func printPrepareActions(rc *RunContext, preparers []actionPreparer) common.Exec
 			if err != nil || action.skipsLocalCheckout(remote, github) {
 				continue
 			}
-			key := remote.CloneURL(action.RunContext.Config.DefaultActionURL()) + "@" + remote.Ref
+			key := remote.downloadKey(action.RunContext.Config.DefaultActionURL())
 			if job.actionDownloads[key] != nil {
 				continue
 			}
@@ -123,6 +123,7 @@ func printPrepareActions(rc *RunContext, preparers []actionPreparer) common.Exec
 			job.actionDownloads[key] = download
 			fetches.Go(func() {
 				defer close(download.fetched)
+				defer common.RecoverPanic(&download.err)
 				slots <- struct{}{}
 				defer func() { <-slots }()
 				download.dir, download.sha, download.err = action.fetchAction(fetchCtx, remote, github.Token)
