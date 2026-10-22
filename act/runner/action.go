@@ -647,8 +647,8 @@ func runPreStep(step actionStep) common.Executor {
 
 func shouldRunPostStep(step actionStep) common.Conditional {
 	return func(ctx context.Context) bool {
-		if remote, ok := step.(*stepActionRemote); ok && remote.preStepStarted {
-			return remote.action != nil
+		if remote, ok := step.(*stepActionRemote); ok && remote.preStepStarted && !remote.action.Runs.Using.IsComposite() {
+			return true
 		}
 		log := common.Logger(ctx)
 		stepResults := step.getRunContext().StepResults

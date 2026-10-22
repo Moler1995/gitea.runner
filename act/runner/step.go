@@ -258,9 +258,15 @@ func setupEnv(ctx context.Context, step step) error {
 	var err error
 	exprEval := rc.NewExpressionEvaluator(ctx)
 	stepEnv := step.getStepModel().Environment()
-	for k, v := range stepEnv {
-		if stepEnv[k], err = exprEval.Interpolate(ctx, v); err != nil {
-			return fmt.Errorf("unable to interpolate env %s: %w", k, err)
+	if envNode := step.getStepModel().Env; strings.Contains(envNode.Value, "${{") { // only a whole-map expression has a value
+		if err := model.DecodeEvaluated("step env", envNode, exprEval.shared(ctx).EvaluateYamlNode, &stepEnv); err != nil {
+			return err
+		}
+	} else {
+		for k, v := range stepEnv {
+			if stepEnv[k], err = exprEval.Interpolate(ctx, v); err != nil {
+				return fmt.Errorf("unable to interpolate env %s: %w", k, err)
+			}
 		}
 	}
 	// merge step env last, since it should not be overwritten

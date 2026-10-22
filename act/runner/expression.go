@@ -127,7 +127,7 @@ func (rc *RunContext) newStepExpressionEvaluator(ctx context.Context, step step,
 func getHashFilesFunction(ctx context.Context, rc *RunContext) func(v []reflect.Value) (any, error) {
 	return func(v []reflect.Value) (any, error) {
 		if rc.JobContainer != nil {
-			timeed, cancel := context.WithTimeout(ctx, time.Minute)
+			timeed, cancel := context.WithTimeout(ctx, 2*time.Minute) // GitHub's hashFiles timeout
 			defer cancel()
 			name := "workflow/hashfiles/index.js"
 			hout := &bytes.Buffer{}

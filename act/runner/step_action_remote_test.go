@@ -251,6 +251,14 @@ func TestStepActionRemotePreCleanup(t *testing.T) {
 			cm.AssertExpectations(t)
 		})
 	}
+
+	skippedComposite := &stepActionRemote{
+		Step:           &model.Step{ID: "step"},
+		RunContext:     &RunContext{StepResults: map[string]*model.StepResult{"step": {Conclusion: model.StepStatusSkipped}}},
+		action:         &model.Action{Runs: model.ActionRuns{Using: "composite"}},
+		preStepStarted: true,
+	}
+	assert.False(t, shouldRunPostStep(skippedComposite)(t.Context()))
 }
 
 func Test_newRemoteAction(t *testing.T) {

@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"os"
 	"strings"
 	"unicode"
 
@@ -159,6 +160,9 @@ const allowUnsecureCommandsVar = "ACTIONS_ALLOW_UNSECURE_COMMANDS"
 // not run, recording the error that fails the step. GitHub disabled both because a step that
 // echoes untrusted content can use them to set NODE_OPTIONS or PATH for every later step.
 func (rc *RunContext) refuseUnsecureCommand(ctx context.Context, command string) bool {
+	if isTruthyEnv(os.Getenv(allowUnsecureCommandsVar)) { // the runner's own opt-in wins, as on GitHub
+		return false
+	}
 	for _, env := range []map[string]string{rc.currentStepEnv(), rc.Env, rc.GlobalEnv} {
 		if value, ok := env[allowUnsecureCommandsVar]; ok {
 			if isTruthyEnv(value) {

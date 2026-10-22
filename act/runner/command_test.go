@@ -136,11 +136,12 @@ func TestEscapeCommandData(t *testing.T) {
 
 func TestUnsecureCommands(t *testing.T) {
 	tests := []struct {
-		name      string
-		jobEnv    map[string]string
-		globalEnv map[string]string
-		stepEnv   map[string]string
-		optedIn   bool
+		name       string
+		jobEnv     map[string]string
+		globalEnv  map[string]string
+		stepEnv    map[string]string
+		processEnv string
+		optedIn    bool
 	}{
 		{name: "refused with no opt-in"},
 		// GitHub reads the opt-in with bool.TryParse, so "1" is not one.
@@ -148,9 +149,11 @@ func TestUnsecureCommands(t *testing.T) {
 		{name: "opted in through the step environment", stepEnv: map[string]string{allowUnsecureCommandsVar: "true"}, optedIn: true},
 		{name: "opted in through the job environment", jobEnv: map[string]string{allowUnsecureCommandsVar: "TRUE"}, optedIn: true},
 		{name: "step opt-out overrides the job and global environment", jobEnv: map[string]string{allowUnsecureCommandsVar: "true"}, globalEnv: map[string]string{allowUnsecureCommandsVar: "true"}, stepEnv: map[string]string{allowUnsecureCommandsVar: "false"}},
+		{name: "the runner's own opt-in overrides a step opt-out", stepEnv: map[string]string{allowUnsecureCommandsVar: "false"}, processEnv: "true", optedIn: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv(allowUnsecureCommandsVar, tt.processEnv)
 			a := assert.New(t)
 			rc := &RunContext{Config: &Config{}, Env: tt.jobEnv, GlobalEnv: tt.globalEnv}
 			rc.setCurrentStepEnv(tt.stepEnv)

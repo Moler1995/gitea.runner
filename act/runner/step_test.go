@@ -257,6 +257,17 @@ jobs:
 		rc.workflowCallInputs = map[string]any{"args": "${{ inputs.unresolved }}"}
 		require.ErrorContains(t, setupInputs(t.Context(), &stepRun{RunContext: rc, Step: workflow.Jobs["test"].Steps[0].Clone(), env: map[string]string{}}), "with:")
 	})
+
+	t.Run("whole step environment expression is evaluated once", func(t *testing.T) {
+		rc := createRunContext(t)
+		rc.Matrix["environment"] = `{"NAME":"dynamic${{ github.job }}","COUNT":12}`
+		step := &stepRun{RunContext: rc, Step: &model.Step{}, env: map[string]string{}}
+		require.NoError(t, step.Step.Env.Encode("${{ fromJSON(matrix.environment) }}"))
+
+		require.NoError(t, setupEnv(t.Context(), step))
+		assert.Equal(t, "dynamic${{ github.job }}", step.env["NAME"])
+		assert.Equal(t, "12", step.env["COUNT"])
+	})
 }
 
 func TestIsStepEnabled(t *testing.T) {
