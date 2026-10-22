@@ -9,26 +9,49 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/johannesboyne/gofakes3"
-	"github.com/johannesboyne/gofakes3/backend/s3mem"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func TestHandler_S3SharesEntriesAndDropsExpiredOnes(t *testing.T) {
-	backend := s3mem.New()
-	require.NoError(t, backend.CreateBucket("cache"))
+	var objects sync.Map
 	var uploads atomic.Int32
-	handler := gofakes3.New(backend).Server()
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		if strings.Contains(request.URL.Path, "/blobs/") && (request.Method == http.MethodPut || request.Method == http.MethodPost) {
-			uploads.Add(1)
+		key, query := strings.TrimPrefix(request.URL.Path, "/cache/"), request.URL.Query()
+		switch {
+		case request.Method == http.MethodPut:
+			if strings.Contains(key, "/blobs/") {
+				uploads.Add(1)
+			}
+			body, err := io.ReadAll(request.Body)
+			assert.NoError(t, err)
+			objects.Store(key, body)
+		case query.Has("list-type"):
+			list := struct {
+				XMLName  xml.Name `xml:"ListBucketResult"`
+				Contents []struct{ Key string }
+			}{}
+			objects.Range(func(stored, _ any) bool {
+				if name := stored.(string); strings.HasPrefix(name, query.Get("prefix")) {
+					list.Contents = append(list.Contents, struct{ Key string }{name})
+				}
+				return true
+			})
+			assert.NoError(t, xml.NewEncoder(writer).Encode(list))
+		default:
+			body, ok := objects.Load(key)
+			if !ok {
+				writer.WriteHeader(http.StatusNotFound)
+				_, _ = io.WriteString(writer, "<Error><Code>NoSuchKey</Code></Error>")
+				return
+			}
+			_, _ = writer.Write(body.([]byte))
 		}
-		handler.ServeHTTP(writer, request)
 	}))
 	t.Cleanup(server.Close)
 	opts := Options{S3: &S3Options{Endpoint: server.URL, Bucket: "cache", Prefix: "runners", AccessKey: "key", SecretKey: "secret"}}
@@ -43,8 +66,7 @@ func TestHandler_S3SharesEntriesAndDropsExpiredOnes(t *testing.T) {
 	require.Equal(t, true, found["ok"])
 	assert.Equal(t, []byte("archive"), getURL(t, found["signed_download_url"].(string)))
 
-	require.NoError(t, backend.ForceDeleteBucket("cache"))
-	require.NoError(t, backend.CreateBucket("cache"))
+	objects.Clear()
 	require.NoError(t, restorer.importMetadata(t.Context()))
 	assert.Equal(t, true, v2Call(t, restorer, testClient, "CreateCacheEntry", entry)["ok"])
 }
