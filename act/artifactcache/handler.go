@@ -535,6 +535,26 @@ func (db *cacheDB) delete(bucket *bbolt.Bucket, id uint64) error {
 	return bucket.Delete(cacheKey(id))
 }
 
+// dropLegacyIndexes deletes the index buckets bolthold kept, all created together and never recreated, checking first so later runs do not write.
+func (db *cacheDB) dropLegacyIndexes() error {
+	var found bool
+	_ = db.bolt.View(func(tx *bbolt.Tx) error {
+		found = tx.Bucket([]byte("_index:Cache:Key")) != nil
+		return nil
+	})
+	if !found {
+		return nil
+	}
+	return db.bolt.Update(func(tx *bbolt.Tx) error {
+		for _, field := range []string{"Repo", "Key", "Version", "Complete", "UsedAt", "CreatedAt"} {
+			if err := tx.DeleteBucket([]byte("_index:Cache:" + field)); err != nil && !errors.Is(err, berrors.ErrBucketNotFound) {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 // save rewrites a stored entry, failing once a sweep has removed it so a late commit cannot resurrect it.
 func (db *cacheDB) save(cache *Cache) error {
 	return db.update(func(bucket *bbolt.Bucket) error {
@@ -1210,6 +1230,9 @@ func (h *Handler) gcCache() {
 	}
 	defer db.Close()
 
+	if err := db.dropLegacyIndexes(); err != nil {
+		h.logger.Warnf("drop legacy indexes: %v", err)
+	}
 	h.evictIncomplete(db)
 	if h.s3 != nil {
 		return // lifecycle rules on the bucket expire its entries
