@@ -308,7 +308,7 @@ func containerInfoFromInspect(inspect container.InspectResponse) *Info {
 }
 
 func (cr *containerReference) UpdateFromEnv(srcPath string, env *map[string]string) common.Executor {
-	return parseEnvFile(cr, srcPath, env).IfNot(common.Dryrun)
+	return parseEnvFile(cr, srcPath, env, false).IfNot(common.Dryrun)
 }
 
 func (cr *containerReference) UpdateFromImageEnv(env *map[string]string) common.Executor {

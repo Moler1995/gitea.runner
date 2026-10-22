@@ -7,7 +7,7 @@ jobs:
     steps:
     - run: test "$CI" = false
     - run: printf 'MULTI<<EOF\r\na\r\nb\r\nEOF\r\n' >> "$GITHUB_ENV"
-    - run: test "$MULTI" = "$(printf 'a\r\nb')"
+    - run: test "$MULTI" = "$(printf 'a\r\nb\r')"
     - run: |
         runs:
           using: composite

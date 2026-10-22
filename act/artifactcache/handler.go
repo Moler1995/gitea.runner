@@ -711,9 +711,10 @@ func (h *Handler) reserve(w http.ResponseWriter, r *http.Request) {
 	}
 	defer db.Close()
 
-	now := time.Now().Unix()
-	cache.CreatedAt = now
-	cache.UsedAt = now
+	now := time.Now()
+	cache.CreatedAt = now.Unix()
+	cache.CreatedAtNanos = now.Nanosecond()
+	cache.UsedAt = now.Unix()
 	if err := h.insertCache(db, cache); err != nil {
 		h.responseJSON(w, r, 500, err)
 		return
@@ -1087,7 +1088,7 @@ func findCache(db *cacheDB, repo string, keys []string, version string) (*Cache,
 		if err != nil {
 			return nil, fmt.Errorf("find cache: %w", err)
 		}
-		if cache := latest(caches, func(cache *Cache) int64 { return cache.CreatedAt }); cache != nil {
+		if cache := latest(caches, (*Cache).createdAtNano); cache != nil {
 			return cache, nil
 		}
 	}
@@ -1119,7 +1120,7 @@ func findExactCache(db *cacheDB, repo, key, version string, complete bool) (*Cac
 	}
 	stamp := func(cache *Cache) int64 { return cache.UsedAt }
 	if complete {
-		stamp = func(cache *Cache) int64 { return cache.CreatedAt }
+		stamp = (*Cache).createdAtNano
 	}
 	return latest(caches, stamp), nil
 }
@@ -1290,7 +1291,7 @@ func (h *Handler) evictSuperseded(db *cacheDB) {
 	}
 	for _, caches := range groups {
 		slices.SortFunc(caches, func(left, right *Cache) int {
-			return cmp.Or(cmp.Compare(left.CreatedAt, right.CreatedAt), cmp.Compare(left.ID, right.ID))
+			return cmp.Or(cmp.Compare(left.createdAtNano(), right.createdAtNano()), cmp.Compare(left.ID, right.ID))
 		})
 		for _, cache := range caches[:len(caches)-1] {
 			if inUse(cache) {

@@ -143,7 +143,10 @@ func TestRunContext_EvalBool(t *testing.T) {
 
 type fakeContainer struct {
 	container.ExecutionsEnvironment
+	caseInsensitive bool
 }
+
+func (c fakeContainer) IsEnvironmentCaseInsensitive() bool { return c.caseInsensitive }
 
 func (fakeContainer) Pull(bool) common.Executor { return func(context.Context) error { return nil } }
 

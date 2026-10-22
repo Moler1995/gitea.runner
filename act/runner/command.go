@@ -163,8 +163,9 @@ func (rc *RunContext) refuseUnsecureCommand(ctx context.Context, command string)
 	if isTruthyEnv(os.Getenv(allowUnsecureCommandsVar)) { // the runner's own opt-in wins, as on GitHub
 		return false
 	}
+	caseInsensitive := rc.JobContainer != nil && rc.JobContainer.IsEnvironmentCaseInsensitive()
 	for _, env := range []map[string]string{rc.currentStepEnv(), rc.Env, rc.GlobalEnv} {
-		if value, ok := env[allowUnsecureCommandsVar]; ok {
+		if value, ok := lookupFold(env, allowUnsecureCommandsVar, caseInsensitive); ok {
 			if isTruthyEnv(value) {
 				return false
 			}

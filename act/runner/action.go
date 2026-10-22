@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strings"
 
 	"gitea.com/gitea/runner/act/common"
@@ -101,6 +102,7 @@ func readActionImpl(ctx context.Context, step *model.Step, actionDir, actionPath
 				action := &model.Action{
 					Name: "(Synthetic)",
 					Inputs: map[string]model.Input{
+						"args": {},
 						"cwd": {
 							Description: "(Actual working directory)",
 							Required:    false,
@@ -178,6 +180,7 @@ func runActionImpl(step actionStep, actionDir string, remoteAction *remoteAction
 		if err := populateEnvsFromInput(ctx, step.getEnv(), action, rc); err != nil {
 			return err
 		}
+		warnUnexpectedInputs(ctx, action, stepModel.With)
 
 		actionName, containerActionDir := getContainerActionPaths(step)
 
@@ -370,7 +373,7 @@ func execAsDocker(ctx context.Context, step actionStep, actionName, actionDir, b
 			}
 		}
 	} else {
-		cmd, err = shellquote.Split(step.getStepModel().With["args"])
+		cmd, err = shellquote.Split(stepInput(step.getStepModel(), "args"))
 		if err != nil {
 			return err
 		}
@@ -403,7 +406,7 @@ func dockerEntrypoint(step actionStep, stage stepStage) ([]string, error) {
 	default:
 		entrypoint = runs.Entrypoint
 		if entrypoint == "" {
-			if fields := strings.Fields(step.getStepModel().With["entrypoint"]); len(fields) > 0 {
+			if fields := strings.Fields(stepInput(step.getStepModel(), "entrypoint")); len(fields) > 0 {
 				return fields, nil
 			}
 		}
@@ -505,6 +508,47 @@ func populateEnvsFromInput(ctx context.Context, env *map[string]string, action *
 		}
 	}
 	return nil
+}
+
+// lookupFold finds name in values, ignoring case where the environment does, as GitHub's inputs always do.
+func lookupFold[V any](values map[string]V, name string, caseInsensitive bool) (V, bool) {
+	if value, ok := values[name]; ok || !caseInsensitive {
+		return value, ok
+	}
+	for key, value := range values {
+		if strings.EqualFold(key, name) {
+			return value, true
+		}
+	}
+	var zero V
+	return zero, false
+}
+
+func stepInput(step *model.Step, name string) string {
+	value, _ := lookupFold(step.With, name, true)
+	return value
+}
+
+func warnUnexpectedInputs(ctx context.Context, action *model.Action, inputs map[string]string) {
+	docker := action.Runs.Using.IsDocker()
+	var unexpectedInputs []string
+	for input := range inputs {
+		_, declared := lookupFold(action.Inputs, input, true)
+		containerInput := docker && (strings.EqualFold(input, "entryPoint") || strings.EqualFold(input, "args"))
+		if !declared && !containerInput {
+			unexpectedInputs = append(unexpectedInputs, input)
+		}
+	}
+	if len(unexpectedInputs) == 0 {
+		return
+	}
+	validInputs := slices.Sorted(maps.Keys(action.Inputs))
+	if docker {
+		validInputs = append([]string{"entryPoint", "args"}, validInputs...)
+	}
+	slices.Sort(unexpectedInputs)
+	common.Logger(ctx).With(rawOutputField, true).Warnf("##[warning]%s", EscapeCommandData(fmt.Sprintf(
+		"Unexpected input(s) '%s', valid inputs are ['%s']", strings.Join(unexpectedInputs, "', '"), strings.Join(validInputs, "', '"))))
 }
 
 func getContainerActionPaths(step actionStep) (string, string) {

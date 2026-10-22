@@ -180,7 +180,7 @@ func TestProxyPasswords(t *testing.T) {
 
 	clearProxyEnv(t)
 	assert.Equal(t, []string{"configured"}, proxyPasswords(map[string]string{
-		"HTTP_PROXY": "http://user:configured@proxy:3128",
+		"Http_Proxy": "http://user:configured@proxy:3128",
 	}))
 }
 

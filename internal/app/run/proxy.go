@@ -113,8 +113,14 @@ func WarnIfDaemonHasNoProxy(ctx context.Context) {
 // a job echoes its environment.
 func proxyPasswords(envs map[string]string) []string {
 	cfg := httpproxy.FromEnvironment()
+	raws := []string{cfg.HTTPProxy, cfg.HTTPSProxy}
+	for name, value := range envs {
+		if strings.EqualFold(name, "http_proxy") || strings.EqualFold(name, "https_proxy") { // Windows reads env names in any case
+			raws = append(raws, value)
+		}
+	}
 	var passwords []string
-	for _, raw := range []string{cfg.HTTPProxy, cfg.HTTPSProxy, envs["http_proxy"], envs["HTTP_PROXY"], envs["https_proxy"], envs["HTTPS_PROXY"]} {
+	for _, raw := range raws {
 		parsed, err := url.Parse(raw)
 		if err != nil || parsed.Scheme == "" || parsed.Host == "" {
 			parsed, err = url.Parse("http://" + raw)

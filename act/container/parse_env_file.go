@@ -18,7 +18,8 @@ import (
 	"golang.org/x/text/transform"
 )
 
-func parseEnvFile(e Container, srcPath string, env *map[string]string) common.Executor {
+// parseEnvFile reads a GITHUB_ENV style file, splitting lines like GitHub's runner on Windows or elsewhere.
+func parseEnvFile(e Container, srcPath string, env *map[string]string, windows bool) common.Executor {
 	localEnv := *env
 	return func(ctx context.Context) error {
 		envTar, err := e.GetContainerArchive(ctx, srcPath)
@@ -46,7 +47,7 @@ func parseEnvFile(e Container, srcPath string, env *map[string]string) common.Ex
 			return advance, token, err
 		})
 		for s.Scan() {
-			line := trimEnvLineEnding(s.Text())
+			line := trimEnvLineEnding(s.Text(), windows)
 			// GitHub's runner ignores blank lines
 			if strings.TrimSpace(line) == "" {
 				continue
@@ -65,7 +66,7 @@ func parseEnvFile(e Container, srcPath string, env *map[string]string) common.Ex
 				delimiterFound := false
 				for s.Scan() {
 					content := s.Text()
-					if trimEnvLineEnding(content) == multiLineEnvDelimiter {
+					if trimEnvLineEnding(content, windows) == multiLineEnvDelimiter {
 						delimiterFound = true
 						break
 					}
@@ -77,7 +78,7 @@ func parseEnvFile(e Container, srcPath string, env *map[string]string) common.Ex
 				if !delimiterFound {
 					return fmt.Errorf("invalid format delimiter '%v' not found before end of file", multiLineEnvDelimiter)
 				}
-				localEnv[line[:multiLineEnv]] = trimEnvLineEnding(strings.Join(multiLineEnvContent, ""))
+				localEnv[line[:multiLineEnv]] = trimEnvLineEnding(strings.Join(multiLineEnvContent, ""), windows)
 			default:
 				return fmt.Errorf("invalid format '%v', expected a line with '=' or '<<'", line)
 			}
@@ -89,6 +90,9 @@ func parseEnvFile(e Container, srcPath string, env *map[string]string) common.Ex
 	}
 }
 
-func trimEnvLineEnding(line string) string {
-	return strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
+func trimEnvLineEnding(line string, windows bool) string {
+	if windows && strings.HasSuffix(line, "\r\n") {
+		return line[:len(line)-2]
+	}
+	return strings.TrimSuffix(line, "\n")
 }

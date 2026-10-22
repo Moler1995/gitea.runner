@@ -355,7 +355,7 @@ func (e *HostEnvironment) ExecWithCmdLine(command []string, cmdline string, env 
 }
 
 func (e *HostEnvironment) UpdateFromEnv(srcPath string, env *map[string]string) common.Executor {
-	return parseEnvFile(e, srcPath, env)
+	return parseEnvFile(e, srcPath, env, runtime.GOOS == "windows")
 }
 
 // removeAll is a var so tests can substitute a blocking stub.
