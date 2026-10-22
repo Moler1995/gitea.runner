@@ -74,18 +74,24 @@ func readActionImpl(ctx context.Context, step *model.Step, actionDir, actionPath
 		reader, closer, err = readFile("action.yaml")
 		addError("action.yaml", err)
 		if os.IsNotExist(err) {
-			_, closer, err := readFile("Dockerfile")
-			addError("Dockerfile", err)
+			dockerfile := "Dockerfile"
+			_, closer, err := readFile(dockerfile)
+			addError(dockerfile, err)
+			if os.IsNotExist(err) {
+				dockerfile = "dockerfile"
+				_, closer, err = readFile(dockerfile)
+				addError(dockerfile, err)
+			}
 			if err == nil {
 				closer.Close()
 				action := &model.Action{
 					Name: "(Synthetic)",
 					Runs: model.ActionRuns{
 						Using: "docker",
-						Image: "Dockerfile",
+						Image: dockerfile,
 					},
 				}
-				logger.Debugf("Using synthetic action %v for Dockerfile", action)
+				logger.Debugf("Using synthetic action %v for %s", action, dockerfile)
 				return action, nil
 			}
 			if val, ok := step.With["args"]; ok {
@@ -350,14 +356,11 @@ func execAsDocker(ctx context.Context, step actionStep, actionName, actionDir, b
 			logger.Debugf("image '%s' for architecture '%s' already exists", image, rc.Config.ContainerArchitecture)
 		}
 	}
-	cmd, err := shellquote.Split(step.getStepModel().With["args"])
-	if err != nil {
-		return err
-	}
 	ee, err := evalDockerEnv(ctx, step, action)
 	if err != nil {
 		return err
 	}
+	var cmd []string
 	if action.Runs.Args != nil {
 		// a fresh slice, the manifest is evaluated again for every stage
 		cmd = make([]string, len(action.Runs.Args))
@@ -365,6 +368,11 @@ func execAsDocker(ctx context.Context, step actionStep, actionName, actionDir, b
 			if cmd[i], err = ee.Interpolate(ctx, v); err != nil {
 				return fmt.Errorf("unable to interpolate runs.args: %w", err)
 			}
+		}
+	} else {
+		cmd, err = shellquote.Split(step.getStepModel().With["args"])
+		if err != nil {
+			return err
 		}
 	}
 	entrypoint, err := dockerEntrypoint(step, stage)
@@ -413,9 +421,15 @@ func evalDockerEnv(ctx context.Context, step step, action *model.Action) (*expre
 
 	var err error
 	inputs := make(map[string]string)
+	providedInputs := make(map[string]bool, len(step.getStepModel().With))
+	for key := range step.getStepModel().With {
+		providedInputs[strings.ToLower(key)] = true
+	}
 	eval := rc.NewExpressionEvaluator(ctx)
-	// Set Defaults
 	for k, input := range action.Inputs {
+		if providedInputs[strings.ToLower(k)] {
+			continue
+		}
 		if inputs[k], err = eval.Interpolate(ctx, input.Default); err != nil {
 			return nil, fmt.Errorf("unable to interpolate the default of input %s: %w", k, err)
 		}
@@ -633,6 +647,9 @@ func runPreStep(step actionStep) common.Executor {
 
 func shouldRunPostStep(step actionStep) common.Conditional {
 	return func(ctx context.Context) bool {
+		if remote, ok := step.(*stepActionRemote); ok && remote.preStepStarted {
+			return remote.action != nil
+		}
 		log := common.Logger(ctx)
 		stepResults := step.getRunContext().StepResults
 		stepResult := stepResults[step.getStepModel().ID]

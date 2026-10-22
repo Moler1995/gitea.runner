@@ -183,6 +183,7 @@ func TestSetupEnv(t *testing.T) {
 		"GITHUB_GRAPHQL_URL":       "",
 		"GITHUB_HEAD_REF":          "",
 		"GITHUB_JOB":               "1",
+		"GITHUB_REF_PROTECTED":     "false",
 		"GITHUB_RETENTION_DAYS":    "0",
 		"GITHUB_RUN_ATTEMPT":       "",
 		"GITHUB_RUN_ID":            "runId",
@@ -478,6 +479,23 @@ func TestRunStepExecutorParity(t *testing.T) {
 		require.NoError(t, runStepExecutor(step, stepStageMain, noopExecutor)(t.Context()))
 	})
 
+	t.Run("command file initialization failure prevents execution and stale commands", func(t *testing.T) {
+		step := newStep(t, &model.Step{ID: "commands"})
+		workflowDir := filepath.Join(step.RunContext.JobContainer.GetActPath(), "workflow")
+		require.NoError(t, os.MkdirAll(filepath.Join(workflowDir, "outputcmd.txt"), 0o700))
+		require.NoError(t, os.WriteFile(filepath.Join(workflowDir, "envs.txt"), []byte("STALE=1\n"), 0o600))
+		executed := false
+		err := runStepExecutor(step, stepStageMain, func(context.Context) error {
+			executed = true
+			return nil
+		})(t.Context())
+
+		require.Error(t, err)
+		assert.False(t, executed)
+		assert.Empty(t, step.RunContext.Env["STALE"])
+		assert.Equal(t, model.StepStatusFailure, step.RunContext.StepResults[step.Step.ID].Conclusion)
+	})
+
 	t.Run("file commands survive a job timeout", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			step := newStep(t, &model.Step{ID: "interrupted"})
@@ -552,13 +570,22 @@ func TestRunStepExecutorParity(t *testing.T) {
 	})
 
 	t.Run("timeout must be positive", func(t *testing.T) {
-		exprEval := createRunContext(t).NewExpressionEvaluator(t.Context())
 		for timeout, wantDeadline := range map[string]bool{"-1": false, "0": false, "1": true} {
-			ctx, cancel := evaluateStepTimeout(t.Context(), exprEval, &model.Step{TimeoutMinutes: timeout})
+			ctx, cancel := evaluateStepTimeout(t.Context(), newStep(t, &model.Step{TimeoutMinutes: timeout}))
 			_, hasDeadline := ctx.Deadline()
 			cancel()
 			assert.Equal(t, wantDeadline, hasDeadline, timeout)
 		}
+	})
+
+	t.Run("timeout reads step environment", func(t *testing.T) {
+		step := newStep(t, &model.Step{ID: "timeout", TimeoutMinutes: "${{ fromJSON(env.STEP_TIMEOUT) }}"})
+		require.NoError(t, step.Step.Env.Encode(map[string]string{"STEP_TIMEOUT": "1"}))
+		require.NoError(t, runStepExecutor(step, stepStageMain, func(ctx context.Context) error {
+			_, hasDeadline := ctx.Deadline()
+			assert.True(t, hasDeadline)
+			return nil
+		})(t.Context()))
 	})
 }
 

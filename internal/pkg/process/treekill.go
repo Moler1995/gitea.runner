@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -32,6 +33,7 @@ const treeKillWaitDelay = 10 * time.Second
 // Callers still set cmd.SysProcAttr (via SysProcAttr) themselves, because the
 // value differs between the plain and PTY execution paths.
 type TreeKill struct {
+	mu     sync.Mutex
 	killer atomic.Pointer[Killer]
 }
 
@@ -44,6 +46,9 @@ func NewTreeKill(cmd *exec.Cmd) *TreeKill {
 			return k.Kill()
 		}
 		if cmd.Process != nil {
+			if killer, err := t.Capture(cmd.Process); err == nil {
+				return killer.Kill()
+			}
 			return cmd.Process.Kill()
 		}
 		return nil
@@ -60,6 +65,11 @@ func NewTreeKill(cmd *exec.Cmd) *TreeKill {
 // still bounds the wait. The returned Killer should be closed when the command
 // finishes (Close is nil-safe).
 func (t *TreeKill) Capture(p *os.Process) (*Killer, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if k := t.killer.Load(); k != nil {
+		return k, nil
+	}
 	k, err := NewKiller(p)
 	if err != nil {
 		return nil, err

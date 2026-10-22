@@ -69,6 +69,9 @@ func TestTreeKillCaptureStoresKiller(t *testing.T) {
 	killer, err := tk.Capture(cmd.Process)
 	require.NoError(t, err)
 	require.NotNil(t, killer)
+	captured, err := tk.Capture(cmd.Process)
+	require.NoError(t, err)
+	require.Same(t, killer, captured)
 	require.NoError(t, cmd.Cancel())
 	require.NoError(t, killer.Close())
 }

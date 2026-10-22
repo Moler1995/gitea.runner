@@ -111,15 +111,14 @@ func WarnIfDaemonHasNoProxy(ctx context.Context) {
 
 // proxyPasswords returns the passwords embedded in the runner's proxy URLs, to mask before
 // a job echoes its environment.
-func proxyPasswords() []string {
-	cfg := proxyFromEnv()
-	if cfg == nil {
-		return nil
-	}
-
+func proxyPasswords(envs map[string]string) []string {
+	cfg := httpproxy.FromEnvironment()
 	var passwords []string
-	for _, raw := range []string{cfg.HTTPProxy, cfg.HTTPSProxy} {
+	for _, raw := range []string{cfg.HTTPProxy, cfg.HTTPSProxy, envs["http_proxy"], envs["HTTP_PROXY"], envs["https_proxy"], envs["HTTPS_PROXY"]} {
 		parsed, err := url.Parse(raw)
+		if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+			parsed, err = url.Parse("http://" + raw)
+		}
 		if err != nil {
 			continue
 		}

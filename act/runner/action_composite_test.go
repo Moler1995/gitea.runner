@@ -29,7 +29,7 @@ func TestCompositeActionParity(t *testing.T) {
 			jobTotal:      4,
 		}
 		composite, err := newCompositeRunContext(ctx, parent, &stepActionRemote{
-			Step:       &model.Step{With: map[string]string{"SHARED": "outer"}},
+			Step:       &model.Step{With: map[string]string{"SHARED": "outer", "extra": "literal${{ github.job }}"}},
 			RunContext: parent,
 			action:     &model.Action{Inputs: map[string]model.Input{"shared": {Default: "outer-default"}}},
 			env:        map[string]string{"INPUT_SHARED": "outer"},
@@ -39,10 +39,11 @@ func TestCompositeActionParity(t *testing.T) {
 		assert.Same(t, strategy, composite.Run.Job().Strategy)
 		assert.True(t, composite.IsHostEnv())
 		interpolated, err := composite.NewExpressionEvaluator(ctx).Interpolate(ctx,
-			"${{ matrix.os }}|${{ strategy.max-parallel }}|${{ strategy.job-index }}|${{ inputs.shared }}")
+			"${{ matrix.os }}|${{ strategy.max-parallel }}|${{ strategy.job-index }}|${{ inputs.shared }}|${{ inputs.extra }}")
 		require.NoError(t, err)
-		assert.Equal(t, "linux|3|1|outer", interpolated)
+		assert.Equal(t, "linux|3|1|outer|literal${{ github.job }}", interpolated)
 		assert.NotContains(t, composite.Env, "INPUT_SHARED")
+		assert.NotContains(t, composite.Env, "INPUT_EXTRA")
 
 		nestedEnv := composite.GetEnv()
 		require.NoError(t, populateEnvsFromInput(ctx, &nestedEnv, &model.Action{Inputs: map[string]model.Input{"shared": {Default: "inner-default"}}}, composite))

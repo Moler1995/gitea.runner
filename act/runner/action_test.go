@@ -86,6 +86,19 @@ runs:
 			},
 		},
 		{
+			name:        "readLowercaseDockerfile",
+			step:        &model.Step{},
+			filename:    "dockerfile",
+			fileContent: "FROM ubuntu:20.04",
+			expected: &model.Action{
+				Name: "(Synthetic)",
+				Runs: model.ActionRuns{
+					Using: "docker",
+					Image: "dockerfile",
+				},
+			},
+		},
+		{
 			name: "readWithArgs",
 			step: &model.Step{
 				With: map[string]string{
@@ -473,6 +486,7 @@ func TestExecAsDockerStageEntrypoint(t *testing.T) {
 		name           string
 		stage          stepStage
 		with           map[string]string
+		inputs         map[string]model.Input
 		runs           model.ActionRuns
 		env            map[string]string
 		wantCmd        []string
@@ -499,9 +513,26 @@ func TestExecAsDockerStageEntrypoint(t *testing.T) {
 			wantEntrypoint: []string{"input.sh", "--verbose"},
 		},
 		{
+			name:    "manifest args keep caller input quotes literal",
+			stage:   stepStageMain,
+			with:    map[string]string{"args": "it's literal"},
+			runs:    model.ActionRuns{Args: []string{"${{ inputs.args }}"}},
+			env:     map[string]string{"INPUT_ARGS": "it's literal"},
+			wantCmd: []string{"it's literal"},
+		},
+		{
+			name:    "caller input skips its default expression",
+			stage:   stepStageMain,
+			with:    map[string]string{"MESSAGE": "provided"},
+			inputs:  map[string]model.Input{"message": {Default: "${{ fromJSON('') }}"}},
+			runs:    model.ActionRuns{Args: []string{"${{ inputs.message }}"}},
+			env:     map[string]string{"INPUT_MESSAGE": "provided"},
+			wantCmd: []string{"provided"},
+		},
+		{
 			name:    "explicit empty manifest args suppress caller args",
 			stage:   stepStageMain,
-			with:    map[string]string{"args": "caller"},
+			with:    map[string]string{"args": "it's ignored"},
 			runs:    model.ActionRuns{Args: []string{}},
 			wantCmd: []string{},
 		},
@@ -542,7 +573,7 @@ func TestExecAsDockerStageEntrypoint(t *testing.T) {
 					Run:          &model.Run{JobID: "1", Workflow: &model.Workflow{Jobs: map[string]*model.Job{"1": {}}}},
 					JobContainer: cm,
 				},
-				action: &model.Action{Runs: tc.runs},
+				action: &model.Action{Inputs: tc.inputs, Runs: tc.runs},
 				env:    mergeMaps(tc.env),
 			}
 
