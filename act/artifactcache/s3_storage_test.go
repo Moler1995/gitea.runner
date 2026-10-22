@@ -22,7 +22,7 @@ func TestHandler_S3SharesEntriesAndDropsExpiredOnes(t *testing.T) {
 	var objects sync.Map
 	var uploads atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		key, query := strings.TrimPrefix(request.URL.Path, "/cache/"), request.URL.Query()
+		key := strings.TrimPrefix(request.URL.Path, "/cache/")
 		switch {
 		case request.Method == http.MethodPut:
 			if strings.Contains(key, "/blobs/") {
@@ -31,26 +31,19 @@ func TestHandler_S3SharesEntriesAndDropsExpiredOnes(t *testing.T) {
 			body, err := io.ReadAll(request.Body)
 			assert.NoError(t, err)
 			objects.Store(key, body)
-		case query.Has("list-type"):
-			list := struct {
-				XMLName  xml.Name `xml:"ListBucketResult"`
-				Contents []struct{ Key string }
-			}{}
+		case request.URL.Query().Has("list-type"):
+			_, _ = io.WriteString(writer, "<ListBucketResult>")
 			objects.Range(func(stored, _ any) bool {
-				if name := stored.(string); strings.HasPrefix(name, query.Get("prefix")) {
-					list.Contents = append(list.Contents, struct{ Key string }{name})
-				}
+				_, _ = io.WriteString(writer, "<Contents><Key>"+stored.(string)+"</Key></Contents>")
 				return true
 			})
-			assert.NoError(t, xml.NewEncoder(writer).Encode(list))
+			_, _ = io.WriteString(writer, "</ListBucketResult>")
 		default:
-			body, ok := objects.Load(key)
-			if !ok {
+			if body, ok := objects.Load(key); ok {
+				_, _ = writer.Write(body.([]byte))
+			} else {
 				writer.WriteHeader(http.StatusNotFound)
-				_, _ = io.WriteString(writer, "<Error><Code>NoSuchKey</Code></Error>")
-				return
 			}
-			_, _ = writer.Write(body.([]byte))
 		}
 	}))
 	t.Cleanup(server.Close)

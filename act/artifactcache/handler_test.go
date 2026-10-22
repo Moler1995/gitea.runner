@@ -141,7 +141,7 @@ func TestHandler(t *testing.T) {
 			require.NoError(t, err)
 			defer db.Close()
 			require.NoError(t, db.bolt.View(func(tx *bbolt.Tx) error {
-				return tx.Bucket(cacheBucket).ForEach(func(k, v []byte) error {
+				return tx.Bucket([]byte("Cache")).ForEach(func(k, v []byte) error {
 					t.Logf("%s: %s", k, v)
 					return nil
 				})
@@ -1086,13 +1086,10 @@ func TestHandler_FindProtectsFromEviction(t *testing.T) {
 	// to drive gcCache would race its read.
 	db, err := handler.openDB()
 	require.NoError(t, err)
-	defer func() { require.NoError(t, db.Close()) }()
 	handler.evictOversized(db)
+	require.NoError(t, db.Close())
 
-	_, err = db.get(wanted.ID)
-	require.NoError(t, err, "the entry just promised to a job must survive")
-	_, err = db.get(other.ID)
-	assert.ErrorIs(t, err, errCacheNotFound, "the next least recently used goes instead")
+	assert.Equal(t, []string{wanted.Key}, keptKeys(t, handler, []*Cache{wanted, other}), "the entry just promised to a job survives, the next least recently used goes instead")
 }
 
 // TestHandler_evictOnCommit proves a repository that goes over its limit gets space back at
@@ -1409,60 +1406,21 @@ func TestHandler_SecretPersistsAcrossRestarts(t *testing.T) {
 	assert.Equal(t, sig, second.computeSignature("", 42, exp))
 }
 
-func TestHandler_ReadsLegacyStoreByKeyDropsItsIndexesAndSeesOtherWriters(t *testing.T) {
-	dir := t.TempDir()
-	legacy, err := bbolt.Open(filepath.Join(dir, "bolt.db"), 0o644, nil)
-	require.NoError(t, err)
-	require.NoError(t, legacy.Update(func(tx *bbolt.Tx) error {
-		bucket, err := tx.CreateBucket(cacheBucket)
-		if err != nil {
-			return err
-		}
-		if _, err := tx.CreateBucket([]byte("_index:Cache:Key")); err != nil {
-			return err
-		}
-		return bucket.Put([]byte("42"), fmt.Appendf(nil, `{"id":0,"key":"legacy","complete":true,"usedAt":%d}`, time.Now().Unix()))
-	}))
-	require.NoError(t, legacy.Close())
-
-	handler, err := StartHandler(Options{Dir: dir, OutboundIP: "127.0.0.1"})
-	require.NoError(t, err)
-	defer handler.Close()
-
-	db, err := handler.openDB()
-	require.NoError(t, err)
-	cache, err := db.get(42)
-	require.NoError(t, err)
-	assert.Equal(t, uint64(42), cache.ID)
-	require.NoError(t, db.bolt.View(func(tx *bbolt.Tx) error {
-		assert.Nil(t, tx.Bucket([]byte("_index:Cache:Key")))
-		return nil
-	}))
-	caches, err := db.find(func(*Cache) bool { return true })
-	require.NoError(t, err)
-	assert.Len(t, caches, 1)
-	require.NoError(t, db.Close())
-
-	legacy, err = bbolt.Open(filepath.Join(dir, "bolt.db"), 0o644, nil)
-	require.NoError(t, err)
-	require.NoError(t, legacy.Update(func(tx *bbolt.Tx) error {
-		bucket := tx.Bucket(cacheBucket)
-		require.NoError(t, bucket.Delete([]byte("42")))
-		return bucket.Put([]byte("43"), []byte(`{"key":"other"}`))
-	}))
-	require.NoError(t, legacy.Close())
-
-	db, err = handler.openDB()
-	require.NoError(t, err)
-	defer db.Close()
-	require.NoError(t, handler.insertCache(db, &Cache{Key: "own"}))
-	caches, err = db.find(func(*Cache) bool { return true })
-	require.NoError(t, err)
-	var keys []string
-	for _, cache := range caches {
-		keys = append(keys, cache.Key)
+func TestHandler_SeesWritesOfOtherProcesses(t *testing.T) {
+	handler := newTestHandler(t, Policy{})
+	insert := func(by *Handler, cache *Cache) {
+		db, err := by.openDB()
+		require.NoError(t, err)
+		require.NoError(t, by.insertCache(db, cache))
+		require.NoError(t, db.Close())
 	}
-	assert.ElementsMatch(t, []string{"other", "own"}, keys)
+	other := &Handler{dir: handler.dir, dbLock: make(chan struct{}, 1)}
+	theirs, later, ours := &Cache{Key: "theirs"}, &Cache{Key: "later"}, &Cache{Key: "ours"}
+	insert(other, theirs)
+	assert.Equal(t, []string{"theirs"}, keptKeys(t, handler, []*Cache{theirs}))
+	insert(other, later)
+	insert(handler, ours)
+	assert.Equal(t, []string{"theirs", "later", "ours"}, keptKeys(t, handler, []*Cache{theirs, later, ours}))
 }
 
 // TestHandler_ArtifactSignatureDownload is a happy-path round trip that

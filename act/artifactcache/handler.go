@@ -5,7 +5,6 @@
 package artifactcache
 
 import (
-	"bytes"
 	"cmp"
 	"context"
 	"crypto/hmac"
@@ -226,9 +225,6 @@ func StartHandler(opts Options) (*Handler, error) {
 
 	h.router = router
 
-	if err := h.dropLegacyIndexes(); err != nil {
-		h.logger.Warnf("drop legacy indexes: %v", err)
-	}
 	h.gcCache()
 
 	if err := h.serve(opts.Port, router); err != nil {
@@ -453,34 +449,16 @@ func cacheKey(id uint64) []byte {
 	return strconv.AppendUint(nil, id, 10)
 }
 
-// decodeCache takes the ID from the key like bolthold did, as an interrupted legacy insert left "id":0 in the value.
-func decodeCache(key, data []byte) (*Cache, error) {
-	cache := &Cache{}
-	if err := json.Unmarshal(data, cache); err != nil {
+func (db *cacheDB) get(id uint64) (*Cache, error) {
+	if err := db.bolt.View(db.load); err != nil {
 		return nil, err
 	}
-	id, err := strconv.ParseUint(string(key), 10, 64)
-	if err != nil {
-		return nil, err
+	cache, ok := db.entries.byID[id]
+	if !ok {
+		return nil, errCacheNotFound
 	}
-	cache.ID = id
-	return cache, nil
-}
-
-func (db *cacheDB) get(id uint64) (cache *Cache, err error) {
-	key := cacheKey(id)
-	err = db.bolt.View(func(tx *bbolt.Tx) error {
-		var data []byte
-		if bucket := tx.Bucket(cacheBucket); bucket != nil {
-			data = bucket.Get(key)
-		}
-		if data == nil {
-			return errCacheNotFound
-		}
-		cache, err = decodeCache(key, data)
-		return err
-	})
-	return cache, err
+	copied := *cache
+	return &copied, nil
 }
 
 // find returns copies of the matching entries in ID order, so ties break the same way every time.
@@ -505,11 +483,13 @@ func (db *cacheDB) load(tx *bbolt.Tx) error {
 	}
 	byID := make(map[uint64]*Cache)
 	if bucket := tx.Bucket(cacheBucket); bucket != nil {
-		if err := bucket.ForEach(func(key, data []byte) error {
-			cache, err := decodeCache(key, data)
-			if err == nil {
-				byID[cache.ID] = cache
+		if err := bucket.ForEach(func(key, data []byte) (err error) {
+			cache := &Cache{}
+			if err := json.Unmarshal(data, cache); err != nil {
+				return err
 			}
+			cache.ID, err = strconv.ParseUint(string(key), 10, 64) // an interrupted legacy insert left "id":0 in the value
+			byID[cache.ID] = cache
 			return err
 		}); err != nil {
 			return err
@@ -517,34 +497,6 @@ func (db *cacheDB) load(tx *bbolt.Tx) error {
 	}
 	db.entries.byID, db.entries.tx = byID, tx.ID()
 	return nil
-}
-
-// dropLegacyIndexes frees the index buckets bolthold kept, which nothing reads or prunes anymore.
-func (h *Handler) dropLegacyIndexes() error {
-	db, err := h.openDB()
-	if err != nil {
-		return err
-	}
-	defer db.Close()
-	var names [][]byte
-	if err := db.bolt.View(func(tx *bbolt.Tx) error {
-		return tx.ForEach(func(name []byte, _bucket *bbolt.Bucket) error {
-			if bytes.HasPrefix(name, []byte("_index:")) {
-				names = append(names, slices.Clone(name))
-			}
-			return nil
-		})
-	}); err != nil || len(names) == 0 {
-		return err
-	}
-	return db.bolt.Update(func(tx *bbolt.Tx) error {
-		for _, name := range names {
-			if err := tx.DeleteBucket(name); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
 }
 
 // update keeps the mirror in step with its own write, and drops it when another process wrote in between or the write rolled back.
