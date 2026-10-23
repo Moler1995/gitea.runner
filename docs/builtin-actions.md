@@ -5,6 +5,7 @@ Built-in actions ship with the runner, so a job needs no action download and no 
 ```yaml
 - uses: builtin:checkout
 - uses: builtin:upload-artifact
+- uses: builtin:download-artifact
 ```
 
 ## checkout
@@ -56,4 +57,25 @@ Works like `actions/upload-artifact` v7 with these inputs. Any other input fails
 
 Patterns, symlinks and the artifact's root directory follow `actions/upload-artifact`, as do `ACTIONS_ARTIFACT_UPLOAD_CONCURRENCY` and `ACTIONS_ARTIFACT_UPLOAD_TIMEOUT_MS`. The step outputs `artifact-id`, `artifact-digest` and `artifact-url`. The `artifact-url` is the artifact's link on the run page for this attempt, where `actions/upload-artifact` gives a link only GitHub serves.
 
-With `gitea-runner exec`, it uses the local artifact server of `--artifact-server-path`.
+## download-artifact
+
+Works like `actions/download-artifact` v8 with these inputs. Any other input fails the step.
+
+| Input | Default |
+| --- | --- |
+| `name` | empty, every artifact of the run |
+| `artifact-ids` | empty, comma-separated IDs instead of `name` |
+| `path` | workspace root, `~` is the job user's home |
+| `pattern` | empty, a pattern the artifact names must match |
+| `merge-multiple` | `false`, `true` puts every artifact in `path` instead of `path/<name>` |
+| `github-token` | empty, a token to download from another run or repository |
+| `repository` | `github.repository`, with `github-token` |
+| `run-id` | `github.run_id`, with `github-token` |
+| `skip-decompress` | `false`, `true` keeps a zipped artifact as `<name>.zip` |
+| `digest-mismatch` | `error`, also `ignore`, `info` or `warn` |
+
+Files are written as `actions/download-artifact` writes them, without their mode, so executables lose their executable bit. `digest-mismatch` only applies when the server reports a digest, which Gitea does not. The step outputs `download-path`.
+
+`github-token` is only sent to the instance the runner is registered with. Downloads from another run read every page of its artifacts and skip expired ones, where `actions/download-artifact` sees only Gitea's first 30 and fails on an expired newest copy.
+
+With `gitea-runner exec`, both actions use the local artifact server of `--artifact-server-path`.
