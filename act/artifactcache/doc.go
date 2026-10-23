@@ -6,6 +6,5 @@
 //
 // Inspired by https://github.com/sp-ricard-valverde/github-act-cache-server
 //
-// TODO: Authorization
 // TODO: Force deleting cache entries, see https://docs.github.com/en/actions/using-workflows/caching-dependencies-to-speed-up-workflows#force-deleting-cache-entries
 package artifactcache
