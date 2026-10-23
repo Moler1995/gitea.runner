@@ -154,8 +154,6 @@ func (sar *stepActionRemote) main() common.Executor {
 		sar.prepareActionExecutor(),
 		runStepExecutor(sar, stepStageMain, func(ctx context.Context) error {
 			printRunActionHeader(ctx, sar.Step, sar.env, sar.RunContext)
-			rawLogger := common.Logger(ctx).With(rawOutputField, true)
-			defer rawLogger.Infof("::endgroup::")
 
 			github := sar.getGithubContext(ctx)
 			if sar.skipsLocalCheckout(sar.remoteAction, github) {

@@ -87,8 +87,7 @@ func (sr *stepRun) printRunScriptActionDetails(ctx context.Context) {
 }
 
 // printRunActionHeader mirrors actions/runner's "Run <action>" header for `uses:` steps,
-// including the with: inputs and the step-level env: block. The caller is responsible
-// for emitting ::endgroup:: after the action finishes.
+// including the with: inputs and the step-level env: block.
 func printRunActionHeader(ctx context.Context, step *model.Step, env map[string]string, rc *RunContext) {
 	if step == nil {
 		return
@@ -105,6 +104,7 @@ func printRunActionHeader(ctx context.Context, step *model.Step, env map[string]
 	}
 
 	printStepEnvBlock(ctx, step, env, rc)
+	rawLogger.Infof("::endgroup::")
 }
 
 // printStepEnvBlock emits the declared-env block (YAML order, internal vars filtered)

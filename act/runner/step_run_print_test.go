@@ -143,6 +143,7 @@ env:
 		"[j1]   |   token: secret",
 		"[j1]   | env:",
 		"[j1]   |   CUSTOM: value",
+		"[j1]   | ::endgroup::",
 		"",
 	}, "\n")
 	assert.Equal(t, want, buf.String())
