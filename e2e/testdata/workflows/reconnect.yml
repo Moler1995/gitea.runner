@@ -1,0 +1,13 @@
+name: reconnect
+on:
+  push:
+    paths:
+      - .gitea/workflows/reconnect.yml
+jobs:
+  slow:
+    runs-on: e2e-reconnect
+    steps:
+      - run: |
+          echo e2e-before-outage
+          sleep 12
+          echo e2e-after-outage

@@ -37,6 +37,7 @@ type ActionJob struct {
 	Name       string `json:"name"`
 	Status     string `json:"status"`
 	Conclusion string `json:"conclusion"`
+	RunnerName string `json:"runner_name"`
 }
 
 func (a *GiteaAPI) CreateRepo(ctx context.Context, name string) error {
@@ -165,7 +166,7 @@ func (a *GiteaAPI) JobLogs(ctx context.Context, repo string, jobID int64) (strin
 		return "", err
 	}
 	if resp.StatusCode >= 300 {
-		return "", fmt.Errorf("GET %s: %d: %s", url, resp.StatusCode, body)
+		return "", statusError{method: http.MethodGet, path: url, code: resp.StatusCode, body: string(body)}
 	}
 	return string(body), nil
 }

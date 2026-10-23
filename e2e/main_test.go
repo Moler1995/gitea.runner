@@ -7,7 +7,9 @@ package e2e
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"regexp"
 	"strings"
@@ -32,6 +34,11 @@ func TestMain(m *testing.M) {
 func runSuite(m *testing.M) int {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
+	defer func() {
+		if runnerBinDir != "" {
+			_ = os.RemoveAll(runnerBinDir)
+		}
+	}()
 
 	cli, err := dockerClient(ctx)
 	if err != nil {
@@ -109,6 +116,10 @@ func runLogs(t *testing.T, api *GiteaAPI, repo string, runID int64) string {
 	var all strings.Builder
 	for _, job := range jobs {
 		logs, err := api.JobLogs(ctx, repo, job.ID)
+		var response statusError
+		if errors.As(err, &response) && response.code == http.StatusNotFound {
+			continue // skipped jobs and reusable workflow callers never ran a task, so have no log
+		}
 		if err != nil {
 			t.Fatalf("job logs for %s: %v", job.Name, err)
 		}
