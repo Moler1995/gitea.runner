@@ -75,7 +75,37 @@ func TestGetContainerArchive(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, expectedContent, content)
 	_, err = reader.Next()
-	assert.ErrorIs(t, err, io.EOF)
+	require.ErrorIs(t, err, io.EOF)
+	require.NoError(t, archive.Close())
+
+	_, err = e.GetContainerArchive(ctx, filepath.Join(e.Path, "missing"))
+	assert.ErrorIs(t, err, os.ErrNotExist)
+}
+
+func TestHostCopyTarStream(t *testing.T) {
+	dest := filepath.Join(t.TempDir(), "out")
+	write := func(name string, mode int64, body string) func(*TarWriter) error {
+		return func(tw *TarWriter) error {
+			if err := tw.WriteHeader(&tar.Header{Typeflag: tar.TypeReg, Name: name, Mode: mode, Size: int64(len(body))}); err != nil {
+				return err
+			}
+			_, err := tw.Write([]byte(body))
+			return err
+		}
+	}
+	e := &HostEnvironment{}
+	require.NoError(t, e.CopyTarStream(t.Context(), dest, write("dir/run.sh", 0o755, "#!/bin/sh\n")))
+	content, err := os.ReadFile(filepath.Join(dest, "dir", "run.sh"))
+	require.NoError(t, err)
+	assert.Equal(t, "#!/bin/sh\n", string(content))
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(filepath.Join(dest, "dir", "run.sh"))
+		require.NoError(t, err)
+		assert.Equal(t, os.FileMode(0o755), info.Mode().Perm())
+	}
+
+	require.ErrorContains(t, e.CopyTarStream(t.Context(), dest, write("../escape", 0o644, "x")), "escapes")
+	assert.NoFileExists(t, filepath.Join(filepath.Dir(dest), "escape"))
 }
 
 func TestHostEnvironmentExecExitCode(t *testing.T) {

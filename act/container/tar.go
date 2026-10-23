@@ -8,12 +8,54 @@ import (
 	"archive/tar"
 	"context"
 	"io"
+	"path"
 	"path/filepath"
 	"strings"
 
 	"gitea.com/gitea/runner/act/common"
 	"gitea.com/gitea/runner/act/filecollector"
 )
+
+// TarWriter takes names relative to the destination, and owns every entry by the user the
+// container extracts as, like the other copies do.
+type TarWriter struct {
+	*tar.Writer
+	uid, gid int
+	prefix   string
+}
+
+func (w *TarWriter) WriteHeader(hdr *tar.Header) error {
+	hdr.Uid, hdr.Gid = w.uid, w.gid
+	if w.prefix != "" {
+		dir := strings.HasSuffix(hdr.Name, "/")
+		hdr.Name = path.Join(w.prefix, hdr.Name)
+		if dir {
+			hdr.Name += "/"
+		}
+	}
+	return w.Writer.WriteHeader(hdr)
+}
+
+// writeTarStream writes parents first with their names as given, then what write produces.
+func writeTarStream(w io.Writer, uid, gid int, prefix string, parents []string, write func(*TarWriter) error) error {
+	tw := &TarWriter{Writer: tar.NewWriter(w), uid: uid, gid: gid}
+	for _, name := range parents {
+		if err := tw.WriteHeader(&tar.Header{Typeflag: tar.TypeDir, Name: name + "/", Mode: 0o755}); err != nil {
+			return err
+		}
+	}
+	tw.prefix = prefix
+	if err := write(tw); err != nil {
+		return err
+	}
+	return tw.Close()
+}
+
+func pipeTar(uid, gid int, prefix string, parents []string, write func(*TarWriter) error) *io.PipeReader {
+	reader, writer := io.Pipe()
+	go func() { writer.CloseWithError(writeTarStream(writer, uid, gid, prefix, parents, write)) }()
+	return reader
+}
 
 func writeFilesTar(ctx context.Context, w io.Writer, uid, gid int, files ...*FileEntry) error {
 	tw := tar.NewWriter(w)
