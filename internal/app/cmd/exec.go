@@ -7,12 +7,11 @@ package cmd
 import (
 	"cmp"
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"maps"
+	"net"
 	"os"
 	"path/filepath"
 	"slices"
@@ -207,6 +206,14 @@ func parseKVAndFile(rawKVs []string, filePath string) map[string]string {
 		result[key] = value
 	}
 	return result
+}
+
+// artifactServerURL is empty when the artifact server does not start.
+func (i *executeArgs) artifactServerURL() string {
+	if i.artifactServerPath == "" {
+		return ""
+	}
+	return "http://" + net.JoinHostPort(i.artifactServerAddr, i.artifactServerPort)
 }
 
 // Workdir returns path to workdir
@@ -490,16 +497,11 @@ func runExec(ctx context.Context, execArgs *executeArgs) func(cmd *cobra.Command
 			actionsRuntimeToken = os.Getenv(actionsRuntimeTokenEnvName)
 		}
 		if actionsRuntimeToken == "" {
-			tmpBranch := make([]byte, 12)
-			if _, err := rand.Read(tmpBranch); err != nil {
-				actionsRuntimeToken = "token"
-			} else {
-				actionsRuntimeToken = hex.EncodeToString(tmpBranch)
-			}
+			actionsRuntimeToken = artifacts.LocalRuntimeToken(cmp.Or(env["GITHUB_RUN_ID"], "1"))
 			env[actionsRuntimeTokenEnvName] = actionsRuntimeToken
 			os.Setenv(actionsRuntimeTokenEnvName, actionsRuntimeToken)
 		}
-		handler.RegisterJob(actionsRuntimeToken, artifactcache.JobCredential{Repo: "__local/__exec"})
+		handler.RegisterJob(actionsRuntimeToken, artifactcache.JobCredential{Repo: "__local/__exec", Results: execArgs.artifactServerURL()})
 
 		// no service aliases: exec builds one config for the whole plan
 		run.BypassProxyForDockerHost(os.Getenv("DOCKER_HOST"))
