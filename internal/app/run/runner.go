@@ -620,6 +620,7 @@ func (r *Runner) run(ctx context.Context, task *runnerv1.Task, reporter *report.
 		ClientCertFile:                    r.cfg.Runner.ClientCertFile,
 		ClientKeyFile:                     r.cfg.Runner.ClientKeyFile,
 		InstanceTransport:                 r.instanceTransport,
+		ResultsURL:                        strings.TrimSuffix(r.client.Address(), "/"),
 		RunnerName:                        r.name,
 		KubernetesPicker:                  r.kubernetesOptions,
 	}

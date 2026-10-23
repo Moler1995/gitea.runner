@@ -390,6 +390,7 @@ func (i *executeArgs) runnerConfig(eventName string, env, proxyEnv map[string]st
 		ArtifactServerPath:                i.artifactServerPath,
 		ArtifactServerPort:                i.artifactServerPort,
 		ArtifactServerAddr:                i.artifactServerAddr,
+		ResultsURL:                        i.artifactServerURL(),
 		NoSkipCheckout:                    i.noSkipCheckout,
 		EventName:                         eventName,
 		EventJSON:                         eventJSON,

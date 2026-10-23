@@ -80,6 +80,7 @@ type Config struct {
 	PlatformPicker                    func(labels []string) string
 	KubernetesPicker                  func(labels []string) container.KubernetesOptions
 	InstanceTransport                 http.RoundTripper
+	ResultsURL                        string         // the results service as the runner reaches it, never the job's ACTIONS_RESULTS_URL, which a step can rewrite
 	JobLoggerLevel                    *logging.Level // the level of job logger
 	ValidVolumes                      []string       // only volumes (and bind mounts) in this slice can be mounted on the job container or service containers
 	SharedToolCache                   bool           // one tool cache for all jobs instead of one per job

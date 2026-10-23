@@ -9,12 +9,14 @@ import (
 	"gitea.com/gitea/runner/act/common"
 	"gitea.com/gitea/runner/internal/pkg/action"
 	"gitea.com/gitea/runner/internal/pkg/action/checkout"
+	"gitea.com/gitea/runner/internal/pkg/action/uploadartifact"
 
 	"gitea.dev/actionslib/pkg/model"
 )
 
 var builtinActions = map[string]func(context.Context, *action.Context) error{
-	"checkout": checkout.Main,
+	"checkout":        checkout.Main,
+	"upload-artifact": uploadartifact.Main,
 }
 
 type stepActionBuiltin struct {
@@ -52,6 +54,13 @@ func (sab *stepActionBuiltin) main() common.Executor {
 			ClientCertFile:  rc.Config.ClientCertFile,
 			ClientKeyFile:   rc.Config.ClientKeyFile,
 			Env:             sab.env,
+			ResultsURL:      rc.Config.ResultsURL,
+			RuntimeToken:    rc.Config.Secrets["ACTIONS_RUNTIME_TOKEN"],
+			Transport:       rc.Config.InstanceTransport,
+			Infof:           rawLogger.Infof,
+			Annotate: func(level, message string) {
+				rawLogger.Infof("%s", formatAnnotation(level, nil, message))
+			},
 		})
 	})
 }
