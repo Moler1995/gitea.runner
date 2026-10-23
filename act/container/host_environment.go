@@ -6,7 +6,6 @@ package container
 
 import (
 	"archive/tar"
-	"bytes"
 	"cmp"
 	"context"
 	"errors"
@@ -115,18 +114,26 @@ func (e *HostEnvironment) Inspect(_ context.Context) (*Info, error) {
 	return &Info{Health: HealthNone, Ports: map[string]string{}}, nil
 }
 
+// GetContainerArchive streams, so a large tree is never held in memory.
 func (e *HostEnvironment) GetContainerArchive(ctx context.Context, srcPath string) (io.ReadCloser, error) {
-	buf := &bytes.Buffer{}
-	tw := tar.NewWriter(buf)
-	defer tw.Close()
 	srcPath = filepath.Clean(srcPath)
 	fi, err := os.Lstat(srcPath)
 	if err != nil {
 		return nil, err
 	}
-	tc := &filecollector.TarCollector{
-		TarWriter: tw,
-	}
+	reader, writer := io.Pipe()
+	go func() {
+		tw := tar.NewWriter(writer)
+		err := writeHostArchive(ctx, &filecollector.TarCollector{TarWriter: tw}, srcPath, fi)
+		if err == nil {
+			err = tw.Close()
+		}
+		writer.CloseWithError(err)
+	}()
+	return reader, nil
+}
+
+func writeHostArchive(ctx context.Context, tc *filecollector.TarCollector, srcPath string, fi fs.FileInfo) error {
 	if fi.IsDir() {
 		srcPrefix := srcPath
 		if !strings.HasSuffix(srcPrefix, string(filepath.Separator)) {
@@ -137,31 +144,68 @@ func (e *HostEnvironment) GetContainerArchive(ctx context.Context, srcPath strin
 			SrcPrefix: srcPrefix,
 			Handler:   tc,
 		}
-		err = filepath.Walk(srcPath, fc.CollectFiles(ctx))
-		if err != nil {
-			return nil, err
+		return filepath.Walk(srcPath, fc.CollectFiles(ctx))
+	}
+	var f io.ReadCloser
+	var linkname string
+	var err error
+	if fi.Mode()&fs.ModeSymlink != 0 {
+		if linkname, err = os.Readlink(srcPath); err != nil {
+			return err
 		}
 	} else {
-		var f io.ReadCloser
-		var linkname string
-		if fi.Mode()&fs.ModeSymlink != 0 {
-			linkname, err = os.Readlink(srcPath)
-			if err != nil {
-				return nil, err
-			}
-		} else {
-			f, err = os.Open(srcPath)
-			if err != nil {
-				return nil, err
-			}
-			defer f.Close()
+		if f, err = os.Open(srcPath); err != nil {
+			return err
 		}
-		err := tc.WriteFile(fi.Name(), fi, linkname, f)
-		if err != nil {
-			return nil, err
+		defer f.Close()
+	}
+	return tc.WriteFile(fi.Name(), fi, linkname, f)
+}
+
+func (e *HostEnvironment) CopyTarStream(_ context.Context, destPath string, write func(*TarWriter) error) error {
+	if err := os.MkdirAll(destPath, 0o777); err != nil {
+		return err
+	}
+	content := pipeTar(0, 0, "", nil, write)
+	defer content.Close()
+	tr := tar.NewReader(content)
+	for {
+		hdr, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			return nil
+		} else if err != nil {
+			return err
+		}
+		name := filepath.FromSlash(strings.TrimSuffix(hdr.Name, "/"))
+		if !filepath.IsLocal(name) {
+			return fmt.Errorf("tar entry %q escapes %s", hdr.Name, destPath)
+		}
+		target := filepath.Join(destPath, name)
+		switch hdr.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(target, hdr.FileInfo().Mode().Perm()); err != nil {
+				return err
+			}
+		case tar.TypeReg:
+			if err := writeHostFile(target, hdr.FileInfo().Mode().Perm(), tr); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("tar entry %q: unsupported type %q", hdr.Name, hdr.Typeflag)
 		}
 	}
-	return io.NopCloser(buf), nil
+}
+
+func writeHostFile(target string, mode fs.FileMode, body io.Reader) error {
+	if err := os.MkdirAll(filepath.Dir(target), 0o777); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
+	if err != nil {
+		return err
+	}
+	_, err = io.Copy(f, body)
+	return errors.Join(err, f.Close())
 }
 
 func (e *HostEnvironment) Pull(_ bool) common.Executor {

@@ -469,6 +469,10 @@ func (c *kubernetesContainer) Copy(destPath string, files ...*FileEntry) common.
 	}
 }
 
+func (c *kubernetesContainer) CopyTarStream(ctx context.Context, destPath string, write func(*TarWriter) error) error {
+	return c.extract(ctx, destPath, func(writer io.Writer) error { return writeTarStream(writer, 0, 0, "", nil, write) })
+}
+
 func (c *kubernetesContainer) CopyDir(destPath, srcPath string, useGitIgnore, skipGitDir bool) common.Executor {
 	return func(ctx context.Context) error {
 		return c.extract(ctx, destPath, func(writer io.Writer) error {

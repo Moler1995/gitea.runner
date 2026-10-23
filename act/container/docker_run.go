@@ -904,10 +904,7 @@ func (cr *containerReference) copyDir(dstPath, srcPath string, useGitIgnore, ski
 				logger.Error(err)
 			}
 		}()
-		extractionRoot := "/"
-		if actPath := cr.GetActPath(); strings.HasPrefix(dstPath+"/", actPath+"/") {
-			extractionRoot = actPath // keeps tar entries from crossing the image's /var/run symlink
-		}
+		extractionRoot := cr.extractionRoot(dstPath)
 		if err := writeDirTar(ctx, tarFile, path.Join("/", strings.TrimPrefix(dstPath, extractionRoot)), srcPath, useGitIgnore, skipGitDir, cr.UID, cr.GID); err != nil {
 			return err
 		}
@@ -918,6 +915,44 @@ func (cr *containerReference) copyDir(dstPath, srcPath string, useGitIgnore, ski
 		}
 		return cr.upload(ctx, extractionRoot, tarFile)
 	}
+}
+
+func (cr *containerReference) extractionRoot(dstPath string) string {
+	if actPath := cr.GetActPath(); strings.HasPrefix(dstPath+"/", actPath+"/") {
+		return actPath // keeps tar entries from crossing the image's /var/run symlink
+	}
+	return "/"
+}
+
+func (cr *containerReference) CopyTarStream(ctx context.Context, destPath string, write func(*TarWriter) error) error {
+	if common.Dryrun(ctx) {
+		return nil
+	}
+	if err := cr.connect()(ctx); err != nil {
+		return err
+	}
+	if err := cr.find()(ctx); err != nil {
+		return err
+	}
+	if cr.id == "" {
+		return cr.missingContainerError("copy to %s", destPath)
+	}
+	destPath = path.Clean(destPath)
+	root := cr.extractionRoot(destPath)
+	rel := func(p string) string { return strings.TrimPrefix(strings.TrimPrefix(p, root), "/") }
+	// the daemon would create missing parents as root, which a non-root job user cannot write to
+	var parents []string
+	for dir := destPath; dir != root && dir != "/" && dir != "."; dir = path.Dir(dir) {
+		if _, err := cr.cli.ContainerStatPath(ctx, cr.id, client.ContainerStatPathOptions{Path: dir}); err == nil {
+			break
+		} else if !cerrdefs.IsNotFound(err) {
+			return fmt.Errorf("stat %s: %w", dir, err)
+		}
+		parents = append([]string{rel(dir)}, parents...)
+	}
+	content := pipeTar(cr.UID, cr.GID, rel(destPath), parents, write)
+	defer content.Close()
+	return cr.upload(ctx, root, content)
 }
 
 func (cr *containerReference) copyContent(dstPath string, files ...*FileEntry) common.Executor {
