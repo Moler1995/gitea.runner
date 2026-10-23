@@ -750,9 +750,50 @@ func TestHandler_PrefixUsesNewestReservationWithinSecond(t *testing.T) {
 	db, err := handler.openDB()
 	require.NoError(t, err)
 	defer db.Close()
-	cache, err := findCache(db, testRepo, []string{"deps-"}, "v")
+	cache, err := findCache(db, JobCredential{Repo: testRepo}, []string{"deps-"}, "v")
 	require.NoError(t, err)
 	require.Equal(t, newer, cache)
+}
+
+func TestHandler_RestoreRefs(t *testing.T) {
+	t.Parallel()
+	const main, feature, pull = "refs/heads/main", "refs/heads/feature", "refs/pull/1/head"
+	created := time.Now().Add(-time.Hour).Unix()
+	entry := func(ref, key string, age int64) *Cache {
+		return &Cache{Repo: testRepo, Ref: ref, Key: key, Version: "v", Complete: true, CreatedAt: created + age}
+	}
+	exactOnMain := entry(main, "deps-exact", -1)
+	onMain := entry(main, "deps-main", 0)
+	onPull := entry(pull, "deps-pull", 1) // newer, as when a pull request saves after main did
+	onFeature := entry(feature, "deps-feature", 2)
+	unscoped := entry("", "deps-unscoped", 3)
+	handler := newTestHandler(t, Policy{}, exactOnMain, onMain, onPull, onFeature, unscoped)
+
+	db, err := handler.openDB()
+	require.NoError(t, err)
+	defer db.Close()
+
+	for _, tc := range []struct {
+		name string
+		cred JobCredential
+		keys []string
+		want *Cache
+	}{
+		{"the default branch never restores what a pull request wrote", JobCredential{Ref: main, DefaultRef: main}, []string{"deps-"}, onMain},
+		{"a pull request restores its own entry first", JobCredential{Ref: pull, BaseRef: main, DefaultRef: main}, []string{"deps-"}, onPull},
+		{"a pull request falls back to its base branch", JobCredential{Ref: "refs/pull/2/head", BaseRef: main, DefaultRef: main}, []string{"deps-"}, onMain},
+		{"a branch does not restore a sibling branch", JobCredential{Ref: "refs/heads/other", DefaultRef: main}, []string{"deps-"}, onMain},
+		{"a prefix in the own ref wins over an exact key in the default branch", JobCredential{Ref: feature, DefaultRef: main}, []string{"deps-exact", "deps-"}, onFeature},
+		{"entries written before refs are searched last", JobCredential{Ref: "refs/heads/other"}, []string{"deps-"}, unscoped},
+		{"a job registered without a ref only restores entries written before refs", JobCredential{}, []string{"deps-"}, unscoped},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.cred.Repo = testRepo
+			cache, err := findCache(db, tc.cred, tc.keys, "v")
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, cache)
+		})
+	}
 }
 
 func TestHandler_evictOnCommit(t *testing.T) {
@@ -923,6 +964,7 @@ func TestHandler_CrossRepoIsolation(t *testing.T) {
 	defer handler.Close()
 	handler.RegisterJob("token-a", JobCredential{Repo: "owner/repoA"})
 	handler.RegisterJob("token-b", JobCredential{Repo: "owner/repoB"})
+	handler.RegisterJob("token-a-pull", JobCredential{Repo: "owner/repoA", Ref: "refs/pull/1/head"})
 
 	base := handler.ExternalURL() + apiPath
 	key := "shared-key"
@@ -957,13 +999,16 @@ func TestHandler_CrossRepoIsolation(t *testing.T) {
 	resp.Body.Close()
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
 
-	req, err = http.NewRequest(http.MethodPatch, fmt.Sprintf("%s/caches/%d", base, id), bytes.NewReader([]byte("poison")))
-	require.NoError(t, err)
-	req.Header.Set("Content-Range", "bytes 0-5/*")
-	resp, err = clientB.Do(req)
-	require.NoError(t, err)
-	resp.Body.Close()
-	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+	clientAPull := &http.Client{Transport: &bearerTransport{token: "token-a-pull"}}
+	for _, client := range []*http.Client{clientB, clientAPull} {
+		req, err = http.NewRequest(http.MethodPatch, fmt.Sprintf("%s/caches/%d", base, id), bytes.NewReader([]byte("poison")))
+		require.NoError(t, err)
+		req.Header.Set("Content-Range", "bytes 0-5/*")
+		resp, err = client.Do(req)
+		require.NoError(t, err)
+		resp.Body.Close()
+		assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+	}
 }
 
 func TestHandler_ArtifactSignature(t *testing.T) {
@@ -1168,10 +1213,10 @@ func TestHandler_InternalAPI_AuthAndUsage(t *testing.T) {
 		}
 
 		assert.Equal(t, http.StatusUnauthorized, probe("via-internal-api"))
-		assert.Equal(t, http.StatusOK, post("/_internal/register", secret, `{"token":"via-internal-api","repo":"owner/repo","public_url":"http://runner.example","results":"https://gitea.example","insecure_tls":true}`))
+		assert.Equal(t, http.StatusOK, post("/_internal/register", secret, `{"token":"via-internal-api","repo":"owner/repo","ref":"refs/pull/1/head","base_ref":"refs/heads/main","default_ref":"refs/heads/main","public_url":"http://runner.example","results":"https://gitea.example","insecure_tls":true}`))
 		cred, ok := handler.lookupCredential("via-internal-api")
 		require.True(t, ok)
-		assert.Equal(t, JobCredential{Repo: testRepo, PublicURL: "http://runner.example"}, cred)
+		assert.Equal(t, JobCredential{Repo: testRepo, Ref: "refs/pull/1/head", BaseRef: "refs/heads/main", DefaultRef: "refs/heads/main", PublicURL: "http://runner.example"}, cred)
 		assert.NotEqual(t, http.StatusUnauthorized, probe("via-internal-api"))
 		assert.Equal(t, http.StatusOK, post("/_internal/revoke", secret, `{"token":"via-internal-api"}`))
 		assert.Equal(t, http.StatusUnauthorized, probe("via-internal-api"))

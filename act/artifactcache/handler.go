@@ -59,6 +59,12 @@ type credKey struct{}
 type JobCredential struct {
 	Repo string `json:"repo"`
 
+	// Ref is the job's github.ref and stamps its entries. As on GitHub, the job also restores
+	// entries of BaseRef (a pull request's target branch) and DefaultRef.
+	Ref        string `json:"ref"`
+	BaseRef    string `json:"base_ref"`
+	DefaultRef string `json:"default_ref"`
+
 	// Results is the instance whose artifact service this server forwards for the job, and
 	// InsecureTLS how the runner reaches it; see results.go.
 	Results     string `json:"-"`
@@ -66,6 +72,25 @@ type JobCredential struct {
 
 	// PublicURL is this server as a reverse proxy makes the job reach it, not the listen address.
 	PublicURL string `json:"public_url"`
+}
+
+// restoreRefs lists the refs the job restores from, in search order. Entries written before refs
+// were stored come last, for every job.
+func (cred JobCredential) restoreRefs() []string {
+	if cred.Ref == "" {
+		return []string{""}
+	}
+	refs := []string{cred.Ref}
+	for _, ref := range []string{cred.BaseRef, cred.DefaultRef} {
+		if ref != "" && !slices.Contains(refs, ref) {
+			refs = append(refs, ref)
+		}
+	}
+	return append(refs, "")
+}
+
+func (cred JobCredential) owns(cache *Cache) bool {
+	return cache.Repo == cred.Repo && cache.Ref == cred.Ref
 }
 
 // credEntry holds a registered job's credential along with an active
@@ -653,7 +678,7 @@ func (h *Handler) find(w http.ResponseWriter, r *http.Request) {
 	}
 	defer db.Close()
 
-	cache, err := h.lookupCache(db, cred.Repo, keys, version)
+	cache, err := h.lookupCache(db, cred, keys, version)
 	if err != nil {
 		h.responseJSON(w, r, 500, err)
 		return
@@ -672,8 +697,8 @@ func (h *Handler) find(w http.ResponseWriter, r *http.Request) {
 // lookupCache returns the entry to restore for these keys, or (nil, nil) when there is none:
 // either nothing matched, or the match had lost its blob to a prune, in which case the dangling
 // entry is dropped on the way out.
-func (h *Handler) lookupCache(db *cacheDB, repo string, keys []string, version string) (*Cache, error) {
-	cache, err := findCache(db, repo, keys, version)
+func (h *Handler) lookupCache(db *cacheDB, cred JobCredential, keys []string, version string) (*Cache, error) {
+	cache, err := findCache(db, cred, keys, version)
 	if err != nil || cache == nil {
 		return nil, err
 	}
@@ -700,7 +725,7 @@ func (h *Handler) reserve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cache := &Cache{Repo: cred.Repo, Key: api.Key, Version: api.Version, Size: api.Size}
+	cache := &Cache{Repo: cred.Repo, Ref: cred.Ref, Key: api.Key, Version: api.Version, Size: api.Size}
 	if cache.Size == 0 {
 		cache.Size = -1
 	}
@@ -749,7 +774,7 @@ func (h *Handler) upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if cache.Repo != cred.Repo {
+	if !cred.owns(cache) {
 		h.responseJSON(w, r, 403, fmt.Errorf("cache %d: forbidden", id))
 		return
 	}
@@ -808,7 +833,7 @@ func (h *Handler) commit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if cache.Repo != cred.Repo {
+	if !cred.owns(cache) {
 		h.responseJSON(w, r, 403, fmt.Errorf("cache %d: forbidden", id))
 		return
 	}
@@ -1071,25 +1096,28 @@ func (h *Handler) signedArtifactURL(cred JobCredential, cacheID uint64, exp time
 	return h.signedURL(cred, apiPath+"/artifacts", "", cacheID, exp)
 }
 
-// if not found, return (nil, nil) instead of an error.
-func findCache(db *cacheDB, repo string, keys []string, version string) (*Cache, error) {
-	for _, prefix := range keys {
-		// if a key in the list matches exactly, don't return partial matches
-		exact, err := findExactCache(db, repo, prefix, version, true)
-		if err != nil {
-			return nil, err
-		}
-		if exact != nil {
-			return exact, nil
-		}
-		caches, err := db.find(func(cache *Cache) bool {
-			return cache.Repo == repo && strings.HasPrefix(cache.Key, prefix) && cache.Version == version && cache.Complete
-		})
-		if err != nil {
-			return nil, fmt.Errorf("find cache: %w", err)
-		}
-		if cache := latest(caches, (*Cache).createdAtNano); cache != nil {
-			return cache, nil
+// findCache returns the entry the job restores, or (nil, nil) if there is none. As on GitHub,
+// every key is tried in the job's own ref before any key is tried in the next ref it may restore.
+func findCache(db *cacheDB, cred JobCredential, keys []string, version string) (*Cache, error) {
+	for _, ref := range cred.restoreRefs() {
+		for _, prefix := range keys {
+			// if a key in the list matches exactly, don't return partial matches
+			exact, err := findExactCache(db, cred.Repo, ref, prefix, version, true)
+			if err != nil {
+				return nil, err
+			}
+			if exact != nil {
+				return exact, nil
+			}
+			caches, err := db.find(func(cache *Cache) bool {
+				return cache.Repo == cred.Repo && cache.Ref == ref && strings.HasPrefix(cache.Key, prefix) && cache.Version == version && cache.Complete
+			})
+			if err != nil {
+				return nil, fmt.Errorf("find cache: %w", err)
+			}
+			if cache := latest(caches, (*Cache).createdAtNano); cache != nil {
+				return cache, nil
+			}
 		}
 	}
 	return nil, nil //nolint:nilnil // pre-existing issue from nektos/act
@@ -1111,9 +1139,9 @@ func latest(caches []*Cache, stamp func(*Cache) int64) *Cache {
 // A completed entry is the one to restore, sorted by when it was written. An incomplete one is a
 // reservation being uploaded to, sorted by when it was last written to, because the upload route
 // touches UsedAt on every part.
-func findExactCache(db *cacheDB, repo, key, version string, complete bool) (*Cache, error) {
+func findExactCache(db *cacheDB, repo, ref, key, version string, complete bool) (*Cache, error) {
 	caches, err := db.find(func(cache *Cache) bool {
-		return cache.Key == key && cache.Repo == repo && cache.Version == version && cache.Complete == complete
+		return cache.Key == key && cache.Repo == repo && cache.Ref == ref && cache.Version == version && cache.Complete == complete
 	})
 	if err != nil {
 		return nil, fmt.Errorf("find cache: %w", err)
@@ -1281,12 +1309,13 @@ func (h *Handler) evictExpired(db *cacheDB) {
 }
 
 // evictSuperseded removes entries a newer one with the same key and version replaced. The
-// grouping includes Repo so two repos sharing a (key, version) do not evict each other.
+// grouping includes Repo and Ref so two repos or branches sharing a (key, version) do not evict
+// each other.
 func (h *Handler) evictSuperseded(db *cacheDB) {
-	type entry struct{ repo, key, version string }
+	type entry struct{ repo, ref, key, version string }
 	groups := make(map[entry][]*Cache)
 	for _, cache := range h.caches(db, func(cache *Cache) bool { return cache.Complete }) {
-		group := entry{cache.Repo, cache.Key, cache.Version}
+		group := entry{cache.Repo, cache.Ref, cache.Key, cache.Version}
 		groups[group] = append(groups[group], cache)
 	}
 	for _, caches := range groups {
