@@ -18,8 +18,6 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.gitea/actions/go-setup
-        with:
-          lint-cache: "true"
       - name: prepare anonymous docker config
         run: mkdir -p "$DOCKER_CONFIG" && echo '{}' > "$DOCKER_CONFIG/config.json"
       # Pre-pull act/runner's two largest base images so a slow pull can't dominate `make test`;
