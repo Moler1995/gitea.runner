@@ -137,6 +137,7 @@ func tempDirPath(t *testing.T) string {
 }
 
 func TestCacheServiceV2EndToEnd(t *testing.T) {
+	t.Parallel()
 	requireHostTools(t, "node")
 
 	restore := patchedAction(t, "actions/cache", actionsCacheRef, "dist/restore/index.js")
@@ -220,6 +221,7 @@ func TestPatchedBundleAcrossActions(t *testing.T) {
 }
 
 func TestUploadArtifactThroughTheResultsService(t *testing.T) {
+	t.Parallel()
 	requireHostTools(t, "node")
 
 	var called []string
@@ -288,6 +290,7 @@ func TestUploadArtifactThroughTheResultsService(t *testing.T) {
 }
 
 func TestSetupActionFindsTheCacheService(t *testing.T) {
+	t.Parallel()
 	requireHostTools(t, "node", "npm")
 
 	setup := patchedAction(t, "actions/setup-node", "v7.1.0", "dist/setup/index.js")

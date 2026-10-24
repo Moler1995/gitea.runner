@@ -18,24 +18,37 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        id: go
         with:
           go-version-file: 'go.mod'
           check-latest: true
+          cache-dependency-path: |
+            go.mod
+            go.sum
+            Makefile
+      - name: cache golangci-lint
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ~/.cache/golangci-lint
+          key: golangci-lint-${{ runner.os }}-${{ runner.arch }}-${{ steps.go.outputs.go-version }}-${{ hashFiles('go.mod', 'go.sum', 'Makefile', '.golangci.yml') }}-${{ github.sha }}
+          restore-keys: golangci-lint-${{ runner.os }}-${{ runner.arch }}-${{ steps.go.outputs.go-version }}-${{ hashFiles('go.mod', 'go.sum', 'Makefile', '.golangci.yml') }}-
       - name: prepare anonymous docker config
         run: mkdir -p "$DOCKER_CONFIG" && echo '{}' > "$DOCKER_CONFIG/config.json"
       # Pre-pull act/runner's two largest base images so a slow pull can't dominate `make test`;
       # the rest (alpine/ubuntu) pull on demand, absorbed by the make-test -timeout. The host
-      # daemon retains them between runs, so this is usually a fast manifest re-check.
+      # daemon retains them between runs, and their digest pins skip the registry when it has them.
       - name: pre-pull test images
         env:
           TEST_JOB_IMAGE: node:24-bookworm-slim@sha256:d6aa754f16b3197301076f047b5def2f02ea1dbbc2ca920407d46d7ec7f87b20 # renovate: datasource=docker
           TEST_SERVICE_IMAGE: nginx:alpine@sha256:df221db836e1754089190208cee7eeda94f233197056426eda74a43ab1abeac2 # renovate: datasource=docker
         run: |
           for image in "$TEST_JOB_IMAGE" "$TEST_SERVICE_IMAGE"; do
-            for attempt in 1 2 3; do
-              docker pull "$image" && break
-              [ "$attempt" = 3 ] || sleep 5
-            done
+            if [ "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$image" 2>/dev/null)" != linux/amd64 ]; then
+              for attempt in 1 2 3; do
+                docker pull "$image" && break
+                [ "$attempt" = 3 ] || sleep 5
+              done
+            fi
             docker tag "$image" "${image%@*}"
           done
       - name: lint
@@ -45,7 +58,9 @@ jobs:
       - name: build
         run: make build
       - name: test
-        run: make test
+        run: |
+          go clean -testcache
+          make test
       # Build the dind image and run the daemon-facing tests against the docker version it
       # ships, catching daemon-level regressions (e.g. gitea/runner#981) before release. Runs
       # after `make test` so the images it needs are already present on the host daemon.
@@ -72,6 +87,11 @@ jobs:
         with:
           go-version-file: 'go.mod'
           check-latest: true
+          cache-dependency-path: |
+            go.mod
+            go.sum
+            Makefile
+            tools/test-e2e.sh
       - name: prepare anonymous docker config
         run: mkdir -p "$DOCKER_CONFIG" && echo '{}' > "$DOCKER_CONFIG/config.json"
       - name: e2e compatibility
