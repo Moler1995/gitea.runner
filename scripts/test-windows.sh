@@ -3,105 +3,62 @@
 #
 # Env:
 #   WINDOWS_TEST_IMAGE    dockur/windows image, pinned in the Makefile
-#   WINDOWS_TEST_TIMEOUT  minutes to wait for each of installing and testing (default 150)
+#   WINDOWS_TEST_TIMEOUT  minutes to wait for installing Windows and running the tests (default 165)
 set -euo pipefail
 
 image="${WINDOWS_TEST_IMAGE:?}"
-timeout="${WINDOWS_TEST_TIMEOUT:-150}"
-volume=gitea-runner-windows-test
+timeout="${WINDOWS_TEST_TIMEOUT:-165}"
 name="gitea-runner-windows-test-$$"
-run="run-$(date +%s)-$$"
 work="$(mktemp -d)"
-vm_env=(-e VERSION=2025 -e EDITION=core -e DISK_FMT=qcow2 -e CPU_CORES=4 -e RAM_SIZE=4G)
-# the quarter renews the base before its 180-day evaluation license expires
-base="base-$( (echo "$image ${vm_env[*]} $(date +%Y)q$((($(date +%-m) + 2) / 3))" && cat scripts/test-windows-setup.ps1) | sha256sum | cut -c1-16)"
-
-on_volume() {
-  docker run --rm --privileged -v "$volume:/cache" --entrypoint sh "$image" -c "$1"
-}
 
 cleanup() {
   docker rm -fv "$name" >/dev/null 2>&1 || true
-  on_volume "rm -rf /cache/$run" >/dev/null 2>&1 || true
   rm -rf "$work"
 }
 trap cleanup EXIT
 
-read -r kvm installed < <(on_volume "find /cache -mindepth 1 -maxdepth 1 \\( -name 'run-*' -mmin +360 -o -name 'base-*' -mtime +14 \\) -exec rm -rf {} +
-  if [ -w /dev/kvm ]; then printf 'Y '; else printf 'N '; fi
-  if [ -f /cache/$base/windows.boot ]; then echo Y; else echo N; fi")
-if [ "$kvm" = N ]; then
+echo "==> Building Windows test binaries"
+oem="$work/oem"
+mkdir -p "$oem/bin" "$oem/src" "$work/shared"
+module="$(go list -m)"
+packages="$(GOOS=windows go list -f '{{if or .TestGoFiles .XTestGoFiles}}{{.ImportPath}}{{end}}' ./...)"
+GOOS=windows GOARCH=amd64 go test -c -ldflags='-s -w' -o "$oem/bin/" $packages
+for package in $packages; do
+  echo "${package##*/}.test.exe ${package#"$module"/}"
+done > "$oem/tests.txt"
+git ls-files -z --cached --others --exclude-standard | while IFS= read -r -d '' file; do
+  [ -e "$file" ] && printf '%s\0' "$file"
+done | tar --null -T - -cf - | tar -xf - -C "$oem/src"
+# a repository like the CI checkout, for the tests that read the github context from it
+git -C "$oem/src" init -q -b main
+git -C "$oem/src" add -Af .
+git -C "$oem/src" -c user.name=test -c user.email=test@localhost -c commit.gpgsign=false -c core.hooksPath=/dev/null commit -qm test
+git -C "$oem/src" remote add origin https://gitea.com/gitea/runner
+cp scripts/test-windows-setup.ps1 scripts/test-windows.ps1 "$oem/"
+printf '%s\r\n' '@powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\OEM\test-windows-setup.ps1 && C:\pwsh\pwsh.exe -NoProfile -ExecutionPolicy Bypass -File C:\OEM\test-windows.ps1' > "$oem/install.bat"
+
+kvm=Y
+if ! docker run --rm --privileged --entrypoint sh "$image" -c 'test -w /dev/kvm'; then
+  kvm=N
   echo "==> The docker host has no usable /dev/kvm, Windows runs emulated and much slower"
 fi
 
-if [ "$installed" = N ]; then
-  mkdir "$work/oem"
-  cp scripts/test-windows-setup.ps1 "$work/oem/"
-  printf '@powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\\OEM\\test-windows-setup.ps1\r\n' > "$work/oem/install.bat"
-  # one install per base and docker host, publishing the base itself so it outlives this run
-  installer="gitea-runner-windows-test-$base"
-  if created="$(docker create --rm --name "$installer" --privileged -v "$volume:/cache" -e STORAGE="/cache/$base-install" -e KVM="$kvm" "${vm_env[@]}" \
-    --entrypoint sh "$image" -c "rm -rf \"\$STORAGE\" && mkdir -p \"\$STORAGE/shared\" && timeout ${timeout}m /usr/bin/tini -s /run/entry.sh
-      cat \"\$STORAGE/shared/error.txt\" 2>/dev/null
-      [ -f \"\$STORAGE/shared/ready\" ] && rm -rf \"\$STORAGE/shared\" && mv -T \"\$STORAGE\" /cache/$base" 2>&1)"; then
-    echo "==> Installing Windows into $base, later runs on this docker host boot it directly"
-    docker cp "$work/oem" "$installer:/oem"
-    docker start -a "$installer" || true
-  elif [[ "$created" == *"already in use"* ]]; then
-    echo "==> Waiting for another run installing Windows into $base"
-    docker wait "$installer" >/dev/null 2>&1 || true
-  else
-    echo "$created" >&2
-    exit 1
-  fi
-  if ! on_volume "test -f /cache/$base/windows.boot"; then
-    echo "Installing Windows failed" >&2
-    exit 1
-  fi
-fi
-
-echo "==> Booting Windows from $base"
-on_volume "mkdir -p /cache/$run/shared/results && touch /cache/$base &&
-  find /cache/$base -maxdepth 1 -type f ! -name 'data.*' -exec cp {} /cache/$run/ \\; &&
-  qemu-img create -q -f qcow2 -F qcow2 -b /cache/$base/data.qcow2 /cache/$run/data.qcow2"
+echo "==> Installing Windows"
 # the timeout stops the VM even when this script is killed before its cleanup runs
-docker run -d --rm --name "$name" --privileged -v "$volume:/cache" -e STORAGE="/cache/$run" -e KVM="$kvm" "${vm_env[@]}" \
+docker create --rm --name "$name" --privileged -e VERSION=2025 -e EDITION=core -e KVM="$kvm" -e CPU_CORES=4 -e RAM_SIZE=4G \
   --entrypoint timeout "$image" "$((timeout + 10))m" /usr/bin/tini -s /run/entry.sh >/dev/null
+docker cp "$oem" "$name:/oem"
+docker cp "$work/shared" "$name:/shared"
+docker start "$name" >/dev/null
 docker logs -f "$name" &
+docker exec "$name" sh -c 'touch /shared/summary.txt && tail -f /shared/summary.txt' &
 
-echo "==> Building Windows test binaries while it boots"
-bundle="$work/bundle"
-mkdir -p "$bundle/bin" "$bundle/src"
-module="$(go list -m)"
-packages="$(GOOS=windows go list -f '{{if or .TestGoFiles .XTestGoFiles}}{{.ImportPath}}{{end}}' ./...)"
-GOOS=windows GOARCH=amd64 go test -c -ldflags='-s -w' -o "$bundle/bin/" $packages
-for package in $packages; do
-  echo "${package##*/}.test.exe ${package#"$module"/}"
-done > "$bundle/tests.txt"
-git ls-files -z --cached --others --exclude-standard | while IFS= read -r -d '' file; do
-  [ -e "$file" ] && printf '%s\0' "$file"
-done | tar --null -T - -cf - | tar -xf - -C "$bundle/src"
-# a repository like the CI checkout, for the tests that read the github context from it
-git -C "$bundle/src" init -q -b main
-git -C "$bundle/src" add -Af .
-git -C "$bundle/src" -c user.name=test -c user.email=test@localhost -c commit.gpgsign=false -c core.hooksPath=/dev/null commit -qm test
-git -C "$bundle/src" remote add origin https://gitea.com/gitea/runner
-docker cp "$bundle" "$name:/cache/$run/shared/bundle"
-docker cp scripts/test-windows.ps1 "$name:/cache/$run/shared/" # last, the logon task waits for it
-docker exec "$name" sh -c "touch /cache/$run/shared/results/summary.txt && tail -f /cache/$run/shared/results/summary.txt" &
-
-boot=20
-[ "$kvm" = Y ] || boot=120
-if ! timeout "${boot}m" docker exec "$name" sh -c "until [ -f /cache/$run/shared/results/started ]; do sleep 5; done"; then
-  echo "Windows did not start the tests within $boot minutes" >&2
-  exit 1
-fi
-if ! timeout "${timeout}m" docker exec "$name" sh -c "until [ -f /cache/$run/shared/results/exitcode ]; do sleep 5; done"; then
+if ! timeout "${timeout}m" docker exec "$name" sh -c 'until [ -f /shared/exitcode ]; do sleep 10; done'; then
   echo "Windows did not finish the tests within $timeout minutes" >&2
   exit 1
 fi
 results="$work/results"
-docker cp "$name:/cache/$run/shared/results" "$results"
+docker cp "$name:/shared" "$results"
 
 tr -d '\r' < "$results/summary.txt" | while read -r result package _; do
   if [ "$result" = FAIL ]; then

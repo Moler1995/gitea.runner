@@ -64,9 +64,8 @@ repository runners. A run path is `<workflow>@<ref>` and a log row is `<timestam
 
 ## Windows tests
 
-`make test-windows` cross-compiles the test binaries and runs them on Windows Server 2025 Core
-in a [dockur/windows](https://github.com/dockur/windows) QEMU VM on the docker host, which must
-allow privileged containers. The first run on a host installs Windows into a base image on the
-`gitea-runner-windows-test` volume, later runs boot an overlay of it. The VM uses KVM when the
-host has `/dev/kvm`, otherwise Windows is emulated and much slower. Docker-backed tests skip in
-the VM and the race detector is off, it needs cgo. CI runs this in its own workflow.
+`make test-windows` cross-compiles the test binaries, installs Windows Server 2025 Core in a
+[dockur/windows](https://github.com/dockur/windows) QEMU VM on the docker host and runs them
+there. The host must allow privileged containers. The VM uses KVM when the host has `/dev/kvm`,
+otherwise Windows is emulated and much slower. Docker-backed tests skip in the VM and the race
+detector is off, it needs cgo. CI runs this weekly and on demand.

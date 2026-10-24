@@ -1,12 +1,9 @@
-# Runs at the logon of a test VM from scripts/test-windows.sh, reports to its shared folder.
+# Runs the test binaries after scripts/test-windows-setup.ps1, reports to the VM's shared folder.
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
-$results = '\\host.lan\Data\results'
-$root = 'C:\tests'
+$results = '\\host.lan\Data'
+$root = $PSScriptRoot
 try {
-    Set-Content "$results\started" ''
-    robocopy \\host.lan\Data\bundle $root /E /MT:8 /NP /NFL /NDL /NJH /NJS | Out-Null
-    if ($LASTEXITCODE -ge 8) { throw "copying the tests failed with exit code $LASTEXITCODE" }
     New-Item -ItemType Directory "$root\logs" | Out-Null
     $env:Path = "C:\git\cmd;C:\git\bin;C:\pwsh;C:\node;$env:Path"
 

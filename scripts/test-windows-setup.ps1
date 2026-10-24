@@ -1,4 +1,4 @@
-# Runs once at the first logon of a new base image from scripts/test-windows.sh, then powers it off.
+# Installs the tools the tests need at the first logon of the VM from scripts/test-windows.sh.
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $shared = '\\host.lan\Data'
@@ -22,15 +22,9 @@ try {
     tar.exe -xf "$env:TEMP\pwsh.zip" -C C:\pwsh
     $env:Path = "C:\git\cmd;C:\git\bin;C:\pwsh;C:\node;$env:Path"
     Get-Command git, bash, node, pwsh | Out-Null
-
-    $script = "$shared\test-windows.ps1"
-    Register-ScheduledTask -TaskName gitea-runner-tests `
-        -Trigger (New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME) `
-        -Principal (New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Highest) `
-        -Action (New-ScheduledTaskAction -Execute C:\pwsh\pwsh.exe -Argument "-NoProfile -ExecutionPolicy Bypass -Command `"while (-not (Test-Path $script)) { Start-Sleep -Seconds 2 }; & $script`"") | Out-Null
-    Remove-Item "$env:TEMP\git.7z.exe", "$env:TEMP\node.zip", "$env:TEMP\pwsh.zip"
-    Set-Content "$shared\ready" ''
 } catch {
     $_ | Out-String | Set-Content "$shared\error.txt"
+    Set-Content "$shared\exitcode" 1
+    Stop-Computer -Force
+    exit 1
 }
-Stop-Computer -Force
