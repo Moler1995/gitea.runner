@@ -42,8 +42,6 @@ func (sal *stepActionLocal) main() common.Executor {
 			return nil
 		}
 
-		printRunActionHeader(ctx, sal.Step, sal.env, sal.getRunContext())
-
 		actionDir := filepath.Join(sal.getRunContext().Config.Workdir, sal.Step.Uses)
 		_, containerActionPath := getContainerActionPaths(sal)
 
