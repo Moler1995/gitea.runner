@@ -233,6 +233,62 @@ func TestFetchAction(t *testing.T) {
 		assert.NoDirExists(t, filepath.Join(input.Dir, "git"))
 	})
 
+	t.Run("downloads again over a tree whose files changed size or that has no record, not under a job copying it", func(t *testing.T) {
+		sha := gitRevParse(t, remote, "main")
+		for _, mode := range []string{"prefixed", "none"} {
+			serve(mode, 0)
+			input := newInput(sha)
+			tree, _, err := FetchAction(t.Context(), input)
+			require.NoError(t, err, mode)
+			yml := filepath.Join(tree, "action.yml")
+			require.NoError(t, os.WriteFile(filepath.Join(tree, "trampoline.js"), nil, 0o644)) // the runner's own, no damage
+			_, _, err = FetchAction(t.Context(), input)
+			require.NoError(t, err, mode)
+			for _, damage := range []func() error{
+				func() error { return os.Truncate(yml, 4) },
+				func() error { return os.Remove(tree + treeSizes) },
+			} {
+				require.NoError(t, damage(), mode)
+				_, _, err := FetchAction(t.Context(), input)
+				require.NoError(t, err, mode)
+				body, err := os.ReadFile(yml)
+				require.NoError(t, err, mode)
+				assert.Equal(t, "name: action\n", string(body), mode)
+			}
+			_, headers := served()
+			assert.Len(t, headers, 3, mode)
+		}
+
+		serve("prefixed", 0)
+		input := newInput(sha)
+		tree, _, err := FetchAction(t.Context(), input)
+		require.NoError(t, err)
+		yml := filepath.Join(tree, "action.yml")
+		require.NoError(t, os.Truncate(yml, 4))
+		unlock, err := AcquireCloneLock(t.Context(), tree)
+		require.NoError(t, err)
+		release := sync.OnceFunc(unlock)
+		defer release()
+		done := make(chan error, 1)
+		go func() {
+			_, _, err := FetchAction(t.Context(), input)
+			done <- err
+		}()
+		select {
+		case err := <-done:
+			t.Fatalf("FetchAction returned while a job held the tree: %v", err)
+		case <-time.After(100 * time.Millisecond):
+		}
+		info, err := os.Stat(yml)
+		require.NoError(t, err)
+		assert.Equal(t, int64(4), info.Size(), "the tree a job holds is left alone")
+		release()
+		require.NoError(t, <-done)
+		body, err := os.ReadFile(yml)
+		require.NoError(t, err)
+		assert.Equal(t, "name: action\n", string(body))
+	})
+
 	t.Run("retries a failing download and drops the token on a redirect to another origin", func(t *testing.T) {
 		serve("redirect", 2)
 		input := newInput("main")
@@ -306,7 +362,7 @@ func TestExtractTreeConfinesEntries(t *testing.T) {
 			require.NoError(t, writer.Close())
 
 			dir := t.TempDir()
-			_, err := extractTree(&archive, dir, false)
+			_, err := extractTree(t.Context(), &archive, dir, false)
 			require.Error(t, err)
 			assert.NoFileExists(t, filepath.Join(dir, "escape"))
 			assert.NoFileExists(t, filepath.Join(outside, "escape"))

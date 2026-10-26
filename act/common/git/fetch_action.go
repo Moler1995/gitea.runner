@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"math/rand/v2"
@@ -27,6 +28,8 @@ import (
 )
 
 var actionFetches sync.Map
+
+const treeSizes = ".sizes" // beside the tree rather than in it, which is copied into job containers as it is
 
 type actionFetch struct {
 	done     chan struct{}
@@ -86,7 +89,7 @@ func fetchAction(ctx context.Context, input NewGitCloneExecutorInput) (string, s
 	record := filepath.Join(input.Dir, "ref")
 	data, _ := os.ReadFile(record)
 	sha, etag, _ := strings.Cut(string(data), "\n")
-	if !isFullObjectID(sha) || !exists(tree(sha)) {
+	if !isFullObjectID(sha) || !treeIntact(input.Dir, sha) {
 		sha, etag = "", ""
 	} else if input.OfflineMode || isFullObjectID(input.Ref) {
 		return tree(sha), sha, nil
@@ -173,7 +176,7 @@ func downloadArchiveOnce(ctx context.Context, client *http.Client, archive, toke
 		newEtag := response.Header.Get("ETag")
 		gz, err := gzip.NewReader(response.Body)
 		if err == nil {
-			sha, err = extractTree(gz, dir, !strings.HasSuffix(newEtag, `-false"`)) // Gitea's mark of an unprefixed archive
+			sha, err = extractTree(ctx, gz, dir, !strings.HasSuffix(newEtag, `-false"`)) // Gitea's mark of an unprefixed archive
 		}
 		var netErr net.Error
 		if errors.Is(err, io.ErrUnexpectedEOF) || errors.As(err, &netErr) {
@@ -191,18 +194,18 @@ func exportClone(ctx context.Context, input NewGitCloneExecutorInput) (string, e
 	clone := input
 	clone.Dir = filepath.Join(input.Dir, "git")
 	sha, _, err := resolveClone(ctx, clone)
-	if err != nil || exists(filepath.Join(input.Dir, sha)) {
+	if err != nil || treeIntact(input.Dir, sha) {
 		return sha, err
 	}
 	archive, err := runGit(ctx, clone.Dir, nil, "archive", "--format=tar", sha)
 	if err != nil {
 		return "", err
 	}
-	_, err = extractTree(bytes.NewReader(archive), input.Dir, false)
+	_, err = extractTree(ctx, bytes.NewReader(archive), input.Dir, false)
 	return sha, err
 }
 
-func extractTree(archive io.Reader, dir string, strip bool) (string, error) { // into dir/<commit of the pax header>, strip dropping the directory wrapping the files
+func extractTree(ctx context.Context, archive io.Reader, dir string, strip bool) (string, error) { // into dir/<commit of the pax header>, strip dropping the directory wrapping the files
 	temp, err := os.MkdirTemp(dir, "tmp-")
 	if err != nil {
 		return "", err
@@ -215,6 +218,7 @@ func extractTree(archive io.Reader, dir string, strip bool) (string, error) { //
 	defer root.Close()
 
 	sha := ""
+	sizes := map[string]int64{}
 	reader := tar.NewReader(archive)
 	for {
 		header, err := reader.Next()
@@ -225,7 +229,7 @@ func extractTree(archive io.Reader, dir string, strip bool) (string, error) { //
 			return "", err
 		}
 		if header.Typeflag == tar.TypeXGlobalHeader {
-			if sha = header.PAXRecords["comment"]; isFullObjectID(sha) && exists(filepath.Join(dir, sha)) {
+			if sha = header.PAXRecords["comment"]; isFullObjectID(sha) && treeIntact(dir, sha) {
 				return sha, nil
 			}
 			continue
@@ -241,10 +245,10 @@ func extractTree(archive io.Reader, dir string, strip bool) (string, error) { //
 		case tar.TypeDir:
 			err = root.MkdirAll(name, 0o755)
 		case tar.TypeReg:
-			err = writeTreeFile(root, name, header.Mode, reader)
+			sizes[name], err = writeTreeFile(root, name, header.Mode, reader)
 		case tar.TypeSymlink:
 			if err = root.Symlink(header.Linkname, name); err != nil && runtime.GOOS == "windows" {
-				err = writeTreeFile(root, name, 0, strings.NewReader(header.Linkname))
+				sizes[name], err = writeTreeFile(root, name, 0, strings.NewReader(header.Linkname))
 			}
 		}
 		if err != nil {
@@ -257,20 +261,69 @@ func extractTree(archive io.Reader, dir string, strip bool) (string, error) { //
 	if err := root.Close(); err != nil {
 		return "", err
 	}
-	return sha, os.Rename(temp, filepath.Join(dir, sha))
+	return sha, installTree(ctx, dir, sha, temp, sizes)
 }
 
-func writeTreeFile(root *os.Root, name string, mode int64, content io.Reader) error {
+// installTree moves temp into place as dir/sha, replacing a tree that failed treeIntact.
+func installTree(ctx context.Context, dir, sha, temp string, sizes map[string]int64) error {
+	data, err := json.Marshal(sizes)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(dir, sha+treeSizes), data, 0o600); err != nil { // a torn record fails treeIntact, so it needs no rename
+		return err
+	}
+	tree := filepath.Join(dir, sha)
+	if !exists(tree) {
+		return os.Rename(temp, tree)
+	}
+	stale, err := os.MkdirTemp(dir, "tmp-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(stale)                  // after the unlock, as no job reads the old tree once it is moved
+	unlock, err := AcquireCloneLock(ctx, tree) // jobs copying the old tree hold it
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if err := os.Rename(tree, filepath.Join(stale, sha)); err != nil {
+		return err
+	}
+	return os.Rename(temp, tree)
+}
+
+// treeIntact reports whether dir/sha still holds each file extracted into it at the size it was written.
+// Only sizes are compared, not content: a stat per file is cheap enough for every job, hashing is not.
+func treeIntact(dir, sha string) bool {
+	data, err := os.ReadFile(filepath.Join(dir, sha+treeSizes))
+	if err != nil || !exists(filepath.Join(dir, sha)) {
+		return false
+	}
+	var sizes map[string]int64
+	if json.Unmarshal(data, &sizes) != nil {
+		return false
+	}
+	for name, size := range sizes {
+		info, err := os.Lstat(filepath.Join(dir, sha, filepath.FromSlash(name)))
+		if err != nil || !info.Mode().IsRegular() || info.Size() != size {
+			return false
+		}
+	}
+	return true
+}
+
+func writeTreeFile(root *os.Root, name string, mode int64, content io.Reader) (int64, error) {
 	perm := os.FileMode(0o644)
 	if mode&0o111 != 0 {
 		perm = 0o755
 	}
 	file, err := root.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, perm)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	_, err = io.Copy(file, content)
-	return errors.Join(err, file.Close())
+	n, err := io.Copy(file, content)
+	return n, errors.Join(err, file.Close())
 }
 
 func exists(name string) bool {
