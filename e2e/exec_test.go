@@ -10,6 +10,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 )
 
@@ -47,6 +49,8 @@ func testExecArtifacts(t *testing.T) {
 	artifacts := t.TempDir()
 	cmd := exec.CommandContext(ctx, bin, "exec", "-C", workdir,
 		"-i", os.Getenv("E2E_JOB_IMAGE"), "--artifact-server-path", artifacts)
+	// exec reuses the artifact service of a surrounding CI job
+	cmd.Env = slices.DeleteFunc(os.Environ(), func(kv string) bool { return strings.HasPrefix(kv, "ACTIONS_") })
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("exec: %v\n%s", err, out)
 	}
