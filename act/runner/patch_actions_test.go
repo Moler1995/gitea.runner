@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 
+	"gitea.com/gitea/runner/act/container"
+
 	"gitea.dev/actionslib/pkg/model"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -133,23 +135,8 @@ func gateOpened(body string) bool {
 // an ordinary Gitea host, the cache server for the service URL, and the results URL when there is
 // no cache server. Unpatched, the same bundle must still choose v1, or the patch proves nothing.
 func TestPatchedBundleBehavesInNode(t *testing.T) {
+	t.Parallel()
 	requireHostTools(t, "node")
-
-	eval := func(t *testing.T, bundle, prelude, cacheURL string) string {
-		t.Helper()
-
-		script := prelude + bundle + "\nprocess.stdout.write(getCacheServiceVersion()+' '+getCacheServiceURL())"
-		cmd := exec.CommandContext(t.Context(), "node", "-e", script)
-		cmd.Env = append(os.Environ(),
-			"ACTIONS_CACHE_SERVICE_V2=true",
-			"ACTIONS_CACHE_URL="+cacheURL,
-			"ACTIONS_RESULTS_URL=https://gitea.example",
-			"GITHUB_SERVER_URL=https://gitea.example",
-		)
-		out, err := cmd.CombinedOutput()
-		require.NoError(t, err, "%s", out)
-		return string(out)
-	}
 
 	for _, tc := range []struct{ name, bundle, prelude string }{
 		{"tsc", gateTSC, ""},
@@ -157,15 +144,27 @@ func TestPatchedBundleBehavesInNode(t *testing.T) {
 		{"esbuild", gateEsbuild, "var vu={};const getCacheServiceVersion=()=>XK(),getCacheServiceURL=()=>YK();"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			// Unpatched, a Gitea host is taken for GHES: v1, whose branch already reads the
-			// cache URL. The patch has to move the version without moving that.
-			assert.Equal(t, "v1 http://cache:8088/", eval(t, tc.bundle, tc.prelude, "http://cache:8088/"))
-
 			patched, ok := patchedBundle([]byte(tc.bundle))
 			require.True(t, ok)
 
-			assert.Equal(t, "v2 http://cache:8088/", eval(t, string(patched), tc.prelude, "http://cache:8088/"))
-			assert.Equal(t, "v2 https://gitea.example", eval(t, string(patched), tc.prelude, ""),
+			evaluate := func(bundle string) string {
+				return "(() => {" + tc.prelude + bundle + "\nconsole.log(getCacheServiceVersion()+' '+getCacheServiceURL());})();\n"
+			}
+			cmd := exec.CommandContext(t.Context(), "node", "-e", evaluate(tc.bundle)+evaluate(string(patched))+
+				"process.env.ACTIONS_CACHE_URL='';\n"+evaluate(string(patched)))
+			cmd.Env = append(os.Environ(),
+				"ACTIONS_CACHE_SERVICE_V2=true",
+				"ACTIONS_CACHE_URL=http://cache:8088/",
+				"ACTIONS_RESULTS_URL=https://gitea.example",
+				"GITHUB_SERVER_URL=https://gitea.example",
+			)
+			out, err := cmd.CombinedOutput()
+			require.NoError(t, err, "%s", out)
+			results := strings.Split(strings.TrimSuffix(string(out), "\n"), "\n")
+			require.Len(t, results, 3)
+			assert.Equal(t, "v1 http://cache:8088/", results[0])
+			assert.Equal(t, "v2 http://cache:8088/", results[1])
+			assert.Equal(t, "v2 https://gitea.example", results[2],
 				"with no cache server the results URL is still the fallback")
 		})
 	}
@@ -175,6 +174,7 @@ func TestPatchedBundleBehavesInNode(t *testing.T) {
 // the gate inside a double-quoted literal. Rewriting the call rather than emptying its argument
 // would end that string early and leave the bundle unparseable.
 func TestPatchedBundleSurvivesInsideAStringLiteral(t *testing.T) {
+	t.Parallel()
 	requireHostTools(t, "node")
 
 	escaped := strings.ReplaceAll(gateTSC, `"`, `\"`)
@@ -188,34 +188,24 @@ func TestPatchedBundleSurvivesInsideAStringLiteral(t *testing.T) {
 	require.NoError(t, err, "%s", checked)
 }
 
-// An action with a pre step is copied, and so patched, twice.
-func TestPatchBundleIsIdempotent(t *testing.T) {
+// A bundle an older runner left patched in the shared copy is copied as it is.
+func TestPatchedScriptIsIdempotent(t *testing.T) {
 	script := bundleFile(t, gateTSC)
 
-	original, err := patchBundle(script)
-	require.NoError(t, err)
-	require.NotNil(t, original)
-	patched, err := os.ReadFile(script)
+	patched, _, err := patchedScript(script)
 	require.NoError(t, err)
 	require.True(t, gateOpened(string(patched)))
 
-	original, err = patchBundle(script)
+	require.NoError(t, os.WriteFile(script, patched, 0o600))
+	again, _, err := patchedScript(script)
 	require.NoError(t, err)
-	assert.Nil(t, original, "a patched bundle is not patched again")
-	again, err := os.ReadFile(script)
-	require.NoError(t, err)
-	assert.Equal(t, string(patched), string(again))
+	assert.Nil(t, again, "a patched bundle is not patched again")
 }
 
-func TestPatchBundleLeavesOtherActionsAlone(t *testing.T) {
-	script := bundleFile(t, `console.log("checkout")`)
-
-	original, err := patchBundle(script)
+func TestPatchedScriptLeavesOtherActionsAlone(t *testing.T) {
+	patched, _, err := patchedScript(bundleFile(t, `console.log("checkout")`))
 	require.NoError(t, err)
-	assert.Nil(t, original)
-	body, err := os.ReadFile(script)
-	require.NoError(t, err)
-	assert.Equal(t, `console.log("checkout")`, string(body))
+	assert.Nil(t, patched)
 }
 
 func bundleFile(t *testing.T, body string) string {
@@ -242,10 +232,10 @@ func TestActionScriptPaths(t *testing.T) {
 
 	var chunks []string
 	for _, name := range []string{"295.index.js", "cache-CTfQoCTL.js", "chunk.cjs", "chunk.mjs", "restore.js", "save.js"} {
-		chunks = append(chunks, filepath.Join(dist, name))
+		chunks = append(chunks, filepath.Join("dist", name))
 	}
 	node := &model.Action{Runs: model.ActionRuns{Using: "node20", Pre: "pre.js", Main: "dist/restore.js", Post: "dist/save.js"}}
-	assert.Equal(t, append(slices.Clone(chunks), filepath.Join(dir, "pre.js")), actionScriptPaths(dir, dir, node))
+	assert.Equal(t, append(slices.Clone(chunks), "pre.js"), actionScriptPaths(dir, dir, node))
 
 	// Only a node action has a bundle to patch.
 	assert.Nil(t, actionScriptPaths(dir, dir, &model.Action{Runs: model.ActionRuns{Using: "docker", Image: "alpine"}}))
@@ -266,7 +256,7 @@ func TestActionScriptPaths(t *testing.T) {
 }
 
 func TestPatchActionsAtTheContainerCopy(t *testing.T) {
-	copiedBundle := func(t *testing.T, noPatch bool) string {
+	copiedBundles := func(t *testing.T, noPatch bool) ([]string, []*container.FileEntry) {
 		t.Helper()
 
 		cm := &containerMock{}
@@ -285,27 +275,39 @@ func TestPatchActionsAtTheContainerCopy(t *testing.T) {
 		require.NoError(t, os.WriteFile(filepath.Join(filepath.Dir(script), "index.js"), []byte("require('./cache.js')"), 0o600))
 		require.NoError(t, os.WriteFile(script, []byte(gateTSC), 0o600))
 
-		var copied string
-		cm.On("CopyDir", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(func(context.Context) error {
-			body, err := os.ReadFile(script)
-			require.NoError(t, err)
-			copied = string(body)
+		var calls []string
+		var copied []*container.FileEntry
+		cm.On("CopyDir", "/var/run/act/actions/repo/", sar.actionDir+"/", false, true).Return(func(context.Context) error {
+			calls = append(calls, "CopyDir")
+			return nil
+		})
+		cm.On("Copy", "/var/run/act/actions/repo/", mock.Anything).Run(func(args mock.Arguments) {
+			copied = args.Get(1).([]*container.FileEntry)
+		}).Return(func(context.Context) error {
+			calls = append(calls, "Copy")
 			return nil
 		})
 		require.NoError(t, maybeCopyToActionDir(t.Context(), sar, sar.actionDir, "sub", "/var/run/act/actions/repo/sub"))
 		source, err := os.ReadFile(script)
 		require.NoError(t, err)
-		assert.Equal(t, gateTSC, string(source), "the shared copy is left as it was found")
-		return copied
+		assert.Equal(t, gateTSC, string(source), "the shared copy is never written")
+		return calls, copied
 	}
 
-	t.Run("patched on its way in", func(t *testing.T) {
-		assert.True(t, gateOpened(copiedBundle(t, false)))
+	t.Run("patched over the container's copy", func(t *testing.T) {
+		calls, copied := copiedBundles(t, false)
+		assert.Equal(t, []string{"CopyDir", "Copy"}, calls)
+		require.Len(t, copied, 1)
+		assert.Equal(t, "dist/cache.js", copied[0].Name)
+		assert.Equal(t, int64(0o600), copied[0].Mode)
+		assert.True(t, gateOpened(copied[0].Body))
 	})
 
 	// The escape hatch, for an action the edit breaks: the artifact actions refuse again, and the
 	// cache client keeps to v1.
 	t.Run("as shipped when the runner is told not to patch", func(t *testing.T) {
-		assert.Equal(t, gateTSC, copiedBundle(t, true))
+		calls, copied := copiedBundles(t, true)
+		assert.Equal(t, []string{"CopyDir"}, calls)
+		assert.Empty(t, copied)
 	})
 }

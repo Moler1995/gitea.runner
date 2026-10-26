@@ -91,7 +91,7 @@ env:
 	sr := &stepRun{
 		Step:               &step,
 		RunContext:         &RunContext{},
-		shellCommand:       "pwsh -command . '{0}'",
+		shellCommand:       `pwsh -command ". '{0}'"`,
 		interpolatedScript: "echo one\necho two\n",
 		env: map[string]string{
 			"PATH_PREFIX":  "/custom/bin",
@@ -106,7 +106,7 @@ env:
 		"[j1]   | ::group::Run echo one",
 		"[j1]   | echo one",
 		"[j1]   | echo two",
-		"[j1]   | shell: pwsh -command . '{0}'",
+		`[j1]   | shell: pwsh -command ". '{0}'"`,
 		"[j1]   | env:",
 		"[j1]   |   PATH_PREFIX: /custom/bin",
 		"[j1]   |   GREETING: hello",
@@ -118,10 +118,12 @@ env:
 
 func TestPrintRunActionHeaderGolden(t *testing.T) {
 	raw := `id: s1
+name: Checkout
 uses: actions/checkout@v4
 with:
   fetch-depth: "0"
-  token: secret
+  Token: secret
+  clean: ""
 env:
   CUSTOM: value
   GITHUB_TOKEN: tok
@@ -134,15 +136,19 @@ env:
 	entry := logger.With("job", "j1")
 	ctx := common.WithLogger(t.Context(), entry)
 
-	printRunActionHeader(ctx, &step, map[string]string{"CUSTOM": "value", "GITHUB_TOKEN": "tok"}, &RunContext{})
+	action := &model.Action{Inputs: map[string]model.Input{"token": {}, "clean": {}, "path": {}, "lfs": {}}}
+	env := map[string]string{"CUSTOM": "value", "GITHUB_TOKEN": "tok", "INPUT_TOKEN": "secret", "INPUT_CLEAN": "", "INPUT_PATH": "sub"}
+	printRunActionHeader(ctx, &step, action, env, &RunContext{})
 
 	want := strings.Join([]string{
 		"[j1]   | ::group::Run actions/checkout@v4",
 		"[j1]   | with:",
+		"[j1]   |   Token: secret",
 		"[j1]   |   fetch-depth: 0",
-		"[j1]   |   token: secret",
+		"[j1]   |   path: sub",
 		"[j1]   | env:",
 		"[j1]   |   CUSTOM: value",
+		"[j1]   | ::endgroup::",
 		"",
 	}, "\n")
 	assert.Equal(t, want, buf.String())
