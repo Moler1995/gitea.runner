@@ -466,7 +466,7 @@ func TestExecAsDockerHoldsCloneLockForRemoteUncached(t *testing.T) {
 
 	cancel()
 	releaseOnce()
-	<-done
+	assert.ErrorIs(t, <-done, context.Canceled)
 }
 
 func TestDockerActionImageTag(t *testing.T) {
