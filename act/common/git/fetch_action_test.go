@@ -206,10 +206,17 @@ func TestFetchAction(t *testing.T) {
 		_, offlineSha, err := FetchAction(t.Context(), input)
 		require.NoError(t, err)
 		assert.Equal(t, movedSha, offlineSha)
+		require.NoError(t, os.Truncate(filepath.Join(moved, "action.yml"), 4)) // fetched again, offline or not
+		_, _, err = FetchAction(t.Context(), input)
+		require.NoError(t, err)
+		require.NoError(t, os.Remove(moved+treeSizes)) // from an older runner, used as it is offline
+		reused, _, err := FetchAction(t.Context(), input)
+		require.NoError(t, err)
+		assert.Equal(t, moved, reused)
 
 		requests, headers := served()
-		assert.Equal(t, 3, requests)
-		require.Len(t, headers, 3)
+		assert.Equal(t, 4, requests)
+		require.Len(t, headers, 4)
 		assert.Equal(t, "Basic "+base64.StdEncoding.EncodeToString([]byte("token:secret")), headers[0].Get("Authorization"))
 		assert.Empty(t, headers[0].Get("If-None-Match"))
 		assert.Equal(t, fmt.Sprintf(`W/"%s-tar.gz-true"`, sha), headers[1].Get("If-None-Match"))

@@ -89,9 +89,14 @@ func fetchAction(ctx context.Context, input NewGitCloneExecutorInput) (string, s
 	record := filepath.Join(input.Dir, "ref")
 	data, _ := os.ReadFile(record)
 	sha, etag, _ := strings.Cut(string(data), "\n")
-	if !isFullObjectID(sha) || !treeIntact(input.Dir, sha) {
+	switch {
+	case !isFullObjectID(sha):
 		sha, etag = "", ""
-	} else if input.OfflineMode || isFullObjectID(input.Ref) {
+	case input.OfflineMode && exists(tree(sha)) && !exists(tree(sha)+treeSizes):
+		return tree(sha), sha, nil // from an older runner, with no sizes to check, and offline mode promises no fetch
+	case !treeIntact(input.Dir, sha):
+		sha, etag = "", ""
+	case input.OfflineMode || isFullObjectID(input.Ref):
 		return tree(sha), sha, nil
 	}
 
