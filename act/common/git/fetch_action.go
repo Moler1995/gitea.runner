@@ -31,6 +31,11 @@ var actionFetches sync.Map
 
 const treeSizes = ".sizes" // beside the tree rather than in it, which is copied into job containers as it is
 
+type treeFile struct {
+	Name []byte // not a string, which JSON would turn into UTF-8, as git allows any bytes but NUL
+	Size int64
+}
+
 type actionFetch struct {
 	done     chan struct{}
 	dir, sha string
@@ -273,7 +278,11 @@ var lockTree = AcquireCloneLock // replaced in tests to see installTree wait for
 
 // installTree moves temp into place as dir/sha, replacing a tree that failed treeIntact.
 func installTree(ctx context.Context, dir, sha, temp string, sizes map[string]int64) error {
-	data, err := json.Marshal(sizes)
+	files := make([]treeFile, 0, len(sizes))
+	for name, size := range sizes {
+		files = append(files, treeFile{[]byte(name), size})
+	}
+	data, err := json.Marshal(files)
 	if err != nil {
 		return err
 	}
@@ -307,13 +316,13 @@ func treeIntact(dir, sha string) bool {
 	if err != nil || !exists(filepath.Join(dir, sha)) {
 		return false
 	}
-	var sizes map[string]int64
-	if json.Unmarshal(data, &sizes) != nil {
+	var files []treeFile
+	if json.Unmarshal(data, &files) != nil {
 		return false
 	}
-	for name, size := range sizes {
-		info, err := os.Lstat(filepath.Join(dir, sha, filepath.FromSlash(name)))
-		if err != nil || !info.Mode().IsRegular() || info.Size() != size {
+	for _, file := range files {
+		info, err := os.Lstat(filepath.Join(dir, sha, filepath.FromSlash(string(file.Name))))
+		if err != nil || !info.Mode().IsRegular() || info.Size() != file.Size {
 			return false
 		}
 	}

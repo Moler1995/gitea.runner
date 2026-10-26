@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -381,4 +382,24 @@ func TestExtractTreeConfinesEntries(t *testing.T) {
 			assert.NoFileExists(t, filepath.Join(outside, "escape"))
 		})
 	}
+}
+
+func TestTreeIntactFindsNamesThatAreNotUTF8(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("macOS and Windows store no name that is not UTF-8")
+	}
+	sha := strings.Repeat("a", 40)
+	var archive bytes.Buffer
+	writer := tar.NewWriter(&archive)
+	require.NoError(t, writer.WriteHeader(&tar.Header{Typeflag: tar.TypeXGlobalHeader, PAXRecords: map[string]string{"comment": sha}}))
+	require.NoError(t, writer.WriteHeader(&tar.Header{Name: "caf\xe9.js", Typeflag: tar.TypeReg, Mode: 0o644, Size: 1, Format: tar.FormatGNU}))
+	_, err := writer.Write([]byte("x"))
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+
+	dir := t.TempDir()
+	_, err = extractTree(t.Context(), &archive, dir, false)
+	require.NoError(t, err)
+	require.FileExists(t, filepath.Join(dir, sha, "caf\xe9.js"))
+	assert.True(t, treeIntact(dir, sha))
 }
