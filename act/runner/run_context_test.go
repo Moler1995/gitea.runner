@@ -43,6 +43,7 @@ func TestRunContext_EvalBool(t *testing.T) {
 	rc := &RunContext{
 		Config: &Config{
 			Workdir: ".",
+			Env:     testCheckoutEnv(),
 		},
 		Env: map[string]string{
 			"SOMETHING_TRUE":  "true",
@@ -143,7 +144,10 @@ func TestRunContext_EvalBool(t *testing.T) {
 
 type fakeContainer struct {
 	container.ExecutionsEnvironment
+	caseInsensitive bool
 }
+
+func (c fakeContainer) IsEnvironmentCaseInsensitive() bool { return c.caseInsensitive }
 
 func (fakeContainer) Pull(bool) common.Executor { return func(context.Context) error { return nil } }
 
@@ -197,7 +201,7 @@ func startJobContainerInputs(t *testing.T, workflowYAML string, cfg *Config) []*
 
 	cfg.Workdir = "/tmp"
 	cfg.ContainerNetworkMode = "host"
-	cfg.Env = map[string]string{}
+	cfg.Env = testCheckoutEnv()
 	cfg.Secrets = map[string]string{}
 
 	rc := &RunContext{
@@ -281,12 +285,13 @@ jobs:
         image: redis:latest
         volumes:
           - data:/data
+          - data:/backup
 `, &Config{ValidVolumes: []string{"data"}})[0]
 
 	require.Equal(t, "redis:latest", redis.Image)
 	require.Equal(t, []string{"data"}, redis.ValidVolumes)
 	require.Equal(t, map[string]string{"data": "/data"}, redis.Mounts)
-	require.Empty(t, redis.Binds)
+	require.Equal(t, []string{"data:/backup"}, redis.Binds)
 	require.Empty(t, redis.WorkingDir)
 	require.Nil(t, redis.Entrypoint)
 	require.Nil(t, redis.Cmd)
@@ -461,6 +466,7 @@ func TestRunContext_GetBindsAndMounts(t *testing.T) {
 			{"BindAnonymousVolume", []string{"/volume"}, "/volume", map[string]string{}},
 			{"BindHostFile", []string{"/path/to/file/on/host:/volume"}, "/path/to/file/on/host:/volume", map[string]string{}},
 			{"MountExistingVolume", []string{"volume-id:/volume"}, "", map[string]string{"volume-id": "/volume"}},
+			{"MountExistingVolumeTwice", []string{"volume-id:/volume", "volume-id:/other"}, "volume-id:/other", map[string]string{"volume-id": "/volume"}},
 			{"MountExistingVolumeReadOnly", []string{"volume-id:/volume:ro"}, "volume-id:/volume:ro", map[string]string{}},
 			{"BindRelativeHostPath", []string{"./relative:/volume"}, "./relative:/volume", map[string]string{}},
 			{"OverridesToolCache", []string{"/host/tools:/opt/hostedtoolcache"}, "/host/tools:/opt/hostedtoolcache", map[string]string{}},
@@ -476,6 +482,7 @@ func TestRunContext_GetBindsAndMounts(t *testing.T) {
 			require.NoError(t, err)
 
 			rc := newRunContext(&Config{
+				Env:          testCheckoutEnv(),
 				ValidVolumes: []string{"**"},
 				Secrets: map[string]string{
 					"MAME": "/host/mame/roms",
@@ -772,7 +779,7 @@ func TestInterpolateOutputsIsPerMatrixComboKeepingNeedsOutputs(t *testing.T) {
 	require.NoError(t, job.RawOutputs.Encode(job.Outputs))
 	needed := &model.Job{Outputs: map[string]string{"o": "from-gitea"}}
 	run := &model.Run{JobID: "j", Workflow: &model.Workflow{Name: "w", Jobs: map[string]*model.Job{"j": job, "needed": needed}}}
-	r := &runnerImpl{config: &Config{}}
+	r := &runnerImpl{config: &Config{PresetGitHubContext: &model.GithubContext{}}}
 	ctx := t.Context()
 
 	_, err := r.newRunContext(ctx, &model.Run{JobID: "needed", Workflow: run.Workflow}, nil)
@@ -799,7 +806,7 @@ func TestInterpolateOutputsFromExpression(t *testing.T) {
 
 	job := &model.Job{RawOutputs: rawOutputs}
 	run := &model.Run{JobID: "j", Workflow: &model.Workflow{Name: "w", Jobs: map[string]*model.Job{"j": job}}}
-	rc, err := (&runnerImpl{config: &Config{}}).newRunContext(t.Context(), run, nil)
+	rc, err := (&runnerImpl{config: &Config{PresetGitHubContext: &model.GithubContext{}}}).newRunContext(t.Context(), run, nil)
 	require.NoError(t, err)
 
 	require.NoError(t, rc.interpolateOutputs()(t.Context()))
@@ -862,11 +869,37 @@ func TestGetGitHubContext(t *testing.T) {
 	assert.Equal(t, rc.Config.Secrets["GITHUB_TOKEN"], ghc.Token)
 	assert.Equal(t, "job1", ghc.Job)
 
-	rc.Config.PresetGitHubContext = &model.GithubContext{Actor: "preset-actor", TriggeringActor: "triggerer", Job: "preset-job"}
+	rc.Config.PresetGitHubContext = &model.GithubContext{
+		Actor:             "preset-actor",
+		ActorID:           "12",
+		TriggeringActor:   "triggerer",
+		Job:               "preset-job",
+		RepositoryID:      "34",
+		RepositoryOwnerID: "56",
+		WorkflowRef:       "owner/repo/.gitea/workflows/test.yml@refs/heads/main",
+		WorkflowSha:       "workflow-sha",
+		RefProtected:      true,
+	}
 	ghc = rc.getGithubContext(t.Context())
 	assert.Equal(t, "preset-actor", ghc.Actor)
 	assert.Equal(t, "triggerer", ghc.TriggeringActor)
 	assert.Equal(t, "job1", ghc.Job)
+	env := map[string]string{}
+	rc.withGithubEnv(t.Context(), ghc, env)
+	for name, value := range map[string]string{
+		"GITHUB_ACTOR_ID":            "12",
+		"GITHUB_TRIGGERING_ACTOR":    "triggerer",
+		"GITHUB_REPOSITORY_ID":       "34",
+		"GITHUB_REPOSITORY_OWNER_ID": "56",
+		"GITHUB_WORKFLOW_REF":        "owner/repo/.gitea/workflows/test.yml@refs/heads/main",
+		"GITHUB_WORKFLOW_SHA":        "workflow-sha",
+		"GITHUB_REF_PROTECTED":       "true",
+	} {
+		assert.Equal(t, value, env[name], name)
+	}
+	ghc.RefProtected = false
+	rc.withGithubEnv(t.Context(), ghc, env)
+	assert.Equal(t, "false", env["GITHUB_REF_PROTECTED"])
 
 	preset := &model.GithubContext{ServerURL: "https://preset.test", APIURL: "https://preset.test/api/v1"}
 	for _, testcase := range []struct {
@@ -925,6 +958,7 @@ func TestGetGithubContextRef(t *testing.T) {
 				Config: &Config{
 					EventName: data.event,
 					Workdir:   "",
+					Env:       map[string]string{"GITHUB_REPOSITORY": "owner/repo", "SHA_REF": "1234567890"},
 				},
 				Run: &model.Run{
 					Workflow: &model.Workflow{
@@ -942,7 +976,7 @@ func TestGetGithubContextRef(t *testing.T) {
 
 func createIfTestRunContext(jobs map[string]*model.Job) *RunContext {
 	rc := &RunContext{
-		Config: &Config{Workdir: ".", PlatformPicker: func([]string) string { return "ubuntu-latest" }},
+		Config: &Config{Workdir: ".", PresetGitHubContext: &model.GithubContext{}, PlatformPicker: func([]string) string { return "ubuntu-latest" }},
 		Run: &model.Run{
 			JobID: "job1",
 			Workflow: &model.Workflow{
@@ -1092,6 +1126,22 @@ func TestRunContext_cleanupFailedStart(t *testing.T) {
 	type ctxKey string
 	const sentinel = ctxKey("sentinel")
 
+	t.Run("removes host directories when tool cache creation fails", func(t *testing.T) {
+		cacheDir := t.TempDir()
+		toolCache := filepath.Join(t.TempDir(), "file")
+		require.NoError(t, os.WriteFile(toolCache, nil, 0o600))
+		rc := &RunContext{
+			Config:        &Config{ActionCacheDir: cacheDir},
+			Env:           map[string]string{"RUNNER_TOOL_CACHE": toolCache},
+			platformImage: "-self-hosted",
+		}
+		require.Error(t, rc.startContainer()(t.Context()))
+		entries, err := os.ReadDir(cacheDir)
+		require.NoError(t, err)
+		assert.Empty(t, entries)
+		assert.FileExists(t, toolCache)
+	})
+
 	for name, canceled := range map[string]bool{"cancellation during cleanup": false, "already canceled": true} {
 		t.Run(name, func(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.WithValue(t.Context(), sentinel, "v"))
@@ -1163,7 +1213,7 @@ func TestRunContext_cleanupFailedStart(t *testing.T) {
 			workflow, err := model.ReadWorkflow(strings.NewReader("jobs: {job: {services: {postgres: {image: postgres:latest}}}}"))
 			require.NoError(t, err)
 			rc := &RunContext{
-				Config:        &Config{ForcePull: true, ContainerNetworkMode: "host", Workdir: "/workspace"},
+				Config:        &Config{ForcePull: true, ContainerNetworkMode: "host", Workdir: "/workspace", Env: testCheckoutEnv()},
 				Run:           &model.Run{JobID: "job", Workflow: workflow},
 				platformImage: "node:20",
 			}
@@ -1515,6 +1565,7 @@ func TestRunContextGetRunnerContext(t *testing.T) {
 }
 
 func TestRunContextUpdateExtraPath(t *testing.T) {
+	t.Parallel()
 	longPath := strings.Repeat("x", 64*1024+1)
 	for _, testcase := range []struct {
 		name    string
@@ -1573,4 +1624,11 @@ func TestRunContextWithGithubEnvRunnerValues(t *testing.T) {
 	assert.Equal(t, "/workspace/owner", env["RUNNER_WORKSPACE"])
 	assert.Equal(t, "1", env["RUNNER_DEBUG"])
 	assert.Equal(t, "http://[2001:db8::1]:8080/", env["ACTIONS_RUNTIME_URL"])
+	assert.Equal(t, "true", env["CI"])
+
+	for _, ci := range []string{"false", ""} {
+		env["CI"] = ci
+		rc.withGithubEnv(ctx, &model.GithubContext{}, env)
+		assert.Equal(t, ci, env["CI"])
+	}
 }

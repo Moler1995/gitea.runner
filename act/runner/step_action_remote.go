@@ -32,6 +32,7 @@ type stepActionRemote struct {
 	remoteAction        *remoteAction
 	actionDir           string // the repository at the resolved commit, shared by the job's actions in it
 	resolvedSha         string // set on the first step preparing the repository
+	preStepStarted      bool
 }
 
 type actionDownload struct {
@@ -142,19 +143,19 @@ func (sar *stepActionRemote) pre() common.Executor {
 
 	return common.NewPipelineExecutor(
 		sar.prepareActionExecutor(),
-		runStepExecutor(sar, stepStagePre, runPreStep(sar)).If(hasPreStep(sar)).If(shouldRunPreStep(sar)))
+		runStepExecutor(sar, stepStagePre, func(ctx context.Context) error {
+			sar.preStepStarted = true
+			return runPreStep(sar)(ctx)
+		}).If(hasPreStep(sar)).If(shouldRunPreStep(sar)))
 }
 
 func (sar *stepActionRemote) main() common.Executor {
 	return common.NewPipelineExecutor(
 		sar.prepareActionExecutor(),
 		runStepExecutor(sar, stepStageMain, func(ctx context.Context) error {
-			printRunActionHeader(ctx, sar.Step, sar.env, sar.RunContext)
-			rawLogger := common.Logger(ctx).With(rawOutputField, true)
-			defer rawLogger.Infof("::endgroup::")
-
 			github := sar.getGithubContext(ctx)
 			if sar.skipsLocalCheckout(sar.remoteAction, github) {
+				printRunActionHeader(ctx, sar.Step, nil, sar.env, sar.RunContext)
 				if sar.RunContext.Config.BindWorkdir {
 					common.Logger(ctx).Debugf("Skipping local actions/checkout because you bound your workspace")
 					return nil

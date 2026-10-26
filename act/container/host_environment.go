@@ -225,12 +225,16 @@ func setupPty(cmd *exec.Cmd, cmdline string) (*os.File, *os.File, error) {
 	return ppty, tty, nil
 }
 
-func writeKeepAlive(ppty io.Writer) {
-	c := 1
-	var err error
-	for c == 1 && err == nil {
-		c, err = ppty.Write([]byte{4})
-		<-time.After(time.Second)
+func writeKeepAlive(ctx context.Context, ppty io.Writer) {
+	for ctx.Err() == nil {
+		if count, err := ppty.Write([]byte{4}); count != 1 || err != nil {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(time.Second):
+		}
 	}
 }
 
@@ -302,7 +306,7 @@ func (e *HostEnvironment) exec(ctx context.Context, command []string, cmdline st
 			defer finishLog()
 			_, _ = io.Copy(writer, ppty)
 		}()
-		go writeKeepAlive(ppty)
+		go writeKeepAlive(logctx, ppty)
 	}
 	if err := cmd.Start(); err != nil {
 		return err
@@ -318,20 +322,20 @@ func (e *HostEnvironment) exec(ctx context.Context, command []string, cmdline st
 		defer k.Close()
 	}
 	err = treeKill.Wait(ctx, cmd)
-	if err != nil {
-		if exitErr, ok := errors.AsType[*exec.ExitError](err); ok {
-			return ExitCodeError(exitErr.ExitCode())
-		}
-		return err
-	}
 	if tty != nil {
 		writer.AutoStop.Store(true)
 		if _, err := tty.WriteString("\x04"); err != nil {
 			common.Logger(ctx).Debug("Failed to write EOT")
 		}
-		<-logctx.Done()
+		select {
+		case <-logctx.Done():
+		case <-ctx.Done(): // a cancelled step does not wait on output nobody consumes
+		}
 		ppty.Close()
 		ppty = nil
+	}
+	if exitErr, ok := errors.AsType[*exec.ExitError](err); ok {
+		return ExitCodeError(exitErr.ExitCode())
 	}
 	return err
 }
@@ -355,7 +359,7 @@ func (e *HostEnvironment) ExecWithCmdLine(command []string, cmdline string, env 
 }
 
 func (e *HostEnvironment) UpdateFromEnv(srcPath string, env *map[string]string) common.Executor {
-	return parseEnvFile(e, srcPath, env)
+	return parseEnvFile(e, srcPath, env, runtime.GOOS == "windows")
 }
 
 // removeAll is a var so tests can substitute a blocking stub.

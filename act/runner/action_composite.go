@@ -31,7 +31,7 @@ func evaluateCompositeInputAndEnv(ctx context.Context, parent *RunContext, step 
 	ee := parent.NewStepExpressionEvaluator(ctx, step)
 
 	for inputID, input := range step.getActionModel().Inputs {
-		envKey := "INPUT_" + inputEnvPattern.ReplaceAllString(strings.ToUpper(inputID), "_")
+		envKey := inputEnvKey(inputID)
 
 		// lookup if key is defined in the step but the already
 		// evaluated value from the environment
@@ -50,6 +50,11 @@ func evaluateCompositeInputAndEnv(ctx context.Context, parent *RunContext, step 
 			if env[envKey], err = ee.Interpolate(ctx, input.Default); err != nil {
 				return nil, fmt.Errorf("unable to interpolate the default of input %s: %w", inputID, err)
 			}
+		}
+	}
+	for envKey, value := range (&model.Step{With: step.getStepModel().With}).GetEnv() {
+		if _, ok := env[envKey]; !ok {
+			env[envKey] = value
 		}
 	}
 	gh := step.getGithubContext(ctx)

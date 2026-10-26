@@ -285,7 +285,7 @@ func newJobExecutor(info jobInfo, sf stepFactory, rc *RunContext) common.Executo
 		jobError := common.JobError(ctx)
 		var err error
 		// always allow 1 min for stopping and removing the runner, even if we were cancelled
-		ctx, cancel := context.WithTimeout(common.WithLogger(context.Background(), common.Logger(ctx)), jobCleanupTimeout)
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), jobCleanupTimeout)
 		defer cancel()
 
 		logger := common.Logger(ctx)
@@ -400,6 +400,7 @@ func runMainStepsAfterInterrupt(ctx context.Context, rc *RunContext, steps []com
 
 func setJobResult(ctx context.Context, info jobInfo, rc *RunContext, success bool) {
 	logger := common.Logger(ctx)
+	success = success && !rc.jobFailed
 
 	// Matrix combinations share one *model.Job and run in parallel; serialize the
 	// read-modify-write of the job result so a failing combination is not lost-updated by a

@@ -114,6 +114,7 @@ type RunContext struct {
 	stepEnv            map[string]string
 	unsecureCommandErr error // refused ::set-env::/::add-path::, turned into a step failure
 	unsecureCommandMu  sync.Mutex
+	checkoutPins       sync.Map // git lookups of contexts no run has pinned
 }
 
 // serviceContainer pairs a service container with the workflow id that keys job.services.
@@ -333,9 +334,12 @@ func splitVolumes(specs []string) ([]string, map[string]string, map[string]bool)
 			continue
 		}
 		targets[parsed.Target] = true
-		if parsed.Type == mount.TypeVolume && parsed.Source != "" && !parsed.ReadOnly {
+		switch {
+		case parsed.Type != mount.TypeVolume || parsed.Source == "" || parsed.ReadOnly:
+			binds = append(binds, spec)
+		case mounts[parsed.Source] == "":
 			mounts[parsed.Source] = parsed.Target
-		} else {
+		case mounts[parsed.Source] != parsed.Target: // a repeat of the same mount is dropped
 			binds = append(binds, spec)
 		}
 	}
@@ -393,6 +397,7 @@ func (rc *RunContext) startHostEnvironment() common.Executor {
 		randBytes := make([]byte, 8)
 		_, _ = rand.Read(randBytes)
 		miscpath := filepath.Join(cacheDir, hex.EncodeToString(randBytes))
+		rc.cleanUpJobContainer = func(_ctx context.Context) error { return os.RemoveAll(miscpath) }
 		actPath := filepath.Join(miscpath, "act")
 		if err := os.MkdirAll(actPath, 0o777); err != nil {
 			return err
@@ -1535,6 +1540,7 @@ func (rc *RunContext) getGithubContext(ctx context.Context) *model.GithubContext
 
 	ghc.SetBaseAndHeadRef()
 	repoPath := rc.Config.Workdir
+	ctx = ghcontext.WithPinnedCheckout(ctx, &rc.checkoutPins)
 	ghcontext.SetRepositoryAndOwner(ctx, ghc, repoPath)
 	if ghc.Ref == "" {
 		ghcontext.SetRef(ctx, ghc, repoPath)
@@ -1593,7 +1599,9 @@ func isLocalCheckout(ghc *model.GithubContext, step *model.Step) bool {
 }
 
 func (rc *RunContext) withGithubEnv(ctx context.Context, github *model.GithubContext, env map[string]string) {
-	env["CI"] = "true"
+	if _, ok := env["CI"]; !ok {
+		env["CI"] = "true"
+	}
 	env["GITHUB_WORKFLOW"] = github.Workflow
 	env["GITHUB_RUN_ID"] = github.RunID
 	env["GITHUB_RUN_NUMBER"] = github.RunNumber
@@ -1611,6 +1619,7 @@ func (rc *RunContext) withGithubEnv(ctx context.Context, github *model.GithubCon
 	env["GITHUB_REF"] = github.Ref
 	env["GITHUB_REF_NAME"] = github.RefName
 	env["GITHUB_REF_TYPE"] = github.RefType
+	env["GITHUB_REF_PROTECTED"] = strconv.FormatBool(github.RefProtected)
 	env["GITHUB_JOB"] = github.Job
 	env["GITHUB_REPOSITORY_OWNER"] = github.RepositoryOwner
 	env["GITHUB_RETENTION_DAYS"] = github.RetentionDays
@@ -1620,6 +1629,18 @@ func (rc *RunContext) withGithubEnv(ctx context.Context, github *model.GithubCon
 	env["GITHUB_HEAD_REF"] = github.HeadRef
 	env["GITHUB_SERVER_URL"] = github.ServerURL
 	env["GITHUB_API_URL"] = github.APIURL
+	for name, value := range map[string]string{
+		"GITHUB_WORKFLOW_REF":        github.WorkflowRef,
+		"GITHUB_WORKFLOW_SHA":        github.WorkflowSha,
+		"GITHUB_ACTOR_ID":            github.ActorID,
+		"GITHUB_TRIGGERING_ACTOR":    github.TriggeringActor,
+		"GITHUB_REPOSITORY_ID":       github.RepositoryID,
+		"GITHUB_REPOSITORY_OWNER_ID": github.RepositoryOwnerID,
+	} {
+		if value != "" { // a context without them keeps what the environment set
+			env[name] = value
+		}
+	}
 
 	for _, name := range []string{"GITHUB_SERVER_URL", "GITHUB_API_URL"} {
 		if env[name] == "" {

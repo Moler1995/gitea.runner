@@ -28,12 +28,12 @@ var (
 
 type pinnedKey struct{}
 
-// WithPinnedCheckout keeps a run's sha and ref fixed when HEAD moves.
-func WithPinnedCheckout(ctx context.Context) context.Context {
+// WithPinnedCheckout keeps a run's sha, ref and repository fixed when HEAD moves, in pins unless ctx has some.
+func WithPinnedCheckout(ctx context.Context, pins *sync.Map) context.Context {
 	if ctx.Value(pinnedKey{}) != nil {
 		return ctx
 	}
-	return context.WithValue(ctx, pinnedKey{}, &sync.Map{})
+	return context.WithValue(ctx, pinnedKey{}, pins)
 }
 
 func pinned(ctx context.Context, key string, lookup func() (string, error)) (string, error) {
@@ -57,12 +57,29 @@ func SetRef(ctx context.Context, ghc *model.GithubContext, repoPath string) {
 	case "pull_request_target":
 		ghc.Ref = "refs/heads/" + ghc.BaseRef
 	case "pull_request", "pull_request_review", "pull_request_review_comment":
-		ghc.Ref = fmt.Sprintf("refs/pull/%.0f/merge", ghc.Event["number"])
+		number := ghc.Event["number"]
+		if number == nil {
+			number = model.NestedMapLookup(ghc.Event, "pull_request", "number")
+		}
+		ghc.Ref = fmt.Sprintf("refs/pull/%.0f/merge", number)
+		if ghc.EventName == "pull_request" && ghc.Event["action"] == "closed" && model.NestedMapLookup(ghc.Event, "pull_request", "merged") == true {
+			ghc.Ref = "refs/heads/" + ghc.BaseRef
+		}
 	case "deployment", "deployment_status":
 		ghc.Ref = model.AsString(model.NestedMapLookup(ghc.Event, "deployment", "ref"))
 	case "release":
 		ghc.Ref = "refs/tags/" + model.AsString(model.NestedMapLookup(ghc.Event, "release", "tag_name"))
-	case "push", "create", "workflow_dispatch":
+	case "create":
+		ghc.Ref = model.AsString(ghc.Event["ref"])
+		if ghc.Ref != "" && !strings.HasPrefix(ghc.Ref, "refs/") {
+			switch model.AsString(ghc.Event["ref_type"]) {
+			case "branch":
+				ghc.Ref = "refs/heads/" + ghc.Ref
+			case "tag":
+				ghc.Ref = "refs/tags/" + ghc.Ref
+			}
+		}
+	case "push", "workflow_dispatch":
 		ghc.Ref = model.AsString(ghc.Event["ref"])
 	default:
 		defaultBranch := model.AsString(model.NestedMapLookup(ghc.Event, "repository", "default_branch"))
@@ -131,7 +148,7 @@ func SetSha(ctx context.Context, ghc *model.GithubContext, repoPath string) {
 // remote in repoPath when it is not set yet, and derives its owner.
 func SetRepositoryAndOwner(ctx context.Context, ghc *model.GithubContext, repoPath string) {
 	if ghc.Repository == "" {
-		repo, err := findGithubRepo(ctx, repoPath)
+		repo, err := pinned(ctx, "repo:"+repoPath, func() (string, error) { return findGithubRepo(ctx, repoPath) })
 		if err != nil {
 			common.Logger(ctx).Warnf("unable to get git repo (repoPath: %v): %v", repoPath, err)
 			return
