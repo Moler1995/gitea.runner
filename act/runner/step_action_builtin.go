@@ -38,6 +38,7 @@ func (sab *stepActionBuiltin) main() common.Executor {
 		}
 
 		printRunActionHeader(ctx, sab.Step, nil, sab.env, sab.RunContext)
+		rawLogger := common.Logger(ctx).With(rawOutputField, true)
 
 		rc := sab.RunContext
 		rc.ApplyExtraPath(ctx, &sab.env)
