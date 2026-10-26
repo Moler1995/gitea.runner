@@ -47,8 +47,11 @@ func testExecArtifacts(t *testing.T) {
 	}
 
 	artifacts := t.TempDir()
-	cmd := exec.CommandContext(ctx, bin, "exec", "-C", workdir,
-		"-i", os.Getenv("E2E_JOB_IMAGE"), "--artifact-server-path", artifacts)
+	args := []string{"exec", "-C", workdir, "-i", os.Getenv("E2E_JOB_IMAGE"), "--artifact-server-path", artifacts}
+	if fixture.network != "" {
+		args = append(args, "--network", fixture.network)
+	}
+	cmd := exec.CommandContext(ctx, bin, args...)
 	// exec reuses the artifact service of a surrounding CI job
 	cmd.Env = slices.DeleteFunc(os.Environ(), func(kv string) bool { return strings.HasPrefix(kv, "ACTIONS_") })
 	if out, err := cmd.CombinedOutput(); err != nil {
