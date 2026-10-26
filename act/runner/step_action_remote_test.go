@@ -51,10 +51,12 @@ func TestShortSHAActionRejected(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(workflowDir, "push.yml"), []byte(workflow), 0o644))
 
 	runner, err := New(&Config{
+		Env:                   testCheckoutEnv(),
 		Workdir:               workflowDir,
 		EventName:             "push",
 		GitHubInstance:        "github.com",
 		DefaultActionInstance: actionRoot,
+		ActionCacheDir:        t.TempDir(),
 		ContainerMaxLifetime:  time.Hour,
 		PlatformPicker:        func([]string) string { return baseImage },
 	})
@@ -94,8 +96,9 @@ func TestStepActionRemote(t *testing.T) {
 			sar := &stepActionRemote{
 				RunContext: &RunContext{
 					Config: &Config{
-						GitHubInstance: "github.com",
-						ActionCacheDir: t.TempDir(),
+						GitHubInstance:      "github.com",
+						ActionCacheDir:      t.TempDir(),
+						PresetGitHubContext: &model.GithubContext{},
 					},
 					Run: &model.Run{
 						JobID: "1",
@@ -134,7 +137,7 @@ func TestStepActionRemote(t *testing.T) {
 	t.Run("refreshes composite inputs without leaking environment", func(t *testing.T) {
 		step := &stepActionRemote{
 			Step:         &model.Step{Uses: "org/composite@v1", With: map[string]string{"SHARED": "first"}},
-			RunContext:   &RunContext{Config: &Config{ActionCacheDir: t.TempDir()}, Run: &model.Run{JobID: "job", Workflow: &model.Workflow{Jobs: map[string]*model.Job{"job": {}}}}, JobContainer: &jobContainerMock{}},
+			RunContext:   &RunContext{Config: &Config{ActionCacheDir: t.TempDir(), PresetGitHubContext: &model.GithubContext{}}, Run: &model.Run{JobID: "job", Workflow: &model.Workflow{Jobs: map[string]*model.Job{"job": {}}}}, JobContainer: &jobContainerMock{}},
 			action:       &model.Action{Inputs: map[string]model.Input{"shared": {}}},
 			env:          map[string]string{},
 			remoteAction: mustNewRemoteAction(t, "org/composite@v1"),
@@ -161,7 +164,7 @@ func TestStepActionRemotePrepare(t *testing.T) {
 	})
 	newJob := func(instance string) *RunContext {
 		return &RunContext{
-			Config:       &Config{GitHubInstance: instance, ActionCacheDir: t.TempDir()},
+			Config:       &Config{GitHubInstance: instance, ActionCacheDir: t.TempDir(), PresetGitHubContext: &model.GithubContext{}},
 			Run:          &model.Run{JobID: "1", Workflow: &model.Workflow{Jobs: map[string]*model.Job{"1": {}}}},
 			JobContainer: &jobContainerMock{},
 		}
@@ -205,6 +208,60 @@ func TestStepActionRemotePrepare(t *testing.T) {
 	_, restoreContainerDir := getContainerActionPaths(restore)
 	assert.NotEqual(t, path.Dir(rootContainerDir), path.Dir(restoreContainerDir))
 	assert.Equal(t, "restore", path.Base(restoreContainerDir))
+}
+
+func TestStepActionRemotePreCleanup(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		preIf    string
+		preError error
+	}{
+		{name: "pre ran and main skipped", preIf: "always()"},
+		{name: "pre failed before main", preIf: "always()", preError: assert.AnError},
+		{name: "pre skipped and main skipped", preIf: "false"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cm := &containerMock{}
+			sar := &stepActionRemote{
+				Step: &model.Step{ID: "step", Uses: "remote/action@v1", If: yaml.Node{Value: "false"}},
+				RunContext: &RunContext{
+					Config:       &Config{PresetGitHubContext: &model.GithubContext{}},
+					Run:          &model.Run{JobID: "job", Workflow: &model.Workflow{Jobs: map[string]*model.Job{"job": {}}}},
+					StepResults:  map[string]*model.StepResult{},
+					JobContainer: cm,
+				},
+				action: &model.Action{Runs: model.ActionRuns{
+					Using: "node24", Pre: "pre.js", PreIf: test.preIf, Post: "post.js", PostIf: "always()",
+				}},
+				remoteAction: mustNewRemoteAction(t, "remote/action@v1"),
+				actionDir:    t.TempDir(),
+			}
+			sar.RunContext.ExprEval = sar.RunContext.NewExpressionEvaluator(t.Context())
+			if test.preIf != "false" {
+				_, actionDir := getContainerActionPaths(sar)
+				expectStepFileCommands(t, cm)
+				cm.On("CopyDir", actionDir+"/", sar.actionDir+"/", false, true).Return(noopExecutor)
+				cm.On("Exec", nodeActionCommand(path.Join(actionDir, "pre.js")), mock.Anything, "", "").Return(func(_ctx context.Context) error { return test.preError }).Once()
+				cm.On("Exec", nodeActionCommand(path.Join(actionDir, "post.js")), mock.Anything, "", "").Return(noopExecutor).Once()
+			}
+
+			assert.Equal(t, test.preError, sar.pre()(t.Context()))
+			if test.preError == nil {
+				require.NoError(t, sar.main()(t.Context()))
+				assert.Equal(t, model.StepStatusSkipped, sar.RunContext.StepResults["step"].Conclusion)
+			}
+			require.NoError(t, sar.post()(t.Context()))
+			cm.AssertExpectations(t)
+		})
+	}
+
+	skippedComposite := &stepActionRemote{
+		Step:           &model.Step{ID: "step"},
+		RunContext:     &RunContext{StepResults: map[string]*model.StepResult{"step": {Conclusion: model.StepStatusSkipped}}},
+		action:         &model.Action{Runs: model.ActionRuns{Using: "composite"}},
+		preStepStarted: true,
+	}
+	assert.False(t, shouldRunPostStep(skippedComposite)(t.Context()))
 }
 
 func Test_newRemoteAction(t *testing.T) {
@@ -351,6 +408,7 @@ func TestStepActionRemotePreResolvesDownloadedCommit(t *testing.T) {
 		Step: &model.Step{Uses: "actions/setup-go@main"},
 		RunContext: &RunContext{
 			Config: &Config{
+				Env:                   testCheckoutEnv(),
 				GitHubInstance:        "https://gitea.example.com",
 				DefaultActionInstance: instance,
 				ActionCacheDir:        t.TempDir(),
@@ -430,6 +488,7 @@ func TestStepActionRemoteCloneTokenSurvivesNilSecrets(t *testing.T) {
 				Step: &model.Step{Uses: "org/repo@v1"},
 				RunContext: &RunContext{
 					Config: &Config{
+						Env:                   testCheckoutEnv(),
 						GitHubInstance:        tt.gitHubInstance,
 						DefaultActionInstance: tt.defaultActionInstance,
 						ActionCacheDir:        t.TempDir(),
