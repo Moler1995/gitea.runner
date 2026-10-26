@@ -264,6 +264,8 @@ func extractTree(ctx context.Context, archive io.Reader, dir string, strip bool)
 	return sha, installTree(ctx, dir, sha, temp, sizes)
 }
 
+var lockTree = AcquireCloneLock // replaced in tests to see installTree wait for a job holding the tree
+
 // installTree moves temp into place as dir/sha, replacing a tree that failed treeIntact.
 func installTree(ctx context.Context, dir, sha, temp string, sizes map[string]int64) error {
 	data, err := json.Marshal(sizes)
@@ -281,8 +283,8 @@ func installTree(ctx context.Context, dir, sha, temp string, sizes map[string]in
 	if err != nil {
 		return err
 	}
-	defer os.RemoveAll(stale)                  // after the unlock, as no job reads the old tree once it is moved
-	unlock, err := AcquireCloneLock(ctx, tree) // jobs copying the old tree hold it
+	defer os.RemoveAll(stale)          // after the unlock, as no job reads the old tree once it is moved
+	unlock, err := lockTree(ctx, tree) // jobs copying the old tree hold it
 	if err != nil {
 		return err
 	}

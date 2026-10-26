@@ -269,6 +269,12 @@ func TestFetchAction(t *testing.T) {
 		require.NoError(t, err)
 		release := sync.OnceFunc(unlock)
 		defer release()
+		waiting := make(chan struct{})
+		lockTree = func(ctx context.Context, dir string) (func(), error) {
+			close(waiting)
+			return AcquireCloneLock(ctx, dir)
+		}
+		t.Cleanup(func() { lockTree = AcquireCloneLock })
 		done := make(chan error, 1)
 		go func() {
 			_, _, err := FetchAction(t.Context(), input)
@@ -276,8 +282,8 @@ func TestFetchAction(t *testing.T) {
 		}()
 		select {
 		case err := <-done:
-			t.Fatalf("FetchAction returned while a job held the tree: %v", err)
-		case <-time.After(100 * time.Millisecond):
+			t.Fatalf("FetchAction replaced the tree without waiting for the job holding it: %v", err)
+		case <-waiting:
 		}
 		info, err := os.Stat(yml)
 		require.NoError(t, err)
