@@ -122,9 +122,11 @@ func patchedAction(t *testing.T, repo, ref, entrypoint string) string {
 
 	body, err := os.ReadFile(bundleFromGitHub(t, repo, ref, entrypoint))
 	require.NoError(t, err)
+	if patched, ok := patchedBundle(body); ok {
+		body = patched
+	}
 	script := filepath.Join(tempDirPath(t), filepath.Base(entrypoint))
 	require.NoError(t, os.WriteFile(script, body, 0o600))
-	patchActions(t.Context(), []string{script})
 	return script
 }
 
@@ -137,6 +139,7 @@ func tempDirPath(t *testing.T) string {
 }
 
 func TestCacheServiceV2EndToEnd(t *testing.T) {
+	t.Parallel()
 	requireHostTools(t, "node")
 
 	restore := patchedAction(t, "actions/cache", actionsCacheRef, "dist/restore/index.js")
@@ -220,6 +223,7 @@ func TestPatchedBundleAcrossActions(t *testing.T) {
 }
 
 func TestUploadArtifactThroughTheResultsService(t *testing.T) {
+	t.Parallel()
 	requireHostTools(t, "node")
 
 	var called []string
@@ -288,6 +292,7 @@ func TestUploadArtifactThroughTheResultsService(t *testing.T) {
 }
 
 func TestSetupActionFindsTheCacheService(t *testing.T) {
+	t.Parallel()
 	requireHostTools(t, "node", "npm")
 
 	setup := patchedAction(t, "actions/setup-node", "v7.1.0", "dist/setup/index.js")
@@ -327,7 +332,9 @@ func TestCodeSplitActionFindsTheCacheService(t *testing.T) {
 	}
 	t.Setenv("CARGO_HOME", tempDirPath(t))
 
-	defer patchActions(t.Context(), actionScriptPaths(dir, dir, action))()
+	for _, entry := range patchedScripts(t.Context(), dir, actionScriptPaths(dir, dir, action)) {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, entry.Name), []byte(entry.Body), 0o600))
+	}
 	out := runActionEntrypoint(t, filepath.Join(dir, action.Runs.Main),
 		newActionJobEnv(t, "split-runtime-token", artifactcache.JobCredential{Repo: "testuser/testrepo"}), inputs)
 
