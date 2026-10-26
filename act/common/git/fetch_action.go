@@ -98,7 +98,7 @@ func fetchAction(ctx context.Context, input NewGitCloneExecutorInput) (string, s
 	case !isFullObjectID(sha):
 		sha, etag = "", ""
 	case input.OfflineMode && exists(tree(sha)) && !exists(tree(sha)+treeSizes):
-		return tree(sha), sha, nil // from an older runner, with no sizes to check, and offline mode promises no fetch
+		return tree(sha), sha, nil // from an older runner, with no sizes to check, so offline mode uses it as before
 	case !treeIntact(input.Dir, sha):
 		sha, etag = "", ""
 	case input.OfflineMode || isFullObjectID(input.Ref):
@@ -286,6 +286,7 @@ func installTree(ctx context.Context, dir, sha, temp string, sizes map[string]in
 	if err != nil {
 		return err
 	}
+	// Written before the swap: it describes the commit, not a copy of it, so it holds for whichever tree is left.
 	if err := os.WriteFile(filepath.Join(dir, sha+treeSizes), data, 0o600); err != nil { // a torn record fails treeIntact, so it needs no rename
 		return err
 	}
