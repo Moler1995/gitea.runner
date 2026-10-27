@@ -313,7 +313,7 @@ kubernetes:
   # costing API server traffic again.
   #transfer:
   #  mode: api
-  #  # Address and port job pods reach the runner at, the outbound IP and a free port when empty.
+  #  # Address and port the runner listens on and job pods reach it at, the outbound IP and a free port when empty.
   #  host: ""
   #  port: 0
   #  # Image holding the runner binary at the runner's own path, the runner pod's image when it has a single container.

@@ -57,18 +57,45 @@ The runner copies files into the job container, such as the actions a step uses,
 kubernetes:
   transfer:
     mode: direct # api (default), auto or direct
-    host: "" # address job pods reach the runner at, defaults to its outbound IP, the pod IP in a cluster
+    host: "" # address the runner listens on and job pods reach it at, defaults to its outbound IP, the pod IP in a cluster
     port: 0 # port it listens on, defaults to a free one
     image: "" # image holding the runner binary at the runner's own path, defaults to the runner pod's image if it has one container
 ```
 
-Each job pod then gets an init container from `image` that copies the runner binary into the `act` volume, and every copy is fetched with it from a one-time URL on the runner over plain HTTP. The modes differ in what happens when that does not work, for example when a NetworkPolicy keeps job pods from reaching the runner, or the runner pod has several containers and no `image` is set:
+Each job pod then gets an init container from `image` that copies the runner binary into the `act` volume, and every copy is fetched with it from the runner over HTTPS. The modes differ in what happens when that does not work, for example when a NetworkPolicy keeps job pods from reaching the runner, or the runner pod has several containers and no `image` is set:
 
 | Mode | Copies | When the pod network does not work |
 |---|---|---|
 | `api` | through the API server | not used |
 | `auto` | over the pod network | the job pod gets its copies through the API server, after one failed attempt, and a warning is logged |
 | `direct` | over the pod network | the job fails, so a broken setup shows instead of quietly costing API server traffic again |
+
+The copies include secrets, such as `run` scripts with `${{ secrets.* }}` expanded, SSH keys for checkout and the runner's client key, so a runner only serves them to its own job pods:
+
+- The runner listens with a certificate it generates at start. Its SHA-256 pin reaches the job pod with the request over the `pods/exec` stream, which the API server protects with TLS, and the job pod trusts no other certificate, so it only talks to its own runner and nobody on the pod network can read or change a copy.
+- Every copy has a one-time token, sent on that stream's stdin, so it shows neither in the command line nor in the API server audit log.
+- The runner serves a copy only to a connection from an IP of the job pod it is for. A request from any other pod, including other runners and their job pods, gets a 404 and leaves the copy for its job pod.
+
+To also keep other pods from connecting at all, allow the port only from the runner's own job pods, which carry its UUID in the `com.gitea.runner.uuid` label, with a NetworkPolicy such as:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gitea-runner-transfer
+spec:
+  podSelector:
+    matchLabels:
+      app: gitea-runner # the runner pod
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              com.gitea.runner.uuid: <runner UUID, from the .runner file>
+      ports:
+        - port: 9090 # kubernetes.transfer.port
+```
 
  Copies out of the job container and step output still go through the API server. Job pods need to be able to pull `image`, so a private one needs `imagePullSecrets` in `pod_template`. The init container is named `gitea-runner-transfer`, an `initContainers` entry of that name in `pod_template` merges into it, for example to set its `securityContext` or `resources`.
 

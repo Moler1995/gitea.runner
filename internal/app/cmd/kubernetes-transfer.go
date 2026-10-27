@@ -24,11 +24,11 @@ func loadKubernetesTransferCmd() *cobra.Command {
 			return container.InstallKubernetesTransferHelper(args[0])
 		},
 	}, &cobra.Command{
-		Use:   "fetch <url> <dir>",
-		Short: "Extract the tar stream at url into dir",
-		Args:  cobra.ExactArgs(2),
+		Use:   "fetch <dir>",
+		Short: "Extract the tar stream the transfer request on stdin points to into dir",
+		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return container.FetchKubernetesTransfer(cmd.Context(), args[0], args[1])
+			return container.FetchKubernetesTransfer(cmd.Context(), cmd.InOrStdin(), args[0])
 		},
 	})
 	return transferCmd

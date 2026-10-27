@@ -226,7 +226,7 @@ var KubernetesTransferModes = []string{KubernetesTransferModeAPI, KubernetesTran
 // KubernetesTransfer configures copying files into job pods over the pod network.
 type KubernetesTransfer struct {
 	Mode  string `yaml:"mode"`  // Mode is one of KubernetesTransferModes, api when empty.
-	Host  string `yaml:"host"`  // Host is the address job pods reach the runner at, empty uses the outbound IP.
+	Host  string `yaml:"host"`  // Host is the address the runner listens on and job pods reach it at, empty uses the outbound IP.
 	Port  uint16 `yaml:"port"`  // Port the runner listens on for job pods, 0 picks a free one.
 	Image string `yaml:"image"` // Image holds the runner binary at the runner's own path, empty uses the image of a single-container runner pod.
 }

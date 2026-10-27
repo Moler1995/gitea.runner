@@ -4,13 +4,16 @@
 package container
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
-	"net/http/httptest"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -25,8 +28,8 @@ const transferHelperEnv = "GITEA_RUNNER_TEST_TRANSFER_HELPER"
 
 // TestMain lets the test binary stand in for the runner binary a job pod runs the transfer helper with.
 func TestMain(m *testing.M) {
-	if os.Getenv(transferHelperEnv) == "1" && len(os.Args) == 5 && os.Args[1] == KubernetesTransferCommand && os.Args[2] == "fetch" {
-		if err := FetchKubernetesTransfer(context.Background(), os.Args[3], os.Args[4]); err != nil {
+	if os.Getenv(transferHelperEnv) == "1" && len(os.Args) == 4 && os.Args[1] == KubernetesTransferCommand && os.Args[2] == "fetch" {
+		if err := FetchKubernetesTransfer(context.Background(), os.Stdin, os.Args[3]); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
@@ -35,78 +38,109 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-func TestTransferServerServesEachOfferOnce(t *testing.T) {
-	server, err := startTransferServer("127.0.0.1", 0)
+// fetch runs the helper side against a request, returning what it extracted into a fresh directory.
+func fetch(t *testing.T, request transferRequest) (string, error) {
+	t.Helper()
+	dest := filepath.Join(t.TempDir(), "act")
+	body, err := json.Marshal(request)
 	require.NoError(t, err)
-	get := func(url string) (int, string, error) {
-		response, err := http.Get(url) //nolint:noctx // test against a local server
-		if err != nil {
-			return 0, "", err
-		}
-		defer response.Body.Close()
-		body, err := io.ReadAll(response.Body)
-		return response.StatusCode, string(body), err
-	}
-
-	url, done := server.offer(func(w io.Writer) error { _, err := io.WriteString(w, "content"); return err })
-	assert.True(t, strings.HasPrefix(url, "http://127.0.0.1:"))
-	status, body, err := get(url)
-	require.NoError(t, err)
-	assert.Equal(t, http.StatusOK, status)
-	assert.Equal(t, "content", body)
-	status, _, err = get(url)
-	require.NoError(t, err)
-	assert.Equal(t, http.StatusNotFound, status, "a token is good for one fetch")
-	done()
-
-	url, done = server.offer(func(io.Writer) error { return nil })
-	done()
-	status, _, err = get(url)
-	require.NoError(t, err)
-	assert.Equal(t, http.StatusNotFound, status, "a finished copy is no longer served")
-
-	url, done = server.offer(func(w io.Writer) error {
-		_, _ = w.Write(make([]byte, 64<<10))
-		return errors.New("source gone")
-	})
-	defer done()
-	_, _, err = get(url)
-	require.Error(t, err, "a failed write cuts the response short")
-
-	again, err := startTransferServer("127.0.0.1", 0)
-	require.NoError(t, err)
-	assert.Same(t, server, again)
+	return dest, FetchKubernetesTransfer(t.Context(), bytes.NewReader(body), dest)
 }
 
-func TestFetchKubernetesTransfer(t *testing.T) {
+func eventArchive(t *testing.T) func(io.Writer) error {
+	return func(w io.Writer) error {
+		return writeFilesTar(t.Context(), w, 0, 0, &FileEntry{Name: "workflow/event.json", Mode: 0o644, Body: `{"ref":"main"}`})
+	}
+}
+
+func TestTransferServer(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("extracts with tar")
 	}
-	archive := func(w io.Writer) error {
-		return writeFilesTar(t.Context(), w, 0, 0, &FileEntry{Name: "workflow/event.json", Mode: 0o644, Body: `{"ref":"main"}`})
-	}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/ok":
-			_ = archive(w)
-		case "/cut":
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write(make([]byte, 700)) // a header block and part of the next
-			panic(http.ErrAbortHandler)
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	t.Cleanup(server.Close)
-	dest := filepath.Join(t.TempDir(), "act")
-
-	require.NoError(t, FetchKubernetesTransfer(t.Context(), server.URL+"/ok", dest))
-	content, err := os.ReadFile(filepath.Join(dest, "workflow", "event.json"))
+	server, err := startTransferServer("127.0.0.1", 0)
 	require.NoError(t, err)
-	assert.JSONEq(t, `{"ref":"main"}`, string(content))
+	again, err := startTransferServer("127.0.0.1", 0)
+	require.NoError(t, err)
+	assert.Same(t, server, again, "one server per runner")
 
-	require.ErrorContains(t, FetchKubernetesTransfer(t.Context(), server.URL+"/gone", dest), "404")
-	require.Error(t, FetchKubernetesTransfer(t.Context(), server.URL+"/cut", dest))
+	t.Run("serves an offer once over TLS to the pod it was offered to", func(t *testing.T) {
+		request, done := server.offer([]string{"127.0.0.1"}, eventArchive(t))
+		defer done()
+		assert.True(t, strings.HasPrefix(request.URL, "https://127.0.0.1:"))
+		dest, err := fetch(t, request)
+		require.NoError(t, err)
+		content, err := os.ReadFile(filepath.Join(dest, "workflow", "event.json"))
+		require.NoError(t, err)
+		assert.JSONEq(t, `{"ref":"main"}`, string(content))
+		_, err = fetch(t, request)
+		require.ErrorContains(t, err, "404", "a token is good for one fetch")
+	})
+
+	t.Run("another pod can neither take nor block a copy", func(t *testing.T) {
+		request, done := server.offer([]string{"10.1.2.3"}, eventArchive(t))
+		defer done()
+		_, err := fetch(t, request) // from 127.0.0.1, not the job pod
+		require.ErrorContains(t, err, "404")
+		server.mu.Lock()
+		_, pending := server.pending[strings.TrimPrefix(request.URL, server.base)]
+		server.mu.Unlock()
+		assert.True(t, pending, "the job pod can still fetch it")
+	})
+
+	t.Run("a dual-stack job pod may fetch from either address", func(t *testing.T) {
+		request, done := server.offer([]string{"fd00::1", "127.0.0.1"}, eventArchive(t))
+		defer done()
+		_, err := fetch(t, request)
+		require.NoError(t, err)
+	})
+
+	t.Run("a finished copy is no longer served", func(t *testing.T) {
+		request, done := server.offer([]string{"127.0.0.1"}, eventArchive(t))
+		done()
+		_, err := fetch(t, request)
+		require.ErrorContains(t, err, "404")
+	})
+
+	t.Run("a failed write cuts the response short", func(t *testing.T) {
+		request, done := server.offer([]string{"127.0.0.1"}, func(w io.Writer) error {
+			_, _ = w.Write(make([]byte, 64<<10))
+			return errors.New("source gone")
+		})
+		defer done()
+		_, err := fetch(t, request)
+		require.Error(t, err)
+	})
+
+	t.Run("the helper only talks to the runner whose pin it got", func(t *testing.T) {
+		other, err := startTransferServer("127.0.0.1", freePort(t))
+		require.NoError(t, err)
+		require.NotEqual(t, server.pin, other.pin, "every runner has its own certificate")
+		request, done := other.offer([]string{"127.0.0.1"}, eventArchive(t))
+		defer done()
+		request.Pin = server.pin
+		_, err = fetch(t, request)
+		require.ErrorContains(t, err, "does not match the pin")
+
+		request.Pin = ""
+		_, err = fetch(t, request)
+		require.ErrorContains(t, err, "no certificate pin")
+	})
+
+	t.Run("the pin is the served certificate", func(t *testing.T) {
+		connection, err := tls.Dial("tcp", strings.TrimSuffix(strings.TrimPrefix(server.base, "https://"), transferPath), &tls.Config{InsecureSkipVerify: true}) //nolint:gosec // inspecting the self-signed certificate
+		require.NoError(t, err)
+		defer connection.Close()
+		sum := sha256.Sum256(connection.ConnectionState().PeerCertificates[0].Raw)
+		assert.Equal(t, hex.EncodeToString(sum[:]), server.pin)
+		assert.Equal(t, uint16(tls.VersionTLS13), connection.ConnectionState().Version)
+	})
+}
+
+func freePort(t *testing.T) uint16 {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer listener.Close()
+	return uint16(listener.Addr().(*net.TCPAddr).Port)
 }
 
 func TestInstallKubernetesTransferHelper(t *testing.T) {
@@ -157,7 +191,7 @@ func TestKubernetesPodCopiesOverPodNetwork(t *testing.T) {
 	ctx := t.Context()
 	workdir, err := filepath.EvalSymlinks(t.TempDir())
 	require.NoError(t, err)
-	kubeconfig, cluster := fakeKubernetes(t, `{"spec":{"containers":[{}]},"status":{"phase":"Running","containerStatuses":[
+	kubeconfig, cluster := fakeKubernetes(t, `{"spec":{"containers":[{}]},"status":{"phase":"Running","podIP":"127.0.0.1","containerStatuses":[
 		{"name":"job","ready":true,"state":{"running":{}}}]}}`, transferHelperEnv+"=1")
 	pod, err := NewKubernetesPod(KubernetesOptions{Kubeconfig: kubeconfig, Transfer: &KubernetesTransfer{
 		Host: "127.0.0.1", Image: "gitea/runner:latest", Binary: "/usr/local/bin/gitea-runner", Fallback: true,
@@ -190,7 +224,7 @@ func TestKubernetesPodCopiesOverPodNetwork(t *testing.T) {
 	assert.JSONEq(t, `{"ref":"main"}`, string(content))
 	execs := cluster.requests["exec"]
 	assert.Contains(t, execs[len(execs)-1], "command="+KubernetesTransferCommand)
-	assert.NotContains(t, execs[len(execs)-1], "stdin=true", "the files come over the pod network, not the exec stream")
+	assert.NotContains(t, execs[len(execs)-1], "transfer%2F", "the token goes over stdin, not into the command line and audit log")
 
 	unreachable := filepath.Join(workdir, "unreachable")
 	require.NoError(t, os.WriteFile(unreachable, []byte("#!/bin/sh\necho 'connection refused' >&2\nexit 1\n"), 0o755))
@@ -208,5 +242,10 @@ func TestKubernetesPodCopiesOverPodNetwork(t *testing.T) {
 	require.NoError(t, err, "auto falls back to the API server")
 	assert.Empty(t, pod.transferHelper, "and the pod stays on it")
 	execs = cluster.requests["exec"]
-	assert.Contains(t, execs[len(execs)-1], "stdin=true")
+	assert.NotContains(t, execs[len(execs)-1], "command="+KubernetesTransferCommand)
+
+	pod.transferHelper, pod.ips = os.Args[0], nil
+	pod.options.Transfer.Fallback = false
+	require.ErrorContains(t, job.Copy(workdir+"/act/", &FileEntry{Name: "workflow/third.json", Mode: 0o644, Body: `{}`})(ctx), "no IP",
+		"without the pod IP there is no one to serve the copy to")
 }

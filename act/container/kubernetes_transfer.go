@@ -5,16 +5,27 @@ package container
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,7 +37,7 @@ import (
 // KubernetesTransfer has job pods fetch the files the runner copies into them from the runner over the pod network,
 // instead of the runner streaming them through the API server, which costs cross-zone traffic and API server load.
 type KubernetesTransfer struct {
-	Host   string // address job pods reach the runner at, empty uses the outbound IP
+	Host   string // address the runner listens on and job pods reach it at, empty uses the outbound IP
 	Port   uint16 // 0 picks a free port
 	Image  string // image an init container copies Binary from into each job pod
 	Binary string // path of the runner binary in Image
@@ -39,10 +50,30 @@ const KubernetesTransferCommand = "kubernetes-transfer"
 
 const transferPath = "/transfer/"
 
+// transferRequest is what the runner hands the helper over the exec stream, which the API server protects with TLS,
+// so neither the token nor the pin shows in the exec command line or the API server audit log.
+type transferRequest struct {
+	URL string `json:"url"`
+	Pin string `json:"pin"` // hex SHA-256 of the runner's certificate, the only one the helper trusts
+}
+
+// transferServer serves each copy once over TLS with a certificate generated at start, to the job pod it was offered to.
 type transferServer struct {
 	base    string
+	pin     string
 	mu      sync.Mutex
-	pending map[string]func(io.Writer) error
+	pending map[string]transferOffer
+}
+
+type transferOffer struct {
+	clients []net.IP // IPs of the job pod, the only ones allowed to fetch
+	write   func(io.Writer) error
+}
+
+func (o transferOffer) allows(remoteAddr string) bool {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	remote := net.ParseIP(host)
+	return err == nil && remote != nil && slices.ContainsFunc(o.clients, remote.Equal)
 }
 
 var (
@@ -65,31 +96,75 @@ func startTransferServer(host string, port uint16) (*transferServer, error) {
 		}
 		host = ip.String()
 	}
-	listener, err := net.Listen("tcp", net.JoinHostPort("", strconv.Itoa(int(port))))
+	certificate, pin, err := transferCertificate(host)
+	if err != nil {
+		return nil, err
+	}
+	// Bound to the address job pods use, not every interface, so a host-network or out-of-cluster runner does not expose it further.
+	listener, err := net.Listen("tcp", net.JoinHostPort(host, strconv.Itoa(int(port))))
 	if err != nil {
 		return nil, fmt.Errorf("listen for job pod transfers: %w", err)
 	}
-	_, listenPort, err := net.SplitHostPort(listener.Addr().String())
-	if err != nil {
-		listener.Close()
-		return nil, err
-	}
 	server := &transferServer{
-		base:    "http://" + net.JoinHostPort(host, listenPort) + transferPath,
-		pending: map[string]func(io.Writer) error{},
+		base:    "https://" + listener.Addr().String() + transferPath,
+		pin:     pin,
+		pending: map[string]transferOffer{},
 	}
-	go func() { _ = (&http.Server{Handler: server, ReadHeaderTimeout: 10 * time.Second}).Serve(listener) }()
+	httpServer := &http.Server{
+		Handler:           server,
+		TLSConfig:         &tls.Config{Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS13},
+		ReadHeaderTimeout: 10 * time.Second, // requests are bodiless; no read or write timeout, a copy takes as long as it takes
+		IdleTimeout:       30 * time.Second,
+	}
+	go func() { _ = httpServer.ServeTLS(listener, "", "") }()
 	transferServers[key] = server
 	return server, nil
 }
 
-// offer serves write once at the returned URL, until done is called.
-func (s *transferServer) offer(write func(io.Writer) error) (url string, done func()) {
+// transferCertificate generates the server's self-signed certificate, trusted by its pin alone, so no CA is involved.
+func transferCertificate(host string) (tls.Certificate, string, error) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return tls.Certificate{}, "", err
+	}
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		return tls.Certificate{}, "", err
+	}
+	template := &x509.Certificate{
+		SerialNumber: serial,
+		Subject:      pkix.Name{CommonName: "gitea-runner transfer"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().AddDate(10, 0, 0), // lives as long as the runner process
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		template.IPAddresses = []net.IP{ip}
+	} else {
+		template.DNSNames = []string{host}
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		return tls.Certificate{}, "", err
+	}
+	sum := sha256.Sum256(der)
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}, hex.EncodeToString(sum[:]), nil
+}
+
+// offer serves write once to one of clients, the job pod's IPs, until done is called. It returns what the helper needs to fetch it.
+func (s *transferServer) offer(clients []string, write func(io.Writer) error) (request transferRequest, done func()) {
 	token := rand.Text()
+	offer := transferOffer{write: write}
+	for _, client := range clients {
+		if ip := net.ParseIP(client); ip != nil {
+			offer.clients = append(offer.clients, ip)
+		}
+	}
 	s.mu.Lock()
-	s.pending[token] = write
+	s.pending[token] = offer
 	s.mu.Unlock()
-	return s.base + token, func() {
+	return transferRequest{URL: s.base + token, Pin: s.pin}, func() {
 		s.mu.Lock()
 		delete(s.pending, token)
 		s.mu.Unlock()
@@ -103,30 +178,57 @@ func (s *transferServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mu.Lock()
-	write := s.pending[token]
-	delete(s.pending, token) // one fetch per offer, a token seen on the wire cannot be replayed
+	offer, ok := s.pending[token]
+	// Only the job pod it was offered to may take it, and without consuming it otherwise, so another pod can neither read nor block the copy.
+	ok = ok && offer.allows(r.RemoteAddr)
+	if ok {
+		delete(s.pending, token) // one fetch per offer
+	}
 	s.mu.Unlock()
-	if write == nil {
+	if !ok {
 		http.NotFound(w, r)
 		return
 	}
 	w.Header().Set("Content-Type", "application/x-tar")
-	if err := write(w); err != nil {
+	if err := offer.write(w); err != nil {
 		panic(http.ErrAbortHandler) // drop the connection so the helper sees a truncated body, not a short tar
 	}
 }
 
-// FetchKubernetesTransfer is the job pod side: it extracts the tar stream at url into dest, as the API server path's `tar -xf -` does.
-func FetchKubernetesTransfer(ctx context.Context, url, dest string) error {
+// FetchKubernetesTransfer is the job pod side: it reads a transferRequest from request,
+// and extracts the tar stream it points to into dest, as the API server path's `tar -xf -` does.
+func FetchKubernetesTransfer(ctx context.Context, request io.Reader, dest string) error {
+	var transfer transferRequest
+	if err := json.NewDecoder(request).Decode(&transfer); err != nil {
+		return fmt.Errorf("read transfer request: %w", err)
+	}
+	if transfer.Pin == "" {
+		return errors.New("transfer request has no certificate pin")
+	}
 	client := &http.Client{Transport: &http.Transport{
-		DialContext:           (&net.Dialer{Timeout: 10 * time.Second}).DialContext, // fail fast so the runner falls back to the API server
+		DialContext:           (&net.Dialer{Timeout: 10 * time.Second}).DialContext, // fail fast, auto mode then uses the API server
 		ResponseHeaderTimeout: time.Minute,
+		TLSClientConfig: &tls.Config{
+			MinVersion: tls.VersionTLS13,
+			// The certificate is self-signed and verified against the pin below instead of a CA.
+			InsecureSkipVerify: true, //nolint:gosec // VerifyConnection pins the certificate
+			VerifyConnection: func(state tls.ConnectionState) error {
+				if len(state.PeerCertificates) == 0 {
+					return errors.New("runner sent no certificate")
+				}
+				sum := sha256.Sum256(state.PeerCertificates[0].Raw)
+				if subtle.ConstantTimeCompare([]byte(hex.EncodeToString(sum[:])), []byte(transfer.Pin)) != 1 {
+					return errors.New("runner certificate does not match the pin")
+				}
+				return nil
+			},
+		},
 	}}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodGet, transfer.URL, nil)
 	if err != nil {
 		return err
 	}
-	response, err := client.Do(request)
+	response, err := client.Do(httpRequest)
 	if err != nil {
 		return err
 	}

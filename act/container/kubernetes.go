@@ -9,6 +9,7 @@ import (
 	"cmp"
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -47,6 +48,7 @@ type KubernetesPod struct {
 	job              *kubernetesContainer
 	services         []*kubernetesContainer
 	arch, path       string
+	ips              []string // the pod IPs, the only addresses its transfers are served to
 	transfer         *transferServer
 	transferImage    string
 	transferHelper   string // the runner binary in the job pod, empty when copies go through the API server
@@ -77,7 +79,8 @@ type containerStatus struct {
 type podStatus struct {
 	Spec   struct{ Containers []struct{} }
 	Status struct {
-		Phase, Reason, Message                   string
+		Phase, Reason, Message, PodIP            string
+		PodIPs                                   []struct{ IP string }
 		Conditions                               []struct{ Type, Status, Message string }
 		InitContainerStatuses, ContainerStatuses []containerStatus
 	}
@@ -376,6 +379,10 @@ func (p *KubernetesPod) waitStarted(ctx context.Context) error {
 			}
 		}
 		if started {
+			p.ips = []string{pod.Status.PodIP}
+			for _, ip := range pod.Status.PodIPs { // both families on a dual-stack cluster
+				p.ips = append(p.ips, ip.IP)
+			}
 			return nil
 		}
 		for _, condition := range pod.Status.Conditions {
@@ -476,10 +483,16 @@ func (c *kubernetesContainer) Exec(command []string, env map[string]string, _, w
 
 func (c *kubernetesContainer) extract(ctx context.Context, destPath string, write func(io.Writer) error) error {
 	if c.pod.transferHelper != "" {
-		url, done := c.pod.transfer.offer(write)
+		var err error
 		var stderr bytes.Buffer
-		err := c.pod.client.exec(ctx, c.pod.name, c.name, []string{c.pod.transferHelper, KubernetesTransferCommand, "fetch", url, destPath}, nil, io.Discard, &stderr)
-		done()
+		if !slices.ContainsFunc(c.pod.ips, func(ip string) bool { return ip != "" }) {
+			err = errors.New("the job pod has no IP to serve it to")
+		} else {
+			request, done := c.pod.transfer.offer(c.pod.ips, write)
+			stdin, _ := json.Marshal(request)
+			err = c.pod.client.exec(ctx, c.pod.name, c.name, []string{c.pod.transferHelper, KubernetesTransferCommand, "fetch", destPath}, bytes.NewReader(stdin), io.Discard, &stderr)
+			done()
+		}
 		if err == nil || ctx.Err() != nil {
 			return err
 		}
