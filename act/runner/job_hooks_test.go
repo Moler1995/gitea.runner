@@ -78,7 +78,7 @@ func (c *hookContainer) GetContainerArchive(context.Context, string) (io.ReadClo
 // newHookRunContext returns a RunContext and the context to run a hook with, whose logger is
 // silenced so the hook's job-log output does not reach the test output.
 func newHookRunContext(jobContainer *hookContainer, config *Config) (*RunContext, context.Context) {
-	// Env is left nil so that it is built from the config, as it is for a real job.
+	config.PresetGitHubContext = &model.GithubContext{}
 	rc := &RunContext{
 		Config:       config,
 		Run:          &model.Run{JobID: "job", Workflow: &model.Workflow{Jobs: map[string]*model.Job{"job": {}}}},
@@ -91,14 +91,28 @@ func newHookRunContext(jobContainer *hookContainer, config *Config) (*RunContext
 }
 
 func TestRunJobHook(t *testing.T) {
-	t.Run("runs the hook with the job environment", func(t *testing.T) {
-		jobContainer := &hookContainer{}
+	t.Run("runs the hook with the job environment after its closed header group", func(t *testing.T) {
+		jobContainer := &hookContainer{output: "from the hook\n"}
 		rc, ctx := newHookRunContext(jobContainer, &Config{
 			JobStartedHook: "/hooks/started.sh",
 			Env:            map[string]string{"A_VAR": "value", jobStartedHookEnv: "/from/env.sh"},
 		})
+		records := logtest.New()
+		ctx = common.WithLogger(ctx, logging.New(records))
 
 		require.NoError(t, rc.runJobStartedHook(ctx))
+
+		var lines []string
+		for _, record := range records.AllRecords() {
+			lines = append(lines, record.Message)
+		}
+		assert.Equal(t, []string{
+			"A job started hook has been configured by the runner administrator",
+			"::group::Run '/hooks/started.sh'",
+			"shell: bash -e {0}",
+			"::endgroup::",
+			"from the hook\n",
+		}, lines)
 
 		// The setting wins over the environment variable.
 		assert.Equal(t, []string{"bash", "-e", "/hooks/started.sh"}, jobContainer.cmd)
