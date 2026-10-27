@@ -51,18 +51,26 @@ Job pods mount no service account token unless the template sets `automountServi
 
 ## Copying files over the pod network
 
-The runner copies files into the job container, such as the actions a step uses, with `tar` over `pods/exec`. That data goes through the API server, which on a managed cluster sits in other zones than the nodes and is billed as cross-zone traffic, twice per byte. With `transfer` the job container fetches the files from the runner pod instead:
+The runner copies files into the job container, such as the actions a step uses, with `tar` over `pods/exec`. That data goes through the API server, which on a managed cluster sits in other zones than the nodes and is billed as cross-zone traffic, twice per byte. With `transfer.mode` set to `auto` or `direct` the job container fetches the files from the runner pod instead:
 
 ```yaml
 kubernetes:
   transfer:
-    enabled: true
+    mode: direct # api (default), auto or direct
     host: "" # address job pods reach the runner at, defaults to its outbound IP, the pod IP in a cluster
     port: 0 # port it listens on, defaults to a free one
     image: "" # image holding the runner binary at the runner's own path, defaults to the runner pod's image if it has one container
 ```
 
-Each job pod then gets an init container from `image` that copies the runner binary into the `act` volume, and every copy is fetched with it from a one-time URL on the runner over plain HTTP. A job pod that cannot reach the runner, for example because of a NetworkPolicy, gets its copies through the API server again, after one failed attempt. Copies out of the job container and step output still go through the API server. Job pods need to be able to pull `image`, so a private one needs `imagePullSecrets` in `pod_template`. The init container is named `gitea-runner-transfer`, an `initContainers` entry of that name in `pod_template` merges into it, for example to set its `securityContext` or `resources`.
+Each job pod then gets an init container from `image` that copies the runner binary into the `act` volume, and every copy is fetched with it from a one-time URL on the runner over plain HTTP. The modes differ in what happens when that does not work, for example when a NetworkPolicy keeps job pods from reaching the runner, or the runner pod has several containers and no `image` is set:
+
+| Mode | Copies | When the pod network does not work |
+|---|---|---|
+| `api` | through the API server | not used |
+| `auto` | over the pod network | the job pod gets its copies through the API server, after one failed attempt, and a warning is logged |
+| `direct` | over the pod network | the job fails, so a broken setup shows instead of quietly costing API server traffic again |
+
+ Copies out of the job container and step output still go through the API server. Job pods need to be able to pull `image`, so a private one needs `imagePullSecrets` in `pod_template`. The init container is named `gitea-runner-transfer`, an `initContainers` entry of that name in `pod_template` merges into it, for example to set its `securityContext` or `resources`.
 
 ## Services
 

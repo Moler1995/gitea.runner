@@ -148,7 +148,9 @@ func (p *KubernetesPod) create(ctx context.Context) error {
 			common.Logger(ctx).Debugf("The runner is not pod %s, job pods get no owner: %v", hostname, err)
 		}
 	}
-	p.setupTransfer(ctx, runnerImages)
+	if err := p.setupTransfer(ctx, runnerImages); err != nil {
+		return err
+	}
 	secretData := map[string]string{}
 	manifest, err := p.manifest(name, secretData, metadata)
 	if err != nil {
@@ -480,6 +482,9 @@ func (c *kubernetesContainer) extract(ctx context.Context, destPath string, writ
 		done()
 		if err == nil || ctx.Err() != nil {
 			return err
+		}
+		if !c.pod.options.Transfer.Fallback {
+			return fmt.Errorf("copy to %s over the pod network: %w: %s", destPath, err, strings.TrimSpace(stderr.String()))
 		}
 		c.pod.transferHelper = "" // a pod that cannot reach the runner once will not later, skip the connect timeout
 		common.Logger(ctx).Warnf("Copying to %s over the pod network failed, copying through the API server instead: %v: %s", destPath, err, strings.TrimSpace(stderr.String()))

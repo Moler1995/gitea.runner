@@ -415,9 +415,12 @@ func (r *Runner) kubernetesOptions(runsOn []string) container.KubernetesOptions 
 		PodTemplates: []map[string]any{r.cfg.Kubernetes.PodTemplate},
 		RunnerUUID:   r.uuid,
 	}
-	if transfer := r.cfg.Kubernetes.Transfer; transfer.Enabled {
+	if transfer := r.cfg.Kubernetes.Transfer; transfer.Mode == config.KubernetesTransferModeAuto || transfer.Mode == config.KubernetesTransferModeDirect {
 		binary, _ := os.Executable() // the image runs the runner at the same path as this process
-		options.Transfer = &container.KubernetesTransfer{Host: transfer.Host, Port: transfer.Port, Image: transfer.Image, Binary: binary}
+		options.Transfer = &container.KubernetesTransfer{
+			Host: transfer.Host, Port: transfer.Port, Image: transfer.Image, Binary: binary,
+			Fallback: transfer.Mode == config.KubernetesTransferModeAuto,
+		}
 	}
 	names := r.labels.Names()
 	for index, name := range runsOn {

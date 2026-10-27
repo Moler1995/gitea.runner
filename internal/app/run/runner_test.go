@@ -278,11 +278,14 @@ func TestRunnerKubernetesOptionsLayerTheLabelPodTemplatesInRunsOnOrder(t *testin
 
 func TestRunnerKubernetesOptionsTransfer(t *testing.T) {
 	r := &Runner{cfg: &config.Config{}}
+	r.cfg.Kubernetes.Transfer = config.KubernetesTransfer{Mode: config.KubernetesTransferModeAPI, Host: "10.0.0.5", Port: 4000, Image: "gitea/runner:latest"}
 	require.Nil(t, r.kubernetesOptions(nil).Transfer)
 
-	r.cfg.Kubernetes.Transfer = config.KubernetesTransfer{Enabled: true, Host: "10.0.0.5", Port: 4000, Image: "gitea/runner:latest"}
 	executable, err := os.Executable()
 	require.NoError(t, err)
+	r.cfg.Kubernetes.Transfer.Mode = config.KubernetesTransferModeAuto
+	require.Equal(t, &container.KubernetesTransfer{Host: "10.0.0.5", Port: 4000, Image: "gitea/runner:latest", Binary: executable, Fallback: true}, r.kubernetesOptions(nil).Transfer)
+	r.cfg.Kubernetes.Transfer.Mode = config.KubernetesTransferModeDirect
 	require.Equal(t, &container.KubernetesTransfer{Host: "10.0.0.5", Port: 4000, Image: "gitea/runner:latest", Binary: executable}, r.kubernetesOptions(nil).Transfer)
 }
 

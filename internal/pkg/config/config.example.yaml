@@ -308,8 +308,11 @@ kubernetes:
   #pod_templates: {}
   # Have job pods fetch the files the runner copies into them, such as actions, from the runner over the pod network,
   # instead of the runner streaming them through the API server. An init container copies the runner binary into each job pod.
+  # api: through the API server (default). auto: over the pod network, through the API server for a job pod that
+  # cannot reach the runner. direct: over the pod network only, so a broken setup fails jobs instead of quietly
+  # costing API server traffic again.
   #transfer:
-  #  enabled: false
+  #  mode: api
   #  # Address and port job pods reach the runner at, the outbound IP and a free port when empty.
   #  host: ""
   #  port: 0

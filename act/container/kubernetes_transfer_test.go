@@ -125,24 +125,29 @@ func TestInstallKubernetesTransferHelper(t *testing.T) {
 }
 
 func TestKubernetesPodTransferImage(t *testing.T) {
-	newPod := func(image string) *KubernetesPod {
-		pod := &KubernetesPod{options: KubernetesOptions{Transfer: &KubernetesTransfer{Host: "127.0.0.1", Image: image, Binary: "/usr/local/bin/gitea-runner"}}}
+	newPod := func(image string, fallback bool) *KubernetesPod {
+		pod := &KubernetesPod{options: KubernetesOptions{Transfer: &KubernetesTransfer{Host: "127.0.0.1", Image: image, Binary: "/usr/local/bin/gitea-runner", Fallback: fallback}}}
 		pod.JobContainer(&NewContainerInput{})
 		return pod
 	}
 
-	pod := newPod("")
-	pod.setupTransfer(t.Context(), []string{"gitea/runner:latest"})
+	pod := newPod("", false)
+	require.NoError(t, pod.setupTransfer(t.Context(), []string{"gitea/runner:latest"}))
 	assert.Equal(t, "gitea/runner:latest", pod.transferImage, "a single-container runner pod's image holds the binary")
 	assert.Equal(t, "/var/run/act/bin/gitea-runner", pod.transferHelper)
 
-	pod = newPod("")
-	pod.setupTransfer(t.Context(), []string{"gitea/runner:latest", "sidecar"})
-	assert.Empty(t, pod.transferHelper, "with several containers the image must be configured")
-
-	pod = newPod("registry.example/runner:1")
-	pod.setupTransfer(t.Context(), []string{"gitea/runner:latest", "sidecar"})
+	pod = newPod("registry.example/runner:1", false)
+	require.NoError(t, pod.setupTransfer(t.Context(), []string{"gitea/runner:latest", "sidecar"}))
 	assert.Equal(t, "registry.example/runner:1", pod.transferImage)
+
+	pod = newPod("", true)
+	require.NoError(t, pod.setupTransfer(t.Context(), []string{"gitea/runner:latest", "sidecar"}))
+	assert.Empty(t, pod.transferHelper, "auto leaves a runner pod with several containers and no image on the API server")
+
+	pod = newPod("", false)
+	require.ErrorContains(t, pod.setupTransfer(t.Context(), []string{"gitea/runner:latest", "sidecar"}), "kubernetes.transfer.image",
+		"direct fails the job rather than quietly using the API server")
+	assert.Empty(t, pod.transferHelper)
 }
 
 func TestKubernetesPodCopiesOverPodNetwork(t *testing.T) {
@@ -155,7 +160,7 @@ func TestKubernetesPodCopiesOverPodNetwork(t *testing.T) {
 	kubeconfig, cluster := fakeKubernetes(t, `{"spec":{"containers":[{}]},"status":{"phase":"Running","containerStatuses":[
 		{"name":"job","ready":true,"state":{"running":{}}}]}}`, transferHelperEnv+"=1")
 	pod, err := NewKubernetesPod(KubernetesOptions{Kubeconfig: kubeconfig, Transfer: &KubernetesTransfer{
-		Host: "127.0.0.1", Image: "gitea/runner:latest", Binary: "/usr/local/bin/gitea-runner",
+		Host: "127.0.0.1", Image: "gitea/runner:latest", Binary: "/usr/local/bin/gitea-runner", Fallback: true,
 	}})
 	require.NoError(t, err)
 	job := pod.JobContainer(&NewContainerInput{Name: "job", Image: "node", WorkingDir: workdir, Stdout: io.Discard, Stderr: io.Discard})
@@ -190,9 +195,17 @@ func TestKubernetesPodCopiesOverPodNetwork(t *testing.T) {
 	unreachable := filepath.Join(workdir, "unreachable")
 	require.NoError(t, os.WriteFile(unreachable, []byte("#!/bin/sh\necho 'connection refused' >&2\nexit 1\n"), 0o755))
 	pod.transferHelper = unreachable
+	pod.options.Transfer.Fallback = false
+	err = job.Copy(workdir+"/act/", &FileEntry{Name: "workflow/other.json", Mode: 0o644, Body: `{}`})(ctx)
+	require.ErrorContains(t, err, "connection refused", "direct fails the copy")
+	assert.Equal(t, unreachable, pod.transferHelper)
+	_, err = os.Stat(filepath.Join(workdir, "act", "workflow", "other.json"))
+	require.ErrorIs(t, err, os.ErrNotExist)
+
+	pod.options.Transfer.Fallback = true
 	require.NoError(t, job.Copy(workdir+"/act/", &FileEntry{Name: "workflow/other.json", Mode: 0o644, Body: `{}`})(ctx))
 	_, err = os.Stat(filepath.Join(workdir, "act", "workflow", "other.json"))
-	require.NoError(t, err, "a failed transfer falls back to the API server")
+	require.NoError(t, err, "auto falls back to the API server")
 	assert.Empty(t, pod.transferHelper, "and the pod stays on it")
 	execs = cluster.requests["exec"]
 	assert.Contains(t, execs[len(execs)-1], "stdin=true")

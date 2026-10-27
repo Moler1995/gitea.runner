@@ -30,6 +30,8 @@ type KubernetesTransfer struct {
 	Port   uint16 // 0 picks a free port
 	Image  string // image an init container copies Binary from into each job pod
 	Binary string // path of the runner binary in Image
+	// Fallback copies through the API server for a job pod that cannot reach the runner, else such a copy, or a pod the transfer cannot be set up for, fails.
+	Fallback bool
 }
 
 // KubernetesTransferCommand is the hidden runner subcommand job pods run the transfer helper with.
@@ -177,25 +179,32 @@ func InstallKubernetesTransferHelper(dir string) error {
 	return errors.Join(err, target.Close())
 }
 
-// setupTransfer turns on transfers for the pod, defaulting the image to the runner pod's only one, else leaves copies to the API server.
-func (p *KubernetesPod) setupTransfer(ctx context.Context, runnerImages []string) {
+// setupTransfer turns on transfers for the pod, defaulting the image to the runner pod's only one.
+// When that is not possible it leaves copies to the API server, or fails without Fallback.
+func (p *KubernetesPod) setupTransfer(ctx context.Context, runnerImages []string) error {
 	settings := p.options.Transfer
 	if settings == nil {
-		return
+		return nil
 	}
 	image := settings.Image
 	if image == "" && len(runnerImages) == 1 {
 		image = runnerImages[0]
 	}
+	var err error
+	var server *transferServer
 	if image == "" || settings.Binary == "" {
-		common.Logger(ctx).Warnf("Job pod copies go through the API server: set kubernetes.transfer.image, as the runner pod has %d containers to take the runner binary from", len(runnerImages))
-		return
+		err = fmt.Errorf("set kubernetes.transfer.image, the runner pod has %d containers to take the runner binary from", len(runnerImages))
+	} else {
+		server, err = startTransferServer(settings.Host, settings.Port)
 	}
-	server, err := startTransferServer(settings.Host, settings.Port)
 	if err != nil {
+		if !settings.Fallback {
+			return fmt.Errorf("kubernetes.transfer: %w", err)
+		}
 		common.Logger(ctx).Warnf("Job pod copies go through the API server: %v", err)
-		return
+		return nil
 	}
 	p.transfer, p.transferImage = server, image
 	p.transferHelper = path.Join(p.job.GetActPath(), "bin", path.Base(settings.Binary))
+	return nil
 }
