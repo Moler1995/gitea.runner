@@ -210,6 +210,15 @@ type Kubernetes struct {
 	Namespace    string                    `yaml:"namespace"`     // Namespace of job pods, empty uses the service account's, else the kubeconfig context's, else default.
 	PodTemplate  map[string]any            `yaml:"pod_template"`  // PodTemplate is a pod manifest the runner merges its own onto.
 	PodTemplates map[string]map[string]any `yaml:"pod_templates"` // PodTemplates are merged over PodTemplate, in runs-on order, for jobs whose runs-on has the label they are keyed by.
+	Transfer     KubernetesTransfer        `yaml:"transfer"`      // Transfer has job pods fetch copied files from the runner over the pod network instead of through the API server.
+}
+
+// KubernetesTransfer configures copying files into job pods over the pod network.
+type KubernetesTransfer struct {
+	Enabled bool   `yaml:"enabled"` // Enabled turns transfers on, the runner falls back to the API server for a job pod that cannot reach it.
+	Host    string `yaml:"host"`    // Host is the address job pods reach the runner at, empty uses the outbound IP.
+	Port    uint16 `yaml:"port"`    // Port the runner listens on for job pods, 0 picks a free one.
+	Image   string `yaml:"image"`   // Image holds the runner binary at the runner's own path, empty uses the image of a single-container runner pod.
 }
 
 // Metrics represents the configuration for the Prometheus metrics endpoint.

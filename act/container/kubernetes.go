@@ -36,6 +36,7 @@ type KubernetesOptions struct {
 	MaxLifetime  time.Duration
 	ForcePull    bool
 	RunnerUUID   string
+	Transfer     *KubernetesTransfer // nil streams copies through the API server
 }
 
 // KubernetesPod runs a job container and its service containers as one pod.
@@ -46,6 +47,9 @@ type KubernetesPod struct {
 	job              *kubernetesContainer
 	services         []*kubernetesContainer
 	arch, path       string
+	transfer         *transferServer
+	transferImage    string
+	transferHelper   string // the runner binary in the job pod, empty when copies go through the API server
 }
 
 type kubernetesContainer struct {
@@ -129,14 +133,22 @@ func (p *KubernetesPod) create(ctx context.Context) error {
 		labels[runnerUUIDLabel] = p.options.RunnerUUID
 	}
 	metadata := map[string]any{"name": name, "labels": labels}
+	var runnerImages []string
 	if hostname, err := os.Hostname(); p.client.inCluster && err == nil {
-		var runner struct{ Metadata struct{ Name, UID string } }
+		var runner struct {
+			Metadata struct{ Name, UID string }
+			Spec     struct{ Containers []struct{ Image string } }
+		}
 		if err := p.client.do(ctx, http.MethodGet, p.client.path("pods/"+hostname), nil, &runner); err == nil {
 			metadata["ownerReferences"] = []any{map[string]any{"apiVersion": "v1", "kind": "Pod", "name": runner.Metadata.Name, "uid": runner.Metadata.UID}}
+			for _, container := range runner.Spec.Containers {
+				runnerImages = append(runnerImages, container.Image)
+			}
 		} else {
 			common.Logger(ctx).Debugf("The runner is not pod %s, job pods get no owner: %v", hostname, err)
 		}
 	}
+	p.setupTransfer(ctx, runnerImages)
 	secretData := map[string]string{}
 	manifest, err := p.manifest(name, secretData, metadata)
 	if err != nil {
@@ -205,6 +217,14 @@ func (p *KubernetesPod) manifest(secret string, secretData map[string]string, me
 		}
 	}
 	spec := map[string]any{"restartPolicy": "Never", "containers": containers, "volumes": volumes}
+	if p.transferHelper != "" {
+		actPath := p.job.GetActPath()
+		spec["initContainers"] = []any{map[string]any{
+			"name": "gitea-runner-transfer", "image": p.transferImage,
+			"command":      []string{p.options.Transfer.Binary, KubernetesTransferCommand, "install", path.Dir(p.transferHelper)},
+			"volumeMounts": []any{map[string]any{"name": "act", "mountPath": actPath}},
+		}}
+	}
 	if len(hostnames) > 0 {
 		spec["hostAliases"] = []any{map[string]any{"ip": "127.0.0.1", "hostnames": hostnames}}
 	}
@@ -453,6 +473,17 @@ func (c *kubernetesContainer) Exec(command []string, env map[string]string, _, w
 }
 
 func (c *kubernetesContainer) extract(ctx context.Context, destPath string, write func(io.Writer) error) error {
+	if c.pod.transferHelper != "" {
+		url, done := c.pod.transfer.offer(write)
+		var stderr bytes.Buffer
+		err := c.pod.client.exec(ctx, c.pod.name, c.name, []string{c.pod.transferHelper, KubernetesTransferCommand, "fetch", url, destPath}, nil, io.Discard, &stderr)
+		done()
+		if err == nil || ctx.Err() != nil {
+			return err
+		}
+		c.pod.transferHelper = "" // a pod that cannot reach the runner once will not later, skip the connect timeout
+		common.Logger(ctx).Warnf("Copying to %s over the pod network failed, copying through the API server instead: %v: %s", destPath, err, strings.TrimSpace(stderr.String()))
+	}
 	reader, writer := io.Pipe()
 	defer reader.Close()
 	go func() { writer.CloseWithError(write(writer)) }()

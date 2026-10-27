@@ -49,6 +49,21 @@ A job with `runs-on: [linux, gpu]` gets the `linux` and then the `gpu` entry of 
 
 Job pods mount no service account token unless the template sets `automountServiceAccountToken: true`. Job pods and their Secrets are labeled `app.kubernetes.io/managed-by: gitea-runner` and `com.gitea.runner.uuid: <runner UUID>`. The idle cleanup removes those the runner did not get to remove, once they are older than `runner.workdir_cleanup_age`.
 
+## Copying files over the pod network
+
+The runner copies files into the job container, such as the actions a step uses, with `tar` over `pods/exec`. That data goes through the API server, which on a managed cluster sits in other zones than the nodes and is billed as cross-zone traffic, twice per byte. With `transfer` the job container fetches the files from the runner pod instead:
+
+```yaml
+kubernetes:
+  transfer:
+    enabled: true
+    host: "" # address job pods reach the runner at, defaults to its outbound IP, the pod IP in a cluster
+    port: 0 # port it listens on, defaults to a free one
+    image: "" # image holding the runner binary at the runner's own path, defaults to the runner pod's image if it has one container
+```
+
+Each job pod then gets an init container from `image` that copies the runner binary into the `act` volume, and every copy is fetched with it from a one-time URL on the runner over plain HTTP. A job pod that cannot reach the runner, for example because of a NetworkPolicy, gets its copies through the API server again, after one failed attempt. Copies out of the job container and step output still go through the API server. Job pods need to be able to pull `image`, so a private one needs `imagePullSecrets` in `pod_template`. The init container is named `gitea-runner-transfer`, an `initContainers` entry of that name in `pod_template` merges into it, for example to set its `securityContext` or `resources`.
+
 ## Services
 
 Services share the pod's network, so a step reaches one by its id or `localhost`, and two services cannot listen on the same port. An id that is not a valid hostname is sanitized, so `my_db` is reached as `my-db`. Pass secrets to services through `env`, as `command` is visible in the pod spec. Of `options`, only `--health-*` is supported. They become a startup probe with Docker's defaults, which stops a service that fails its retries, so the job fails as on Docker.

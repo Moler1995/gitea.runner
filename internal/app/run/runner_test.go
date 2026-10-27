@@ -20,6 +20,7 @@ import (
 
 	"gitea.com/gitea/runner/act/common"
 	"gitea.com/gitea/runner/act/common/logging"
+	"gitea.com/gitea/runner/act/container"
 	"gitea.com/gitea/runner/act/runner"
 	clientmocks "gitea.com/gitea/runner/internal/pkg/client/mocks"
 	"gitea.com/gitea/runner/internal/pkg/config"
@@ -273,6 +274,16 @@ func TestRunnerKubernetesOptionsLayerTheLabelPodTemplatesInRunsOnOrder(t *testin
 	r := &Runner{cfg: cfg, labels: labels.Labels{{Name: "linux"}, {Name: "gpu"}, {Name: "large"}}}
 
 	require.Equal(t, []map[string]any{{"base": true}, {"large": true}, {"gpu": true}}, r.kubernetesOptions([]string{"linux", "large", "other", "gpu", "large"}).PodTemplates)
+}
+
+func TestRunnerKubernetesOptionsTransfer(t *testing.T) {
+	r := &Runner{cfg: &config.Config{}}
+	require.Nil(t, r.kubernetesOptions(nil).Transfer)
+
+	r.cfg.Kubernetes.Transfer = config.KubernetesTransfer{Enabled: true, Host: "10.0.0.5", Port: 4000, Image: "gitea/runner:latest"}
+	executable, err := os.Executable()
+	require.NoError(t, err)
+	require.Equal(t, &container.KubernetesTransfer{Host: "10.0.0.5", Port: 4000, Image: "gitea/runner:latest", Binary: executable}, r.kubernetesOptions(nil).Transfer)
 }
 
 // Proxy variables are assembled per task, because a job's service containers have to be
