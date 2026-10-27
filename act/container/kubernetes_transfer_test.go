@@ -103,7 +103,7 @@ func TestTransferServer(t *testing.T) {
 
 	t.Run("a failed write cuts the response short", func(t *testing.T) {
 		request, done := server.offer([]string{"127.0.0.1"}, func(w io.Writer) error {
-			_, _ = w.Write(make([]byte, 64<<10))
+			_, _ = w.Write(make([]byte, 64<<10)) // zero blocks GNU tar takes for the end of the archive before the cut
 			return errors.New("source gone")
 		})
 		defer done()

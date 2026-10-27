@@ -242,7 +242,9 @@ func FetchKubernetesTransfer(ctx context.Context, request io.Reader, dest string
 	body := &errorReader{reader: response.Body}
 	cmd := exec.CommandContext(ctx, "tar", "-xf", "-", "-C", dest)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = body, os.Stderr, os.Stderr
-	return errors.Join(body.err, cmd.Run())
+	err = cmd.Run()
+	_, _ = io.Copy(io.Discard, body) // tar stops at the first zero blocks, read on so a cut-off response still fails
+	return errors.Join(body.err, err)
 }
 
 // errorReader keeps the body's read error, which tar may hide by stopping at a block boundary.
