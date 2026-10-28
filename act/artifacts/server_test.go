@@ -28,6 +28,7 @@ func TestArtifactFlow(t *testing.T) {
 	router := http.NewServeMux()
 	uploads(router, artifactPath)
 	downloads(router, artifactPath)
+	registerV4(router, artifactPath)
 	server := httptest.NewServer(router)
 	defer server.Close()
 
@@ -173,6 +174,65 @@ func TestArtifactFlow(t *testing.T) {
 		status, data = request(t, http.MethodGet, baseURL+"/artifact/"+runID+"/escape.txt", nil, nil)
 		require.Equal(t, http.StatusOK, status)
 		require.Equal(t, content, string(data))
+	})
+
+	t.Run("v4", func(t *testing.T) {
+		call := func(method, body string) (int, map[string]any) {
+			status, data := request(t, http.MethodPost, baseURL+artifactServicePath+"/"+method, strings.NewReader(body), nil)
+			var out map[string]any
+			require.NoError(t, json.Unmarshal(data, &out), string(data))
+			return status, out
+		}
+		put := func(rawURL, body string) int {
+			status, _ := request(t, http.MethodPut, rawURL, strings.NewReader(body), nil)
+			return status
+		}
+
+		status, created := call("CreateArtifact", `{"workflow_run_backend_id":"7","name":"50% art"}`)
+		require.Equal(t, http.StatusOK, status, created)
+		upload := created["signedUploadUrl"].(string)
+		require.Equal(t, http.StatusCreated, put(upload+"&comp=block&blockid=Yg", "world"))
+		require.Equal(t, http.StatusCreated, put(upload+"&comp=block&blockid=YQ", "hello "))
+		status, _ = call("CreateArtifact", `{"workflow_run_backend_id":"7","name":"50% art"}`)
+		require.Equal(t, http.StatusConflict, status)
+		for attempt := range 2 {
+			require.Equal(t, http.StatusCreated, put(upload+"&comp=blocklist", `<?xml version="1.0"?><BlockList><Latest>YQ</Latest><Latest>Yg</Latest></BlockList>`), "commit attempt %d", attempt)
+		}
+
+		digest := "sha256:b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+		status, _ = call("FinalizeArtifact", `{"workflow_run_backend_id":"7","name":"50% art","size":"10"}`)
+		require.Equal(t, http.StatusBadRequest, status)
+		status, finalized := call("FinalizeArtifact", `{"workflow_run_backend_id":"7","name":"50% art","size":"11","hash":"`+digest+`"}`)
+		require.Equal(t, http.StatusOK, status, finalized)
+		id := finalized["artifactId"].(string)
+
+		status, listed := call("ListArtifacts", `{"workflowRunBackendId":"7","idFilter":"`+id+`"}`)
+		require.Equal(t, http.StatusOK, status)
+		artifacts := listed["artifacts"].([]any)
+		require.Len(t, artifacts, 1)
+		artifact := artifacts[0].(map[string]any)
+		require.Regexp(t, `^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$`, artifact["createdAt"])
+		delete(artifact, "createdAt")
+		require.Equal(t, map[string]any{"workflowRunBackendId": "7", "name": "50% art", "size": "11", "digest": digest, "databaseId": id}, artifact)
+		_, other := call("ListArtifacts", `{"workflow_run_backend_id":"8"}`)
+		require.Empty(t, other["artifacts"])
+
+		status, signed := call("GetSignedArtifactURL", `{"workflow_run_backend_id":"7","name":"50% art"}`)
+		require.Equal(t, http.StatusOK, status)
+		resp, err := client.Get(signed["signedUrl"].(string))
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		require.Equal(t, "hello world", string(body))
+		require.Equal(t, "application/zip", resp.Header.Get("Content-Type"))
+		require.Equal(t, "attachment; filename*=UTF-8''50%25%20art.zip", resp.Header.Get("Content-Disposition"))
+
+		status, _ = call("DeleteArtifact", `{"workflow_run_backend_id":"7","name":"50% art"}`)
+		require.Equal(t, http.StatusOK, status)
+		status, missing := call("GetSignedArtifactURL", `{"workflow_run_backend_id":"7","name":"50% art"}`)
+		require.Equal(t, http.StatusNotFound, status)
+		require.Equal(t, "not_found", missing["code"])
 	})
 }
 

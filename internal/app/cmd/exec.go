@@ -208,14 +208,6 @@ func parseKVAndFile(rawKVs []string, filePath string) map[string]string {
 	return result
 }
 
-// artifactServerURL is empty when the artifact server does not start.
-func (i *executeArgs) artifactServerURL() string {
-	if i.artifactServerPath == "" {
-		return ""
-	}
-	return "http://" + net.JoinHostPort(i.artifactServerAddr, i.artifactServerPort)
-}
-
 // Workdir returns path to workdir
 func (i *executeArgs) Workdir() string {
 	return i.resolve(".")
@@ -496,11 +488,11 @@ func runExec(ctx context.Context, execArgs *executeArgs) func(cmd *cobra.Command
 			actionsRuntimeToken = os.Getenv(actionsRuntimeTokenEnvName)
 		}
 		if actionsRuntimeToken == "" {
-			actionsRuntimeToken = artifacts.LocalRuntimeToken(cmp.Or(env["GITHUB_RUN_ID"], "1"))
+			actionsRuntimeToken = artifacts.LocalRuntimeToken(cmp.Or(env["GITHUB_RUN_ID"], "1"), maxLifetime)
 			env[actionsRuntimeTokenEnvName] = actionsRuntimeToken
 			os.Setenv(actionsRuntimeTokenEnvName, actionsRuntimeToken)
 		}
-		handler.RegisterJob(actionsRuntimeToken, artifactcache.JobCredential{Repo: "__local/__exec", Results: execArgs.artifactServerURL()})
+		handler.RegisterJob(actionsRuntimeToken, artifactcache.JobCredential{Repo: "__local/__exec", Results: "http://" + net.JoinHostPort(execArgs.artifactServerAddr, execArgs.artifactServerPort)})
 
 		// no service aliases: exec builds one config for the whole plan
 		run.BypassProxyForDockerHost(os.Getenv("DOCKER_HOST"))
@@ -582,9 +574,9 @@ func loadExecCmd(ctx context.Context) *cobra.Command {
 	execCmd.Flags().StringArrayVarP(&execArg.containerCapAdd, "container-cap-add", "", []string{}, "kernel capabilities to add to the workflow containers (e.g. --container-cap-add SYS_PTRACE)")
 	execCmd.Flags().StringArrayVarP(&execArg.containerCapDrop, "container-cap-drop", "", []string{}, "kernel capabilities to remove from the workflow containers (e.g. --container-cap-drop SYS_PTRACE)")
 	execCmd.Flags().StringVarP(&execArg.containerOptions, "container-opts", "", "", "container options")
-	execCmd.PersistentFlags().StringVarP(&execArg.artifactServerPath, "artifact-server-path", "", ".", "Defines the path where the artifact server stores uploads and retrieves downloads from. If not specified the artifact server will not start.")
+	execCmd.PersistentFlags().StringVarP(&execArg.artifactServerPath, "artifact-server-path", "", ".", "Defines the path where the artifact server stores uploads and retrieves downloads from, a temporary directory when empty.")
 	execCmd.PersistentFlags().StringVarP(&execArg.artifactServerAddr, "artifact-server-addr", "", "", "Defines the address where the artifact server listens")
-	execCmd.PersistentFlags().StringVarP(&execArg.artifactServerPort, "artifact-server-port", "", "34567", "Defines the port where the artifact server listens (will only bind to localhost).")
+	execCmd.PersistentFlags().StringVarP(&execArg.artifactServerPort, "artifact-server-port", "", "34567", "Defines the port where the artifact server listens")
 	execCmd.PersistentFlags().StringVarP(&execArg.defaultActionsURL, "default-actions-url", "", "https://github.com", "Defines the default url of action instance.")
 	execCmd.PersistentFlags().BoolVarP(&execArg.noSkipCheckout, "no-skip-checkout", "", false, "Do not skip actions/checkout")
 	execCmd.PersistentFlags().BoolVarP(&execArg.debug, "debug", "d", false, "enable debug log")

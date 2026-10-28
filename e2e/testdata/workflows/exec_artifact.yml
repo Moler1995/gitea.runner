@@ -1,7 +1,7 @@
 name: exec-artifact
 on: push
 jobs:
-  upload:
+  roundtrip:
     runs-on: ubuntu-latest
     steps:
       - run: mkdir -p out && echo exec-payload > out/data.txt
@@ -9,10 +9,6 @@ jobs:
         with:
           name: exec-artifact
           path: out/data.txt
-  download:
-    needs: upload
-    runs-on: ubuntu-latest
-    steps:
       - uses: actions/download-artifact@v8
         with:
           name: exec-artifact

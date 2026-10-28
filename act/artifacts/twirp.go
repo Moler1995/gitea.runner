@@ -3,104 +3,57 @@
 
 package artifacts
 
-import (
-	"encoding/json/jsontext"
-	"strconv"
-	"time"
-)
+import "time"
 
-// ArtifactServicePath is the twirp service the v4 artifact clients talk to.
-const ArtifactServicePath = "/twirp/github.actions.results.api.v1.ArtifactService"
+const artifactServicePath = "/twirp/github.actions.results.api.v1.ArtifactService"
 
-// The ArtifactService messages in the protobuf JSON mapping. Requests are written with the proto
-// names as the toolkit sends them, responses in camelCase as Gitea answers, and either reads both.
-type (
-	CreateArtifactRequest struct {
-		WorkflowRunBackendID    string     `json:"workflow_run_backend_id,case:ignore"`
-		WorkflowJobRunBackendID string     `json:"workflow_job_run_backend_id,case:ignore"`
-		Name                    string     `json:"name"`
-		ExpiresAt               *time.Time `json:"expires_at,omitempty,case:ignore"`
-		Version                 int32      `json:"version"`
-		MimeType                *string    `json:"mime_type,omitempty,case:ignore"`
+type ( // the ArtifactService messages in the protobuf JSON mapping, which writes int64 as strings
+	createArtifactRequest struct {
+		WorkflowRunBackendID string
+		Name                 string
+		MimeType             string
 	}
-	CreateArtifactResponse struct {
+	createArtifactResponse struct {
 		Ok              bool   `json:"ok"`
-		SignedUploadURL string `json:"signedUploadUrl,case:ignore"`
+		SignedUploadURL string `json:"signedUploadUrl"`
 	}
 
-	FinalizeArtifactRequest struct {
-		WorkflowRunBackendID    string  `json:"workflow_run_backend_id,case:ignore"`
-		WorkflowJobRunBackendID string  `json:"workflow_job_run_backend_id,case:ignore"`
-		Name                    string  `json:"name"`
-		Size                    Int64   `json:"size"`
-		Hash                    *string `json:"hash,omitempty"`
+	finalizeArtifactRequest struct {
+		WorkflowRunBackendID string
+		Name                 string
+		Size                 int64 `json:",string"`
+		Hash                 string
 	}
-	FinalizeArtifactResponse struct {
+	finalizeArtifactResponse struct {
 		Ok         bool  `json:"ok"`
-		ArtifactID Int64 `json:"artifactId,case:ignore"`
+		ArtifactID int64 `json:"artifactId,string"`
 	}
 
-	ListArtifactsRequest struct {
-		WorkflowRunBackendID    string  `json:"workflow_run_backend_id,case:ignore"`
-		WorkflowJobRunBackendID string  `json:"workflow_job_run_backend_id,case:ignore"`
-		NameFilter              *string `json:"name_filter,omitempty,case:ignore"`
-		IDFilter                *Int64  `json:"id_filter,omitempty,case:ignore"`
+	listArtifactsRequest struct {
+		WorkflowRunBackendID string
+		NameFilter           string
+		IDFilter             int64 `json:",string"`
 	}
-	ListArtifactsResponse struct {
-		Artifacts []MonolithArtifact `json:"artifacts"`
+	listArtifactsResponse struct {
+		Artifacts []monolithArtifact `json:"artifacts"`
 	}
-	MonolithArtifact struct {
-		WorkflowRunBackendID    string     `json:"workflowRunBackendId,case:ignore"`
-		WorkflowJobRunBackendID string     `json:"workflowJobRunBackendId,case:ignore"`
-		DatabaseID              Int64      `json:"databaseId,case:ignore"`
-		Name                    string     `json:"name"`
-		Size                    Int64      `json:"size"`
-		CreatedAt               *time.Time `json:"createdAt,omitempty,case:ignore"`
-		Digest                  *string    `json:"digest,omitempty"`
+	monolithArtifact struct {
+		WorkflowRunBackendID string    `json:"workflowRunBackendId"` // the toolkit sends it back to GetSignedArtifactURL
+		DatabaseID           int64     `json:"databaseId,string"`
+		Name                 string    `json:"name"`
+		Size                 int64     `json:"size,string"`
+		CreatedAt            time.Time `json:"createdAt"` // whole seconds, the toolkit rejects the trimmed fractions json writes
+		Digest               string    `json:"digest"`
 	}
 
-	GetSignedArtifactURLRequest struct {
-		WorkflowRunBackendID    string `json:"workflow_run_backend_id,case:ignore"`
-		WorkflowJobRunBackendID string `json:"workflow_job_run_backend_id,case:ignore"`
-		Name                    string `json:"name"`
+	getSignedArtifactURLRequest struct {
+		WorkflowRunBackendID string
+		Name                 string
 	}
-	GetSignedArtifactURLResponse struct {
-		SignedURL string `json:"signedUrl,case:ignore"`
+	getSignedArtifactURLResponse struct {
+		SignedURL string `json:"signedUrl"`
 	}
 
-	DeleteArtifactRequest struct {
-		WorkflowRunBackendID    string `json:"workflow_run_backend_id,case:ignore"`
-		WorkflowJobRunBackendID string `json:"workflow_job_run_backend_id,case:ignore"`
-		Name                    string `json:"name"`
-	}
-	DeleteArtifactResponse struct {
-		Ok         bool  `json:"ok"`
-		ArtifactID Int64 `json:"artifactId,case:ignore"`
-	}
+	deleteArtifactRequest  = getSignedArtifactURLRequest
+	deleteArtifactResponse = finalizeArtifactResponse
 )
-
-// Int64 is written as the JSON string the mapping prescribes, and read from a string or a number.
-type Int64 int64
-
-func (n Int64) MarshalJSONTo(enc *jsontext.Encoder) error {
-	return enc.WriteToken(jsontext.String(strconv.FormatInt(int64(n), 10)))
-}
-
-func (n *Int64) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
-	val, err := dec.ReadValue()
-	if err != nil {
-		return err
-	}
-	digits := []byte(val)
-	switch val.Kind() {
-	case 'n':
-		return nil
-	case '"':
-		if digits, err = jsontext.AppendUnquote(nil, val); err != nil {
-			return err
-		}
-	}
-	parsed, err := strconv.ParseInt(string(digits), 10, 64)
-	*n = Int64(parsed)
-	return err
-}
