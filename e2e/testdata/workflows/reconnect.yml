@@ -9,5 +9,7 @@ jobs:
     steps:
       - run: |
           echo e2e-before-outage
-          sleep 12
-          echo e2e-after-outage
+          for i in $(seq -w 1 15); do
+            echo "tick-$i"
+            sleep 1
+          done

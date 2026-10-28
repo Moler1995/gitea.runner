@@ -6,6 +6,7 @@
 package e2e
 
 import (
+	"fmt"
 	"io"
 	"net"
 	"net/url"
@@ -79,14 +80,14 @@ func (p *flakyProxy) dropAll() {
 	clear(p.conns)
 }
 
-// cut starts the outage and returns once the runner has been refused at least twice more.
-func (p *flakyProxy) cut(t *testing.T) {
+// cut starts the outage and returns once the runner has been refused at least refusals more times.
+func (p *flakyProxy) cut(t *testing.T, refusals int64) {
 	t.Helper()
 	before := p.refused.Load()
 	p.down.Store(true)
 	p.dropAll()
 	deadline := time.Now().Add(30 * time.Second)
-	for p.refused.Load() < before+2 {
+	for p.refused.Load() < before+refusals {
 		if time.Now().After(deadline) {
 			t.Fatal("runner never retried during the outage")
 		}
@@ -103,7 +104,7 @@ func testReconnect(t *testing.T) {
 	proxy := newFlakyProxy(t, fixture.baseURL)
 	startRunner(t, repo, "e2e-reconnect", runnerOptions{host: true, address: proxy.URL()})
 
-	proxy.cut(t)
+	proxy.cut(t, 2)
 	pushWorkflow(t, api, repo, "reconnect_idle.yml")
 	idle := waitForRun(t, api, repo)
 	proxy.restore()
@@ -112,10 +113,15 @@ func testReconnect(t *testing.T) {
 	pushWorkflow(t, api, repo, "reconnect.yml")
 	slow := waitForRunAfter(t, api, repo, idle.ID)
 	waitForRunningJobLog(t, api, repo, slow.ID, "e2e-before-outage")
-	proxy.cut(t)
+	// the job logs a line per second, so a long outage spans several that can only arrive after it
+	proxy.cut(t, 8)
 	proxy.restore()
 	requireSuccess(t, api, repo, slow.ID)
-	if logs := runLogs(t, api, repo, slow.ID); commandRow(logs, "e2e-after-outage") == "" {
-		t.Errorf("logs written during the outage were lost:\n%s", logs)
+	logs := runLogs(t, api, repo, slow.ID)
+	for i := 1; i <= 15; i++ {
+		if tick := fmt.Sprintf("tick-%02d", i); commandRow(logs, tick) != tick {
+			t.Errorf("log line %s written during or after the outage was lost:\n%s", tick, logs)
+			break
+		}
 	}
 }
