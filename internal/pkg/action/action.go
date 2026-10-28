@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 
 	"gitea.com/gitea/runner/act/container"
@@ -34,20 +35,14 @@ type Context struct {
 	ClientCertFile  string
 	ClientKeyFile   string
 	Env             map[string]string
-	ResultsURL      string                           // the results service as the runner reaches it
-	RuntimeToken    string                           // ACTIONS_RUNTIME_TOKEN, the job's credential for it
-	Transport       http.RoundTripper                // carries the instance's TLS settings, nil for the default
-	Infof           func(format string, args ...any) // a line of step output
-	Annotate        func(level, message string)      // a notice, warning or error, as the workflow command would log it
+	ResultsURL      string // the results service as the runner reaches it
+	RuntimeToken    string
+	Transport       http.RoundTripper // carries the instance's TLS settings, nil for the default
+	Infof           func(format string, args ...any)
+	Warning         func(format string, args ...any)
 }
 
-// Warning logs what @actions/core warning does.
-func (c *Context) Warning(format string, args ...any) {
-	c.Annotate("warning", fmt.Sprintf(format, args...))
-}
-
-// ApplyDefaults gives each input not set its default, names and defaults alternating, and warns
-// about unknown inputs, as GitHub's runner does with an action.yml.
+// ApplyDefaults sets the defaults of inputs not given, names and defaults alternating, and warns about unknown inputs as GitHub does.
 func (c *Context) ApplyDefaults(pairs ...string) {
 	var valid, unexpected []string
 	for i := 0; i+1 < len(pairs); i += 2 {
@@ -172,17 +167,19 @@ func (c *Context) Home(ctx context.Context) (string, error) {
 	return out.String(), nil
 }
 
-// failure carries a message worded as the JavaScript action words it, capitalised and punctuated.
-type failure struct {
-	msg string
-	err error
+// Failf is fmt.Errorf for messages worded as the JavaScript action words them, which the error string lint rejects.
+func Failf(format string, args ...any) error {
+	return fmt.Errorf(format, args...)
 }
 
-func (f *failure) Error() string { return f.msg }
-func (f *failure) Unwrap() error { return f.err }
-
-// Failf formats like fmt.Errorf, %w included, for a message users know from the JavaScript action.
-func Failf(format string, args ...any) error {
-	err := fmt.Errorf(format, args...)
-	return &failure{msg: err.Error(), err: errors.Unwrap(err)}
+// ParseInt reads a leading integer the way JavaScript's parseInt does.
+func ParseInt(s string) (int, error) {
+	end := 0
+	if end < len(s) && (s[end] == '-' || s[end] == '+') {
+		end++
+	}
+	for end < len(s) && s[end] >= '0' && s[end] <= '9' {
+		end++
+	}
+	return strconv.Atoi(s[:end])
 }

@@ -25,22 +25,16 @@ import (
 
 var fastRetry = Retry{Attempts: 3, Base: time.Millisecond, Multiplier: 1, MaxWait: time.Second}
 
-func newLocalClient(t *testing.T) *Client {
-	t.Helper()
+func TestClientRoundTrip(t *testing.T) {
+	ctx := t.Context()
 	router := http.NewServeMux()
 	artifacts.RegisterV4(router, t.TempDir())
 	server := httptest.NewServer(router)
-	t.Cleanup(server.Close)
+	defer server.Close()
 	client, err := New(server.URL, artifacts.LocalRuntimeToken("7", time.Hour), nil)
 	require.NoError(t, err)
 	client.Retry = fastRetry
-	return client
-}
-
-func TestClientRoundTrip(t *testing.T) {
-	ctx := t.Context()
-	client := newLocalClient(t)
-	content := make([]byte, 2*BlockSize+123) // three blocks, finishing out of order
+	content := make([]byte, 2*BlockSize+123)
 	_, _ = rand.Read(content)
 	sum := sha256.Sum256(content)
 
@@ -52,14 +46,9 @@ func TestClientRoundTrip(t *testing.T) {
 	id, err := client.Finalize(ctx, "art", uploaded.Size, uploaded.Digest)
 	require.NoError(t, err)
 
-	name := "art"
-	byName, err := client.List(ctx, &name, nil)
+	listed, err := client.List(ctx, "art")
 	require.NoError(t, err)
-	byID, err := client.List(ctx, nil, &id)
-	require.NoError(t, err)
-	require.Len(t, byName, 1)
-	assert.Equal(t, byName, byID)
-	assert.Equal(t, Artifact{ID: id, Name: "art", Size: int64(len(content)), CreatedAt: byName[0].CreatedAt, Digest: uploaded.Digest}, byName[0])
+	assert.Equal(t, []Artifact{{ID: id, Name: "art", Size: int64(len(content)), Digest: uploaded.Digest}}, listed)
 
 	signed, err := client.SignedURL(ctx, "art")
 	require.NoError(t, err)
@@ -76,7 +65,6 @@ func TestClientRoundTrip(t *testing.T) {
 	_, err = client.SignedURL(ctx, "art")
 	assert.True(t, IsNotFound(err), err)
 
-	// an empty file still commits a blob
 	uploadURL, err = client.Create(ctx, "empty.txt", "text/plain", nil)
 	require.NoError(t, err)
 	uploaded, err = client.Upload(ctx, uploadURL, "text/plain", strings.NewReader(""), 2, time.Minute)
@@ -97,7 +85,7 @@ func TestClientRetries(t *testing.T) {
 			w.Header().Set("Retry-After", "0")
 			w.WriteHeader(http.StatusTooManyRequests)
 		case 2:
-			http.Error(w, "Error create or get artifact", http.StatusInternalServerError) // Gitea answers in plain text
+			http.Error(w, "Error create or get artifact", http.StatusInternalServerError)
 		default:
 			_, _ = io.WriteString(w, `{"ok":true,"signedUploadUrl":"http://blob/u?sig=x"}`)
 		}
@@ -155,8 +143,7 @@ func TestDownloadStalls(t *testing.T) {
 	}))
 	defer server.Close()
 	defer close(release)
-	client := newLocalClient(t)
-	resp, err := client.Download(t.Context(), server.URL, 50*time.Millisecond)
+	resp, err := download(t.Context(), http.DefaultClient, server.URL, 50*time.Millisecond)
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	_, err = io.ReadAll(resp.Body)

@@ -1,8 +1,7 @@
 // Copyright 2026 The Gitea Authors. All rights reserved.
 // SPDX-License-Identifier: MIT
 
-// Package artifact talks to the artifact services the built-in artifact actions use: the v4
-// results service of the job's own run, and Gitea's REST API for other runs.
+// Package artifact talks to the v4 results service of the job's run and, for other runs, to Gitea's API.
 package artifact
 
 import (
@@ -14,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -21,13 +21,11 @@ import (
 	"time"
 )
 
-// Artifact is an artifact as either service lists it.
 type Artifact struct {
-	ID        int64
-	Name      string
-	Size      int64
-	CreatedAt time.Time
-	Digest    string // empty when the service reports none, Gitea never does
+	ID     int64  `json:"databaseId,string"`
+	Name   string `json:"name"`
+	Size   int64  `json:"size,string"`
+	Digest string `json:"digest"` // empty when the service reports none, Gitea never does
 }
 
 // Retry is how requests retry, the toolkit's schedule by default.
@@ -40,38 +38,33 @@ type Retry struct {
 
 var DefaultRetry = Retry{Attempts: 5, Base: 8 * time.Second, Multiplier: 1.5, MaxWait: 2 * time.Minute}
 
-// Client is the v4 results service of one job.
 type Client struct {
-	base         *url.URL
-	token        string
-	runID, jobID string
-	api, blob    *http.Client
-	Retry        Retry
-	Logf         func(format string, args ...any)
+	base      *url.URL
+	token     string
+	ids       backendIDsMessage
+	api, blob *http.Client
+	Retry     Retry
+	Logf      func(format string, args ...any)
 }
 
-// New reaches base, the results service as the runner reaches it, through transport, which
-// carries the instance's TLS settings. Signed URLs elsewhere use the default transport.
+// New reaches base through transport, which carries the instance's TLS settings, and signed URLs elsewhere directly.
 func New(base, token string, transport http.RoundTripper) (*Client, error) {
 	if base == "" {
 		return nil, errors.New("no artifact service is configured for this runner")
 	}
-	parsed, err := url.Parse(strings.TrimSuffix(base, "/"))
+	parsed, err := url.Parse(base)
 	if err != nil {
 		return nil, err
 	}
 	if token == "" {
 		return nil, errors.New("ACTIONS_RUNTIME_TOKEN is not set")
 	}
-	runID, jobID, err := backendIDs(token)
+	ids, err := backendIDs(token)
 	if err != nil {
 		return nil, err
 	}
-	if transport == nil {
-		transport = http.DefaultTransport
-	}
 	return &Client{
-		base: parsed, token: token, runID: runID, jobID: jobID,
+		base: parsed, token: token, ids: ids,
 		api:   &http.Client{Transport: transport},
 		blob:  &http.Client{Transport: blobTransport{instance: parsed.Host, transport: transport}},
 		Retry: DefaultRetry,
@@ -79,46 +72,42 @@ func New(base, token string, transport http.RoundTripper) (*Client, error) {
 	}, nil
 }
 
-// backendIDs reads the run and job IDs the results service expects from the unverified claims of
-// a runtime token, the same way the toolkit does.
-func backendIDs(token string) (runID, jobID string, err error) {
+// backendIDs reads the unverified scp claim of a runtime token, as the toolkit does.
+func backendIDs(token string) (backendIDsMessage, error) {
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
-		return "", "", errors.New("the runtime token is not a JWT, artifacts v4 need Gitea 1.22 or later")
+		return backendIDsMessage{}, errors.New("the runtime token is not a JWT, artifacts v4 need Gitea 1.22 or later")
 	}
 	payload, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(parts[1], "="))
 	if err != nil {
-		return "", "", err
+		return backendIDsMessage{}, err
 	}
 	var claims struct {
 		Scp string `json:"scp"`
 	}
 	if err := json.Unmarshal(payload, &claims); err != nil {
-		return "", "", err
+		return backendIDsMessage{}, err
 	}
 	for scope := range strings.FieldsSeq(claims.Scp) {
 		if fields := strings.Split(scope, ":"); fields[0] == "Actions.Results" && len(fields) == 3 {
-			return fields[1], fields[2], nil
+			return backendIDsMessage{fields[1], fields[2]}, nil
 		}
 	}
-	return "", "", errors.New("the runtime token has no Actions.Results scope")
+	return backendIDsMessage{}, errors.New("the runtime token has no Actions.Results scope")
 }
 
-// blobTransport only offers the instance's transport to the instance, a signed URL can point at
-// object storage.
-type blobTransport struct {
+type blobTransport struct { // the instance's TLS settings only for the instance, as a signed URL can point at object storage
 	instance  string
 	transport http.RoundTripper
 }
 
 func (t blobTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if req.URL.Host == t.instance {
+	if req.URL.Host == t.instance && t.transport != nil {
 		return t.transport.RoundTrip(req)
 	}
 	return http.DefaultTransport.RoundTrip(req)
 }
 
-// StatusError is a response the service answered with.
 type StatusError struct {
 	Status int
 	Msg    string
@@ -131,7 +120,6 @@ func (e *StatusError) Error() string {
 	return fmt.Sprintf("(%d) %s: %s", e.Status, http.StatusText(e.Status), e.Msg)
 }
 
-// IsNotFound reports whether err is a 404 from the service.
 func IsNotFound(err error) bool {
 	var status *StatusError
 	return errors.As(err, &status) && status.Status == http.StatusNotFound
@@ -145,8 +133,7 @@ func retryable(status int) bool {
 	return false
 }
 
-// do sends the request send builds until it succeeds or fails for good, and returns the
-// successful response for the caller to close.
+// do retries send until it succeeds or fails for good, the caller closing the response.
 func (r Retry) do(ctx context.Context, logf func(string, ...any), what string, send func() (*http.Response, error)) (*http.Response, error) {
 	var waited time.Duration
 	for attempt := 0; ; attempt++ {
@@ -173,7 +160,7 @@ func (r Retry) do(ctx context.Context, logf func(string, ...any), what string, s
 			return nil, fmt.Errorf("%s failed after %d attempts: %w", what, r.Attempts, err)
 		}
 		if wait == 0 {
-			wait = time.Duration(float64(r.Base) * pow(r.Multiplier, attempt))
+			wait = time.Duration(float64(r.Base) * math.Pow(r.Multiplier, float64(attempt)))
 		}
 		if waited+wait > r.MaxWait {
 			return nil, fmt.Errorf("%s: a retry wait of %s would exceed %s: %w", what, wait, r.MaxWait, err)
@@ -186,14 +173,6 @@ func (r Retry) do(ctx context.Context, logf func(string, ...any), what string, s
 		}
 		waited += wait
 	}
-}
-
-func pow(base float64, exp int) float64 {
-	result := 1.0
-	for range exp {
-		result *= base
-	}
-	return result
 }
 
 // twirpMessage is the msg of a twirp error, the message of a Gitea API one, or the body Gitea answers in plain text.
@@ -230,8 +209,7 @@ type ( // the ArtifactService messages in the protobuf JSON mapping, requests wi
 	}
 	listRequest struct {
 		backendIDsMessage
-		NameFilter *string `json:"name_filter,omitempty"`
-		IDFilter   *int64  `json:"id_filter,omitempty,string"`
+		NameFilter string `json:"name_filter,omitempty"`
 	}
 	idResponse struct {
 		Ok         bool  `json:"ok"`
@@ -266,7 +244,7 @@ func call[Req, Resp any](ctx context.Context, c *Client, method string, req Req)
 }
 
 func (c *Client) named(name string) namedRequest {
-	return namedRequest{backendIDsMessage{c.runID, c.jobID}, name}
+	return namedRequest{c.ids, name}
 }
 
 // Create starts an upload and returns where the content goes.
@@ -289,25 +267,12 @@ func (c *Client) Finalize(ctx context.Context, name string, size int64, digest s
 	return resp.ArtifactID, err
 }
 
-// List returns the run's artifacts, filtered by name or ID when given.
-func (c *Client) List(ctx context.Context, name *string, id *int64) ([]Artifact, error) {
+// List returns the run's artifacts, those named name when given.
+func (c *Client) List(ctx context.Context, name string) ([]Artifact, error) {
 	resp, err := call[listRequest, struct {
-		Artifacts []struct {
-			DatabaseID int64     `json:"databaseId,string"`
-			Name       string    `json:"name"`
-			Size       int64     `json:"size,string"`
-			CreatedAt  time.Time `json:"createdAt"`
-			Digest     string    `json:"digest"`
-		} `json:"artifacts"`
-	}](ctx, c, "ListArtifacts", listRequest{backendIDsMessage{c.runID, c.jobID}, name, id})
-	if err != nil {
-		return nil, err
-	}
-	list := make([]Artifact, 0, len(resp.Artifacts))
-	for _, a := range resp.Artifacts {
-		list = append(list, Artifact{ID: a.DatabaseID, Name: a.Name, Size: a.Size, CreatedAt: a.CreatedAt, Digest: a.Digest})
-	}
-	return list, nil
+		Artifacts []Artifact `json:"artifacts"`
+	}](ctx, c, "ListArtifacts", listRequest{c.ids, name})
+	return resp.Artifacts, err
 }
 
 func (c *Client) SignedURL(ctx context.Context, name string) (string, error) {
