@@ -36,27 +36,19 @@ func (b *syncBuffer) String() string {
 	return b.buf.String()
 }
 
-var (
-	runnerBinDir  string
-	runnerBinOnce sync.Once
-	runnerBinErr  error
-)
+var buildRunnerBinary = sync.OnceValue(func() error {
+	out, err := exec.Command("go", "build", "-o", filepath.Join(runnerBinDir, "gitea-runner"), "..").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("build runner: %w\n%s", err, out)
+	}
+	return nil
+})
 
 // runnerBinary builds the runner once for every CLI scenario.
 func runnerBinary(t *testing.T) string {
 	t.Helper()
-	runnerBinOnce.Do(func() {
-		runnerBinDir, runnerBinErr = os.MkdirTemp("", "e2e-runner-bin")
-		if runnerBinErr != nil {
-			return
-		}
-		out, err := exec.Command("go", "build", "-o", filepath.Join(runnerBinDir, "gitea-runner"), "..").CombinedOutput()
-		if err != nil {
-			runnerBinErr = fmt.Errorf("build runner: %w\n%s", err, out)
-		}
-	})
-	if runnerBinErr != nil {
-		t.Fatal(runnerBinErr)
+	if err := buildRunnerBinary(); err != nil {
+		t.Fatal(err)
 	}
 	return filepath.Join(runnerBinDir, "gitea-runner")
 }
@@ -271,7 +263,9 @@ func testCLIShutdownCancels(t *testing.T) {
 	waitForRunningJobLog(t, c.api, c.repo, wfRun.ID, "e2e-shutdown-started")
 
 	d.terminate(t)
-	d.wait(t, runTimeout) //nolint:errcheck // only the cancellation message matters here
+	if err := d.wait(t, runTimeout); err != nil {
+		t.Errorf("daemon did not exit cleanly after cancelling the job: %v\n%s", err, d.log)
+	}
 	if !strings.Contains(d.log.String(), "cancelled in progress jobs") {
 		t.Errorf("daemon did not report cancelling the running job\n%s", d.log)
 	}

@@ -25,6 +25,8 @@ var nonRepoChars = regexp.MustCompile(`[^a-zA-Z0-9._-]+`)
 
 var fixture *GiteaFixture
 
+var runnerBinDir string // the CLI scenarios build the runner here once
+
 var skipReason string
 
 func TestMain(m *testing.M) {
@@ -34,11 +36,6 @@ func TestMain(m *testing.M) {
 func runSuite(m *testing.M) int {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	defer func() {
-		if runnerBinDir != "" {
-			_ = os.RemoveAll(runnerBinDir)
-		}
-	}()
 
 	cli, err := dockerClient(ctx)
 	if err != nil {
@@ -53,6 +50,13 @@ func runSuite(m *testing.M) int {
 	}
 	fixture = f
 	defer func() { _ = fixture.Close(context.Background()) }()
+
+	runnerBinDir, err = os.MkdirTemp("", "e2e-runner-bin")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "create runner binary dir: %v\n", err)
+		return 1
+	}
+	defer func() { _ = os.RemoveAll(runnerBinDir) }()
 
 	fmt.Fprintf(os.Stderr, "gitea fixture: image=%s version=%s\n", fixture.image, fixture.version)
 

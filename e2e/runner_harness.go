@@ -71,6 +71,7 @@ func startRunner(t *testing.T, repo, labelName string, options runnerOptions) *p
 	rawLabel := labelName + ":" + scheme + "://" + cmp.Or(options.image, os.Getenv("E2E_JOB_IMAGE"))
 	if options.host {
 		rawLabel = labelName + ":" + labels.SchemeHost
+		cfg.Host.WorkdirParent = t.TempDir()
 	}
 	label, err := labels.Parse(rawLabel)
 	if err != nil {
