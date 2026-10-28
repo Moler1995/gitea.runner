@@ -120,10 +120,10 @@ type link struct {
 	chain           []string
 }
 
-// missing reports a path Docker did not find, or whose `test -e` failed on Kubernetes.
+// missing reports a path Docker did not find, or whose `test -e` exited 1 on Kubernetes.
 func missing(err error) bool {
 	var exit container.ExitCodeError
-	return cerrdefs.IsNotFound(err) || errors.Is(err, fs.ErrNotExist) || errors.As(err, &exit)
+	return cerrdefs.IsNotFound(err) || errors.Is(err, fs.ErrNotExist) || errors.As(err, &exit) && exit == 1
 }
 
 // containerTree walks the archive of source as found at virtual, chain holding the real directories entered.
@@ -187,11 +187,11 @@ func (w *walker) containerTree(ctx context.Context, c *action.Context, virtual, 
 	if err := archive.Close(); err != nil {
 		return err
 	}
-	for _, l := range links {
-		if depth >= maxFollow || slices.Contains(l.chain, l.target) {
+	for _, followed := range links {
+		if depth >= maxFollow || slices.Contains(followed.chain, followed.target) {
 			continue // a symlink cycle
 		}
-		if err := w.containerTree(ctx, c, l.virtual, l.target, l.chain, depth+1); err != nil {
+		if err := w.containerTree(ctx, c, followed.virtual, followed.target, followed.chain, depth+1); err != nil {
 			return err
 		}
 	}
