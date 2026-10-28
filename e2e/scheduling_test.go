@@ -63,6 +63,7 @@ func testLabelRouting(t *testing.T) {
 
 // testCapacity checks that runner.capacity bounds how many jobs run at once.
 func testCapacity(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name       string
 		capacity   int
