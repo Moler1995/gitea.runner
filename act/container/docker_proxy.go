@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"gitea.com/gitea/runner/act/common"
+	"gitea.com/gitea/runner/act/common/logging"
 
 	cerrdefs "github.com/containerd/errdefs"
 	"github.com/moby/moby/api/types/container"
@@ -48,7 +49,10 @@ var (
 	rawStreamPath = regexp.MustCompile(`^(/v[0-9.]+)?/(containers/[^/]+/attach|exec/[^/]+/start)$`)
 )
 
-var dockerProxyDirectories, dockerProxyProbes sync.Map
+var (
+	dockerProxyProbes       sync.Map
+	dockerProxyProbeWorkers sync.WaitGroup
+)
 
 type dockerProxyDirectory struct {
 	dir, daemonDir string
@@ -68,7 +72,7 @@ func NewDockerProxy(ctx context.Context, job string) *DockerProxy {
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, dockerProxyProbeTimeout)
 	defer cancel()
-	cli, err := GetDockerClient(probeCtx)
+	cli, err := client.New(client.FromEnv) // negotiates on first request, so a cached probe costs no round trip
 	if err != nil {
 		return nil
 	}
@@ -83,12 +87,7 @@ func NewDockerProxy(ctx context.Context, job string) *DockerProxy {
 	}
 	workdir, _ := os.Getwd()
 	key := [3]string{cli.DaemonHost(), workdir, os.TempDir()}
-	cached, _ := dockerProxyDirectories.Load(key)
-	directory, seen := cached.(dockerProxyDirectory)
-	seen = seen && os.SameFile(directory.socket, socket) // daemon replacement invalidates cached paths
-	if !seen {
-		directory, seen, err = probeDockerProxyDirectory(probeCtx, cli, key, socket)
-	}
+	directory, seen, err := probeDockerProxyDirectory(probeCtx, cli, key, socket)
 	if err != nil {
 		common.Logger(ctx).Infof("docker proxy probe failed, jobs get the daemon socket directly: %v", err)
 		return nil
@@ -102,13 +101,17 @@ func NewDockerProxy(ctx context.Context, job string) *DockerProxy {
 	}
 	proxy, err := StartDockerProxy(daemonSocket, directory.dir, job)
 	if err != nil {
-		dockerProxyDirectories.Delete(key)
+		dockerProxyProbes.Delete(key)
 		common.Logger(ctx).Warnf("docker proxy not started, the job gets the daemon socket directly: %v", err)
 		return nil
 	}
-	dockerProxyDirectories.Store(key, directory)
 	proxy.Socket = directory.daemonDir + strings.TrimPrefix(proxy.Socket, directory.dir)
 	return proxy
+}
+
+// WaitDockerProxyProbes waits for detached probes so none exits before removing its container.
+func WaitDockerProxyProbes() {
+	dockerProxyProbeWorkers.Wait()
 }
 
 func probeDockerProxyDirectory(ctx context.Context, cli client.APIClient, key [3]string, socket os.FileInfo) (dockerProxyDirectory, bool, error) {
@@ -117,29 +120,36 @@ func probeDockerProxyDirectory(ctx context.Context, cli client.APIClient, key [3
 		actual, loaded := dockerProxyProbes.LoadOrStore(key, probe)
 		if loaded {
 			probe, _ = actual.(*dockerProxyProbe)
-			if !os.SameFile(probe.directory.socket, socket) {
+			if !os.SameFile(probe.directory.socket, socket) { // daemon replacement invalidates cached paths
 				dockerProxyProbes.CompareAndDelete(key, probe)
 				continue
 			}
-			select {
-			case <-ctx.Done():
-				return dockerProxyDirectory{}, false, ctx.Err()
-			case <-probe.done:
-			}
-			if ctx.Err() == nil && (errors.Is(probe.err, context.Canceled) || errors.Is(probe.err, context.DeadlineExceeded)) {
-				continue
-			}
 		} else {
-			probe.directory.dir, probe.directory.daemonDir = runnerContainerWorkdir(ctx, cli)
-			probe.seen = probe.directory.daemonDir != ""
-			if !probe.seen {
-				if probe.directory.dir, probe.err = filepath.Abs(key[2]); probe.err == nil {
-					probe.directory.daemonDir = probe.directory.dir
-					probe.seen, probe.err = daemonSeesDir(ctx, cli, probe.directory.dir, probe.directory.daemonDir)
+			dockerProxyProbeWorkers.Go(func() { // outlives a caller's deadline so the daemon never finishes a create whose ID nobody receives
+				defer cli.Close()
+				ctx, cancel := context.WithTimeout(common.WithLogger(context.Background(), logging.Default()), time.Minute)
+				defer cancel()
+				probe.directory.dir, probe.directory.daemonDir = runnerContainerWorkdir(ctx, cli)
+				probe.seen = probe.directory.daemonDir != ""
+				if !probe.seen {
+					if probe.directory.dir, probe.err = filepath.Abs(key[2]); probe.err == nil {
+						probe.directory.daemonDir = probe.directory.dir
+						probe.seen, probe.err = daemonSeesDir(ctx, cli, probe.directory.dir, probe.directory.daemonDir)
+					}
 				}
-			}
+				if probe.seen {
+					dockerProxyProbes.LoadOrStore(key, probe)
+				} else {
+					dockerProxyProbes.CompareAndDelete(key, probe)
+				}
+				close(probe.done)
+			})
+		}
+		select {
+		case <-ctx.Done():
 			dockerProxyProbes.CompareAndDelete(key, probe)
-			close(probe.done)
+			return dockerProxyDirectory{}, false, ctx.Err()
+		case <-probe.done:
 		}
 		return probe.directory, probe.seen, probe.err
 	}

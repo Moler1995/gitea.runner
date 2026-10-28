@@ -42,6 +42,8 @@ func NewDockerProxy(_ context.Context, _ string) *DockerProxy {
 	return nil
 }
 
+func WaitDockerProxyProbes() {}
+
 func StartDockerProxy(daemonSocket, dir, job string) (*DockerProxy, error) {
 	return nil, errors.New("Unsupported Operation")
 }

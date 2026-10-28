@@ -235,7 +235,8 @@ func TestDockerProxy(t *testing.T) {
 			t.Skip("automatic proxy discovery requires Linux")
 		}
 		t.Setenv("DOCKER_HOST", "unix://"+daemonSocket)
-		t.Setenv("TMPDIR", shortTempDir(t))
+		tempDir := shortTempDir(t)
+		t.Setenv("TMPDIR", tempDir)
 		require.Nil(t, NewDockerProxy(t.Context(), "failed"))
 		for _, job := range []string{"first", "second"} {
 			proxy := NewDockerProxy(t.Context(), job)
@@ -243,12 +244,10 @@ func TestDockerProxy(t *testing.T) {
 			require.NoError(t, proxy.Close(context.Background()))
 		}
 		assert.EqualValues(t, 2, probes.Load())
-		dockerProxyDirectories.Range(func(key, value any) bool {
-			directory, _ := value.(dockerProxyDirectory)
-			directory.socket, _ = os.Stat(t.TempDir())
-			dockerProxyDirectories.Store(key, directory)
-			return true
-		})
+		workdir, err := os.Getwd()
+		require.NoError(t, err)
+		cached, _ := dockerProxyProbes.Load([3]string{"unix://" + daemonSocket, workdir, tempDir})
+		cached.(*dockerProxyProbe).directory.socket, _ = os.Stat(t.TempDir())
 		proxy := NewDockerProxy(t.Context(), "replaced daemon")
 		require.NotNil(t, proxy)
 		require.NoError(t, proxy.Close(context.Background()))
@@ -476,10 +475,14 @@ func BenchmarkDockerProxy(b *testing.B) {
 
 type probeClient struct {
 	mobyclient.APIClient
-	create func(mobyclient.ContainerCreateOptions) (mobyclient.ContainerCreateResult, error)
+	create func(context.Context, mobyclient.ContainerCreateOptions) (mobyclient.ContainerCreateResult, error)
 	remove func(context.Context, string, mobyclient.ContainerRemoveOptions) (mobyclient.ContainerRemoveResult, error)
 	stat   func(string) error
 	mounts []container.MountPoint
+}
+
+func (c *probeClient) Close() error {
+	return nil
 }
 
 func (c *probeClient) ContainerInspect(context.Context, string, mobyclient.ContainerInspectOptions) (mobyclient.ContainerInspectResult, error) {
@@ -490,8 +493,8 @@ func (c *probeClient) ImageList(context.Context, mobyclient.ImageListOptions) (m
 	return mobyclient.ImageListResult{Items: []image.Summary{{ID: "removed-image"}, {ID: "probe-image"}}}, nil
 }
 
-func (c *probeClient) ContainerCreate(_ context.Context, opts mobyclient.ContainerCreateOptions) (mobyclient.ContainerCreateResult, error) {
-	return c.create(opts)
+func (c *probeClient) ContainerCreate(ctx context.Context, opts mobyclient.ContainerCreateOptions) (mobyclient.ContainerCreateResult, error) {
+	return c.create(ctx, opts)
 }
 
 func (c *probeClient) ContainerRemove(ctx context.Context, id string, opts mobyclient.ContainerRemoveOptions) (mobyclient.ContainerRemoveResult, error) {
@@ -518,7 +521,7 @@ func TestDockerProxyDirectoryProbes(t *testing.T) {
 				var calls, removals atomic.Int32
 				visible := false
 				cli := &probeClient{
-					create: func(_opts mobyclient.ContainerCreateOptions) (mobyclient.ContainerCreateResult, error) {
+					create: func(_ctx context.Context, _opts mobyclient.ContainerCreateOptions) (mobyclient.ContainerCreateResult, error) {
 						calls.Add(1)
 						<-release
 						return mobyclient.ContainerCreateResult{ID: "probe"}, createErr
@@ -544,11 +547,6 @@ func TestDockerProxyDirectoryProbes(t *testing.T) {
 				}
 				synctest.Wait()
 				assert.EqualValues(t, 1, calls.Load())
-				ctx, cancel := context.WithCancel(t.Context())
-				cancel()
-				_, seen, err := probeDockerProxyDirectory(ctx, cli, key, socket)
-				require.ErrorIs(t, err, context.Canceled)
-				assert.False(t, seen)
 				replacement, err := os.Stat(t.TempDir())
 				require.NoError(t, err)
 				replaced := make(chan result, 1)
@@ -586,7 +584,7 @@ func TestDockerProxyDirectoryProbes(t *testing.T) {
 			})
 		})
 	}
-	t.Run("cancelled probe does not cancel another caller", func(t *testing.T) {
+	t.Run("cancelled caller retires the probe but leaves it to finish and remove its container", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			dir := t.TempDir()
 			socket, err := os.Stat(t.TempDir())
@@ -595,23 +593,20 @@ func TestDockerProxyDirectoryProbes(t *testing.T) {
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
 			release := make(chan struct{})
-			calls := 0
+			var calls, removals atomic.Int32
 			cli := &probeClient{
-				create: func(_opts mobyclient.ContainerCreateOptions) (mobyclient.ContainerCreateResult, error) {
-					calls++
-					if calls == 1 {
-						<-release
-						return mobyclient.ContainerCreateResult{}, ctx.Err()
-					} else {
-						return mobyclient.ContainerCreateResult{ID: "probe"}, nil
-					}
+				create: func(ctx context.Context, _opts mobyclient.ContainerCreateOptions) (mobyclient.ContainerCreateResult, error) {
+					calls.Add(1)
+					<-release
+					return mobyclient.ContainerCreateResult{ID: "probe"}, ctx.Err()
 				},
 				stat: func(_path string) error { return nil },
 				remove: func(_ctx context.Context, _id string, _opts mobyclient.ContainerRemoveOptions) (mobyclient.ContainerRemoveResult, error) {
+					removals.Add(1)
 					return mobyclient.ContainerRemoveResult{}, nil
 				},
 			}
-			leader, follower := make(chan result, 1), make(chan result, 1)
+			leader, follower, late := make(chan result, 1), make(chan result, 1), make(chan result, 1)
 			go func() {
 				_, seen, err := probeDockerProxyDirectory(ctx, cli, key, socket)
 				leader <- result{seen, err}
@@ -622,15 +617,26 @@ func TestDockerProxyDirectoryProbes(t *testing.T) {
 				follower <- result{seen, err}
 			}()
 			synctest.Wait()
-			assert.Equal(t, 1, calls)
 			cancel()
-			close(release)
-			leaderResult, followerResult := <-leader, <-follower
+			leaderResult := <-leader
 			require.ErrorIs(t, leaderResult.err, context.Canceled)
 			assert.False(t, leaderResult.seen)
-			require.NoError(t, followerResult.err)
-			assert.True(t, followerResult.seen)
-			assert.Equal(t, 2, calls)
+			assert.EqualValues(t, 1, calls.Load())
+			go func() {
+				_, seen, err := probeDockerProxyDirectory(t.Context(), cli, key, socket)
+				late <- result{seen, err}
+			}()
+			synctest.Wait()
+			assert.EqualValues(t, 2, calls.Load())
+			close(release)
+			for _, results := range []chan result{follower, late} {
+				result := <-results
+				require.NoError(t, result.err)
+				assert.True(t, result.seen)
+			}
+			assert.EqualValues(t, 2, removals.Load())
+			_, cached := dockerProxyProbes.Load(key)
+			assert.True(t, cached)
 		})
 	})
 }
@@ -656,7 +662,7 @@ func TestDaemonSeesDir(t *testing.T) {
 			removed := false
 			var attemptedImages []string
 			cli := &probeClient{
-				create: func(opts mobyclient.ContainerCreateOptions) (mobyclient.ContainerCreateResult, error) {
+				create: func(_ctx context.Context, opts mobyclient.ContainerCreateOptions) (mobyclient.ContainerCreateResult, error) {
 					assert.Equal(t, []mount.Mount{{Type: mount.TypeBind, Source: testCase.daemonDir, Target: "/gitea-runner-probe", ReadOnly: true}}, opts.HostConfig.Mounts)
 					attemptedImages = append(attemptedImages, opts.Config.Image)
 					if opts.Config.Image == "removed-image" {

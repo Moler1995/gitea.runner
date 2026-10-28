@@ -7,6 +7,7 @@ import (
 	"context"
 	"os"
 
+	"gitea.com/gitea/runner/act/container"
 	"gitea.com/gitea/runner/internal/pkg/ver"
 
 	"github.com/spf13/cobra"
@@ -82,7 +83,9 @@ func Execute(ctx context.Context) {
 	// hide completion command
 	rootCmd.CompletionOptions.HiddenDefaultCmd = true
 
-	if err := rootCmd.ExecuteContext(ctx); err != nil {
+	err := rootCmd.ExecuteContext(ctx)
+	container.WaitDockerProxyProbes()
+	if err != nil {
 		os.Exit(1)
 	}
 }
