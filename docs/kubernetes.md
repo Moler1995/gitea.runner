@@ -19,7 +19,7 @@ In a cluster, the runner uses its pod's service account and namespace. [`example
 | `pods/log` | `get` |
 | `secrets` | `create`, `delete` |
 
-Outside a cluster, it uses the current context of the first file in `$KUBECONFIG`, or of `~/.kube/config`, which must authenticate with a token, token file or client certificate. The cluster must run Kubernetes 1.30 or later, and job images need `sh`, `tar`, `tail` and `env`. The runner copies files such as actions into the job container with `tar` over `pods/exec`, gzipped when the image has `gzip`, as that traffic goes through the API server.
+Outside a cluster, it uses the current context of the first file in `$KUBECONFIG`, or of `~/.kube/config`, which must authenticate with a token, token file or client certificate. The cluster must run Kubernetes 1.30 or later, and job images need `sh`, `tar`, `tail` and `env`.
 
 ## Configuration
 
