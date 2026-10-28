@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -215,6 +216,25 @@ func testCLILabelsOverride(t *testing.T) {
 	pushWorkflow(t, c.api, c.repo, "cli_labels.yml")
 	wfRun := waitForRun(t, c.api, c.repo)
 	d.requireSuccess(t, c, wfRun.ID)
+
+	runners, err := c.api.Runners(t.Context(), c.repo)
+	if err != nil {
+		t.Fatalf("list runners: %v", err)
+	}
+	for _, runner := range runners {
+		if runner.Name != c.repo {
+			continue
+		}
+		var labels []string
+		for _, label := range runner.Labels {
+			labels = append(labels, label.Name)
+		}
+		if !slices.Equal(labels, []string{"e2e-override"}) {
+			t.Errorf("runner has labels %v on the server, want only the --labels override", labels)
+		}
+		return
+	}
+	t.Errorf("runner %q not found among %+v", c.repo, runners)
 }
 
 // testCLIShutdownDrains checks that SIGTERM lets a running job finish within shutdown_timeout.

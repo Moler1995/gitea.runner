@@ -40,6 +40,13 @@ type ActionJob struct {
 	RunnerName string `json:"runner_name"`
 }
 
+type ActionRunner struct {
+	Name   string `json:"name"`
+	Labels []struct {
+		Name string `json:"name"`
+	} `json:"labels"`
+}
+
 func (a *GiteaAPI) CreateRepo(ctx context.Context, name string) error {
 	body := map[string]any{"name": name, "auto_init": true}
 	return a.doJSON(ctx, http.MethodPost, "/api/v1/user/repos", body, nil)
@@ -145,6 +152,17 @@ func (a *GiteaAPI) Jobs(ctx context.Context, repo string, runID int64) ([]Action
 		return nil, err
 	}
 	return resp.Jobs, nil
+}
+
+func (a *GiteaAPI) Runners(ctx context.Context, repo string) ([]ActionRunner, error) {
+	var resp struct {
+		Runners []ActionRunner `json:"runners"`
+	}
+	url := fmt.Sprintf("/api/v1/repos/%s/%s/actions/runners", giteaAdminUser, repo)
+	if err := a.doJSON(ctx, http.MethodGet, url, nil, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Runners, nil
 }
 
 func (a *GiteaAPI) JobLogs(ctx context.Context, repo string, jobID int64) (string, error) {
