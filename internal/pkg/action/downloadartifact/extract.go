@@ -26,8 +26,7 @@ import (
 	"github.com/bmatcuk/doublestar/v4"
 )
 
-// spooled is a download on the runner's disk, as a zip can only be read with random access, and
-// the toolkit's zips carry data descriptors even on stored entries.
+// spooled is a download on the runner's disk, as reading a zip with data descriptors needs random access.
 type spooled struct {
 	file   *os.File
 	size   int64
@@ -81,8 +80,7 @@ func rawFileName(disposition string) string {
 // dotdot is unzip-stream's rewrite of every run of dots that makes up a path segment.
 var dotdot = regexp.MustCompile(`(^|[/\\])\.\.+([/\\]|$)`)
 
-// entryName is where unzip-stream writes an entry: below the destination, with `..` segments
-// turned into `.`, and on Windows with either separator.
+// entryName is where unzip-stream writes an entry: below the destination, `..` turned into `.`, either separator on Windows.
 func entryName(name string, windows bool) string {
 	for dotdot.MatchString(name) {
 		name = dotdot.ReplaceAllString(name, "$1.$2")
@@ -93,8 +91,7 @@ func entryName(name string, windows bool) string {
 	return strings.TrimPrefix(path.Clean("/"+name), "/")
 }
 
-// extractZip writes the entries as unzip-stream does: files with the default mode and the
-// current time, symlinks as files holding their target, directories created.
+// extractZip writes entries as unzip-stream does: default mode, current time, symlinks as files holding their target.
 func extractZip(ctx context.Context, c *action.Context, s *spooled, target string) error {
 	reader, err := zip.NewReader(s.file, s.size)
 	if err != nil {
@@ -102,18 +99,18 @@ func extractZip(ctx context.Context, c *action.Context, s *spooled, target strin
 	}
 	now := time.Now()
 	return c.Container.CopyTarStream(ctx, target, func(tw *container.TarWriter) error {
-		for _, f := range reader.File {
-			name := entryName(f.Name, c.Windows())
+		for _, entry := range reader.File {
+			name := entryName(entry.Name, c.Windows())
 			if name == "" {
 				continue
 			}
-			if f.UncompressedSize64 == 0 && strings.ContainsAny(f.Name[len(f.Name)-1:], `/\`) {
+			if entry.UncompressedSize64 == 0 && strings.ContainsAny(entry.Name[len(entry.Name)-1:], `/\`) {
 				if err := tw.WriteHeader(&tar.Header{Typeflag: tar.TypeDir, Name: name + "/", Mode: 0o755, ModTime: now}); err != nil {
 					return err
 				}
 				continue
 			}
-			if err := writeEntry(tw, f, name, now); err != nil {
+			if err := writeEntry(tw, entry, name, now); err != nil {
 				return err
 			}
 		}
@@ -121,13 +118,13 @@ func extractZip(ctx context.Context, c *action.Context, s *spooled, target strin
 	})
 }
 
-func writeEntry(tw *container.TarWriter, f *zip.File, name string, now time.Time) error {
-	body, err := f.Open()
+func writeEntry(tw *container.TarWriter, entry *zip.File, name string, now time.Time) error {
+	body, err := entry.Open()
 	if err != nil {
 		return err
 	}
 	defer body.Close()
-	if err := tw.WriteHeader(&tar.Header{Typeflag: tar.TypeReg, Name: name, Mode: 0o644, Size: int64(f.UncompressedSize64), ModTime: now}); err != nil {
+	if err := tw.WriteHeader(&tar.Header{Typeflag: tar.TypeReg, Name: name, Mode: 0o644, Size: int64(entry.UncompressedSize64), ModTime: now}); err != nil {
 		return err
 	}
 	_, err = io.Copy(tw, body)
@@ -147,8 +144,7 @@ func writeRaw(ctx context.Context, c *action.Context, s *spooled, target, fileNa
 	})
 }
 
-// matchName matches an artifact name the way minimatch does with its default options: a leading
-// `!` negates, a `#` pattern matches nothing, and a wildcard never matches a leading dot.
+// matchName matches as minimatch's defaults do: `!` negates, `#` matches nothing, a wildcard skips a leading dot.
 func matchName(pattern, name string) bool {
 	if strings.HasPrefix(pattern, "#") {
 		return false

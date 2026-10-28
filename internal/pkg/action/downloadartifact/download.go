@@ -7,9 +7,9 @@ package downloadartifact
 import (
 	"cmp"
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -26,18 +26,16 @@ var digestBehaviors = []string{"ignore", "info", "warn", "error"}
 const (
 	parallelDownloads = 5
 	downloadAttempts  = 5
+	downloadStall     = 30 * time.Second
 )
 
-// Overridable in tests.
-var (
-	retryDelay    = 5 * time.Second
-	downloadStall = 30 * time.Second
-)
+var retryDelay = 5 * time.Second
 
-// source is where the artifacts come from, the job's own run or another one.
+// source is the job's own run or, with github-token, another one.
 type source interface {
 	list(ctx context.Context, name string) ([]artifact.Artifact, error)
-	open(ctx context.Context, a artifact.Artifact) (*http.Response, error)
+	signedURL(ctx context.Context, art artifact.Artifact) (string, error)
+	Download(ctx context.Context, signedURL string, stall time.Duration) (*http.Response, error)
 }
 
 func Main(ctx context.Context, c *action.Context) error {
@@ -116,27 +114,30 @@ func run(ctx context.Context, c *action.Context) error {
 	}
 	if len(artifacts) > 0 {
 		c.Infof("Preparing to download the following artifacts:")
-		for _, a := range artifacts {
-			c.Infof("- %s (ID: %d, Size: %d, Expected Digest: %s)", a.Name, a.ID, a.Size, cmp.Or(a.Digest, "undefined"))
+		for _, art := range artifacts {
+			if !filepath.IsLocal(art.Name) || strings.ContainsAny(art.Name, `/\`) { // Gitea's v4 API takes any name, which path/<name> must not leave
+				return action.Failf("Artifact name is not valid: %s", art.Name)
+			}
+			c.Infof("- %s (ID: %d, Size: %d, Expected Digest: %s)", art.Name, art.ID, art.Size, cmp.Or(art.Digest, "undefined"))
 		}
 	}
 
 	mismatched := make([]bool, len(artifacts))
 	group, groupCtx := errgroup.WithContext(ctx)
 	group.SetLimit(parallelDownloads)
-	for i, a := range artifacts {
+	for i, art := range artifacts {
 		target := dest
 		if name == "" && !mergeMultiple && len(artifacts) > 1 {
-			target = c.Join(dest, a.Name)
+			target = c.Join(dest, art.Name)
 		}
 		group.Go(func() error {
-			mismatch, err := fetch(groupCtx, c, src, a, target, skipDecompress)
+			mismatch, err := fetch(groupCtx, c, src, art, target, skipDecompress)
 			if err != nil {
 				return err
 			}
 			if mismatch {
 				mismatched[i] = true
-				message := fmt.Sprintf("Artifact '%s' digest validation failed. Please verify the integrity of the artifact.", a.Name)
+				message := fmt.Sprintf("Artifact '%s' digest validation failed. Please verify the integrity of the artifact.", art.Name)
 				switch digestMismatch {
 				case "info":
 					c.Infof("%s", message)
@@ -151,9 +152,9 @@ func run(ctx context.Context, c *action.Context) error {
 		return err
 	}
 	var mismatches []string
-	for i, a := range artifacts {
+	for i, art := range artifacts {
 		if mismatched[i] {
-			mismatches = append(mismatches, a.Name)
+			mismatches = append(mismatches, art.Name)
 		}
 	}
 	if len(mismatches) > 0 && digestMismatch == "error" {
@@ -173,11 +174,11 @@ func byIDs(ctx context.Context, c *action.Context, src source, input string) ([]
 		if id = strings.TrimSpace(id); id == "" {
 			continue
 		}
-		parsed, ok := parseInt(id)
-		if !ok {
+		parsed, err := action.ParseInt(id)
+		if err != nil {
 			return nil, action.Failf("Invalid artifact ID: '%s'. Must be a number.", id)
 		}
-		wanted = append(wanted, parsed)
+		wanted = append(wanted, int64(parsed))
 	}
 	if len(wanted) == 0 {
 		return nil, action.Failf("No valid artifact IDs provided in 'artifact-ids' input")
@@ -214,38 +215,21 @@ func latest(artifacts []artifact.Artifact) []artifact.Artifact {
 	})
 }
 
-// parseInt reads a leading integer the way JavaScript's parseInt(s, 10) does.
-func parseInt(s string) (int64, bool) {
-	end := 0
-	if end < len(s) && (s[end] == '-' || s[end] == '+') {
-		end++
+// fetch downloads one artifact into target, retrying the blob as the toolkit does, and reports a digest mismatch.
+func fetch(ctx context.Context, c *action.Context, src source, art artifact.Artifact, target string, skipDecompress bool) (bool, error) {
+	signed, err := src.signedURL(ctx, art)
+	if err != nil {
+		return false, err
 	}
-	digits := end
-	for end < len(s) && s[end] >= '0' && s[end] <= '9' {
-		end++
-	}
-	if end == digits {
-		return 0, false
-	}
-	parsed, err := strconv.ParseInt(s[:end], 10, 64)
-	return parsed, err == nil
-}
-
-// fetch downloads one artifact into target, retrying as the toolkit does, and reports a digest
-// that does not match the one the service listed.
-func fetch(ctx context.Context, c *action.Context, src source, a artifact.Artifact, target string, skipDecompress bool) (bool, error) {
+	c.Infof("Redirecting to blob download url: %s", artifact.ScrubQuery(signed))
+	c.Infof("Starting download of artifact to: %s", target)
 	var digest string
-	var err error
 	for attempt := 1; attempt <= downloadAttempts; attempt++ {
-		c.Infof("Starting download of artifact to: %s", target)
-		if digest, err = fetchOnce(ctx, c, src, a, target, skipDecompress); err == nil {
+		if digest, err = fetchOnce(ctx, c, src, signed, target, skipDecompress); err == nil {
 			break
 		}
 		if ctx.Err() != nil {
 			return false, ctx.Err()
-		}
-		if _, api := errors.AsType[*artifact.StatusError](err); api {
-			return false, err // the service gave up already, only the blob download retries
 		}
 		if attempt == downloadAttempts {
 			return false, action.Failf("Unable to download and extract artifact: Artifact download failed after %d retries: %w", attempt, err)
@@ -257,11 +241,11 @@ func fetch(ctx context.Context, c *action.Context, src source, a artifact.Artifa
 		}
 	}
 	c.Infof("Artifact download completed successfully.")
-	return a.Digest != "" && a.Digest != digest, nil
+	return art.Digest != "" && art.Digest != digest, nil
 }
 
-func fetchOnce(ctx context.Context, c *action.Context, src source, a artifact.Artifact, target string, skipDecompress bool) (string, error) {
-	resp, err := src.open(ctx, a)
+func fetchOnce(ctx context.Context, c *action.Context, src source, signed, target string, skipDecompress bool) (string, error) {
+	resp, err := src.Download(ctx, signed, downloadStall)
 	if err != nil {
 		return "", err
 	}

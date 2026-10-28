@@ -915,7 +915,10 @@ func (cr *containerReference) copyDir(dstPath, srcPath string, useGitIgnore, ski
 				logger.Error(err)
 			}
 		}()
-		extractionRoot := cr.extractionRoot(dstPath)
+		extractionRoot := "/"
+		if actPath := cr.GetActPath(); strings.HasPrefix(dstPath+"/", actPath+"/") {
+			extractionRoot = actPath // keeps tar entries from crossing the image's /var/run symlink
+		}
 		if err := writeDirTar(ctx, tarFile, path.Join("/", strings.TrimPrefix(dstPath, extractionRoot)), srcPath, useGitIgnore, skipGitDir, cr.UID, cr.GID); err != nil {
 			return err
 		}
@@ -926,13 +929,6 @@ func (cr *containerReference) copyDir(dstPath, srcPath string, useGitIgnore, ski
 		}
 		return cr.upload(ctx, extractionRoot, tarFile)
 	}
-}
-
-func (cr *containerReference) extractionRoot(dstPath string) string {
-	if actPath := cr.GetActPath(); strings.HasPrefix(dstPath+"/", actPath+"/") {
-		return actPath // keeps tar entries from crossing the image's /var/run symlink
-	}
-	return "/"
 }
 
 func (cr *containerReference) CopyTarStream(ctx context.Context, destPath string, write func(*TarWriter) error) error {
@@ -948,27 +944,19 @@ func (cr *containerReference) CopyTarStream(ctx context.Context, destPath string
 	if cr.id == "" {
 		return cr.missingContainerError("copy to %s", destPath)
 	}
-	// extracting into the deepest existing directory owns the missing ones by the job user, and
-	// passes the daemon's read-only rootfs check for a writable volume
-	var missing []string
-	root := path.Clean(destPath)
+	destPath = path.Clean(destPath)
+	root := destPath // the deepest existing directory, as the daemon refuses a read-only rootfs even for a volume below it
 	for ; root != "/" && root != "."; root = path.Dir(root) {
 		if _, err := cr.cli.ContainerStatPath(ctx, cr.id, client.ContainerStatPathOptions{Path: root}); err == nil {
 			break
 		} else if !cerrdefs.IsNotFound(err) {
 			return fmt.Errorf("stat %s: %w", root, err)
 		}
-		missing = append(missing, root)
-	}
-	rel := func(p string) string { return strings.TrimPrefix(strings.TrimPrefix(p, root), "/") }
-	var parents []string
-	for _, dir := range slices.Backward(missing) {
-		parents = append(parents, rel(dir))
 	}
 	reader, writer := io.Pipe()
 	written := make(chan error, 1)
 	go func() {
-		err := writeTarStream(writer, cr.UID, cr.GID, rel(path.Clean(destPath)), parents, write)
+		err := writeTarStream(writer, cr.UID, cr.GID, strings.TrimPrefix(strings.TrimPrefix(destPath, root), "/"), write)
 		writer.CloseWithError(err)
 		written <- err
 	}()

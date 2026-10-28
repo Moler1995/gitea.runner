@@ -56,13 +56,13 @@ type harness struct {
 	server, store    string
 	client           *artifact.Client
 	workspace        string
-	mu               sync.Mutex // downloads log in parallel
+	mu               sync.Mutex
 	logs, annotation []string
 }
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
-	retryDelay, downloadStall = time.Millisecond, time.Minute
+	retryDelay = time.Millisecond
 	store := t.TempDir()
 	router := http.NewServeMux()
 	artifacts.RegisterV4(router, store)
@@ -100,10 +100,10 @@ func (h *harness) run(inputs map[string]string) error {
 			defer h.mu.Unlock()
 			h.logs = append(h.logs, fmt.Sprintf(format, args...))
 		},
-		Annotate: func(level, message string) {
+		Warning: func(format string, args ...any) {
 			h.mu.Lock()
 			defer h.mu.Unlock()
-			h.annotation = append(h.annotation, level+": "+message)
+			h.annotation = append(h.annotation, "warning: "+fmt.Sprintf(format, args...))
 		},
 	})
 }
@@ -175,6 +175,8 @@ func TestDownloadSelection(t *testing.T) {
 	require.ErrorContains(t, h.run(map[string]string{"artifact-ids": "x"}), "Invalid artifact ID: 'x'. Must be a number.")
 	require.ErrorContains(t, h.run(map[string]string{"digest-mismatch": "loud"}), "Valid options are: ignore, info, warn, error")
 	require.ErrorContains(t, h.run(map[string]string{"merge-multiple": "yes"}), "Core Schema")
+	h.upload("..", "", zipOf(t, zipEntry{name: "escaped.txt", body: "x", mode: 0o644}))
+	require.ErrorContains(t, h.run(map[string]string{"path": "all"}), "Artifact name is not valid: ..")
 	require.NoError(t, h.run(map[string]string{"name": "beta", "path": "warned", "retention-days": "1"}))
 	assert.Equal(t, []string{"warning: Unexpected input(s) 'retention-days', valid inputs are ['name', 'artifact-ids', 'path', 'pattern', 'merge-multiple', 'github-token', 'repository', 'run-id', 'skip-decompress', 'digest-mismatch']"}, h.annotation)
 }

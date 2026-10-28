@@ -114,7 +114,6 @@ func (e *HostEnvironment) Inspect(_ context.Context) (*Info, error) {
 	return &Info{Health: HealthNone, Ports: map[string]string{}}, nil
 }
 
-// GetContainerArchive streams, so a large tree is never held in memory.
 func (e *HostEnvironment) GetContainerArchive(ctx context.Context, srcPath string) (io.ReadCloser, error) {
 	srcPath = filepath.Clean(srcPath)
 	fi, err := os.Lstat(srcPath)
@@ -166,9 +165,10 @@ func (e *HostEnvironment) CopyTarStream(ctx context.Context, destPath string, wr
 	if err := os.MkdirAll(destPath, 0o777); err != nil {
 		return err
 	}
-	content := pipeTar(0, 0, "", nil, write)
-	defer content.Close()
-	tr := tar.NewReader(content)
+	reader, writer := io.Pipe()
+	go func() { writer.CloseWithError(writeTarStream(writer, 0, 0, "", write)) }()
+	defer reader.Close()
+	tr := tar.NewReader(reader)
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -200,9 +200,6 @@ func (e *HostEnvironment) CopyTarStream(ctx context.Context, destPath string, wr
 }
 
 func writeHostFile(target string, mode fs.FileMode, body io.Reader) error {
-	if err := os.MkdirAll(filepath.Dir(target), 0o777); err != nil {
-		return err
-	}
 	f, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
 	if err != nil {
 		return err

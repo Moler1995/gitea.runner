@@ -39,7 +39,7 @@ func TestRESTListsEveryPageAndSkipsExpired(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []string{"1/50", "2/50", "3/50"}, pages)
 	assert.Len(t, list, 52)
-	assert.Equal(t, Artifact{ID: 3, Name: "a3", Size: 3, CreatedAt: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)}, list[1])
+	assert.Equal(t, Artifact{ID: 3, Name: "a3", Size: 3}, list[1])
 }
 
 func TestRESTDownloadKeepsTheTokenOffTheBlob(t *testing.T) {

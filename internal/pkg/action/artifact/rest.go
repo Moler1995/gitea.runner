@@ -14,8 +14,7 @@ import (
 	"time"
 )
 
-// restPageSize goes in `limit`, as Gitea ignores the `per_page` the toolkit sends and then misses
-// every artifact past Gitea's default page of 30. MAX_RESPONSE_ITEMS can shrink it further.
+// restPageSize goes in `limit`, as Gitea ignores the toolkit's `per_page` and pages by 30 then.
 const restPageSize = 50
 
 // REST reaches artifacts of other runs through Gitea's API, with a token of the workflow's choice.
@@ -28,15 +27,11 @@ type REST struct {
 	Logf  func(format string, args ...any)
 }
 
-// NewREST takes the instance as the runner reaches it, never the job's GITHUB_API_URL, so the
-// token only goes to the instance.
+// NewREST takes the instance as the runner reaches it, never the job's GITHUB_API_URL, so the token only goes there.
 func NewREST(instance, token string, transport http.RoundTripper) (*REST, error) {
 	parsed, err := url.Parse(instance)
 	if err != nil {
 		return nil, err
-	}
-	if transport == nil {
-		transport = http.DefaultTransport
 	}
 	return &REST{
 		base:  parsed.JoinPath("api", "v1"),
@@ -81,12 +76,11 @@ func (r *REST) List(ctx context.Context, owner, repo string, runID int64, name s
 		var body struct {
 			TotalCount int `json:"total_count"`
 			Artifacts  []struct {
-				ID          int64     `json:"id"`
-				Name        string    `json:"name"`
-				SizeInBytes int64     `json:"size_in_bytes"`
-				CreatedAt   time.Time `json:"created_at"`
-				Expired     bool      `json:"expired"`
-				Digest      string    `json:"digest"`
+				ID          int64  `json:"id"`
+				Name        string `json:"name"`
+				SizeInBytes int64  `json:"size_in_bytes"`
+				Expired     bool   `json:"expired"`
+				Digest      string `json:"digest"`
 			} `json:"artifacts"`
 		}
 		err = json.UnmarshalRead(resp.Body, &body)
@@ -94,9 +88,9 @@ func (r *REST) List(ctx context.Context, owner, repo string, runID int64, name s
 		if err != nil {
 			return nil, fmt.Errorf("list artifacts: %w", err)
 		}
-		for _, a := range body.Artifacts {
-			if !a.Expired {
-				list = append(list, Artifact{ID: a.ID, Name: a.Name, Size: a.SizeInBytes, CreatedAt: a.CreatedAt, Digest: a.Digest})
+		for _, listed := range body.Artifacts {
+			if !listed.Expired {
+				list = append(list, Artifact{ID: listed.ID, Name: listed.Name, Size: listed.SizeInBytes, Digest: listed.Digest})
 			}
 		}
 		if seen += len(body.Artifacts); len(body.Artifacts) == 0 || seen >= body.TotalCount {

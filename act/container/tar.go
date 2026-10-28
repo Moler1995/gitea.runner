@@ -17,8 +17,7 @@ import (
 	"gitea.com/gitea/runner/act/filecollector"
 )
 
-// TarWriter takes names relative to the destination, and owns every entry by the user the
-// container extracts as, like the other copies do.
+// TarWriter takes names relative to the destination, owns entries by the user the container extracts as, and writes missing parents first.
 type TarWriter struct {
 	*tar.Writer
 	uid, gid int
@@ -28,8 +27,14 @@ type TarWriter struct {
 
 func (w *TarWriter) WriteHeader(hdr *tar.Header) error {
 	name := strings.TrimSuffix(hdr.Name, "/")
+	hdr.Name = path.Join(w.prefix, name) + hdr.Name[len(name):]
+	return w.writeHeader(hdr)
+}
+
+func (w *TarWriter) writeHeader(hdr *tar.Header) error {
+	name := strings.TrimSuffix(hdr.Name, "/")
 	if dir := path.Dir(name); dir != "." && dir != "/" && !w.dirs[dir] { // else the daemon creates it as root
-		if err := w.WriteHeader(&tar.Header{Typeflag: tar.TypeDir, Name: dir + "/", Mode: 0o755, ModTime: time.Now()}); err != nil {
+		if err := w.writeHeader(&tar.Header{Typeflag: tar.TypeDir, Name: dir + "/", Mode: 0o755, ModTime: time.Now()}); err != nil {
 			return err
 		}
 	}
@@ -37,35 +42,20 @@ func (w *TarWriter) WriteHeader(hdr *tar.Header) error {
 		w.dirs[name] = true
 	}
 	hdr.Uid, hdr.Gid = w.uid, w.gid
-	if w.prefix != "" {
-		dir := strings.HasSuffix(hdr.Name, "/")
-		hdr.Name = path.Join(w.prefix, hdr.Name)
-		if dir {
-			hdr.Name += "/"
-		}
-	}
 	return w.Writer.WriteHeader(hdr)
 }
 
-// writeTarStream writes parents first with their names as given, then what write produces.
-func writeTarStream(w io.Writer, uid, gid int, prefix string, parents []string, write func(*TarWriter) error) error {
-	tw := &TarWriter{Writer: tar.NewWriter(w), uid: uid, gid: gid, dirs: map[string]bool{}}
-	for _, name := range parents {
-		if err := tw.Writer.WriteHeader(&tar.Header{Typeflag: tar.TypeDir, Name: name + "/", Mode: 0o755, Uid: uid, Gid: gid, ModTime: time.Now()}); err != nil {
+func writeTarStream(w io.Writer, uid, gid int, prefix string, write func(*TarWriter) error) error {
+	tw := &TarWriter{Writer: tar.NewWriter(w), uid: uid, gid: gid, prefix: prefix, dirs: map[string]bool{}}
+	if prefix != "" {
+		if err := tw.writeHeader(&tar.Header{Typeflag: tar.TypeDir, Name: prefix + "/", Mode: 0o755, ModTime: time.Now()}); err != nil {
 			return err
 		}
 	}
-	tw.prefix = prefix
 	if err := write(tw); err != nil {
 		return err
 	}
 	return tw.Close()
-}
-
-func pipeTar(uid, gid int, prefix string, parents []string, write func(*TarWriter) error) *io.PipeReader {
-	reader, writer := io.Pipe()
-	go func() { writer.CloseWithError(writeTarStream(writer, uid, gid, prefix, parents, write)) }()
-	return reader
 }
 
 func writeFilesTar(ctx context.Context, w io.Writer, uid, gid int, files ...*FileEntry) error {
