@@ -115,7 +115,7 @@ func readInputs(c *action.Context) (*inputs, error) {
 
 func parse(ctx context.Context, c *action.Context, patterns string) (*glob.Globber, error) {
 	opts := glob.Options{Workdir: c.Workspace, Windows: c.Windows(), ImplicitDescendants: true}
-	if strings.Contains(patterns, "~") {
+	if slices.ContainsFunc(strings.Split(patterns, "\n"), func(line string) bool { return strings.HasPrefix(strings.TrimLeft(strings.TrimSpace(line), "!"), "~") }) {
 		home, err := c.Home(ctx)
 		if err != nil {
 			return nil, err
@@ -131,8 +131,8 @@ type collected struct {
 }
 
 // collect writes the selected files to spool, zipped or, without archiving, the first one as is.
-func collect(ctx context.Context, c *action.Context, g *glob.Globber, in *inputs, spool *os.File) (*collected, error) {
-	roots := g.SearchPaths()
+func collect(ctx context.Context, c *action.Context, globber *glob.Globber, in *inputs, spool *os.File) (*collected, error) {
+	roots := globber.SearchPaths()
 	root := ""
 	if len(roots) > 1 {
 		c.Infof("Multiple search paths detected. Calculating the least common ancestor of all paths")
@@ -150,17 +150,17 @@ func collect(ctx context.Context, c *action.Context, g *glob.Globber, in *inputs
 		return deflater, nil
 	})
 	seen := map[string]bool{}
-	w := &walker{g: g, includeHidden: in.includeHidden, visit: func(f found) error {
+	files := &walker{g: globber, includeHidden: in.includeHidden, visit: func(file found) error {
 		result.files++
-		if lower := strings.ToLower(f.path); seen[lower] {
-			c.Infof("Uploads are case insensitive: %s was detected that it will be overwritten by another file with the same path", f.path)
+		if lower := strings.ToLower(file.path); seen[lower] {
+			c.Infof("Uploads are case insensitive: %s was detected that it will be overwritten by another file with the same path", file.path)
 		} else {
 			seen[lower] = true
 		}
 		if !in.archiveIt {
 			if result.files == 1 {
-				result.fileName = c.Base(f.path)
-				_, err := io.Copy(spool, f.body)
+				result.fileName = c.Base(file.path)
+				_, err := io.Copy(spool, file.body)
 				return err
 			}
 			return nil
@@ -168,15 +168,15 @@ func collect(ctx context.Context, c *action.Context, g *glob.Globber, in *inputs
 		base := root
 		if base == "" {
 			base = roots[0]
-			if f.path == base { // a single file uploaded by its own path keeps no directory
+			if file.path == base { // a single file uploaded by its own path keeps no directory
 				base = c.Dir(base)
 			}
 		}
-		return addToZip(zw, in.compressionLevel, base, f)
+		return addToZip(zw, in.compressionLevel, base, file)
 	}}
-	walk := func() error { return w.walkContainer(ctx, c, roots) }
+	walk := func() error { return files.walkContainer(ctx, c, roots) }
 	if c.Host() {
-		walk = func() error { return w.walkHost(roots) }
+		walk = func() error { return files.walkHost(roots) }
 	}
 	if err := walk(); err != nil {
 		return nil, err
@@ -209,29 +209,29 @@ var (
 
 func labels(chars []invalidChar) string {
 	var list []string
-	for _, c := range chars {
-		list = append(list, c.label)
+	for _, char := range chars {
+		list = append(list, char.label)
 	}
 	return strings.Join(list, ",")
 }
 
-func addToZip(zw *zip.Writer, level int, root string, f found) error {
-	rel := strings.TrimPrefix(f.path, root)
+func addToZip(zw *zip.Writer, level int, root string, file found) error {
+	rel := strings.TrimPrefix(file.path, root)
 	for _, invalid := range invalidPathChars {
 		if strings.Contains(rel, invalid.char) {
 			return action.Failf("The path for one of the files in artifact is not valid: %s. Contains the following character: %s\n\nInvalid characters include: %s\n\nThe following characters are not allowed in files that are uploaded due to limitations with certain file systems such as NTFS. To maintain file system agnostic behavior, these characters are intentionally not allowed to prevent potential problems with downloads on different file systems.", rel, invalid.label, labels(invalidPathChars))
 		}
 	}
-	header := &zip.FileHeader{Name: strings.TrimLeft(strings.ReplaceAll(rel, `\`, "/"), "/"), Method: zip.Deflate, Modified: f.mtime.UTC()} // zip-stream writes DOS times in UTC
+	header := &zip.FileHeader{Name: strings.TrimLeft(strings.ReplaceAll(rel, `\`, "/"), "/"), Method: zip.Deflate, Modified: file.mtime.UTC()} // zip-stream writes DOS times in UTC
 	if level == 0 {
 		header.Method = zip.Store
 	}
-	header.SetMode(f.mode & (fs.ModePerm | fs.ModeSetuid | fs.ModeSetgid | fs.ModeSticky))
-	w, err := zw.CreateHeader(header)
+	header.SetMode(file.mode & (fs.ModePerm | fs.ModeSetuid | fs.ModeSetgid | fs.ModeSticky))
+	entry, err := zw.CreateHeader(header)
 	if err != nil {
 		return err
 	}
-	_, err = io.Copy(w, f.body)
+	_, err = io.Copy(entry, file.body)
 	return err
 }
 
