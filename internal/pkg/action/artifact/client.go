@@ -7,6 +7,7 @@ package artifact
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/base64"
 	"encoding/json/v2"
@@ -195,13 +196,14 @@ func pow(base float64, exp int) float64 {
 	return result
 }
 
-// twirpMessage is the msg of a twirp error, or the body Gitea answers in plain text.
+// twirpMessage is the msg of a twirp error, the message of a Gitea API one, or the body Gitea answers in plain text.
 func twirpMessage(body []byte) string {
 	var twirpErr struct {
-		Msg string `json:"msg"`
+		Msg     string `json:"msg"`
+		Message string `json:"message"`
 	}
-	if json.Unmarshal(body, &twirpErr) == nil && twirpErr.Msg != "" {
-		return twirpErr.Msg
+	if json.Unmarshal(body, &twirpErr) == nil && cmp.Or(twirpErr.Msg, twirpErr.Message) != "" {
+		return cmp.Or(twirpErr.Msg, twirpErr.Message)
 	}
 	return strings.TrimSpace(string(body))
 }

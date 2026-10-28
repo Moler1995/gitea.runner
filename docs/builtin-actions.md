@@ -41,7 +41,7 @@ With `gitea-runner exec`, checking out the workflow's own repository copies your
 
 ## upload-artifact
 
-Works like `actions/upload-artifact` v7 with these inputs. Any other input fails the step. It needs Gitea 1.22 or later, and 1.26 for `archive: false`.
+Works like `actions/upload-artifact` v7 with these inputs. Any other input logs a warning, as on GitHub. It needs Gitea 1.22.4 or later, and 1.26 for `archive: false`.
 
 | Input | Default |
 | --- | --- |
@@ -54,6 +54,6 @@ Works like `actions/upload-artifact` v7 with these inputs. Any other input fails
 | `include-hidden-files` | `false`, `true` uploads files and directories whose name starts with `.` |
 | `archive` | `true`, `false` uploads a single file as is |
 
-Patterns, symlinks and the artifact's root directory follow `actions/upload-artifact`, as do `ACTIONS_ARTIFACT_UPLOAD_CONCURRENCY` and `ACTIONS_ARTIFACT_UPLOAD_TIMEOUT_MS`. The step outputs `artifact-id`, `artifact-digest` and `artifact-url`. The `artifact-url` is the artifact's link on the run page for this attempt, where `actions/upload-artifact` gives a link only GitHub serves.
+Patterns, symlinks and the artifact's root directory follow `actions/upload-artifact`, as do `ACTIONS_ARTIFACT_UPLOAD_CONCURRENCY` and `ACTIONS_ARTIFACT_UPLOAD_TIMEOUT_MS`. The step outputs `artifact-id`, `artifact-digest` and `artifact-url`. On Gitea 1.26 and later, the `artifact-url` is the artifact's link on the run page for this attempt, where `actions/upload-artifact` gives a link only GitHub serves.
 
 With `gitea-runner exec`, it uses the local artifact server of `--artifact-server-path`.

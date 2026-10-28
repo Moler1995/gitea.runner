@@ -6,6 +6,7 @@ package runner
 import (
 	"cmp"
 	"context"
+	"strings"
 
 	"gitea.com/gitea/runner/act/common"
 	"gitea.com/gitea/runner/internal/pkg/action"
@@ -41,10 +42,14 @@ func (sab *stepActionBuiltin) main() common.Executor {
 
 		rc := sab.RunContext
 		rc.ApplyExtraPath(ctx, &sab.env)
+		inputs := make(map[string]string, len(sab.Step.With))
+		for name, value := range sab.Step.With {
+			inputs[strings.ToLower(name)] = value // input names are case-insensitive on GitHub
+		}
 		return sab.run(ctx, &action.Context{
 			Container:       rc.JobContainer,
 			Github:          rc.getGithubContext(ctx),
-			Inputs:          sab.Step.With,
+			Inputs:          inputs,
 			HostWorkdir:     rc.Config.Workdir,
 			Workspace:       rc.JobContainer.ToContainerPath(rc.Config.Workdir),
 			BindWorkdir:     rc.Config.BindWorkdir,
@@ -55,7 +60,7 @@ func (sab *stepActionBuiltin) main() common.Executor {
 			ClientKeyFile:   rc.Config.ClientKeyFile,
 			Env:             sab.env,
 			ResultsURL:      rc.Config.ResultsURL,
-			RuntimeToken:    cmp.Or(rc.runtimeToken, rc.Config.Secrets["ACTIONS_RUNTIME_TOKEN"]),
+			RuntimeToken:    cmp.Or(rc.runtimeToken, rc.topLevelRunContext().Config.Secrets["ACTIONS_RUNTIME_TOKEN"]), // composite contexts have no secrets
 			Transport:       rc.Config.InstanceTransport,
 			Infof:           rawLogger.Infof,
 			Annotate: func(level, message string) {
