@@ -59,6 +59,11 @@ Each lives in `internal/pkg/action/<name>` and is registered in `builtinActions`
 It requires Docker and is excluded from `make test`. CI runs stable and nightly variants in
 parallel.
 
+The `cli_*` scenarios build the binary and drive `register` and `daemon` as a user would, including `--once`,
+`--labels` and shutdown with a running job. `failure_paths` covers failed, skipped, tolerated and timed-out jobs.
+`label_routing` and `capacity` cover scheduling, `reconnect` drops the connection to Gitea through a proxy, and
+`host_mode` and `reusable_workflow` cover host labels and `workflow_call`.
+
 The suite shares one Gitea and regular runner. Cache and ephemeral scenarios use isolated
 repository runners. A run path is `<workflow>@<ref>` and a log row is `<timestamp>Z <payload>`.
 
