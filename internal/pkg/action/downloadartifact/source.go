@@ -4,7 +4,6 @@
 package downloadartifact
 
 import (
-	"cmp"
 	"context"
 	"net/http"
 	"strings"
@@ -22,13 +21,13 @@ func newSource(c *action.Context, token string) (source, error) {
 		client.Logf = c.Infof
 		return &runSource{c: c, client: client}, nil
 	}
-	repository := cmp.Or(c.Input("repository"), c.Github.Repository)
-	owner, repo, _ := strings.Cut(repository, "/")
+	parts := append(strings.Split(c.Input("repository"), "/"), "")
+	owner, repo := parts[0], parts[1]
 	if owner == "" || repo == "" {
-		return nil, action.Failf("Invalid repository: '%s'. Must be in format owner/repo", repository)
+		return nil, action.Failf("Invalid repository: '%s'. Must be in format owner/repo", c.Input("repository"))
 	}
-	runID, ok := parseInt(cmp.Or(c.Input("run-id"), c.Github.RunID))
-	if !ok {
+	runID, ok := parseInt(c.Input("run-id"))
+	if !ok || runID <= 0 { // Gitea lists the artifacts of every run for those
 		return nil, action.Failf("Invalid run-id: '%s'. Must be a number.", c.Input("run-id"))
 	}
 	rest, err := artifact.NewREST(c.ResultsURL, token, c.Transport)

@@ -162,7 +162,7 @@ func writeHostArchive(ctx context.Context, tc *filecollector.TarCollector, srcPa
 	return tc.WriteFile(fi.Name(), fi, linkname, f)
 }
 
-func (e *HostEnvironment) CopyTarStream(_ context.Context, destPath string, write func(*TarWriter) error) error {
+func (e *HostEnvironment) CopyTarStream(ctx context.Context, destPath string, write func(*TarWriter) error) error {
 	if err := os.MkdirAll(destPath, 0o777); err != nil {
 		return err
 	}
@@ -170,6 +170,9 @@ func (e *HostEnvironment) CopyTarStream(_ context.Context, destPath string, writ
 	defer content.Close()
 	tr := tar.NewReader(content)
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		hdr, err := tr.Next()
 		if errors.Is(err, io.EOF) {
 			return nil

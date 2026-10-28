@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -174,7 +175,8 @@ func TestDownloadSelection(t *testing.T) {
 	require.ErrorContains(t, h.run(map[string]string{"artifact-ids": "x"}), "Invalid artifact ID: 'x'. Must be a number.")
 	require.ErrorContains(t, h.run(map[string]string{"digest-mismatch": "loud"}), "Valid options are: ignore, info, warn, error")
 	require.ErrorContains(t, h.run(map[string]string{"merge-multiple": "yes"}), "Core Schema")
-	require.ErrorContains(t, h.run(map[string]string{"retention-days": "1"}), `unsupported input "retention-days"`)
+	require.NoError(t, h.run(map[string]string{"name": "beta", "path": "warned", "retention-days": "1"}))
+	assert.Equal(t, []string{"warning: Unexpected input(s) 'retention-days', valid inputs are ['name', 'artifact-ids', 'path', 'pattern', 'merge-multiple', 'github-token', 'repository', 'run-id', 'skip-decompress', 'digest-mismatch']"}, h.annotation)
 }
 
 func TestDownloadRawFilesAndSkipDecompress(t *testing.T) {
@@ -210,6 +212,8 @@ func TestDownloadDigestMismatch(t *testing.T) {
 func TestDownloadFromAnotherRun(t *testing.T) {
 	h := newHarness(t)
 	archive := zipOf(t, zipEntry{name: "other.txt", body: "from run 12", mode: 0o644})
+	var expired atomic.Bool
+	var zipCalls atomic.Int32
 	var gitea *httptest.Server
 	gitea = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -219,6 +223,11 @@ func TestDownloadFromAnotherRun(t *testing.T) {
 				{"id":30,"name":"dist","size_in_bytes":1,"expired":true},
 				{"id":20,"name":"dist","size_in_bytes":1,"expired":false}]}`)
 		case "/api/v1/repos/someone/else/actions/artifacts/20/zip":
+			zipCalls.Add(1)
+			if expired.Load() {
+				http.Error(w, "Artifact has expired", http.StatusNotFound)
+				return
+			}
 			http.Redirect(w, r, gitea.URL+"/raw/20?sig=abc", http.StatusFound)
 		case "/raw/20":
 			assert.Empty(t, r.Header.Get("Authorization"))
@@ -231,9 +240,14 @@ func TestDownloadFromAnotherRun(t *testing.T) {
 	defer gitea.Close()
 	h.server = gitea.URL
 
-	require.NoError(t, h.run(map[string]string{"name": "dist", "github-token": "pat", "repository": "someone/else", "run-id": "12", "path": "other"}))
+	inputs := map[string]string{"name": "dist", "github-token": "pat", "repository": "someone/else/ignored", "run-id": "12", "path": "other"}
+	require.NoError(t, h.run(inputs))
 	assert.Equal(t, "from run 12", h.read("other/other.txt"), "the expired newer copy is skipped")
 	assert.Contains(t, strings.Join(h.logs, "\n"), "Redirecting to blob download url: "+gitea.URL+"/raw/20\n")
 
+	expired.Store(true)
+	require.ErrorContains(t, h.run(inputs), "Artifact has expired")
+	assert.Equal(t, int32(2), zipCalls.Load(), "an API error is not retried")
 	require.ErrorContains(t, h.run(map[string]string{"github-token": "pat", "repository": "nobody"}), "Invalid repository: 'nobody'. Must be in format owner/repo")
+	require.ErrorContains(t, h.run(map[string]string{"github-token": "pat", "run-id": "0"}), "Invalid run-id: '0'")
 }

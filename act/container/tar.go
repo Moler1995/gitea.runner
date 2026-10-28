@@ -11,6 +11,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"gitea.com/gitea/runner/act/common"
 	"gitea.com/gitea/runner/act/filecollector"
@@ -22,9 +23,19 @@ type TarWriter struct {
 	*tar.Writer
 	uid, gid int
 	prefix   string
+	dirs     map[string]bool
 }
 
 func (w *TarWriter) WriteHeader(hdr *tar.Header) error {
+	name := strings.TrimSuffix(hdr.Name, "/")
+	if dir := path.Dir(name); dir != "." && dir != "/" && !w.dirs[dir] { // else the daemon creates it as root
+		if err := w.WriteHeader(&tar.Header{Typeflag: tar.TypeDir, Name: dir + "/", Mode: 0o755, ModTime: time.Now()}); err != nil {
+			return err
+		}
+	}
+	if hdr.Typeflag == tar.TypeDir {
+		w.dirs[name] = true
+	}
 	hdr.Uid, hdr.Gid = w.uid, w.gid
 	if w.prefix != "" {
 		dir := strings.HasSuffix(hdr.Name, "/")
@@ -38,9 +49,9 @@ func (w *TarWriter) WriteHeader(hdr *tar.Header) error {
 
 // writeTarStream writes parents first with their names as given, then what write produces.
 func writeTarStream(w io.Writer, uid, gid int, prefix string, parents []string, write func(*TarWriter) error) error {
-	tw := &TarWriter{Writer: tar.NewWriter(w), uid: uid, gid: gid}
+	tw := &TarWriter{Writer: tar.NewWriter(w), uid: uid, gid: gid, dirs: map[string]bool{}}
 	for _, name := range parents {
-		if err := tw.WriteHeader(&tar.Header{Typeflag: tar.TypeDir, Name: name + "/", Mode: 0o755}); err != nil {
+		if err := tw.Writer.WriteHeader(&tar.Header{Typeflag: tar.TypeDir, Name: name + "/", Mode: 0o755, Uid: uid, Gid: gid, ModTime: time.Now()}); err != nil {
 			return err
 		}
 	}

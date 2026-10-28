@@ -948,22 +948,36 @@ func (cr *containerReference) CopyTarStream(ctx context.Context, destPath string
 	if cr.id == "" {
 		return cr.missingContainerError("copy to %s", destPath)
 	}
-	destPath = path.Clean(destPath)
-	root := cr.extractionRoot(destPath)
-	rel := func(p string) string { return strings.TrimPrefix(strings.TrimPrefix(p, root), "/") }
-	// the daemon would create missing parents as root, which a non-root job user cannot write to
-	var parents []string
-	for dir := destPath; dir != root && dir != "/" && dir != "."; dir = path.Dir(dir) {
-		if _, err := cr.cli.ContainerStatPath(ctx, cr.id, client.ContainerStatPathOptions{Path: dir}); err == nil {
+	// extracting into the deepest existing directory owns the missing ones by the job user, and
+	// passes the daemon's read-only rootfs check for a writable volume
+	var missing []string
+	root := path.Clean(destPath)
+	for ; root != "/" && root != "."; root = path.Dir(root) {
+		if _, err := cr.cli.ContainerStatPath(ctx, cr.id, client.ContainerStatPathOptions{Path: root}); err == nil {
 			break
 		} else if !cerrdefs.IsNotFound(err) {
-			return fmt.Errorf("stat %s: %w", dir, err)
+			return fmt.Errorf("stat %s: %w", root, err)
 		}
-		parents = append([]string{rel(dir)}, parents...)
+		missing = append(missing, root)
 	}
-	content := pipeTar(cr.UID, cr.GID, rel(destPath), parents, write)
-	defer content.Close()
-	return cr.upload(ctx, root, content)
+	rel := func(p string) string { return strings.TrimPrefix(strings.TrimPrefix(p, root), "/") }
+	var parents []string
+	for _, dir := range slices.Backward(missing) {
+		parents = append(parents, rel(dir))
+	}
+	reader, writer := io.Pipe()
+	written := make(chan error, 1)
+	go func() {
+		err := writeTarStream(writer, cr.UID, cr.GID, rel(path.Clean(destPath)), parents, write)
+		writer.CloseWithError(err)
+		written <- err
+	}()
+	err := cr.upload(ctx, root, reader)
+	reader.Close()
+	if writeErr := <-written; writeErr != nil && !errors.Is(writeErr, io.ErrClosedPipe) {
+		return writeErr // the client reports it as a failure to connect
+	}
+	return err
 }
 
 func (cr *containerReference) copyContent(dstPath string, files ...*FileEntry) common.Executor {

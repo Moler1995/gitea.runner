@@ -549,7 +549,7 @@ func TestCopyTarStreamOwnsMissingParents(t *testing.T) {
 	var entries []string
 	client.On("CopyToContainer", ctx, "job", mock.Anything).Run(func(args mock.Arguments) {
 		opts := args.Get(2).(mobyclient.CopyToContainerOptions)
-		assert.Equal(t, "/", opts.DestinationPath)
+		assert.Equal(t, "/w", opts.DestinationPath)
 		reader := tar.NewReader(opts.Content)
 		for {
 			header, err := reader.Next()
@@ -564,12 +564,15 @@ func TestCopyTarStreamOwnsMissingParents(t *testing.T) {
 
 	cr := &containerReference{id: "job", cli: client, input: &NewContainerInput{Name: "job"}, UID: 1001, GID: 1002}
 	require.NoError(t, cr.CopyTarStream(ctx, "/w/out/a/", func(tw *TarWriter) error {
-		if err := tw.WriteHeader(&tar.Header{Typeflag: tar.TypeDir, Name: "dir/", Mode: 0o755}); err != nil {
-			return err
-		}
 		return tw.WriteHeader(&tar.Header{Typeflag: tar.TypeReg, Name: "dir/f.txt", Mode: 0o644})
 	}))
-	assert.Equal(t, []string{"w/out/", "w/out/a/", "w/out/a/dir/", "w/out/a/dir/f.txt"}, entries)
+	assert.Equal(t, []string{"out/", "out/a/", "out/a/dir/", "out/a/dir/f.txt"}, entries)
+
+	stat("/w/out/a", nil)
+	client.On("CopyToContainer", ctx, "job", mock.Anything).Run(func(args mock.Arguments) {
+		_, _ = io.Copy(io.Discard, args.Get(2).(mobyclient.CopyToContainerOptions).Content)
+	}).Return(mobyclient.CopyToContainerResult{}, errors.New("error during connect")).Once()
+	require.EqualError(t, cr.CopyTarStream(ctx, "/w/out/a", func(*TarWriter) error { return errors.New("boom") }), "boom")
 	client.AssertExpectations(t)
 }
 

@@ -107,6 +107,11 @@ func TestHostCopyTarStream(t *testing.T) {
 
 	require.ErrorContains(t, e.CopyTarStream(t.Context(), dest, write("../escape", 0o644, "x")), "escapes")
 	assert.NoFileExists(t, filepath.Join(filepath.Dir(dest), "escape"))
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	require.ErrorIs(t, e.CopyTarStream(ctx, dest, write("late.txt", 0o644, "x")), context.Canceled)
+	assert.NoFileExists(t, filepath.Join(dest, "late.txt"))
 }
 
 func TestHostEnvironmentExecExitCode(t *testing.T) {

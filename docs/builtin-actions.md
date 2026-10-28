@@ -59,15 +59,15 @@ Patterns, symlinks and the artifact's root directory follow `actions/upload-arti
 
 ## download-artifact
 
-Works like `actions/download-artifact` v8 with these inputs. Any other input fails the step.
+Works like `actions/download-artifact` v8 with these inputs. Any other input logs a warning, as on GitHub.
 
 | Input | Default |
 | --- | --- |
 | `name` | empty, every artifact of the run |
 | `artifact-ids` | empty, comma-separated IDs instead of `name` |
 | `path` | workspace root, `~` is the job user's home |
-| `pattern` | empty, a pattern the artifact names must match |
-| `merge-multiple` | `false`, `true` puts every artifact in `path` instead of `path/<name>` |
+| `pattern` | empty, a glob the artifact names must match, without the extglobs and brace ranges of minimatch |
+| `merge-multiple` | `false`, several artifacts go to `path/<name>`, `true` puts them all in `path` |
 | `github-token` | empty, a token to download from another run or repository |
 | `repository` | `github.repository`, with `github-token` |
 | `run-id` | `github.run_id`, with `github-token` |
@@ -76,6 +76,6 @@ Works like `actions/download-artifact` v8 with these inputs. Any other input fai
 
 Files are written as `actions/download-artifact` writes them, without their mode, so executables lose their executable bit. `digest-mismatch` only applies when the server reports a digest, which Gitea does not. The step outputs `download-path`.
 
-`github-token` is only sent to the instance the runner is registered with. Downloads from another run read every page of its artifacts and skip expired ones, where `actions/download-artifact` sees only Gitea's first 30 and fails on an expired newest copy.
+`github-token` needs Gitea 1.24 or later and is only sent to the instance the runner is registered with. Downloads from another run read every page of its artifacts and skip expired ones, where `actions/download-artifact` sees only Gitea's first 30 and fails on an expired newest copy.
 
-With `gitea-runner exec`, both actions use the local artifact server of `--artifact-server-path`.
+With `gitea-runner exec`, both actions use the local artifact server of `--artifact-server-path`, which serves no other runs for `github-token`.

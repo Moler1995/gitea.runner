@@ -7,12 +7,12 @@ package downloadartifact
 import (
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"gitea.com/gitea/runner/internal/pkg/action"
@@ -20,11 +20,6 @@ import (
 
 	"golang.org/x/sync/errgroup"
 )
-
-var inputNames = []string{
-	"name", "artifact-ids", "path", "pattern", "merge-multiple", "github-token", "repository", "run-id",
-	"skip-decompress", "digest-mismatch",
-}
 
 var digestBehaviors = []string{"ignore", "info", "warn", "error"}
 
@@ -53,19 +48,18 @@ func Main(ctx context.Context, c *action.Context) error {
 }
 
 func run(ctx context.Context, c *action.Context) error {
-	if err := c.CheckInputs("download-artifact", inputNames...); err != nil {
-		return err
-	}
+	c.ApplyDefaults("name", "", "artifact-ids", "", "path", "", "pattern", "", "merge-multiple", "false", "github-token", "",
+		"repository", c.Github.Repository, "run-id", c.Github.RunID, "skip-decompress", "false", "digest-mismatch", "error")
 	name, ids, pattern, token := c.Input("name"), c.Input("artifact-ids"), c.Input("pattern"), c.Input("github-token")
-	mergeMultiple, err := c.BoolInput("merge-multiple", false)
+	mergeMultiple, err := c.BoolInput("merge-multiple")
 	if err != nil {
 		return err
 	}
-	skipDecompress, err := c.BoolInput("skip-decompress", false)
+	skipDecompress, err := c.BoolInput("skip-decompress")
 	if err != nil {
 		return err
 	}
-	digestMismatch := cmp.Or(c.Input("digest-mismatch"), "error")
+	digestMismatch := c.Input("digest-mismatch")
 	if !slices.Contains(digestBehaviors, digestMismatch) {
 		return action.Failf("Invalid value for 'digest-mismatch': '%s'. Valid options are: %s", digestMismatch, strings.Join(digestBehaviors, ", "))
 	}
@@ -127,11 +121,10 @@ func run(ctx context.Context, c *action.Context) error {
 		}
 	}
 
-	var mismatches []string
-	var mu sync.Mutex
+	mismatched := make([]bool, len(artifacts))
 	group, groupCtx := errgroup.WithContext(ctx)
 	group.SetLimit(parallelDownloads)
-	for _, a := range artifacts {
+	for i, a := range artifacts {
 		target := dest
 		if name == "" && !mergeMultiple && len(artifacts) > 1 {
 			target = c.Join(dest, a.Name)
@@ -142,9 +135,7 @@ func run(ctx context.Context, c *action.Context) error {
 				return err
 			}
 			if mismatch {
-				mu.Lock()
-				mismatches = append(mismatches, a.Name)
-				mu.Unlock()
+				mismatched[i] = true
 				message := fmt.Sprintf("Artifact '%s' digest validation failed. Please verify the integrity of the artifact.", a.Name)
 				switch digestMismatch {
 				case "info":
@@ -158,6 +149,12 @@ func run(ctx context.Context, c *action.Context) error {
 	}
 	if err := group.Wait(); err != nil {
 		return err
+	}
+	var mismatches []string
+	for i, a := range artifacts {
+		if mismatched[i] {
+			mismatches = append(mismatches, a.Name)
+		}
 	}
 	if len(mismatches) > 0 && digestMismatch == "error" {
 		return action.Failf("Digest validation failed for artifact(s): %s. Use 'digest-mismatch: warn' to continue on mismatch.", strings.Join(mismatches, ", "))
@@ -246,6 +243,9 @@ func fetch(ctx context.Context, c *action.Context, src source, a artifact.Artifa
 		}
 		if ctx.Err() != nil {
 			return false, ctx.Err()
+		}
+		if _, api := errors.AsType[*artifact.StatusError](err); api {
+			return false, err // the service gave up already, only the blob download retries
 		}
 		if attempt == downloadAttempts {
 			return false, action.Failf("Unable to download and extract artifact: Artifact download failed after %d retries: %w", attempt, err)

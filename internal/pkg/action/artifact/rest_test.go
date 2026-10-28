@@ -25,13 +25,9 @@ func TestRESTListsEveryPageAndSkipsExpired(t *testing.T) {
 		assert.Empty(t, r.URL.Query().Get("per_page"))
 		pages = append(pages, r.URL.Query().Get("page")+"/"+r.URL.Query().Get("limit"))
 		page, _ := strconv.Atoi(r.URL.Query().Get("page"))
-		count := restPageSize
-		if page == 2 {
-			count = 3
-		}
+		const maxResponseItems = 20
 		var entries []string
-		for i := range count {
-			id := (page-1)*restPageSize + i + 1
+		for id := (page-1)*maxResponseItems + 1; id <= min(page*maxResponseItems, 53); id++ {
 			entries = append(entries, fmt.Sprintf(`{"id":%d,"name":"a%d","size_in_bytes":%d,"created_at":"2026-01-02T03:04:05Z","expired":%t}`, id, id, id, id == 2))
 		}
 		_, _ = io.WriteString(w, `{"total_count":53,"artifacts":[`+strings.Join(entries, ",")+`]}`)
@@ -41,7 +37,7 @@ func TestRESTListsEveryPageAndSkipsExpired(t *testing.T) {
 	require.NoError(t, err)
 	list, err := rest.List(t.Context(), "own er", "repo", 12, "")
 	require.NoError(t, err)
-	assert.Equal(t, []string{"1/50", "2/50"}, pages)
+	assert.Equal(t, []string{"1/50", "2/50", "3/50"}, pages)
 	assert.Len(t, list, 52)
 	assert.Equal(t, Artifact{ID: 3, Name: "a3", Size: 3, CreatedAt: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)}, list[1])
 }
@@ -57,7 +53,8 @@ func TestRESTDownloadKeepsTheTokenOffTheBlob(t *testing.T) {
 		case "/api/v1/repos/o/r/actions/artifacts/5/zip":
 			http.Redirect(w, r, blob.URL+"/raw?sig=x", http.StatusFound)
 		case "/api/v1/repos/o/r/actions/artifacts/6/zip":
-			http.Error(w, "Artifact has expired", http.StatusNotFound)
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(w, `{"message":"Artifact has expired","url":"https://gitea.example/api/swagger"}`)
 		}
 	}))
 	defer api.Close()
@@ -76,5 +73,5 @@ func TestRESTDownloadKeepsTheTokenOffTheBlob(t *testing.T) {
 	assert.Equal(t, "zip bytes", string(body))
 
 	_, err = rest.DownloadURL(t.Context(), "o", "r", 6)
-	require.ErrorContains(t, err, "Artifact has expired")
+	require.EqualError(t, err, "unable to download artifact: (404) Not Found: Artifact has expired")
 }

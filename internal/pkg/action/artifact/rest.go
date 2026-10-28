@@ -14,8 +14,8 @@ import (
 	"time"
 )
 
-// restPageSize is Gitea's largest page, which reads `limit` and ignores the `per_page` the
-// toolkit sends, so the toolkit misses every artifact past Gitea's default of 30.
+// restPageSize goes in `limit`, as Gitea ignores the `per_page` the toolkit sends and then misses
+// every artifact past Gitea's default page of 30. MAX_RESPONSE_ITEMS can shrink it further.
 const restPageSize = 50
 
 // REST reaches artifacts of other runs through Gitea's API, with a token of the workflow's choice.
@@ -66,6 +66,7 @@ func (r *REST) get(ctx context.Context, what string, endpoint *url.URL) (*http.R
 func (r *REST) List(ctx context.Context, owner, repo string, runID int64, name string) ([]Artifact, error) {
 	r.Logf("Fetching artifact list for workflow run %d in repository %s/%s", runID, owner, repo)
 	var list []Artifact
+	seen := 0
 	for page := 1; ; page++ {
 		endpoint := r.base.JoinPath("repos", owner, repo, "actions", "runs", strconv.FormatInt(runID, 10), "artifacts")
 		query := url.Values{"page": {strconv.Itoa(page)}, "limit": {strconv.Itoa(restPageSize)}}
@@ -78,7 +79,8 @@ func (r *REST) List(ctx context.Context, owner, repo string, runID int64, name s
 			return nil, err
 		}
 		var body struct {
-			Artifacts []struct {
+			TotalCount int `json:"total_count"`
+			Artifacts  []struct {
 				ID          int64     `json:"id"`
 				Name        string    `json:"name"`
 				SizeInBytes int64     `json:"size_in_bytes"`
@@ -97,7 +99,7 @@ func (r *REST) List(ctx context.Context, owner, repo string, runID int64, name s
 				list = append(list, Artifact{ID: a.ID, Name: a.Name, Size: a.SizeInBytes, CreatedAt: a.CreatedAt, Digest: a.Digest})
 			}
 		}
-		if len(body.Artifacts) < restPageSize {
+		if seen += len(body.Artifacts); len(body.Artifacts) == 0 || seen >= body.TotalCount {
 			r.Logf("Found %d artifact(s)", len(list))
 			return list, nil
 		}

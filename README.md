@@ -297,7 +297,7 @@ A password in a proxy URL is hidden in job logs. Any step can still read it, bec
 
 #### Built-in actions (`uses: builtin:<name>`)
 
-Use `uses: builtin:checkout` or `builtin:upload-artifact` in place of the `actions/` ones to run without an action download or Node in the job image, see **[docs/builtin-actions.md](docs/builtin-actions.md)**.
+Use `uses: builtin:checkout`, `builtin:upload-artifact` or `builtin:download-artifact` in place of the `actions/` ones to run without an action download or Node in the job image, see **[docs/builtin-actions.md](docs/builtin-actions.md)**.
 
 #### Caching (`actions/cache`)
 
