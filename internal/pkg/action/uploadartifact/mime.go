@@ -61,7 +61,7 @@ var mimeTypes = map[string]string{
 }
 
 func mimeTypeOf(name string) string {
-	if mimeType, ok := mimeTypes[strings.ToLower(path.Ext(name))]; ok {
+	if mimeType, ok := mimeTypes[strings.ToLower(path.Ext(strings.TrimPrefix(name, ".")))]; ok { // .json has no extension to Node either
 		return mimeType
 	}
 	return "application/octet-stream"

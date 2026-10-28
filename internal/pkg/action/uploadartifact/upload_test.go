@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -33,7 +34,7 @@ import (
 )
 
 // dockerArchives archives like the Docker API: entries named below the base name of the path,
-// symlinks kept as links, the path itself not followed.
+// symlinks and hard links kept as links, the path itself not followed.
 type dockerArchives struct {
 	*container.HostEnvironment
 }
@@ -44,6 +45,11 @@ func (d dockerArchives) GetContainerArchive(_ context.Context, srcPath string) (
 	}
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)
+	type file struct {
+		info fs.FileInfo
+		name string
+	}
+	var files []file
 	err := filepath.WalkDir(srcPath, func(p string, entry fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -64,7 +70,12 @@ func (d dockerArchives) GetContainerArchive(_ context.Context, srcPath string) (
 		}
 		rel, _ := filepath.Rel(srcPath, p)
 		hdr.Name = filepath.ToSlash(filepath.Join(filepath.Base(srcPath), rel))
-		if err := tw.WriteHeader(hdr); err != nil || !info.Mode().IsRegular() {
+		if i := slices.IndexFunc(files, func(f file) bool { return os.SameFile(f.info, info) }); i >= 0 {
+			hdr.Typeflag, hdr.Linkname, hdr.Size = tar.TypeLink, files[i].name, 0
+		} else if info.Mode().IsRegular() {
+			files = append(files, file{info, hdr.Name})
+		}
+		if err := tw.WriteHeader(hdr); err != nil || hdr.Typeflag != tar.TypeReg {
 			return err
 		}
 		content, err := os.ReadFile(p)
@@ -87,7 +98,7 @@ type harness struct {
 	workspace        string
 	env              container.ExecutionsEnvironment
 	logs, annotation []string
-	extraEnv         map[string]string
+	retentionDays    string
 	output           string
 }
 
@@ -114,14 +125,12 @@ func (h *harness) write(rel, content string, mode os.FileMode) {
 func (h *harness) run(inputs map[string]string) error {
 	h.logs, h.annotation = nil, nil
 	h.output = filepath.Join(h.t.TempDir(), "output")
-	env := map[string]string{"GITHUB_OUTPUT": h.output}
-	maps.Copy(env, h.extraEnv)
 	return Main(h.t.Context(), &action.Context{
 		Container:    h.env,
-		Github:       &model.GithubContext{ServerURL: "https://gitea.example", Repository: "owner/repo", RunID: "7", RunAttempt: "2"},
+		Github:       &model.GithubContext{ServerURL: "https://gitea.example", Repository: "owner/repo", RunID: "7", RunAttempt: "2", RetentionDays: h.retentionDays},
 		Inputs:       inputs,
 		Workspace:    h.workspace,
-		Env:          env,
+		Env:          map[string]string{"GITHUB_OUTPUT": h.output},
 		ResultsURL:   h.server,
 		RuntimeToken: artifacts.LocalRuntimeToken("7", time.Hour),
 		Infof:        func(format string, args ...any) { h.logs = append(h.logs, fmt.Sprintf(format, args...)) },
@@ -179,13 +188,14 @@ func TestUploadSelectsWhatTheToolkitSelects(t *testing.T) {
 				require.NoError(t, os.Symlink("sub", filepath.Join(h.workspace, "dist", "linkdir")))
 				require.NoError(t, os.Symlink("missing", filepath.Join(h.workspace, "dist", "broken")))
 				require.NoError(t, os.Symlink("..", filepath.Join(h.workspace, "dist", "loop")))
+				require.NoError(t, os.Link(filepath.Join(h.workspace, "dist", "a.txt"), filepath.Join(h.workspace, "dist", "hard.txt")))
 			}
 
 			for _, test := range []struct {
 				name     string
 				inputs   map[string]string
 				expected map[string]string
-				symlinks map[string]string
+				links    map[string]string
 			}{
 				{
 					name:     "a directory",
@@ -193,19 +203,19 @@ func TestUploadSelectsWhatTheToolkitSelects(t *testing.T) {
 					expected: map[string]string{"a.txt": "a", "run.sh": "#!/bin/sh\n", "sub/b.txt": "b"},
 					// the loop resolves to the workspace, which the toolkit enters once, as only the
 					// real path of an ancestor counts as a cycle
-					symlinks: map[string]string{"link.txt": "a", "linkdir/b.txt": "b", "loop/logs/x.log": "x"},
+					links: map[string]string{"link.txt": "a", "hard.txt": "a", "linkdir/b.txt": "b", "loop/logs/x.log": "x"},
 				},
 				{
 					name:     "hidden files included",
 					inputs:   map[string]string{"path": "dist/", "include-hidden-files": "true"},
 					expected: map[string]string{"a.txt": "a", "run.sh": "#!/bin/sh\n", "sub/b.txt": "b", ".hidden": "h", ".git/config": "c"},
-					symlinks: map[string]string{"link.txt": "a", "linkdir/b.txt": "b", "loop/logs/x.log": "x"},
+					links:    map[string]string{"link.txt": "a", "hard.txt": "a", "linkdir/b.txt": "b", "loop/logs/x.log": "x"},
 				},
 				{
 					name:     "several patterns share their common ancestor as root",
 					inputs:   map[string]string{"path": "dist/**/*.txt\n!dist/sub/**\n# a comment\nlogs/x.log"},
 					expected: map[string]string{"dist/a.txt": "a", "logs/x.log": "x"},
-					symlinks: map[string]string{"dist/link.txt": "a", "dist/linkdir/b.txt": "b"},
+					links:    map[string]string{"dist/link.txt": "a", "dist/hard.txt": "a", "dist/linkdir/b.txt": "b"},
 				},
 				{
 					name:     "a single file keeps no directory",
@@ -214,10 +224,12 @@ func TestUploadSelectsWhatTheToolkitSelects(t *testing.T) {
 				},
 			} {
 				t.Run(test.name, func(t *testing.T) {
-					require.NoError(t, h.run(map[string]string{"name": "art", "path": test.inputs["path"], "include-hidden-files": test.inputs["include-hidden-files"], "overwrite": "true"}))
+					inputs := map[string]string{"name": "art", "overwrite": "true"}
+					maps.Copy(inputs, test.inputs)
+					require.NoError(t, h.run(inputs))
 					expected := test.expected
 					if runtime.GOOS != "windows" {
-						maps.Copy(expected, test.symlinks)
+						maps.Copy(expected, test.links)
 					}
 					_, entries := h.fetch("art")
 					assert.Equal(t, expected, entries)
@@ -231,7 +243,7 @@ func TestUploadZipAndOutputs(t *testing.T) {
 	h := newHarness(t, &container.HostEnvironment{})
 	h.write("out/run.sh", "#!/bin/sh\n", 0o755)
 	h.write("out/data.txt", strings.Repeat("data", 1000), 0o644)
-	h.extraEnv = map[string]string{"GITHUB_RETENTION_DAYS": "3"}
+	h.retentionDays = "3"
 	require.NoError(t, h.run(map[string]string{"name": "packed", "path": "out", "compression-level": "0", "retention-days": "10"}))
 	assert.Equal(t, []string{"warning: Retention days cannot be greater than the maximum allowed retention set within the repository. Using 3 instead."}, h.annotation)
 	assert.Contains(t, h.logs, "With the provided path, there will be 2 files uploaded")
@@ -309,6 +321,10 @@ func TestUploadFailures(t *testing.T) {
 
 	require.ErrorContains(t, h.run(map[string]string{"name": "a/b", "path": "ok.txt"}), "The artifact name is not valid: a/b. Contains the following character:  Forward slash /")
 	require.ErrorContains(t, h.run(map[string]string{}), "Input required and not supplied: path")
+	require.ErrorContains(t, h.run(map[string]string{"name": "", "path": "ok.txt"}), "Provided artifact name input during validation is empty")
+	require.ErrorContains(t, h.run(map[string]string{"path": "ok.txt", "overwrite": ""}), "Core Schema")
+	require.NoError(t, h.run(map[string]string{"path": "ok.txt", "retention": "1", "overwrite": "true"}))
+	assert.Equal(t, []string{"warning: Unexpected input(s) 'retention', valid inputs are ['name', 'path', 'if-no-files-found', 'retention-days', 'compression-level', 'overwrite', 'include-hidden-files', 'archive']"}, h.annotation)
 	require.ErrorContains(t, h.run(map[string]string{"path": "ok.txt", "compression-level": "10"}), "Invalid compression-level. Valid values are 0-9")
 	require.ErrorContains(t, h.run(map[string]string{"path": "ok.txt", "if-no-files-found": "fail"}), "Unrecognized if-no-files-found input. Provided: fail. Available options: warn,error,ignore")
 	require.ErrorContains(t, h.run(map[string]string{"path": "ok.txt", "archive": "no"}), "Core Schema")

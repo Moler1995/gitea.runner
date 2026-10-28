@@ -126,6 +126,21 @@ func TestClientRetries(t *testing.T) {
 	_, err = client.Create(t.Context(), "art", "", nil)
 	require.ErrorContains(t, err, "(400) Bad Request: bad name")
 	assert.Equal(t, int32(11), calls.Load(), "a 400 is not retried")
+
+	var blockIDs []string
+	blob := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		blockIDs = append(blockIDs, r.URL.Query().Get("blockid"))
+		w.WriteHeader(http.StatusCreated)
+	}))
+	for range 2 {
+		_, err = client.Upload(t.Context(), blob.URL+"/u?sig=secret", "application/zip", strings.NewReader("x"), 1, time.Minute)
+		require.NoError(t, err)
+	}
+	assert.NotEqual(t, blockIDs[0], blockIDs[2], "each upload names its blocks anew")
+	blob.Close()
+	_, err = client.Upload(t.Context(), blob.URL+"/u?sig=secret", "application/zip", strings.NewReader("x"), 1, time.Minute)
+	require.Error(t, err)
+	assert.NotContains(t, err.Error()+strings.Join(logged, ""), "secret")
 }
 
 func TestDownloadStalls(t *testing.T) {

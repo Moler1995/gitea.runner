@@ -176,6 +176,10 @@ func (w *walker) containerTree(ctx context.Context, c *action.Context, virtual, 
 				target = path.Join(path.Dir(path.Join(path.Dir(source), name)), target)
 			}
 			links = append(links, link{virtual: entryVirtual, target: target, chain: entryChain})
+		case tar.TypeLink:
+			if match&glob.MatchFile != 0 {
+				links = append(links, link{virtual: entryVirtual, target: path.Join(path.Dir(source), hdr.Linkname), chain: entryChain})
+			}
 		case tar.TypeDir:
 			if dirReal := path.Join(path.Dir(source), name); !slices.Contains(entryChain, dirReal) { // else a symlink cycle
 				descended[entryVirtual] = append(slices.Clip(entryChain), dirReal)
@@ -187,6 +191,9 @@ func (w *walker) containerTree(ctx context.Context, c *action.Context, virtual, 
 				}
 			}
 		}
+	}
+	if _, err := io.Copy(io.Discard, archive); err != nil { // the exit status of a Kubernetes tar arrives after its archive
+		return err
 	}
 	if err := archive.Close(); err != nil {
 		return err

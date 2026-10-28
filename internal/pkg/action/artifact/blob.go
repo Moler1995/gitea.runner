@@ -6,6 +6,7 @@ package artifact
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -38,17 +39,19 @@ func (c *Client) Upload(ctx context.Context, signedURL, contentType string, body
 	reader := io.TeeReader(body, hash)
 	group, blockCtx := errgroup.WithContext(ctx)
 	buffers := make(chan []byte, concurrency)
-	for range concurrency {
-		buffers <- make([]byte, BlockSize)
-	}
+	prefix := rand.Text()
 	var ids []string
 	var uploaded atomic.Int64
 	for index := 0; ; index++ {
 		var buf []byte
-		select {
-		case buf = <-buffers:
-		case <-blockCtx.Done():
-			return Uploaded{}, group.Wait()
+		if index < concurrency {
+			buf = make([]byte, BlockSize)
+		} else {
+			select {
+			case buf = <-buffers:
+			case <-blockCtx.Done():
+				return Uploaded{}, group.Wait()
+			}
 		}
 		n, readErr := io.ReadFull(reader, buf)
 		if errors.Is(readErr, io.EOF) && index > 0 {
@@ -57,8 +60,7 @@ func (c *Client) Upload(ctx context.Context, signedURL, contentType string, body
 			_ = group.Wait()
 			return Uploaded{}, readErr
 		}
-		// fixed width, as the block IDs of one blob must all have the same length
-		id := base64.StdEncoding.EncodeToString(fmt.Appendf(nil, "block-%08d", index))
+		id := base64.StdEncoding.EncodeToString(fmt.Appendf(nil, "%s-%08d", prefix, index)) // fixed width as Azure needs, unique as Gitea before 1.25.5 shares a run's blocks
 		ids = append(ids, id)
 		group.Go(func() error {
 			defer func() { buffers <- buf }()
@@ -93,7 +95,7 @@ func (c *Client) putBlock(ctx context.Context, signedURL, id string, block []byt
 		resp, err := c.blob.Do(req)
 		if err != nil {
 			cancel()
-			return nil, err
+			return nil, scrub(err)
 		}
 		resp.Body = cancelOnClose{resp.Body, cancel}
 		return resp, nil
@@ -117,7 +119,8 @@ func (c *Client) putBlockList(ctx context.Context, signedURL, contentType string
 			return nil, err
 		}
 		req.Header.Set("x-ms-blob-content-type", contentType)
-		return c.blob.Do(req)
+		resp, err := c.blob.Do(req)
+		return resp, scrub(err)
 	})
 	if err != nil {
 		return err
@@ -140,7 +143,7 @@ func download(ctx context.Context, client *http.Client, signedURL string, stall 
 	resp, err := client.Do(req)
 	if err != nil {
 		cancel(nil)
-		return nil, err
+		return nil, scrub(err)
 	}
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
@@ -151,6 +154,13 @@ func download(ctx context.Context, client *http.Client, signedURL string, stall 
 		cancel(fmt.Errorf("blob storage chunk did not respond in %s", stall))
 	}), stall: stall, cancel: cancel, ctx: ctx}
 	return resp, nil
+}
+
+func scrub(err error) error { // the signature of a signed URL is a credential
+	if urlErr, ok := errors.AsType[*url.Error](err); ok {
+		urlErr.URL = ScrubQuery(urlErr.URL)
+	}
+	return err
 }
 
 type stallReader struct {

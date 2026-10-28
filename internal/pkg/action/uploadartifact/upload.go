@@ -11,6 +11,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/url"
 	"os"
 	"runtime"
@@ -24,7 +25,10 @@ import (
 	"gitea.com/gitea/runner/internal/pkg/action/glob"
 )
 
-var inputNames = []string{"name", "path", "if-no-files-found", "retention-days", "compression-level", "overwrite", "include-hidden-files", "archive"}
+var inputDefaults = []string{
+	"name", "artifact", "path", "", "if-no-files-found", "warn", "retention-days", "", "compression-level", "6",
+	"overwrite", "false", "include-hidden-files", "false", "archive", "true",
+}
 
 var noFileBehaviors = []string{"warn", "error", "ignore"}
 
@@ -35,9 +39,7 @@ type inputs struct {
 }
 
 func Main(ctx context.Context, c *action.Context) error {
-	if err := c.CheckInputs("upload-artifact", inputNames...); err != nil {
-		return err
-	}
+	c.ApplyDefaults(inputDefaults...)
 	in, err := readInputs(c)
 	if err != nil {
 		return err
@@ -82,18 +84,18 @@ func Main(ctx context.Context, c *action.Context) error {
 }
 
 func readInputs(c *action.Context) (*inputs, error) {
-	in := &inputs{name: cmp.Or(c.Input("name"), "artifact"), path: c.Input("path"), ifNoFilesFound: cmp.Or(c.Input("if-no-files-found"), "warn"), compressionLevel: 6}
+	in := &inputs{name: c.Input("name"), path: c.Input("path"), ifNoFilesFound: c.Input("if-no-files-found"), compressionLevel: 6}
 	if in.path == "" {
 		return nil, action.Failf("Input required and not supplied: path")
 	}
 	var err error
-	if in.overwrite, err = c.BoolInput("overwrite", false); err != nil {
+	if in.overwrite, err = c.BoolInput("overwrite"); err != nil {
 		return nil, err
 	}
-	if in.includeHidden, err = c.BoolInput("include-hidden-files", false); err != nil {
+	if in.includeHidden, err = c.BoolInput("include-hidden-files"); err != nil {
 		return nil, err
 	}
-	if in.archiveIt, err = c.BoolInput("archive", true); err != nil {
+	if in.archiveIt, err = c.BoolInput("archive"); err != nil {
 		return nil, err
 	}
 	if !slices.Contains(noFileBehaviors, in.ifNoFilesFound) {
@@ -233,11 +235,11 @@ func addToZip(zw *zip.Writer, level int, root string, f found) error {
 			return action.Failf("The path for one of the files in artifact is not valid: %s. Contains the following character: %s\n\nInvalid characters include: %s\n\nThe following characters are not allowed in files that are uploaded due to limitations with certain file systems such as NTFS. To maintain file system agnostic behavior, these characters are intentionally not allowed to prevent potential problems with downloads on different file systems.", rel, invalid.label, labels(invalidPathChars))
 		}
 	}
-	header := &zip.FileHeader{Name: strings.TrimLeft(strings.ReplaceAll(rel, `\`, "/"), "/"), Method: zip.Deflate, Modified: f.mtime}
+	header := &zip.FileHeader{Name: strings.TrimLeft(strings.ReplaceAll(rel, `\`, "/"), "/"), Method: zip.Deflate, Modified: f.mtime.UTC()} // zip-stream writes DOS times in UTC
 	if level == 0 {
 		header.Method = zip.Store
 	}
-	header.SetMode(f.mode.Perm())
+	header.SetMode(f.mode & (fs.ModePerm | fs.ModeSetuid | fs.ModeSetgid | fs.ModeSticky))
 	w, err := zw.CreateHeader(header)
 	if err != nil {
 		return err
@@ -273,7 +275,9 @@ func upload(ctx context.Context, c *action.Context, in *inputs, got *collected, 
 	}
 	client.Logf = c.Infof
 	if in.overwrite {
-		if _, err := client.Delete(ctx, name); err != nil && !artifact.IsNotFound(err) {
+		if id, err := client.Delete(ctx, name); err == nil {
+			c.Infof("Artifact '%s' (ID: %d) deleted", name, id)
+		} else if !artifact.IsNotFound(err) {
 			c.Infof("Unable to delete artifact: %v", err) // best effort, as the JavaScript action
 		}
 	}
@@ -328,7 +332,7 @@ func expiresAt(c *action.Context, days int) *time.Time {
 	if days == 0 {
 		return nil
 	}
-	if limit, err := parseInt(c.Env["GITHUB_RETENTION_DAYS"]); err == nil && limit != 0 && limit < days {
+	if limit, err := parseInt(c.Github.RetentionDays); err == nil && limit != 0 && limit < days {
 		c.Warning("Retention days cannot be greater than the maximum allowed retention set within the repository. Using %d instead.", limit)
 		days = limit
 	}

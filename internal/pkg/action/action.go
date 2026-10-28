@@ -46,15 +46,25 @@ func (c *Context) Warning(format string, args ...any) {
 	c.Annotate("warning", fmt.Sprintf(format, args...))
 }
 
-// CheckInputs fails on an input the action does not know, as a built-in action has no
-// action.yml to ignore it with.
-func (c *Context) CheckInputs(action string, known ...string) error {
-	for name := range c.Inputs {
-		if !slices.Contains(known, name) {
-			return fmt.Errorf("%s: unsupported input %q", action, name)
+// ApplyDefaults gives each input not set its default, names and defaults alternating, and warns
+// about unknown inputs, as GitHub's runner does with an action.yml.
+func (c *Context) ApplyDefaults(pairs ...string) {
+	var valid, unexpected []string
+	for i := 0; i+1 < len(pairs); i += 2 {
+		valid = append(valid, pairs[i])
+		if _, set := c.Inputs[pairs[i]]; !set && pairs[i+1] != "" {
+			c.Inputs[pairs[i]] = pairs[i+1]
 		}
 	}
-	return nil
+	for name := range c.Inputs {
+		if !slices.Contains(valid, name) {
+			unexpected = append(unexpected, name)
+		}
+	}
+	if len(unexpected) > 0 {
+		slices.Sort(unexpected)
+		c.Warning("Unexpected input(s) '%s', valid inputs are ['%s']", strings.Join(unexpected, "', '"), strings.Join(valid, "', '"))
+	}
 }
 
 // Input is the trimmed input, as @actions/core getInput returns it.
@@ -62,12 +72,9 @@ func (c *Context) Input(name string) string {
 	return strings.TrimSpace(c.Inputs[name])
 }
 
-// BoolInput accepts what @actions/core getBooleanInput does, the default standing in for the
-// action.yml one when the input is not given.
-func (c *Context) BoolInput(name string, fallback bool) (bool, error) {
-	switch value := c.Input(name); value {
-	case "":
-		return fallback, nil
+// BoolInput accepts what @actions/core getBooleanInput does.
+func (c *Context) BoolInput(name string) (bool, error) {
+	switch c.Input(name) {
 	case "true", "True", "TRUE":
 		return true, nil
 	case "false", "False", "FALSE":
