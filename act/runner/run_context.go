@@ -194,6 +194,9 @@ func (rc *RunContext) GetEnv() map[string]string {
 				rc.Env = mergeMaps(rc.Run.Workflow.Env, job.Environment(), rc.Config.Env)
 			}
 		}
+		if rc.runtimeToken != "" {
+			rc.Env["ACTIONS_RUNTIME_TOKEN"] = rc.runtimeToken // as the daemon's Config.Env carries its token
+		}
 	}
 	if !rc.Config.DisableActEnv {
 		rc.Env["ACT"] = "true"
@@ -1663,7 +1666,7 @@ func (rc *RunContext) withGithubEnv(ctx context.Context, github *model.GithubCon
 
 	if rc.Config.ArtifactServerPath != "" {
 		env["ACTIONS_RUNTIME_URL"] = cmp.Or(os.Getenv("ACTIONS_RUNTIME_URL"), "http://"+net.JoinHostPort(rc.Config.ArtifactServerAddr, rc.Config.ArtifactServerPort)+"/")
-		env["ACTIONS_RUNTIME_TOKEN"] = rc.runtimeToken
+		env["ACTIONS_RUNTIME_TOKEN"] = cmp.Or(rc.runtimeToken, os.Getenv("ACTIONS_RUNTIME_TOKEN"), "token")
 	}
 
 	if imageOS := rc.imageOS(ctx); imageOS != "" {

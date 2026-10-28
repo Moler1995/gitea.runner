@@ -232,10 +232,12 @@ func (s *serverV4) finalizeArtifact(_ *http.Request, req finalizeArtifactRequest
 	meta, err := readMeta(dir)
 	if err != nil {
 		return finalizeArtifactResponse{}, notFound(req.Name)
+	} else if meta.Digest != "" {
+		return finalizeArtifactResponse{Ok: true, ArtifactID: meta.DatabaseID}, nil
 	}
 	blob, err := os.Open(filepath.Join(dir, "blob"))
 	if err != nil {
-		return finalizeArtifactResponse{}, err
+		return finalizeArtifactResponse{}, badRequest("artifact %q has no upload", req.Name)
 	}
 	defer blob.Close()
 	hash := sha256.New()
@@ -306,7 +308,7 @@ func (s *serverV4) downloadArtifact(w http.ResponseWriter, r *http.Request) {
 	if !strings.Contains(contentType, "/") {
 		contentType = zipMimeType
 	}
-	if contentType == zipMimeType {
+	if contentType == zipMimeType && !strings.HasSuffix(filename, ".zip") {
 		filename += ".zip"
 	}
 	w.Header().Set("Content-Type", contentType)

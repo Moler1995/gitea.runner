@@ -543,10 +543,10 @@ jobs:
 	called := resolve("call", callee)
 	assert.Equal(t, map[string]any{"flag": true}, called.workflowCallInputs)
 	assert.Equal(t, map[string]string{"undeclared": "${{ github.token }}"}, called.workflowCallSecrets)
-	assert.Equal(t, "caller-run", called.runtimeToken)
+	assert.Equal(t, "caller-run", called.GetEnv()["ACTIONS_RUNTIME_TOKEN"])
 	inherited := resolve("inherit", notCallable)
 	assert.Empty(t, inherited.workflowCallInputs)
-	assert.Equal(t, config.Secrets, inherited.workflowCallSecrets)
+	assert.Equal(t, map[string]string{"token": "${{ github.token }}", "ACTIONS_RUNTIME_TOKEN": "caller-run"}, inherited.workflowCallSecrets)
 }
 
 func TestJobNameMasksSecrets(t *testing.T) {

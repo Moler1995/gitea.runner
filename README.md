@@ -358,7 +358,7 @@ Entries not read or written within `retention` (default `168h`) are removed. A r
 
 With v2, artifact calls also go through the cache server, so jobs must be able to reach it. `cache.v2: false` sends them to Gitea directly, unless the Gitea URL has a path or `runner.insecure` is set with HTTPS.
 
-`gitea-runner exec` serves both artifact APIs itself from `--artifact-server-path`. For `actions/upload-artifact` v4 and later, each workflow is its own run, keyed by `GITHUB_RUN_ID` and its file name, and each exec invocation acts as a re-run of it. Artifacts from earlier invocations stay visible until uploaded again, and uploading one name twice in an invocation fails as on GitHub. An inherited `ACTIONS_RUNTIME_TOKEN` replaces exec's own, and with `ACTIONS_RESULTS_URL` also set, as inside another job, artifacts go to that job's service.
+`gitea-runner exec` serves both artifact APIs itself, from a temporary directory or from `--artifact-server-path`, which belongs outside the workspace that jobs copy. For `actions/upload-artifact` v4 and later, each workflow is its own run, and uploading one name twice in a run fails as on GitHub. With a persistent `--artifact-server-path`, runs are keyed by `GITHUB_RUN_ID` and the workflow's file name, and each invocation acts as a re-run that sees, and may replace, the artifacts of earlier ones. Inside another job, the inherited `ACTIONS_RUNTIME_TOKEN`, `ACTIONS_RUNTIME_URL` and `ACTIONS_RESULTS_URL` send artifacts to that job's services instead.
 
 #### Official Docker image
 
