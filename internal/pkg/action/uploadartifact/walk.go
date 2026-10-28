@@ -31,12 +31,10 @@ type found struct {
 	body  io.Reader
 }
 
-// maxFollow bounds how deep symlinked directories nest, standing in for the realpath cycle check
-// where a path cannot be resolved.
+// maxFollow bounds symlinked directory nesting where no realpath tells a cycle.
 const maxFollow = 32
 
-// walker visits what @actions/glob yields with the options upload-artifact uses: symlinks
-// followed, broken ones omitted, hidden entries skipped unless included, files only.
+// walker visits what @actions/glob yields with upload-artifact's options: links followed, broken and hidden ones skipped, files only.
 type walker struct {
 	g             *glob.Globber
 	includeHidden bool
@@ -53,14 +51,8 @@ func (w *walker) hidden(base string) bool {
 	return !w.includeHidden && strings.HasPrefix(base, ".")
 }
 
-// walkHost walks the host filesystem the way the toolkit's globber does.
 func (w *walker) walkHost(roots []string) error {
 	for _, root := range roots {
-		if _, err := os.Lstat(root); errors.Is(err, fs.ErrNotExist) {
-			continue
-		} else if err != nil {
-			return err
-		}
 		if err := w.hostItem(root, nil); err != nil {
 			return err
 		}
@@ -113,8 +105,7 @@ func (w *walker) hostItem(p string, chain []string) error {
 	return nil
 }
 
-// walkContainer reads each search root as an archive. The archive holds symlinks as links, so
-// each one selected is followed afterwards by archiving its target.
+// walkContainer reads each search root as an archive, following the links in it by archiving their targets.
 func (w *walker) walkContainer(ctx context.Context, c *action.Context, roots []string) error {
 	for _, root := range roots {
 		if err := w.containerTree(ctx, c, root, root, nil, 0); err != nil {
@@ -129,15 +120,13 @@ type link struct {
 	chain           []string
 }
 
-// missing reports a path the backend found nothing at: a not-found error from Docker, or the
-// failing `test -e` that Kubernetes archives start with.
+// missing reports a path Docker did not find, or whose `test -e` failed on Kubernetes.
 func missing(err error) bool {
 	var exit container.ExitCodeError
 	return cerrdefs.IsNotFound(err) || errors.Is(err, fs.ErrNotExist) || errors.As(err, &exit)
 }
 
-// containerTree walks the archive of source as if it were found at virtual. chain holds the real
-// directories already descended into, to tell a symlink cycle.
+// containerTree walks the archive of source as found at virtual, chain holding the real directories entered.
 func (w *walker) containerTree(ctx context.Context, c *action.Context, virtual, source string, chain []string, depth int) error {
 	archive, err := c.Container.GetContainerArchive(ctx, source)
 	if missing(err) {

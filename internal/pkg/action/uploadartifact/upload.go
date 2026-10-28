@@ -25,11 +25,6 @@ import (
 	"gitea.com/gitea/runner/internal/pkg/action/glob"
 )
 
-var inputDefaults = []string{
-	"name", "artifact", "path", "", "if-no-files-found", "warn", "retention-days", "", "compression-level", "6",
-	"overwrite", "false", "include-hidden-files", "false", "archive", "true",
-}
-
 var noFileBehaviors = []string{"warn", "error", "ignore"}
 
 type inputs struct {
@@ -39,7 +34,8 @@ type inputs struct {
 }
 
 func Main(ctx context.Context, c *action.Context) error {
-	c.ApplyDefaults(inputDefaults...)
+	c.ApplyDefaults("name", "artifact", "path", "", "if-no-files-found", "warn", "retention-days", "", "compression-level", "6",
+		"overwrite", "false", "include-hidden-files", "false", "archive", "true")
 	in, err := readInputs(c)
 	if err != nil {
 		return err
@@ -102,12 +98,12 @@ func readInputs(c *action.Context) (*inputs, error) {
 		return nil, action.Failf("Unrecognized if-no-files-found input. Provided: %s. Available options: %s", in.ifNoFilesFound, strings.Join(noFileBehaviors, ","))
 	}
 	if days := c.Input("retention-days"); days != "" {
-		if in.retentionDays, err = parseInt(days); err != nil {
+		if in.retentionDays, err = action.ParseInt(days); err != nil {
 			return nil, action.Failf("Invalid retention-days")
 		}
 	}
 	if level := c.Input("compression-level"); level != "" {
-		if in.compressionLevel, err = parseInt(level); err != nil {
+		if in.compressionLevel, err = action.ParseInt(level); err != nil {
 			return nil, action.Failf("Invalid compression-level")
 		}
 		if in.compressionLevel < 0 || in.compressionLevel > 9 {
@@ -115,18 +111,6 @@ func readInputs(c *action.Context) (*inputs, error) {
 		}
 	}
 	return in, nil
-}
-
-// parseInt reads a leading integer the way JavaScript's parseInt does.
-func parseInt(s string) (int, error) {
-	end := 0
-	if end < len(s) && (s[end] == '-' || s[end] == '+') {
-		end++
-	}
-	for end < len(s) && s[end] >= '0' && s[end] <= '9' {
-		end++
-	}
-	return strconv.Atoi(s[:end])
 }
 
 func parse(ctx context.Context, c *action.Context, patterns string) (*glob.Globber, error) {
@@ -144,7 +128,6 @@ func parse(ctx context.Context, c *action.Context, patterns string) (*glob.Globb
 type collected struct {
 	files    int
 	fileName string // the single file uploaded as is
-	size     int64
 }
 
 // collect writes the selected files to spool, zipped or, without archiving, the first one as is.
@@ -157,9 +140,14 @@ func collect(ctx context.Context, c *action.Context, g *glob.Globber, in *inputs
 		c.Infof("The least common ancestor is %s. This will be the root directory of the artifact", root)
 	}
 	result := &collected{}
+	deflater, err := flate.NewWriter(nil, in.compressionLevel)
+	if err != nil {
+		return nil, err
+	}
 	zw := zip.NewWriter(spool)
 	zw.RegisterCompressor(zip.Deflate, func(w io.Writer) (io.WriteCloser, error) {
-		return flate.NewWriter(w, in.compressionLevel)
+		deflater.Reset(w)
+		return deflater, nil
 	})
 	seen := map[string]bool{}
 	w := &walker{g: g, includeHidden: in.includeHidden, visit: func(f found) error {
@@ -172,8 +160,7 @@ func collect(ctx context.Context, c *action.Context, g *glob.Globber, in *inputs
 		if !in.archiveIt {
 			if result.files == 1 {
 				result.fileName = c.Base(f.path)
-				n, err := io.Copy(spool, f.body)
-				result.size = n
+				_, err := io.Copy(spool, f.body)
 				return err
 			}
 			return nil
@@ -317,8 +304,7 @@ func upload(ctx context.Context, c *action.Context, in *inputs, got *collected, 
 	return c.SetOutputs(ctx, "artifact-id", strconv.FormatInt(id, 10), "artifact-digest", digest, "artifact-url", artifactURL)
 }
 
-// artifactURL is the run page's link, by name and attempt, where Gitea serves artifacts. The
-// JavaScript action's ID-based link resolves on GitHub only.
+// artifactURL links the run page by name and attempt, as the JavaScript action's ID-based link only resolves on GitHub.
 func artifactURL(c *action.Context, name string) string {
 	ghc := c.Github
 	link := strings.TrimSuffix(ghc.ServerURL, "/") + "/" + ghc.Repository + "/actions/runs/" + ghc.RunID + "/artifacts/" + url.PathEscape(name)
@@ -332,7 +318,7 @@ func expiresAt(c *action.Context, days int) *time.Time {
 	if days == 0 {
 		return nil
 	}
-	if limit, err := parseInt(c.Github.RetentionDays); err == nil && limit != 0 && limit < days {
+	if limit, err := action.ParseInt(c.Github.RetentionDays); err == nil && limit != 0 && limit < days {
 		c.Warning("Retention days cannot be greater than the maximum allowed retention set within the repository. Using %d instead.", limit)
 		days = limit
 	}
@@ -349,7 +335,7 @@ func uploadConcurrency(c *action.Context) (int, error) {
 	if override == "" {
 		return 5, nil
 	}
-	concurrency, err := parseInt(override)
+	concurrency, err := action.ParseInt(override)
 	if err != nil || concurrency < 1 {
 		return 0, action.Failf("Invalid value set for ACTIONS_ARTIFACT_UPLOAD_CONCURRENCY env variable")
 	}
@@ -366,7 +352,7 @@ func uploadTimeout(c *action.Context) (time.Duration, error) {
 	if value == "" {
 		return 5 * time.Minute, nil
 	}
-	ms, err := parseInt(value)
+	ms, err := action.ParseInt(value)
 	if err != nil {
 		return 0, action.Failf("Invalid value set for ACTIONS_ARTIFACT_UPLOAD_TIMEOUT_MS env variable")
 	}

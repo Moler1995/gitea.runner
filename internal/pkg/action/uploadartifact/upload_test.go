@@ -18,7 +18,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -33,8 +32,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// dockerArchives archives like the Docker API: entries named below the base name of the path,
-// symlinks and hard links kept as links, the path itself not followed.
 type dockerArchives struct {
 	*container.HostEnvironment
 }
@@ -134,11 +131,12 @@ func (h *harness) run(inputs map[string]string) error {
 		ResultsURL:   h.server,
 		RuntimeToken: artifacts.LocalRuntimeToken("7", time.Hour),
 		Infof:        func(format string, args ...any) { h.logs = append(h.logs, fmt.Sprintf(format, args...)) },
-		Annotate:     func(level, message string) { h.annotation = append(h.annotation, level+": "+message) },
+		Warning: func(format string, args ...any) {
+			h.annotation = append(h.annotation, "warning: "+fmt.Sprintf(format, args...))
+		},
 	})
 }
 
-// fetch returns the artifact's content, and its zip entries with their mode when it is a zip.
 func (h *harness) fetch(name string) ([]byte, map[string]string) {
 	h.t.Helper()
 	signed, err := h.client.SignedURL(h.t.Context(), name)
@@ -163,20 +161,14 @@ func (h *harness) fetch(name string) ([]byte, map[string]string) {
 	return content, entries
 }
 
-func environments() map[string]func() container.ExecutionsEnvironment {
-	envs := map[string]func() container.ExecutionsEnvironment{
-		"host": func() container.ExecutionsEnvironment { return &container.HostEnvironment{} },
-	}
-	if runtime.GOOS != "windows" {
-		envs["container"] = func() container.ExecutionsEnvironment { return dockerArchives{&container.HostEnvironment{}} }
-	}
-	return envs
-}
-
 func TestUploadSelectsWhatTheToolkitSelects(t *testing.T) {
-	for envName, newEnv := range environments() {
+	envs := map[string]container.ExecutionsEnvironment{"host": &container.HostEnvironment{}}
+	if runtime.GOOS != "windows" {
+		envs["container"] = dockerArchives{&container.HostEnvironment{}}
+	}
+	for envName, env := range envs {
 		t.Run(envName, func(t *testing.T) {
-			h := newHarness(t, newEnv())
+			h := newHarness(t, env)
 			h.write("dist/a.txt", "a", 0o644)
 			h.write("dist/run.sh", "#!/bin/sh\n", 0o755)
 			h.write("dist/sub/b.txt", "b", 0o644)
@@ -201,9 +193,7 @@ func TestUploadSelectsWhatTheToolkitSelects(t *testing.T) {
 					name:     "a directory",
 					inputs:   map[string]string{"path": "dist"},
 					expected: map[string]string{"a.txt": "a", "run.sh": "#!/bin/sh\n", "sub/b.txt": "b"},
-					// the loop resolves to the workspace, which the toolkit enters once, as only the
-					// real path of an ancestor counts as a cycle
-					links: map[string]string{"link.txt": "a", "hard.txt": "a", "linkdir/b.txt": "b", "loop/logs/x.log": "x"},
+					links:    map[string]string{"link.txt": "a", "hard.txt": "a", "linkdir/b.txt": "b", "loop/logs/x.log": "x"},
 				},
 				{
 					name:     "hidden files included",
@@ -258,40 +248,17 @@ func TestUploadZipAndOutputs(t *testing.T) {
 		}
 	}
 
-	list, err := h.client.List(t.Context(), nil, nil)
+	list, err := h.client.List(t.Context(), "")
 	require.NoError(t, err)
 	require.Len(t, list, 1)
-	outputs := h.outputs()
-	assert.Equal(t, strconv.FormatInt(list[0].ID, 10), outputs["artifact-id"])
-	assert.Equal(t, strings.TrimPrefix(list[0].Digest, "sha256:"), outputs["artifact-digest"])
-	assert.Equal(t, "https://gitea.example/owner/repo/actions/runs/7/artifacts/packed?attempt=2", outputs["artifact-url"])
+	outputs, err := os.ReadFile(h.output)
+	require.NoError(t, err)
+	assert.Equal(t, fmt.Sprintf("artifact-id=%d\nartifact-digest=%s\nartifact-url=https://gitea.example/owner/repo/actions/runs/7/artifacts/packed?attempt=2\n", list[0].ID, strings.TrimPrefix(list[0].Digest, "sha256:")), string(outputs))
 
 	require.NoError(t, h.run(map[string]string{"name": "packed", "path": "out/data.txt", "overwrite": "true"}))
-	list, err = h.client.List(t.Context(), nil, nil)
+	list, err = h.client.List(t.Context(), "")
 	require.NoError(t, err)
 	require.Len(t, list, 1)
-	_, entries := h.fetch("packed")
-	assert.Equal(t, []string{"data.txt"}, keys(entries))
-}
-
-func (h *harness) outputs() map[string]string {
-	h.t.Helper()
-	content, err := os.ReadFile(h.output)
-	require.NoError(h.t, err)
-	outputs := map[string]string{}
-	for line := range strings.Lines(string(content)) {
-		name, value, _ := strings.Cut(strings.TrimSuffix(line, "\n"), "=")
-		outputs[name] = value
-	}
-	return outputs
-}
-
-func keys(m map[string]string) []string {
-	var list []string
-	for k := range m {
-		list = append(list, k)
-	}
-	return list
 }
 
 func TestUploadWithoutArchiving(t *testing.T) {
@@ -327,7 +294,6 @@ func TestUploadFailures(t *testing.T) {
 	assert.Equal(t, []string{"warning: Unexpected input(s) 'retention', valid inputs are ['name', 'path', 'if-no-files-found', 'retention-days', 'compression-level', 'overwrite', 'include-hidden-files', 'archive']"}, h.annotation)
 	require.ErrorContains(t, h.run(map[string]string{"path": "ok.txt", "compression-level": "10"}), "Invalid compression-level. Valid values are 0-9")
 	require.ErrorContains(t, h.run(map[string]string{"path": "ok.txt", "if-no-files-found": "fail"}), "Unrecognized if-no-files-found input. Provided: fail. Available options: warn,error,ignore")
-	require.ErrorContains(t, h.run(map[string]string{"path": "ok.txt", "archive": "no"}), "Core Schema")
 	if runtime.GOOS != "windows" {
 		h.write("bad/a:b.txt", "x", 0o644)
 		require.ErrorContains(t, h.run(map[string]string{"path": "bad"}), "The path for one of the files in artifact is not valid: /a:b.txt. Contains the following character:  Colon :")

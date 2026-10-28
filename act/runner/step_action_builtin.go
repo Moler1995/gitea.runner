@@ -6,6 +6,7 @@ package runner
 import (
 	"cmp"
 	"context"
+	"fmt"
 	"strings"
 
 	"gitea.com/gitea/runner/act/common"
@@ -63,8 +64,8 @@ func (sab *stepActionBuiltin) main() common.Executor {
 			RuntimeToken:    cmp.Or(rc.runtimeToken, rc.topLevelRunContext().Config.Secrets["ACTIONS_RUNTIME_TOKEN"]), // composite contexts have no secrets
 			Transport:       rc.Config.InstanceTransport,
 			Infof:           rawLogger.Infof,
-			Annotate: func(level, message string) {
-				rawLogger.Infof("%s", formatAnnotation(level, nil, message))
+			Warning: func(format string, args ...any) {
+				rawLogger.Infof("%s", formatAnnotation("warning", nil, fmt.Sprintf(format, args...)))
 			},
 		})
 	})

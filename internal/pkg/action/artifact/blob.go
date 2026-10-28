@@ -31,9 +31,7 @@ type Uploaded struct {
 	Digest string
 }
 
-// Upload puts body to a signed URL with the Azure block protocol Gitea also speaks: blocks go up
-// in parallel, and the block list puts them in order. A block that stalls longer than stall fails
-// the upload.
+// Upload puts body to a signed URL as parallel Azure blocks, a block attempt failing when it stalls for stall.
 func (c *Client) Upload(ctx context.Context, signedURL, contentType string, body io.Reader, concurrency int, stall time.Duration) (Uploaded, error) {
 	hash := sha256.New()
 	reader := io.TeeReader(body, hash)
@@ -128,7 +126,7 @@ func (c *Client) putBlockList(ctx context.Context, signedURL, contentType string
 	return resp.Body.Close()
 }
 
-// Download GETs a signed URL. A body that sends nothing for stall fails the read.
+// Download GETs a signed URL, a read failing when nothing arrives for stall.
 func (c *Client) Download(ctx context.Context, signedURL string, stall time.Duration) (*http.Response, error) {
 	return download(ctx, c.blob, signedURL, stall)
 }
