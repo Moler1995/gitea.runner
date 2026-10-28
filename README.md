@@ -358,8 +358,6 @@ Entries not read or written within `retention` (default `168h`) are removed. A r
 
 With v2, artifact calls also go through the cache server, so jobs must be able to reach it. `cache.v2: false` sends them to Gitea directly, unless the Gitea URL has a path or `runner.insecure` is set with HTTPS.
 
-`gitea-runner exec` serves both artifact APIs itself, from a temporary directory or from `--artifact-server-path`, which belongs outside the workspace that jobs copy. For `actions/upload-artifact` v4 and later, each workflow is its own run, and uploading one name twice in a run fails as on GitHub. With a persistent `--artifact-server-path`, runs are keyed by `GITHUB_RUN_ID` and the workflow's file name, and each invocation acts as a re-run that sees, and may replace, the artifacts of earlier ones. Inside another job, the inherited `ACTIONS_RUNTIME_TOKEN`, `ACTIONS_RUNTIME_URL` and `ACTIONS_RESULTS_URL` send artifacts to that job's services instead.
-
 #### Official Docker image
 
 Besides `GITEA_INSTANCE_URL` and `GITEA_RUNNER_REGISTRATION_TOKEN`, the image entrypoint supports optional variables such as `CONFIG_FILE` (passed through as `-c`), `GITEA_RUNNER_LABELS`, `GITEA_RUNNER_EPHEMERAL`, `GITEA_RUNNER_ONCE`, `GITEA_RUNNER_NAME`, `GITEA_MAX_REG_ATTEMPTS`, `RUNNER_STATE_FILE`, and `GITEA_RUNNER_REGISTRATION_TOKEN_FILE`. See [scripts/run.sh](scripts/run.sh) for exact behavior.
