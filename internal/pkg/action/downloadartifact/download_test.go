@@ -67,7 +67,7 @@ func newHarness(t *testing.T) *harness {
 	artifacts.RegisterV4(router, store)
 	server := httptest.NewServer(router)
 	t.Cleanup(server.Close)
-	client, err := artifact.New(server.URL, artifacts.LocalRuntimeToken("7"), nil)
+	client, err := artifact.New(server.URL, artifacts.LocalRuntimeToken("7", time.Hour), nil)
 	require.NoError(t, err)
 	return &harness{t: t, server: server.URL, store: store, client: client, workspace: t.TempDir()}
 }
@@ -93,7 +93,7 @@ func (h *harness) run(inputs map[string]string) error {
 		Workspace:    h.workspace,
 		Env:          map[string]string{"GITHUB_OUTPUT": filepath.Join(h.workspace, "output")},
 		ResultsURL:   h.server,
-		RuntimeToken: artifacts.LocalRuntimeToken("7"),
+		RuntimeToken: artifacts.LocalRuntimeToken("7", time.Hour),
 		Infof: func(format string, args ...any) {
 			h.mu.Lock()
 			defer h.mu.Unlock()
@@ -145,7 +145,9 @@ func TestDownloadSelection(t *testing.T) {
 	first := h.upload("alpha", "", zipOf(t, zipEntry{name: "a.txt", body: "a1", mode: 0o644}))
 	h.upload("beta", "", zipOf(t, zipEntry{name: "b.txt", body: "b", mode: 0o644}))
 	h.upload(".hidden", "", zipOf(t, zipEntry{name: "h.txt", body: "h", mode: 0o644}))
-	second := h.upload("alpha", "", zipOf(t, zipEntry{name: "a.txt", body: "a2", mode: 0o644})) // replaces the first
+	_, err := h.client.Delete(t.Context(), "alpha")
+	require.NoError(t, err)
+	second := h.upload("alpha", "", zipOf(t, zipEntry{name: "a.txt", body: "a2", mode: 0o644}))
 
 	require.NoError(t, h.run(map[string]string{"path": "all"}))
 	assert.Equal(t, "a2", h.read("all/alpha/a.txt"))
