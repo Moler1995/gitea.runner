@@ -31,7 +31,7 @@ func newLocalClient(t *testing.T) *Client {
 	artifacts.RegisterV4(router, t.TempDir())
 	server := httptest.NewServer(router)
 	t.Cleanup(server.Close)
-	client, err := New(server.URL, artifacts.LocalRuntimeToken("7"), nil)
+	client, err := New(server.URL, artifacts.LocalRuntimeToken("7", time.Hour), nil)
 	require.NoError(t, err)
 	client.Retry = fastRetry
 	return client
@@ -103,7 +103,7 @@ func TestClientRetries(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	client, err := New(server.URL, artifacts.LocalRuntimeToken("7"), nil)
+	client, err := New(server.URL, artifacts.LocalRuntimeToken("7", time.Hour), nil)
 	require.NoError(t, err)
 	client.Retry = fastRetry
 	var logged []string

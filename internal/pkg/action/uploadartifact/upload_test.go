@@ -97,7 +97,7 @@ func newHarness(t *testing.T, env container.ExecutionsEnvironment) *harness {
 	artifacts.RegisterV4(router, t.TempDir())
 	server := httptest.NewServer(router)
 	t.Cleanup(server.Close)
-	client, err := artifact.New(server.URL, artifacts.LocalRuntimeToken("7"), nil)
+	client, err := artifact.New(server.URL, artifacts.LocalRuntimeToken("7", time.Hour), nil)
 	require.NoError(t, err)
 	workspace, err := filepath.EvalSymlinks(t.TempDir())
 	require.NoError(t, err)
@@ -123,7 +123,7 @@ func (h *harness) run(inputs map[string]string) error {
 		Workspace:    h.workspace,
 		Env:          env,
 		ResultsURL:   h.server,
-		RuntimeToken: artifacts.LocalRuntimeToken("7"),
+		RuntimeToken: artifacts.LocalRuntimeToken("7", time.Hour),
 		Infof:        func(format string, args ...any) { h.logs = append(h.logs, fmt.Sprintf(format, args...)) },
 		Annotate:     func(level, message string) { h.annotation = append(h.annotation, level+": "+message) },
 	})
@@ -214,7 +214,7 @@ func TestUploadSelectsWhatTheToolkitSelects(t *testing.T) {
 				},
 			} {
 				t.Run(test.name, func(t *testing.T) {
-					require.NoError(t, h.run(map[string]string{"name": "art", "path": test.inputs["path"], "include-hidden-files": test.inputs["include-hidden-files"]}))
+					require.NoError(t, h.run(map[string]string{"name": "art", "path": test.inputs["path"], "include-hidden-files": test.inputs["include-hidden-files"], "overwrite": "true"}))
 					expected := test.expected
 					if runtime.GOOS != "windows" {
 						maps.Copy(expected, test.symlinks)

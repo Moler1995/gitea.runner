@@ -4,6 +4,7 @@
 package runner
 
 import (
+	"cmp"
 	"context"
 
 	"gitea.com/gitea/runner/act/common"
@@ -54,7 +55,7 @@ func (sab *stepActionBuiltin) main() common.Executor {
 			ClientKeyFile:   rc.Config.ClientKeyFile,
 			Env:             sab.env,
 			ResultsURL:      rc.Config.ResultsURL,
-			RuntimeToken:    rc.Config.Secrets["ACTIONS_RUNTIME_TOKEN"],
+			RuntimeToken:    cmp.Or(rc.runtimeToken, rc.Config.Secrets["ACTIONS_RUNTIME_TOKEN"]),
 			Transport:       rc.Config.InstanceTransport,
 			Infof:           rawLogger.Infof,
 			Annotate: func(level, message string) {

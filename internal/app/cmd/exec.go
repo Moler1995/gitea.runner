@@ -208,11 +208,7 @@ func parseKVAndFile(rawKVs []string, filePath string) map[string]string {
 	return result
 }
 
-// artifactServerURL is empty when the artifact server does not start.
 func (i *executeArgs) artifactServerURL() string {
-	if i.artifactServerPath == "" {
-		return ""
-	}
 	return "http://" + net.JoinHostPort(i.artifactServerAddr, i.artifactServerPort)
 }
 
@@ -489,19 +485,7 @@ func runExec(ctx context.Context, execArgs *executeArgs) func(cmd *cobra.Command
 			execArgs.artifactServerPath = tempDir
 		}
 
-		// Register ACTIONS_RUNTIME_TOKEN against local cache server
 		env := execArgs.LoadEnvs()
-		const actionsRuntimeTokenEnvName = "ACTIONS_RUNTIME_TOKEN"
-		actionsRuntimeToken := env[actionsRuntimeTokenEnvName]
-		if actionsRuntimeToken == "" {
-			actionsRuntimeToken = os.Getenv(actionsRuntimeTokenEnvName)
-		}
-		if actionsRuntimeToken == "" {
-			actionsRuntimeToken = artifacts.LocalRuntimeToken(cmp.Or(env["GITHUB_RUN_ID"], "1"))
-			env[actionsRuntimeTokenEnvName] = actionsRuntimeToken
-			os.Setenv(actionsRuntimeTokenEnvName, actionsRuntimeToken)
-		}
-		handler.RegisterJob(actionsRuntimeToken, artifactcache.JobCredential{Repo: "__local/__exec", Results: execArgs.artifactServerURL()})
 
 		// no service aliases: exec builds one config for the whole plan
 		run.BypassProxyForDockerHost(os.Getenv("DOCKER_HOST"))
@@ -520,7 +504,22 @@ func runExec(ctx context.Context, execArgs *executeArgs) func(cmd *cobra.Command
 		}
 
 		config.Env["ACT_EXEC"] = "true"
-		config.Secrets[actionsRuntimeTokenEnvName] = actionsRuntimeToken
+		inheritedToken := cmp.Or(env["ACTIONS_RUNTIME_TOKEN"], os.Getenv("ACTIONS_RUNTIME_TOKEN"))
+		config.RuntimeTokens = map[*model.Workflow]string{}
+		sameFile := map[string]int{}
+		for _, stage := range plan.Stages {
+			for _, run := range stage.Runs {
+				if config.RuntimeTokens[run.Workflow] != "" {
+					continue
+				}
+				sameFile[run.Workflow.File]++
+				workflowRun := fmt.Sprintf("%s/%s/%d", cmp.Or(env["GITHUB_RUN_ID"], "1"), run.Workflow.File, sameFile[run.Workflow.File]) // each workflow its own run as on GitHub, also when file names repeat across directories
+				token := cmp.Or(inheritedToken, artifacts.LocalRuntimeToken(workflowRun, maxLifetime))
+				config.RuntimeTokens[run.Workflow] = token
+				config.ExtraMasks = append(config.ExtraMasks, token)
+				handler.RegisterJob(token, artifactcache.JobCredential{Repo: "__local/__exec", Results: execArgs.artifactServerURL()})
+			}
+		}
 
 		config.Token = cmp.Or(config.Secrets["GITEA_TOKEN"], config.Secrets["GITHUB_TOKEN"])
 
@@ -583,9 +582,9 @@ func loadExecCmd(ctx context.Context) *cobra.Command {
 	execCmd.Flags().StringArrayVarP(&execArg.containerCapAdd, "container-cap-add", "", []string{}, "kernel capabilities to add to the workflow containers (e.g. --container-cap-add SYS_PTRACE)")
 	execCmd.Flags().StringArrayVarP(&execArg.containerCapDrop, "container-cap-drop", "", []string{}, "kernel capabilities to remove from the workflow containers (e.g. --container-cap-drop SYS_PTRACE)")
 	execCmd.Flags().StringVarP(&execArg.containerOptions, "container-opts", "", "", "container options")
-	execCmd.PersistentFlags().StringVarP(&execArg.artifactServerPath, "artifact-server-path", "", ".", "Defines the path where the artifact server stores uploads and retrieves downloads from. If not specified the artifact server will not start.")
+	execCmd.PersistentFlags().StringVarP(&execArg.artifactServerPath, "artifact-server-path", "", "", "Defines the path where the artifact server stores uploads and retrieves downloads from, outside the workspace that jobs copy. Defaults to a temporary directory removed on exit.")
 	execCmd.PersistentFlags().StringVarP(&execArg.artifactServerAddr, "artifact-server-addr", "", "", "Defines the address where the artifact server listens")
-	execCmd.PersistentFlags().StringVarP(&execArg.artifactServerPort, "artifact-server-port", "", "34567", "Defines the port where the artifact server listens (will only bind to localhost).")
+	execCmd.PersistentFlags().StringVarP(&execArg.artifactServerPort, "artifact-server-port", "", "34567", "Defines the port where the artifact server listens")
 	execCmd.PersistentFlags().StringVarP(&execArg.defaultActionsURL, "default-actions-url", "", "https://github.com", "Defines the default url of action instance.")
 	execCmd.PersistentFlags().BoolVarP(&execArg.noSkipCheckout, "no-skip-checkout", "", false, "Do not skip actions/checkout")
 	execCmd.PersistentFlags().BoolVarP(&execArg.debug, "debug", "d", false, "enable debug log")
