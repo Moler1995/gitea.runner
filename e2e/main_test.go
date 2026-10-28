@@ -6,13 +6,17 @@
 package e2e
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"net/http"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -25,9 +29,17 @@ var nonRepoChars = regexp.MustCompile(`[^a-zA-Z0-9._-]+`)
 
 var fixture *GiteaFixture
 
-var runnerBinDir string // the CLI scenarios build the runner here once
-
 var skipReason string
+
+var binDir string
+
+var runnerBinary = sync.OnceValues(func() (string, error) {
+	bin := filepath.Join(binDir, "gitea-runner")
+	if out, err := exec.Command(cmp.Or(os.Getenv("GO"), "go"), "build", "-o", bin, "..").CombinedOutput(); err != nil {
+		return "", fmt.Errorf("build runner: %w\n%s", err, out)
+	}
+	return bin, nil
+})
 
 func TestMain(m *testing.M) {
 	os.Exit(runSuite(m))
@@ -51,12 +63,11 @@ func runSuite(m *testing.M) int {
 	fixture = f
 	defer func() { _ = fixture.Close(context.Background()) }()
 
-	runnerBinDir, err = os.MkdirTemp("", "e2e-runner-bin")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "create runner binary dir: %v\n", err)
+	if binDir, err = os.MkdirTemp("", "gitea-runner-e2e-"); err != nil {
+		fmt.Fprintf(os.Stderr, "create binary dir: %v\n", err)
 		return 1
 	}
-	defer func() { _ = os.RemoveAll(runnerBinDir) }()
+	defer os.RemoveAll(binDir)
 
 	fmt.Fprintf(os.Stderr, "gitea fixture: image=%s version=%s\n", fixture.image, fixture.version)
 

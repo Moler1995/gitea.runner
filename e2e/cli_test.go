@@ -36,23 +36,6 @@ func (b *syncBuffer) String() string {
 	return b.buf.String()
 }
 
-var buildRunnerBinary = sync.OnceValue(func() error {
-	out, err := exec.Command("go", "build", "-o", filepath.Join(runnerBinDir, "gitea-runner"), "..").CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("build runner: %w\n%s", err, out)
-	}
-	return nil
-})
-
-// runnerBinary builds the runner once for every CLI scenario.
-func runnerBinary(t *testing.T) string {
-	t.Helper()
-	if err := buildRunnerBinary(); err != nil {
-		t.Fatal(err)
-	}
-	return filepath.Join(runnerBinDir, "gitea-runner")
-}
-
 type cliRunner struct {
 	api     *GiteaAPI
 	repo    string
@@ -71,6 +54,11 @@ func newCLIRunner(t *testing.T, label, extraRunnerConfig string) *cliRunner {
 	}
 
 	dir := t.TempDir()
+	bin, err := runnerBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	cfg := fmt.Sprintf(`runner:
   file: %s
   fetch_interval: 250ms
@@ -83,7 +71,7 @@ func newCLIRunner(t *testing.T, label, extraRunnerConfig string) *cliRunner {
 	if fixture.network != "" {
 		cfg += "container:\n  network: " + fixture.network + "\n"
 	}
-	c := &cliRunner{api: api, repo: repo, bin: runnerBinary(t), cfgFile: filepath.Join(dir, "config.yaml"), dir: dir}
+	c := &cliRunner{api: api, repo: repo, bin: bin, cfgFile: filepath.Join(dir, "config.yaml"), dir: dir}
 	if err := os.WriteFile(c.cfgFile, []byte(cfg), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
@@ -275,5 +263,50 @@ func testCLIShutdownCancels(t *testing.T) {
 	}
 	if completed.Conclusion == "success" {
 		t.Errorf("run concluded success although the job was cancelled")
+	}
+}
+
+func testExecArtifacts(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+
+	bin, err := runnerBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflow, err := os.ReadFile("testdata/workflows/exec_artifact.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflows := t.TempDir()
+	for _, name := range []string{"a.yml", "b.yml"} {
+		if err := os.WriteFile(filepath.Join(workflows, name), workflow, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	workdir := t.TempDir()
+	for _, args := range [][]string{
+		{"init", "-q"},
+		{"remote", "add", "origin", "https://example.com/e2e/exec.git"},
+		{"-c", "user.name=e2e", "-c", "user.email=e2e@example.com", "commit", "-q", "--allow-empty", "-m", "init"},
+	} {
+		if out, err := exec.CommandContext(ctx, "git", append([]string{"-C", workdir}, args...)...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+
+	artifacts := t.TempDir()
+	args := []string{"exec", "-C", workdir, "-W", workflows, "-i", os.Getenv("E2E_JOB_IMAGE"), "--artifact-server-path", artifacts}
+	if fixture.network != "" {
+		args = append(args, "--network", fixture.network)
+	}
+	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd.Env = slices.DeleteFunc(os.Environ(), func(kv string) bool { return strings.HasPrefix(kv, "ACTIONS_") })
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("exec: %v\n%s", err, out)
+	}
+	if blobs, _ := filepath.Glob(filepath.Join(artifacts, "v4", "*", "*", "blob")); len(blobs) != 2 {
+		t.Fatalf("want one v4 artifact blob per workflow run, got %v", blobs)
 	}
 }
