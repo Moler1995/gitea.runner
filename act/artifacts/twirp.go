@@ -8,11 +8,6 @@ import "time"
 const artifactServicePath = "/twirp/github.actions.results.api.v1.ArtifactService"
 
 type ( // the ArtifactService messages in the protobuf JSON mapping, which writes int64 as strings
-	createArtifactRequest struct {
-		WorkflowRunBackendID string
-		Name                 string
-		MimeType             string
-	}
 	createArtifactResponse struct {
 		Ok              bool   `json:"ok"`
 		SignedUploadURL string `json:"signedUploadUrl"`
@@ -43,7 +38,7 @@ type ( // the ArtifactService messages in the protobuf JSON mapping, which write
 		Name                 string    `json:"name"`
 		Size                 int64     `json:"size,string"`
 		CreatedAt            time.Time `json:"createdAt"` // whole seconds, the toolkit rejects the trimmed fractions json writes
-		Digest               string    `json:"digest"`
+		Digest               string    `json:"digest"`    // empty until the upload is finalized
 	}
 
 	getSignedArtifactURLRequest struct {
@@ -54,6 +49,7 @@ type ( // the ArtifactService messages in the protobuf JSON mapping, which write
 		SignedURL string `json:"signedUrl"`
 	}
 
+	createArtifactRequest  = getSignedArtifactURLRequest
 	deleteArtifactRequest  = getSignedArtifactURLRequest
 	deleteArtifactResponse = finalizeArtifactResponse
 )

@@ -10,10 +10,10 @@ import (
 	"time"
 )
 
-func LocalRuntimeToken(runID string, lifetime time.Duration) string { // an unsecured JWT with the claims the toolkit and docker buildx read, its jti making it unguessable as the cache server's bearer
+func LocalRuntimeToken(run string, lifetime time.Duration) string { // an unsecured JWT with the claims the toolkit and buildx read, its run hashed for scp and its jti an unguessable bearer
 	now := time.Now()
 	claims, _ := json.Marshal(map[string]any{
-		"scp": "Actions.Results:" + runID + ":1",
+		"scp": "Actions.Results:" + fileName(run) + ":1",
 		"ac":  `[{"Scope":"","Permission":3}]`,
 		"nbf": now.Unix(),
 		"exp": now.Add(lifetime).Unix(),

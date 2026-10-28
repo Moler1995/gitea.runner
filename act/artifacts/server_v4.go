@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 )
@@ -25,13 +26,8 @@ import (
 type serverV4 struct { // the subset of Gitea's v4 artifact service that the toolkit uses, unauthenticated like the v3 routes beside it
 	dir     string
 	mu      sync.Mutex
-	startID int64
 	lastID  int64
-}
-
-type artifactMeta struct {
-	monolithArtifact // its Digest stays empty until the upload is finalized
-	MimeType         string
+	created map[string]bool
 }
 
 const (
@@ -40,8 +36,7 @@ const (
 )
 
 func registerV4(router *http.ServeMux, baseDir string) {
-	startID := time.Now().UnixMilli() // so artifacts of earlier runs in baseDir have lower IDs
-	server := &serverV4{dir: filepath.Join(baseDir, "v4"), startID: startID, lastID: startID}
+	server := &serverV4{dir: filepath.Join(baseDir, "v4"), lastID: time.Now().UnixMilli(), created: map[string]bool{}} // IDs stay unique across invocations sharing baseDir
 	router.HandleFunc("POST "+artifactServicePath+"/CreateArtifact", twirp(server.createArtifact))
 	router.HandleFunc("POST "+artifactServicePath+"/FinalizeArtifact", twirp(server.finalizeArtifact))
 	router.HandleFunc("POST "+artifactServicePath+"/ListArtifacts", twirp(server.listArtifacts))
@@ -106,16 +101,16 @@ func (s *serverV4) urlDir(r *http.Request) string {
 	return s.artifactDir(r.URL.Query().Get("run"), r.URL.Query().Get("name"))
 }
 
-func readMeta(dir string) (*artifactMeta, error) {
+func readMeta(dir string) (*monolithArtifact, error) {
 	data, err := os.ReadFile(filepath.Join(dir, "meta.json"))
 	if err != nil {
 		return nil, err
 	}
-	var meta artifactMeta
+	var meta monolithArtifact
 	return &meta, json.Unmarshal(data, &meta)
 }
 
-func writeMeta(dir string, meta *artifactMeta) error {
+func writeMeta(dir string, meta *monolithArtifact) error {
 	data, err := json.Marshal(meta)
 	if err != nil {
 		return err
@@ -127,12 +122,12 @@ func blobURL(r *http.Request, endpoint, runID, name string) string {
 	return "http://" + r.Host + artifactServicePath + "/" + endpoint + "?" + url.Values{"run": {runID}, "name": {name}}.Encode()
 }
 
-func (s *serverV4) createArtifact(r *http.Request, req createArtifactRequest) (createArtifactResponse, error) { // replaces a finalized artifact of the same name, as Gitea does
+func (s *serverV4) createArtifact(r *http.Request, req createArtifactRequest) (createArtifactResponse, error) { // an exec invocation re-runs its workflows, so it replaces earlier invocations' artifacts but conflicts with its own
 	dir := s.artifactDir(req.WorkflowRunBackendID, req.Name)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if meta, err := readMeta(dir); err == nil && meta.Digest == "" && meta.DatabaseID > s.startID {
-		return createArtifactResponse{}, &twirpError{http.StatusConflict, "already_exists", fmt.Sprintf("artifact %q is still being uploaded", req.Name)}
+	if s.created[dir] {
+		return createArtifactResponse{}, &twirpError{http.StatusConflict, "already_exists", "an artifact with this name already exists on the workflow run"}
 	}
 	if err := os.RemoveAll(dir); err != nil {
 		return createArtifactResponse{}, err
@@ -141,15 +136,15 @@ func (s *serverV4) createArtifact(r *http.Request, req createArtifactRequest) (c
 		return createArtifactResponse{}, err
 	}
 	s.lastID++
-	if err := writeMeta(dir, &artifactMeta{
+	if err := writeMeta(dir, &monolithArtifact{
 		WorkflowRunBackendID: req.WorkflowRunBackendID,
 		DatabaseID:           s.lastID,
 		Name:                 req.Name,
 		CreatedAt:            time.Now().UTC().Truncate(time.Second),
-		MimeType:             cmp.Or(req.MimeType, zipMimeType),
 	}); err != nil {
 		return createArtifactResponse{}, err
 	}
+	s.created[dir] = true
 	return createArtifactResponse{Ok: true, SignedUploadURL: blobURL(r, "UploadArtifact", req.WorkflowRunBackendID, req.Name)}, nil
 }
 
@@ -159,16 +154,22 @@ type blockList struct {
 
 func (s *serverV4) uploadArtifact(w http.ResponseWriter, r *http.Request) {
 	dir := s.urlDir(r)
-	if _, err := os.Stat(filepath.Join(dir, "meta.json")); err != nil {
-		http.Error(w, "artifact not created", http.StatusNotFound)
+	if meta, err := readMeta(dir); err != nil || meta.Digest != "" {
+		http.Error(w, "no artifact awaits an upload", http.StatusNotFound)
 		return
 	}
+	contentType := r.Header.Get("x-ms-blob-content-type")
 	var err error
 	switch comp := r.URL.Query().Get("comp"); comp {
 	case "block":
 		err = writeFile(filepath.Join(dir, "blocks", fileName(r.URL.Query().Get("blockid"))), r.Body)
 	case "blocklist":
-		err = joinBlocks(dir, r.Body)
+		err = commitBlob(dir, contentType, func(out io.Writer) error { return joinBlocks(out, dir, r.Body) })
+	case "": // Put Blob, which docker/build-push-action uses
+		err = commitBlob(dir, contentType, func(out io.Writer) error {
+			_, err := io.Copy(out, r.Body)
+			return err
+		})
 	default:
 		http.Error(w, "unsupported comp "+comp, http.StatusBadRequest)
 		return
@@ -189,24 +190,31 @@ func writeFile(name string, body io.Reader) error {
 	return errors.Join(err, file.Close())
 }
 
-func joinBlocks(dir string, body io.Reader) error { // keeps the blocks for finalizeArtifact, so that a retried commit can join them again
-	var list blockList
-	if err := xml.NewDecoder(io.LimitReader(body, maxTwirpBytes)).Decode(&list); err != nil {
-		return err
-	}
+func commitBlob(dir, contentType string, write func(io.Writer) error) error { // replaces the blob whole and keeps its content type, as Azure does
 	out, err := os.CreateTemp(dir, "blob")
 	if err != nil {
 		return err
 	}
-	for _, id := range list.Blocks {
-		if err = appendBlock(out, filepath.Join(dir, "blocks", fileName(id))); err != nil {
-			break
-		}
+	if err = errors.Join(write(out), out.Close()); err == nil {
+		err = os.Rename(out.Name(), filepath.Join(dir, "blob"))
 	}
-	if err = errors.Join(err, out.Close()); err != nil {
+	if err != nil {
 		return errors.Join(err, os.Remove(out.Name()))
 	}
-	return os.Rename(out.Name(), filepath.Join(dir, "blob"))
+	return os.WriteFile(filepath.Join(dir, "content-type"), []byte(contentType), 0o644)
+}
+
+func joinBlocks(out io.Writer, dir string, body io.Reader) error { // keeps the blocks for finalizeArtifact, so that a retried commit can join them again
+	var list blockList
+	if err := xml.NewDecoder(io.LimitReader(body, maxTwirpBytes)).Decode(&list); err != nil {
+		return err
+	}
+	for _, id := range list.Blocks {
+		if err := appendBlock(out, filepath.Join(dir, "blocks", fileName(id))); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func appendBlock(out io.Writer, name string) error {
@@ -221,8 +229,6 @@ func appendBlock(out io.Writer, name string) error {
 
 func (s *serverV4) finalizeArtifact(_ *http.Request, req finalizeArtifactRequest) (finalizeArtifactResponse, error) {
 	dir := s.artifactDir(req.WorkflowRunBackendID, req.Name)
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	meta, err := readMeta(dir)
 	if err != nil {
 		return finalizeArtifactResponse{}, notFound(req.Name)
@@ -244,6 +250,11 @@ func (s *serverV4) finalizeArtifact(_ *http.Request, req finalizeArtifactRequest
 	if req.Hash != "" && req.Hash != digest {
 		return finalizeArtifactResponse{}, badRequest("hash %s does not match the uploaded %s", req.Hash, digest)
 	}
+	s.mu.Lock() // only after hashing, so finalizing one large artifact does not stall the others
+	defer s.mu.Unlock()
+	if current, err := readMeta(dir); err != nil || current.DatabaseID != meta.DatabaseID {
+		return finalizeArtifactResponse{}, notFound(req.Name)
+	}
 	meta.Size, meta.Digest = size, digest
 	if err := writeMeta(dir, meta); err != nil {
 		return finalizeArtifactResponse{}, err
@@ -264,7 +275,7 @@ func (s *serverV4) listArtifacts(_ *http.Request, req listArtifactsRequest) (lis
 			req.NameFilter != "" && req.NameFilter != meta.Name || req.IDFilter != 0 && req.IDFilter != meta.DatabaseID {
 			continue
 		}
-		resp.Artifacts = append(resp.Artifacts, meta.monolithArtifact)
+		resp.Artifacts = append(resp.Artifacts, *meta)
 	}
 	slices.SortFunc(resp.Artifacts, func(left, right monolithArtifact) int { return cmp.Compare(left.DatabaseID, right.DatabaseID) })
 	return resp, nil
@@ -290,12 +301,16 @@ func (s *serverV4) downloadArtifact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer blob.Close()
-	filename := meta.Name
-	if meta.MimeType == zipMimeType {
+	data, _ := os.ReadFile(filepath.Join(dir, "content-type"))
+	contentType, filename := string(data), meta.Name
+	if !strings.Contains(contentType, "/") {
+		contentType = zipMimeType
+	}
+	if contentType == zipMimeType {
 		filename += ".zip"
 	}
-	w.Header().Set("Content-Type", meta.MimeType)
-	w.Header().Set("Content-Disposition", "attachment; filename*=UTF-8''"+url.PathEscape(filename)) // the toolkit URI-decodes any filename
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Disposition", "attachment; filename*=UTF-8''"+strings.ReplaceAll(url.QueryEscape(filename), "+", "%20")) // RFC 5987 attr-chars only, which the toolkit and mime.ParseMediaType both accept
 	http.ServeContent(w, r, "", meta.CreatedAt, blob)
 }
 
@@ -307,5 +322,6 @@ func (s *serverV4) deleteArtifact(_ *http.Request, req deleteArtifactRequest) (d
 	if err != nil {
 		return deleteArtifactResponse{}, notFound(req.Name)
 	}
+	delete(s.created, dir)
 	return deleteArtifactResponse{Ok: true, ArtifactID: meta.DatabaseID}, os.RemoveAll(dir)
 }

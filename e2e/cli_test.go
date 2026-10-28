@@ -130,9 +130,15 @@ func testExecArtifacts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	workflow, err := filepath.Abs("testdata/workflows/exec_artifact.yml")
+	workflow, err := os.ReadFile("testdata/workflows/exec_artifact.yml")
 	if err != nil {
 		t.Fatal(err)
+	}
+	workflows := t.TempDir()
+	for _, name := range []string{"a.yml", "b.yml"} {
+		if err := os.WriteFile(filepath.Join(workflows, name), workflow, 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	workdir := t.TempDir()
@@ -147,7 +153,7 @@ func testExecArtifacts(t *testing.T) {
 	}
 
 	artifacts := t.TempDir()
-	args := []string{"exec", "-C", workdir, "-W", workflow, "-i", os.Getenv("E2E_JOB_IMAGE"), "--artifact-server-path", artifacts}
+	args := []string{"exec", "-C", workdir, "-W", workflows, "-i", os.Getenv("E2E_JOB_IMAGE"), "--artifact-server-path", artifacts}
 	if fixture.network != "" {
 		args = append(args, "--network", fixture.network)
 	}
@@ -156,7 +162,7 @@ func testExecArtifacts(t *testing.T) {
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("exec: %v\n%s", err, out)
 	}
-	if blobs, _ := filepath.Glob(filepath.Join(artifacts, "v4", "*", "*", "blob")); len(blobs) != 1 {
-		t.Fatalf("want one v4 artifact blob, got %v", blobs)
+	if blobs, _ := filepath.Glob(filepath.Join(artifacts, "v4", "*", "*", "blob")); len(blobs) != 2 {
+		t.Fatalf("want one v4 artifact blob per workflow run, got %v", blobs)
 	}
 }

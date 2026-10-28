@@ -480,19 +480,7 @@ func runExec(ctx context.Context, execArgs *executeArgs) func(cmd *cobra.Command
 			execArgs.artifactServerPath = tempDir
 		}
 
-		// Register ACTIONS_RUNTIME_TOKEN against local cache server
 		env := execArgs.LoadEnvs()
-		const actionsRuntimeTokenEnvName = "ACTIONS_RUNTIME_TOKEN"
-		actionsRuntimeToken := env[actionsRuntimeTokenEnvName]
-		if actionsRuntimeToken == "" {
-			actionsRuntimeToken = os.Getenv(actionsRuntimeTokenEnvName)
-		}
-		if actionsRuntimeToken == "" {
-			actionsRuntimeToken = artifacts.LocalRuntimeToken(cmp.Or(env["GITHUB_RUN_ID"], "1"), maxLifetime)
-			env[actionsRuntimeTokenEnvName] = actionsRuntimeToken
-			os.Setenv(actionsRuntimeTokenEnvName, actionsRuntimeToken)
-		}
-		handler.RegisterJob(actionsRuntimeToken, artifactcache.JobCredential{Repo: "__local/__exec", Results: "http://" + net.JoinHostPort(execArgs.artifactServerAddr, execArgs.artifactServerPort)})
 
 		// no service aliases: exec builds one config for the whole plan
 		run.BypassProxyForDockerHost(os.Getenv("DOCKER_HOST"))
@@ -511,7 +499,22 @@ func runExec(ctx context.Context, execArgs *executeArgs) func(cmd *cobra.Command
 		}
 
 		config.Env["ACT_EXEC"] = "true"
-		config.Secrets[actionsRuntimeTokenEnvName] = actionsRuntimeToken
+		inheritedToken := cmp.Or(env["ACTIONS_RUNTIME_TOKEN"], os.Getenv("ACTIONS_RUNTIME_TOKEN"))
+		config.RuntimeTokens = map[*model.Workflow]string{}
+		sameFile := map[string]int{}
+		for _, stage := range plan.Stages {
+			for _, run := range stage.Runs {
+				if config.RuntimeTokens[run.Workflow] != "" {
+					continue
+				}
+				sameFile[run.Workflow.File]++
+				workflowRun := fmt.Sprintf("%s/%s/%d", cmp.Or(env["GITHUB_RUN_ID"], "1"), run.Workflow.File, sameFile[run.Workflow.File]) // each workflow its own run as on GitHub, also when file names repeat across directories
+				token := cmp.Or(inheritedToken, artifacts.LocalRuntimeToken(workflowRun, maxLifetime))
+				config.RuntimeTokens[run.Workflow] = token
+				config.ExtraMasks = append(config.ExtraMasks, token)
+				handler.RegisterJob(token, artifactcache.JobCredential{Repo: "__local/__exec", Results: "http://" + net.JoinHostPort(execArgs.artifactServerAddr, execArgs.artifactServerPort)})
+			}
+		}
 
 		config.Token = cmp.Or(config.Secrets["GITEA_TOKEN"], config.Secrets["GITHUB_TOKEN"])
 
