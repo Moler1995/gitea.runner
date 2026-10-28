@@ -17,6 +17,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -109,7 +110,7 @@ func fakeKubernetes(t *testing.T, podStatus string, env ...string) (string, *fak
 			if failure := cluster.nextExecFailure(); failure != nil {
 				failure(w, r)
 			} else {
-				serveLocalExec(t, w, r, env)
+				serveLocalExec(t, w, r, env, cluster)
 			}
 		case strings.HasSuffix(r.URL.Path, "/log"):
 			_, _ = io.WriteString(w, "log of "+r.URL.Query().Get("container"))
@@ -132,7 +133,7 @@ users: [{name: test, user: {tokenFile: token}}]
 	return kubeconfig, cluster
 }
 
-func serveLocalExec(t *testing.T, w http.ResponseWriter, r *http.Request, env []string) {
+func serveLocalExec(t *testing.T, w http.ResponseWriter, r *http.Request, env []string, cluster *fakeCluster) {
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{Subprotocols: []string{execProtocol}})
 	if err != nil {
 		t.Error(err)
@@ -153,6 +154,7 @@ func serveLocalExec(t *testing.T, w http.ResponseWriter, r *http.Request, env []
 		}
 		stdin.Write(frame[1:])
 	}
+	cluster.record("exec stdin bytes", strconv.Itoa(stdin.Len()))
 	cmd := exec.Command(command[0], command[1:]...)
 	cmd.Env = append(append(os.Environ(), "COPYFILE_DISABLE=1"), env...)
 	var stdout, stderr bytes.Buffer
