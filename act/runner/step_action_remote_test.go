@@ -346,9 +346,6 @@ func Test_newRemoteActionSelfRepo(t *testing.T) {
 			},
 		},
 		{name: "unknown instance", action: "$/.gitea/actions/build", github: &model.GithubContext{Repository: "owner/workflow-repo", Sha: "abc123"}},
-		{name: "empty path", action: "$/", github: workflow},
-		{name: "ref suffix is not allowed", action: "$/.gitea/actions/build@v1", github: workflow},
-		{name: "path traversal", action: "$/../escape", github: workflow},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

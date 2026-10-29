@@ -68,6 +68,7 @@ func TestStepActionLocalTest(t *testing.T) {
 				},
 			},
 			JobContainer: cm,
+			Env:          map[string]string{"GITHUB_ACTION_REPOSITORY": "other/action", "GITHUB_ACTION_REF": "v1"},
 		},
 		Step: &model.Step{
 			ID:   "1",
@@ -87,6 +88,8 @@ func TestStepActionLocalTest(t *testing.T) {
 
 	err = sal.main()(ctx)
 	require.NoError(t, err)
+	assert.Empty(t, sal.env["GITHUB_ACTION_REPOSITORY"])
+	assert.Empty(t, sal.env["GITHUB_ACTION_REF"])
 
 	cm.AssertExpectations(t)
 	salm.AssertExpectations(t)
