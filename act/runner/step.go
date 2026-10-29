@@ -32,13 +32,16 @@ type step interface {
 	getIfExpression(context context.Context, stage stepStage) string
 }
 
+func stepActionIdentity(step step) (repository, ref string) {
+	if action, ok := step.(interface{ actionIdentity() (string, string) }); ok {
+		return action.actionIdentity()
+	}
+	return "", ""
+}
+
 func getStepGithubContext(ctx context.Context, step step) *model.GithubContext {
 	github := step.getRunContext().getGithubContext(ctx)
-	github.ActionRepository, github.ActionRef = "", ""
-	if remote, ok := step.(*stepActionRemote); ok && remote.remoteAction != nil {
-		github.ActionRepository = remote.remoteAction.Org + "/" + remote.remoteAction.Repo
-		github.ActionRef = remote.remoteAction.Ref
-	}
+	github.ActionRepository, github.ActionRef = stepActionIdentity(step)
 	return github
 }
 
@@ -101,9 +104,8 @@ func runStepExecutor(step step, stage stepStage, executor common.Executor) commo
 			runStep, err = isStepEnabled(ctx, ifExpression, step, stage)
 		}
 		if err == nil && runStep {
-			github := getStepGithubContext(ctx, step)
-			(*step.getEnv())["GITHUB_ACTION_REPOSITORY"] = github.ActionRepository
-			(*step.getEnv())["GITHUB_ACTION_REF"] = github.ActionRef
+			env := *step.getEnv()
+			env["GITHUB_ACTION_REPOSITORY"], env["GITHUB_ACTION_REF"] = stepActionIdentity(step)
 			err = setupInputs(ctx, step)
 		}
 		if err != nil {

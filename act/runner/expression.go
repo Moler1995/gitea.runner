@@ -112,7 +112,7 @@ func (rc *RunContext) newStepExpressionEvaluator(ctx context.Context, step step,
 		Needs:    exprparser.NeedsContext(rc.Run),
 		// todo: should be unavailable
 		// but required to interpolate/evaluate the inputs in actions/composite
-		Inputs:    getEvaluatorInputs(rc, stepInputs, rc.getGithubContext(ctx)),
+		Inputs:    getEvaluatorInputs(rc, stepInputs, github),
 		HashFiles: getHashFilesFunction(ctx, rc),
 	}
 	ee.Runner = rc.getRunnerContext(ctx)

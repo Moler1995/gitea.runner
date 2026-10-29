@@ -181,6 +181,13 @@ func (sar *stepActionRemote) getRunContext() *RunContext {
 	return sar.RunContext
 }
 
+func (sar *stepActionRemote) actionIdentity() (string, string) {
+	if sar.remoteAction == nil {
+		return "", ""
+	}
+	return sar.remoteAction.Org + "/" + sar.remoteAction.Repo, sar.remoteAction.Ref
+}
+
 func (sar *stepActionRemote) getStepModel() *model.Step {
 	return sar.Step
 }
