@@ -76,7 +76,7 @@ func TestStepActionRemote(t *testing.T) {
 		status          model.StepStatus
 		runError        error
 	}{
-		{name: "run-successful", status: model.StepStatusSuccess},
+		{name: "run-successful", condition: "github.action_repository == 'other/composite' && github.action_ref == 'v2'", status: model.StepStatusSuccess},
 		{name: "run-skipped", condition: "false", status: model.StepStatusSkipped},
 		{name: "run-error", status: model.StepStatusFailure, runError: assert.AnError},
 	} {
@@ -110,6 +110,7 @@ func TestStepActionRemote(t *testing.T) {
 					},
 					StepResults:  map[string]*model.StepResult{},
 					JobContainer: cm,
+					Env:          map[string]string{"GITHUB_ACTION_REPOSITORY": "other/composite", "GITHUB_ACTION_REF": "v2"},
 				},
 				Step:       &model.Step{ID: "step", Uses: "remote/action@v1", If: yaml.Node{Value: tt.condition}},
 				readAction: sarm.readAction,
@@ -127,6 +128,8 @@ func TestStepActionRemote(t *testing.T) {
 			require.NoError(t, sar.pre()(ctx))
 			assert.Equal(t, tt.runError, sar.main()(ctx))
 			assert.True(t, clonedAction)
+			assert.Equal(t, "remote/action", sar.env["GITHUB_ACTION_REPOSITORY"])
+			assert.Equal(t, "v1", sar.env["GITHUB_ACTION_REF"])
 			assert.Equal(t, &model.StepResult{Conclusion: tt.status, Outcome: tt.status, Outputs: map[string]string{}}, sar.RunContext.StepResults["step"])
 
 			sarm.AssertExpectations(t)
@@ -137,18 +140,25 @@ func TestStepActionRemote(t *testing.T) {
 	t.Run("refreshes composite inputs without leaking environment", func(t *testing.T) {
 		step := &stepActionRemote{
 			Step:         &model.Step{Uses: "org/composite@v1", With: map[string]string{"SHARED": "first"}},
-			RunContext:   &RunContext{Config: &Config{ActionCacheDir: t.TempDir(), PresetGitHubContext: &model.GithubContext{}}, Run: &model.Run{JobID: "job", Workflow: &model.Workflow{Jobs: map[string]*model.Job{"job": {}}}}, JobContainer: &jobContainerMock{}},
+			RunContext:   &RunContext{Config: &Config{GitHubInstance: "github.com", ActionCacheDir: t.TempDir(), PresetGitHubContext: &model.GithubContext{}}, Run: &model.Run{JobID: "job", Workflow: &model.Workflow{Jobs: map[string]*model.Job{"job": {}}}}, JobContainer: &jobContainerMock{}},
 			action:       &model.Action{Inputs: map[string]model.Input{"shared": {}}},
 			env:          map[string]string{},
 			remoteAction: mustNewRemoteAction(t, "org/composite@v1"),
 		}
 
-		for _, value := range []string{"first", "second"} {
+		for _, value := range []string{"pre", "main", "post"} {
 			step.env["INPUT_SHARED"] = value
+			step.env["GITHUB_ACTION_REPOSITORY"] = "forged/repo"
+			step.env["GITHUB_ACTION_REF"] = "forged-ref"
 			composite, err := step.getCompositeRunContext(t.Context())
 			require.NoError(t, err)
 			assert.Equal(t, map[string]any{"shared": value}, composite.actionInputs)
 			assert.NotContains(t, composite.Env, "INPUT_SHARED")
+			assert.Equal(t, "org/composite", composite.Env["GITHUB_ACTION_REPOSITORY"])
+			assert.Equal(t, "v1", composite.Env["GITHUB_ACTION_REF"])
+			resolved, err := newRemoteAction("$/nested", composite.getGithubContext(t.Context()), "github.com")
+			require.NoError(t, err)
+			assert.Equal(t, "org/composite/nested@v1", resolved.Reference())
 		}
 	})
 }
@@ -182,7 +192,7 @@ func TestStepActionRemotePrepare(t *testing.T) {
 	require.NoError(t, err)
 	root, err := prepare(job, "org/repo@v1")
 	require.NoError(t, err)
-	nested, err := prepare(&RunContext{Config: job.Config, Run: job.Run, JobContainer: job.JobContainer, Parent: job}, "org/repo/save@v1")
+	nested, err := prepare(&RunContext{Config: job.Config, Run: job.Run, JobContainer: job.JobContainer, Parent: job, Env: map[string]string{"GITHUB_ACTION_REPOSITORY": "org/repo", "GITHUB_ACTION_REF": "v1"}}, "$/save")
 	require.NoError(t, err)
 	other, err := prepare(job, "org/repo@v2")
 	require.NoError(t, err)

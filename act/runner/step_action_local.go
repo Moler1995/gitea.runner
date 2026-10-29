@@ -95,12 +95,6 @@ func (sal *stepActionLocal) getRunContext() *RunContext {
 	return sal.RunContext
 }
 
-func (sal *stepActionLocal) getGithubContext(ctx context.Context) *model.GithubContext {
-	github := sal.getRunContext().getGithubContext(ctx)
-	github.ActionRepository, github.ActionRef = "", ""
-	return github
-}
-
 func (sal *stepActionLocal) getStepModel() *model.Step {
 	return sal.Step
 }
