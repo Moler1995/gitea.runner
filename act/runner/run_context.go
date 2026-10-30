@@ -81,6 +81,7 @@ type RunContext struct {
 	jobRunDefaults      model.RunDefaults // defaults.run, resolved once at job setup as GitHub does
 	platformImage       string            // container.image or the runs-on pick, resolved once by isEnabled
 	jobIndex, jobTotal  int               // strategy.job-index and job-total, total 0 when unknown
+	runtimeToken        string            // ACTIONS_RUNTIME_TOKEN of the workflow run, shared with its called workflows and composite actions
 
 	jobEnv             map[string]string          // workflow and job env as evaluated for the container and service specs
 	dockerActionImages map[*model.Step]string     // Dockerfile action images built for this job, removed when it ends
@@ -192,6 +193,9 @@ func (rc *RunContext) GetEnv() map[string]string {
 			if job != nil {
 				rc.Env = mergeMaps(rc.Run.Workflow.Env, job.Environment(), rc.Config.Env)
 			}
+		}
+		if rc.runtimeToken != "" {
+			rc.Env["ACTIONS_RUNTIME_TOKEN"] = rc.runtimeToken // as the daemon's Config.Env carries its token
 		}
 	}
 	if !rc.Config.DisableActEnv {
@@ -1598,6 +1602,23 @@ func isLocalCheckout(ghc *model.GithubContext, step *model.Step) bool {
 	return true
 }
 
+// aliasGiteaEnv mirrors the runner's GITHUB_* variables as GITEA_*, call it after the last write to them.
+func aliasGiteaEnv(env map[string]string) {
+	for _, suffix := range []string{
+		"ACTION", "ACTION_PATH", "ACTION_REF", "ACTION_REPOSITORY", "ACTIONS", "ACTOR", "ACTOR_ID", "API_URL", "BASE_REF",
+		"ENV", "EVENT_NAME", "EVENT_PATH", "GRAPHQL_URL", "HEAD_REF", "JOB", "OUTPUT", "PATH", "REF", "REF_NAME",
+		"REF_PROTECTED", "REF_TYPE", "REPOSITORY", "REPOSITORY_ID", "REPOSITORY_OWNER", "REPOSITORY_OWNER_ID",
+		"RETENTION_DAYS", "RUN_ATTEMPT", "RUN_ID", "RUN_NUMBER", "SERVER_URL", "SHA", "STATE", "STEP_SUMMARY",
+		"TRIGGERING_ACTOR", "WORKFLOW", "WORKFLOW_REF", "WORKFLOW_SHA", "WORKSPACE",
+	} {
+		if value, ok := env["GITHUB_"+suffix]; ok {
+			env["GITEA_"+suffix] = value
+		} else {
+			delete(env, "GITEA_"+suffix)
+		}
+	}
+}
+
 func (rc *RunContext) withGithubEnv(ctx context.Context, github *model.GithubContext, env map[string]string) {
 	if _, ok := env["CI"]; !ok {
 		env["CI"] = "true"
@@ -1650,6 +1671,7 @@ func (rc *RunContext) withGithubEnv(ctx context.Context, github *model.GithubCon
 
 	env["GITHUB_GRAPHQL_URL"] = ""
 	env["GITHUB_RUN_ATTEMPT"] = github.RunAttempt
+	aliasGiteaEnv(env)
 
 	env["RUNNER_NAME"] = rc.Config.RunnerName
 	env["RUNNER_ENVIRONMENT"] = "self-hosted"
@@ -1662,7 +1684,7 @@ func (rc *RunContext) withGithubEnv(ctx context.Context, github *model.GithubCon
 
 	if rc.Config.ArtifactServerPath != "" {
 		env["ACTIONS_RUNTIME_URL"] = cmp.Or(os.Getenv("ACTIONS_RUNTIME_URL"), "http://"+net.JoinHostPort(rc.Config.ArtifactServerAddr, rc.Config.ArtifactServerPort)+"/")
-		env["ACTIONS_RUNTIME_TOKEN"] = cmp.Or(os.Getenv("ACTIONS_RUNTIME_TOKEN"), "token")
+		env["ACTIONS_RUNTIME_TOKEN"] = cmp.Or(rc.runtimeToken, os.Getenv("ACTIONS_RUNTIME_TOKEN"), "token")
 	}
 
 	if imageOS := rc.imageOS(ctx); imageOS != "" {
