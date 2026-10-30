@@ -51,7 +51,7 @@ Job pods mount no service account token unless the template sets `automountServi
 
 ## Copying files over the pod network
 
-The runner copies files into the job container, such as the actions a step uses, with `tar` over `pods/exec`. That data goes through the API server, which on a managed cluster sits in other zones than the nodes and is billed as cross-zone traffic, twice per byte. With `transfer.mode` set to `auto` or `direct` the job container fetches the files from the runner pod instead:
+The runner copies files into the job container, such as the actions a step uses, with `tar` over `pods/exec`. That data goes through the API server, which on a managed cluster often sits in other zones than the nodes, so each byte can cross zones twice. With `transfer.mode` set to `auto` or `direct`, the job container instead fetches directories, such as actions and workspaces, and other copies of 64 KiB or more gzipped from the runner pod. Smaller ones, like step scripts, stay on `pods/exec`, as do copies out of the job container and step output.
 
 ```yaml
 kubernetes:
@@ -59,10 +59,10 @@ kubernetes:
     mode: direct # api (default), auto or direct
     host: "" # address the runner listens on and job pods reach it at, defaults to its outbound IP, the pod IP in a cluster
     port: 0 # port it listens on, defaults to a free one
-    image: "" # image holding the runner binary at the runner's own path, defaults to the runner pod's image if it has one container
+    image: "" # image with gitea-runner on its PATH, defaults to the image of a single-container runner pod in kubernetes.namespace
 ```
 
-Each job pod then gets an init container from `image` that copies the runner binary into the `act` volume, and every copy is fetched with it from the runner over HTTPS. The modes differ in what happens when that does not work, for example when a NetworkPolicy keeps job pods from reaching the runner, or the runner pod has several containers and no `image` is set:
+Each job pod then gets an init container named `gitea-runner-transfer` from `image`, which copies its `gitea-runner` into the `act` volume for the job container to fetch with over HTTPS. The modes differ in what happens when a job pod cannot reach the runner, for example because of a NetworkPolicy, or when no `image` is set and the runner is not a single-container pod in `kubernetes.namespace`:
 
 | Mode | Copies | When the pod network does not work |
 |---|---|---|
@@ -70,13 +70,15 @@ Each job pod then gets an init container from `image` that copies the runner bin
 | `auto` | over the pod network | the job pod gets its copies through the API server, after one failed attempt, and a warning is logged |
 | `direct` | over the pod network | the job fails, so a broken setup shows instead of quietly costing API server traffic again |
 
+In both `auto` and `direct`, a job fails when its init container does, for example when `image` cannot be pulled or has no `gitea-runner` on its PATH. A private `image` needs `imagePullSecrets` in `pod_template`, and a versioned tag keeps job pods on the runner's version. An `initContainers` entry named `gitea-runner-transfer` in `pod_template` merges into the init container, for example to set its `resources`.
+
 The copies include secrets, such as `run` scripts with `${{ secrets.* }}` expanded, SSH keys for checkout and the runner's client key, so a runner only serves them to its own job pods:
 
-- The runner listens with a certificate it generates at start. Its SHA-256 pin reaches the job pod with the request over the `pods/exec` stream, which the API server protects with TLS, and the job pod trusts no other certificate, so it only talks to its own runner and nobody on the pod network can read or change a copy.
+- The runner listens with a certificate it generates at start. Its SHA-256 pin reaches the job pod over the `pods/exec` stream, which the API server protects with TLS, and the job pod trusts no other certificate, so nobody on the pod network can read or change a copy.
 - Every copy has a one-time token, sent on that stream's stdin, so it shows neither in the command line nor in the API server audit log.
-- The runner serves a copy only to a connection from an IP of the job pod it is for. A request from any other pod, including other runners and their job pods, gets a 404 and leaves the copy for its job pod.
+- The runner serves a copy only to a connection from an IP of the job pod it is for. Other pods get a 404 and leave the copy for its job pod. This needs the runner to see the job pods' own addresses, so it does not work for a runner outside the cluster or behind a proxy that rewrites source addresses.
 
-To also keep other pods from connecting at all, allow the port only from the runner's own job pods, which carry its UUID in the `com.gitea.runner.uuid` label, with a NetworkPolicy such as:
+To also keep other pods from connecting at all, allow the port only from the runner's own job pods, which carry its UUID in the `com.gitea.runner.uuid` label. The policy denies every other connection to the runner pod, so it also needs to allow `cache.port`, and both ports need fixed values:
 
 ```yaml
 apiVersion: networking.k8s.io/v1
@@ -86,18 +88,20 @@ metadata:
 spec:
   podSelector:
     matchLabels:
-      app: gitea-runner # the runner pod
+      app: runner # the runner pod
   policyTypes: [Ingress]
   ingress:
     - from:
-        - podSelector:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: <kubernetes.namespace>
+          podSelector:
             matchLabels:
               com.gitea.runner.uuid: <runner UUID, from the .runner file>
       ports:
         - port: 9090 # kubernetes.transfer.port
+        - port: 9091 # cache.port
 ```
-
- Copies out of the job container and step output still go through the API server. Job pods need to be able to pull `image`, so a private one needs `imagePullSecrets` in `pod_template`. The init container is named `gitea-runner-transfer`, an `initContainers` entry of that name in `pod_template` merges into it, for example to set its `securityContext` or `resources`.
 
 ## Services
 

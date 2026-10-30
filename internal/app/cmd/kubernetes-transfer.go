@@ -17,10 +17,10 @@ func loadKubernetesTransferCmd() *cobra.Command {
 		Hidden: true,
 	}
 	transferCmd.AddCommand(&cobra.Command{
-		Use:   "install <dir>",
-		Short: "Copy this binary into dir",
+		Use:   "install <path>",
+		Short: "Copy this binary to path",
 		Args:  cobra.ExactArgs(1),
-		RunE: func(_ *cobra.Command, args []string) error {
+		RunE: func(_cmd *cobra.Command, args []string) error {
 			return container.InstallKubernetesTransferHelper(args[0])
 		},
 	}, &cobra.Command{

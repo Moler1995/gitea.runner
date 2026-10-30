@@ -228,7 +228,7 @@ type KubernetesTransfer struct {
 	Mode  string `yaml:"mode"`  // Mode is one of KubernetesTransferModes, api when empty.
 	Host  string `yaml:"host"`  // Host is the address the runner listens on and job pods reach it at, empty uses the outbound IP.
 	Port  uint16 `yaml:"port"`  // Port the runner listens on for job pods, 0 picks a free one.
-	Image string `yaml:"image"` // Image holds the runner binary at the runner's own path, empty uses the image of a single-container runner pod.
+	Image string `yaml:"image"` // Image has gitea-runner on its PATH, empty uses the image of a single-container runner pod.
 }
 
 // Metrics represents the configuration for the Prometheus metrics endpoint.

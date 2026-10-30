@@ -416,10 +416,8 @@ func (r *Runner) kubernetesOptions(runsOn []string) container.KubernetesOptions 
 		RunnerUUID:   r.uuid,
 	}
 	if transfer := r.cfg.Kubernetes.Transfer; transfer.Mode == config.KubernetesTransferModeAuto || transfer.Mode == config.KubernetesTransferModeDirect {
-		binary, _ := os.Executable() // the image runs the runner at the same path as this process
 		options.Transfer = &container.KubernetesTransfer{
-			Host: transfer.Host, Port: transfer.Port, Image: transfer.Image, Binary: binary,
-			Fallback: transfer.Mode == config.KubernetesTransferModeAuto,
+			Host: transfer.Host, Port: transfer.Port, Image: transfer.Image, Fallback: transfer.Mode == config.KubernetesTransferModeAuto,
 		}
 	}
 	names := r.labels.Names()

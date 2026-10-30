@@ -277,16 +277,14 @@ func TestRunnerKubernetesOptionsLayerTheLabelPodTemplatesInRunsOnOrder(t *testin
 }
 
 func TestRunnerKubernetesOptionsTransfer(t *testing.T) {
-	r := &Runner{cfg: &config.Config{}}
-	r.cfg.Kubernetes.Transfer = config.KubernetesTransfer{Mode: config.KubernetesTransferModeAPI, Host: "10.0.0.5", Port: 4000, Image: "gitea/runner:latest"}
-	require.Nil(t, r.kubernetesOptions(nil).Transfer)
+	kubernetesRunner := &Runner{cfg: &config.Config{}}
+	kubernetesRunner.cfg.Kubernetes.Transfer = config.KubernetesTransfer{Mode: config.KubernetesTransferModeAPI, Host: "10.0.0.5", Port: 4000, Image: "gitea/runner:latest"}
+	require.Nil(t, kubernetesRunner.kubernetesOptions(nil).Transfer)
 
-	executable, err := os.Executable()
-	require.NoError(t, err)
-	r.cfg.Kubernetes.Transfer.Mode = config.KubernetesTransferModeAuto
-	require.Equal(t, &container.KubernetesTransfer{Host: "10.0.0.5", Port: 4000, Image: "gitea/runner:latest", Binary: executable, Fallback: true}, r.kubernetesOptions(nil).Transfer)
-	r.cfg.Kubernetes.Transfer.Mode = config.KubernetesTransferModeDirect
-	require.Equal(t, &container.KubernetesTransfer{Host: "10.0.0.5", Port: 4000, Image: "gitea/runner:latest", Binary: executable}, r.kubernetesOptions(nil).Transfer)
+	kubernetesRunner.cfg.Kubernetes.Transfer.Mode = config.KubernetesTransferModeAuto
+	require.Equal(t, &container.KubernetesTransfer{Host: "10.0.0.5", Port: 4000, Image: "gitea/runner:latest", Fallback: true}, kubernetesRunner.kubernetesOptions(nil).Transfer)
+	kubernetesRunner.cfg.Kubernetes.Transfer.Mode = config.KubernetesTransferModeDirect
+	require.Equal(t, &container.KubernetesTransfer{Host: "10.0.0.5", Port: 4000, Image: "gitea/runner:latest"}, kubernetesRunner.kubernetesOptions(nil).Transfer)
 }
 
 // Proxy variables are assembled per task, because a job's service containers have to be
