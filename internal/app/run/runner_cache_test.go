@@ -114,16 +114,21 @@ func decodeJSON(resp *http.Response, v any) error {
 }
 
 func TestCacheCredential(t *testing.T) {
-	event := map[string]any{"repository": map[string]any{"default_branch": "main"}}
-	pull := &model.GithubContext{Repository: "owner/repo", Ref: "refs/pull/3/head", BaseRef: "release", Event: event}
+	repository := map[string]any{"default_branch": "main"}
+	review := &model.GithubContext{
+		Repository: "owner/repo", EventName: "pull_request_review", Ref: "refs/heads/main", BaseRef: "release",
+		Event: map[string]any{"repository": repository, "number": float64(3)},
+	}
 	assert.Equal(t, artifactcache.JobCredential{
 		Repo: "owner/repo", Ref: "refs/pull/3/head", BaseRef: "refs/heads/release", DefaultRef: "refs/heads/main", PublicURL: "http://cache",
-	}, cacheCredential(pull, "http://cache"))
+	}, cacheCredential(review, "http://cache"))
 
-	push := &model.GithubContext{Repository: "owner/repo", Ref: "refs/heads/feature", Event: event}
+	review.EventName, review.Ref = "pull_request_target", "refs/heads/release"
+	assert.Equal(t, "refs/heads/release", cacheCredential(review, "").Ref)
+
 	assert.Equal(t, artifactcache.JobCredential{
 		Repo: "owner/repo", Ref: "refs/heads/feature", DefaultRef: "refs/heads/main",
-	}, cacheCredential(push, ""))
+	}, cacheCredential(&model.GithubContext{Repository: "owner/repo", Ref: "refs/heads/feature", Event: map[string]any{"repository": repository}}, ""))
 }
 
 func TestRunner_ExternalCacheServer_RegisterRevoke(t *testing.T) {
@@ -208,7 +213,7 @@ func TestRunner_ExternalCacheServer_RegisterRevoke(t *testing.T) {
 	require.NoError(t, decodeJSON(resp, &hit))
 	require.True(t, strings.HasPrefix(hit.ArchiveLocation, publicURL+"/"), hit.ArchiveLocation)
 
-	unregisterOther, _ := r.registerCacheForTask("external-other-token", artifactcache.JobCredential{Repo: repo, Ref: "refs/heads/other", PublicURL: publicURL}, nil)
+	unregisterOther, _ := r.registerCacheForTask("external-other-token", artifactcache.JobCredential{Repo: repo, Ref: "refs/heads/other"}, nil)
 	defer unregisterOther()
 	resp = cacheRequest(t, "external-other-token", http.MethodGet, base+"/cache?keys=ext-key&version=v", "", "", "")
 	resp.Body.Close()

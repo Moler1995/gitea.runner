@@ -706,9 +706,14 @@ func (r *Runner) registerCacheForTask(token string, cred artifactcache.JobCreden
 
 // cacheCredential scopes the job's cache entries by ref, as GitHub does.
 func cacheCredential(preset *model.GithubContext, publicURL string) artifactcache.JobCredential {
+	ref := preset.Ref
+	if strings.HasPrefix(preset.EventName, "pull_request") && preset.EventName != "pull_request_target" {
+		number, _ := preset.Event["number"].(float64)
+		ref = fmt.Sprintf("refs/pull/%d/head", int64(number)) // review events take github.ref from the reviewer's commit_id
+	}
 	return artifactcache.JobCredential{
 		Repo:       preset.Repository,
-		Ref:        preset.Ref,
+		Ref:        ref,
 		BaseRef:    branchRef(preset.BaseRef),
 		DefaultRef: branchRef(model.AsString(model.NestedMapLookup(preset.Event, "repository", "default_branch"))),
 		PublicURL:  publicURL,
@@ -729,10 +734,10 @@ func branchRef(branch string) string {
 // cache calls 401, instead of having to read the runner daemon's stderr.
 func (r *Runner) registerExternalCacheJob(token string, cred artifactcache.JobCredential, reporter *report.Reporter) func() {
 	base := strings.TrimRight(r.cfg.Cache.ExternalServer, "/")
-	if err := postInternalCache(base+"/_internal/register", r.cfg.Cache.ExternalSecret, map[string]any{
-		"token": token, "repo": cred.Repo, "ref": cred.Ref, "base_ref": cred.BaseRef, "default_ref": cred.DefaultRef,
-		"public_url": cred.PublicURL,
-	}); err != nil {
+	if err := postInternalCache(base+"/_internal/register", r.cfg.Cache.ExternalSecret, struct {
+		Token string `json:"token"`
+		artifactcache.JobCredential
+	}{token, cred}); err != nil {
 		logging.Warnf("cache external_server register failed (%s): %v", base, err)
 		if reporter != nil {
 			reporter.Logf("::warning::%s", runner.EscapeCommandData(fmt.Sprintf(
@@ -751,7 +756,7 @@ func (r *Runner) registerExternalCacheJob(token string, cred artifactcache.JobCr
 	}
 }
 
-func postInternalCache(url, secret string, body map[string]any) error {
+func postInternalCache(url, secret string, body any) error {
 	buf, err := json.Marshal(body)
 	if err != nil {
 		return err

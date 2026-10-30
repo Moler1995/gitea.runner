@@ -229,20 +229,22 @@ func TestCacheServiceV2Lookups(t *testing.T) {
 		assert.Equal(t, false, got["ok"])
 	})
 
-	t.Run("another ref of the same repository keeps its own entry", func(t *testing.T) {
-		handler.RegisterJob("pull-runtime-token", JobCredential{Repo: testRepo, Ref: "refs/pull/1/head"})
-		pullClient := &http.Client{Transport: &bearerTransport{token: "pull-runtime-token"}}
-
-		created := v2Call(t, handler, pullClient, "CreateCacheEntry", map[string]any{"key": "deps-abc", "version": "v1"})
-		require.Equal(t, true, created["ok"])
-		require.Equal(t, http.StatusCreated, putBlob(t, created["signed_upload_url"].(string), []byte("y")))
-		finalized := v2Call(t, handler, pullClient, "FinalizeCacheEntryUpload", map[string]any{"key": "deps-abc", "version": "v1", "size_bytes": 1})
-		require.Equal(t, true, finalized["ok"])
-
-		got := v2Call(t, handler, pullClient, "GetCacheEntryDownloadURL", map[string]any{"key": "deps-abc", "version": "v1"})
-		assert.Equal(t, "y", string(getURL(t, got["signed_download_url"].(string))))
-		got = v2Call(t, handler, testClient, "GetCacheEntryDownloadURL", map[string]any{"key": "deps-abc", "version": "v1"})
-		assert.Equal(t, "x", string(getURL(t, got["signed_download_url"].(string))), "a job of another ref never restores it")
+	t.Run("each ref saves and restores its own entry for the same key", func(t *testing.T) {
+		clients := map[string]*http.Client{"x": testClient}
+		for _, ref := range []string{"y", "z"} {
+			handler.RegisterJob(ref, JobCredential{Repo: testRepo, Ref: "refs/pull/" + ref + "/head"})
+			clients[ref] = &http.Client{Transport: &bearerTransport{token: ref}}
+			created := v2Call(t, handler, clients[ref], "CreateCacheEntry", map[string]any{"key": "deps-abc", "version": "v1"})
+			require.Equal(t, true, created["ok"])
+			require.Equal(t, http.StatusCreated, putBlob(t, created["signed_upload_url"].(string), []byte(ref)))
+		}
+		for _, ref := range []string{"y", "z"} {
+			require.Equal(t, true, v2Call(t, handler, clients[ref], "FinalizeCacheEntryUpload", map[string]any{"key": "deps-abc", "version": "v1", "size_bytes": 1})["ok"])
+		}
+		for content, client := range clients {
+			got := v2Call(t, handler, client, "GetCacheEntryDownloadURL", map[string]any{"key": "deps-abc", "version": "v1"})
+			assert.Equal(t, content, string(getURL(t, got["signed_download_url"].(string))))
+		}
 	})
 }
 
