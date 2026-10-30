@@ -139,16 +139,16 @@ func runStepExecutor(step step, stage stepStage, executor common.Executor) commo
 		actPath := rc.JobContainer.GetActPath()
 
 		outputFileCommand := path.Join("workflow", "outputcmd.txt")
-		setGiteaAndGithubEnv(*step.getEnv(), "OUTPUT", path.Join(actPath, outputFileCommand))
+		(*step.getEnv())["GITHUB_OUTPUT"] = path.Join(actPath, outputFileCommand)
 
 		stateFileCommand := path.Join("workflow", "statecmd.txt")
-		setGiteaAndGithubEnv(*step.getEnv(), "STATE", path.Join(actPath, stateFileCommand))
+		(*step.getEnv())["GITHUB_STATE"] = path.Join(actPath, stateFileCommand)
 
 		pathFileCommand := path.Join("workflow", "pathcmd.txt")
-		setGiteaAndGithubEnv(*step.getEnv(), "PATH", path.Join(actPath, pathFileCommand))
+		(*step.getEnv())["GITHUB_PATH"] = path.Join(actPath, pathFileCommand)
 
 		envFileCommand := path.Join("workflow", "envs.txt")
-		setGiteaAndGithubEnv(*step.getEnv(), "ENV", path.Join(actPath, envFileCommand))
+		(*step.getEnv())["GITHUB_ENV"] = path.Join(actPath, envFileCommand)
 
 		// Per-step summary file. Composite sub-steps share the outer job step's index
 		// via the Parent chain so all writes from within a composite action accumulate
@@ -156,7 +156,8 @@ func runStepExecutor(step step, stage stepStage, executor common.Executor) commo
 		topRC := rc.topLevelRunContext()
 		stepSummaryIndex := topRC.CurrentStepIndex
 		summaryFileCommand := path.Join("workflow", "step-summary-"+strconv.Itoa(stepSummaryIndex)+".md")
-		setGiteaAndGithubEnv(*step.getEnv(), "STEP_SUMMARY", path.Join(actPath, summaryFileCommand))
+		(*step.getEnv())["GITHUB_STEP_SUMMARY"] = path.Join(actPath, summaryFileCommand)
+		aliasGiteaEnv(*step.getEnv())
 
 		// Reset the per-phase file-command files. GITHUB_STEP_SUMMARY is intentionally
 		// excluded here and initialized below at most once per step so writes from later

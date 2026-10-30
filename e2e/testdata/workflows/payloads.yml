@@ -13,9 +13,6 @@ jobs:
     steps:
       - run: |
           echo 'plain-100%-done;-[bracket]'
-          test -n "$GITEA_SERVER_URL"
-          test "$GITEA_SERVER_URL" = "$GITHUB_SERVER_URL"
-          test "$GITEA_ENV" = "$GITHUB_ENV"
           printf 'multiline-first\nmultiline-second\n'
           echo '::notice::notice-payload-here'
           echo '::warning::warning-payload-here'

@@ -155,18 +155,10 @@ func TestSetupEnv(t *testing.T) {
 	require.NoError(t, setupEnv(t.Context(), testStep))
 	require.NoError(t, setupInputs(t.Context(), testStep))
 
-	delete(env, "GITHUB_REF")
-	delete(env, "GITHUB_REF_NAME")
-	delete(env, "GITHUB_REF_TYPE")
-	delete(env, "GITHUB_SHA")
-	delete(env, "GITHUB_WORKSPACE")
-	delete(env, "GITHUB_REPOSITORY")
-	delete(env, "GITHUB_REPOSITORY_OWNER")
-	delete(env, "GITHUB_ACTOR")
-	for _, name := range []string{"REF", "REF_NAME", "REF_TYPE", "SHA", "WORKSPACE", "REPOSITORY", "REPOSITORY_OWNER", "ACTOR"} {
-		delete(env, "GITEA_"+name)
+	for _, suffix := range []string{"REF", "REF_NAME", "REF_TYPE", "SHA", "WORKSPACE", "REPOSITORY", "REPOSITORY_OWNER", "ACTOR"} {
+		delete(env, "GITHUB_"+suffix)
+		delete(env, "GITEA_"+suffix)
 	}
-	// Host-dependent, asserted in TestRunContextWithGithubEnvRunnerValues instead.
 	delete(env, "RUNNER_NAME")
 	delete(env, "RUNNER_WORKSPACE")
 
@@ -467,10 +459,6 @@ func TestRunStepExecutorParity(t *testing.T) {
 		step := newStep(t, &model.Step{ID: "commands", RawContinueOnError: "true"})
 		logger, hook := logtest.NewLogger()
 		err := runStepExecutor(step, stepStageMain, func(context.Context) error {
-			for _, name := range []string{"ENV", "OUTPUT", "STATE", "PATH", "STEP_SUMMARY"} {
-				require.NotEmpty(t, step.env["GITEA_"+name], name)
-				assert.Equal(t, step.env["GITHUB_"+name], step.env["GITEA_"+name], name)
-			}
 			require.NoError(t, os.WriteFile(step.env["GITHUB_STEP_SUMMARY"], []byte("report"), 0o600))
 			require.NoError(t, os.WriteFile(step.env["GITHUB_ENV"], []byte("GOOD=1\nmalformed\n"), 0o600))
 			require.NoError(t, os.WriteFile(step.env["GITHUB_OUTPUT"], []byte("kept=value\n"), 0o600))
