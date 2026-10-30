@@ -40,7 +40,9 @@ const (
 	jobLabel      = "com.gitea.runner.job."
 	maxCreateBody = 8 << 20
 
-	dockerProxyProbeTimeout = 5 * time.Second
+	dockerProxyProbeTimeout       = 5 * time.Second
+	dockerProxyProbeWorkerTimeout = time.Minute
+	dockerProxyProbeTarget        = "/gitea-runner-probe"
 )
 
 var (
@@ -48,11 +50,18 @@ var (
 	rawStreamPath = regexp.MustCompile(`^(/v[0-9.]+)?/(containers/[^/]+/attach|exec/[^/]+/start)$`)
 )
 
-var dockerProxyDirectories sync.Map
+var dockerProxyProbes sync.Map
 
 type dockerProxyDirectory struct {
 	dir, daemonDir string
 	socket         os.FileInfo
+}
+
+type dockerProxyProbe struct {
+	directory dockerProxyDirectory
+	done      chan struct{}
+	seen      bool
+	err       error
 }
 
 func NewDockerProxy(ctx context.Context, job string) *DockerProxy {
@@ -61,7 +70,7 @@ func NewDockerProxy(ctx context.Context, job string) *DockerProxy {
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, dockerProxyProbeTimeout)
 	defer cancel()
-	cli, err := GetDockerClient(probeCtx)
+	cli, err := client.New(client.FromEnv) // negotiates on first request, so a cached probe costs no round trip
 	if err != nil {
 		return nil
 	}
@@ -76,40 +85,70 @@ func NewDockerProxy(ctx context.Context, job string) *DockerProxy {
 	}
 	workdir, _ := os.Getwd()
 	key := [3]string{cli.DaemonHost(), workdir, os.TempDir()}
-	cached, _ := dockerProxyDirectories.Load(key)
-	directory, seen := cached.(dockerProxyDirectory)
-	seen = seen && os.SameFile(directory.socket, socket) // daemon replacement invalidates cached paths
-	dir, daemonDir := directory.dir, directory.daemonDir
-	if !seen {
-		dir, daemonDir = runnerContainerWorkdir(probeCtx, cli)
-		seen = daemonDir != ""
-		if !seen {
-			if dir, err = filepath.Abs(os.TempDir()); err == nil {
-				daemonDir = dir
-				seen, err = daemonSeesDir(probeCtx, cli, dir, daemonDir)
-			}
-		}
-	}
+	probe, err := probeDockerProxyDirectory(probeCtx, cli, key, socket)
 	if err != nil {
 		common.Logger(ctx).Infof("docker proxy probe failed, jobs get the daemon socket directly: %v", err)
 		return nil
 	}
-	if !seen {
+	if !probe.seen {
 		common.Logger(ctx).Infof("the docker daemon cannot reach the runner's temporary or working directory, jobs get the daemon socket directly")
 		return nil
 	}
 	if ctx.Err() != nil {
 		return nil
 	}
-	proxy, err := StartDockerProxy(daemonSocket, dir, job)
+	proxy, err := StartDockerProxy(daemonSocket, probe.directory.dir, job)
 	if err != nil {
-		dockerProxyDirectories.Delete(key)
+		dockerProxyProbes.CompareAndDelete(key, probe)
 		common.Logger(ctx).Warnf("docker proxy not started, the job gets the daemon socket directly: %v", err)
 		return nil
 	}
-	dockerProxyDirectories.Store(key, dockerProxyDirectory{dir, daemonDir, socket})
-	proxy.Socket = daemonDir + strings.TrimPrefix(proxy.Socket, dir)
+	proxy.Socket = probe.directory.daemonDir + strings.TrimPrefix(proxy.Socket, probe.directory.dir)
 	return proxy
+}
+
+func probeDockerProxyDirectory(ctx context.Context, cli client.APIClient, key [3]string, socket os.FileInfo) (*dockerProxyProbe, error) {
+	for {
+		probe := &dockerProxyProbe{directory: dockerProxyDirectory{socket: socket}, done: make(chan struct{})}
+		actual, loaded := dockerProxyProbes.LoadOrStore(key, probe)
+		if loaded {
+			probe, _ = actual.(*dockerProxyProbe)
+			if !os.SameFile(probe.directory.socket, socket) { // daemon replacement invalidates cached paths
+				dockerProxyProbes.CompareAndDelete(key, probe)
+				continue
+			}
+		} else {
+			go func() { // outlives callers' deadlines so a slow daemon still gets its result cached
+				defer cli.Close()
+				ctx, cancel := context.WithTimeout(context.Background(), dockerProxyProbeWorkerTimeout)
+				defer cancel()
+				probe.directory.dir, probe.directory.daemonDir = runnerContainerWorkdir(ctx, cli)
+				probe.seen = probe.directory.daemonDir != ""
+				if !probe.seen {
+					if probe.directory.dir, probe.err = filepath.Abs(key[2]); probe.err == nil {
+						probe.directory.daemonDir = probe.directory.dir
+						probe.seen, probe.err = daemonSeesDir(ctx, cli, probe.directory.dir, probe.directory.daemonDir)
+					}
+				}
+				if probe.seen {
+					dockerProxyProbes.LoadOrStore(key, probe)
+				} else {
+					dockerProxyProbes.CompareAndDelete(key, probe)
+				}
+				close(probe.done)
+				removeStaleProbeContainers(cli)
+			}()
+		}
+		select {
+		case <-ctx.Done():
+			return &dockerProxyProbe{}, ctx.Err()
+		case <-probe.done:
+		}
+		if ctx.Err() == nil && errors.Is(probe.err, context.DeadlineExceeded) {
+			continue
+		}
+		return probe, probe.err
+	}
 }
 
 // runnerContainerWorkdir looks the runner's container up by hostname to find the daemon's path to its working directory.
@@ -162,25 +201,61 @@ func daemonSeesDir(ctx context.Context, cli client.APIClient, dir, daemonDir str
 	if len(images.Items) == 0 {
 		return false, errors.New("no image available for the docker proxy probe")
 	}
-	created, err := cli.ContainerCreate(ctx, client.ContainerCreateOptions{
-		Config: &container.Config{Image: images.Items[0].ID, Cmd: []string{"true"}},
-		HostConfig: &container.HostConfig{Mounts: []mount.Mount{
-			{Type: mount.TypeBind, Source: daemonDir, Target: "/gitea-runner-probe", ReadOnly: true}, // not the marker itself, podman creates a missing bind source where docker rejects it
-		}},
-	})
+	var created client.ContainerCreateResult
+	for _, image := range images.Items {
+		created, err = cli.ContainerCreate(ctx, client.ContainerCreateOptions{
+			Config: &container.Config{Image: image.ID, Cmd: []string{"true"}},
+			HostConfig: &container.HostConfig{Mounts: []mount.Mount{
+				{Type: mount.TypeBind, Source: daemonDir, Target: dockerProxyProbeTarget, ReadOnly: true}, // not the marker itself, podman creates a missing bind source where docker rejects it
+			}},
+		})
+		if !cerrdefs.IsNotFound(err) {
+			break
+		}
+	}
 	if cerrdefs.IsInvalidArgument(err) {
 		return false, nil
 	}
 	if err != nil {
 		return false, err
 	}
-	seen, err := containerSeesMarker(ctx, cli, dir, created.ID, "/gitea-runner-probe")
+	seen, err := containerSeesMarker(ctx, cli, dir, created.ID, dockerProxyProbeTarget)
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), dockerProxyProbeTimeout)
 	defer cancel()
 	if _, removeErr := cli.ContainerRemove(cleanupCtx, created.ID, client.ContainerRemoveOptions{Force: true, RemoveVolumes: true}); removeErr != nil {
 		return false, fmt.Errorf("removing the docker proxy probe container failed: %w", removeErr)
 	}
 	return seen, err
+}
+
+// removeStaleProbeContainers removes probe containers left by abandoned creates once any probe in flight when listed has ended.
+func removeStaleProbeContainers(cli client.APIClient) {
+	ctx, cancel := context.WithTimeout(context.Background(), dockerProxyProbeTimeout)
+	defer cancel()
+	listed, err := cli.ContainerList(ctx, client.ContainerListOptions{
+		All:     true,
+		Filters: make(client.Filters).Add("status", string(container.StateCreated)).Add("volume", dockerProxyProbeTarget),
+	})
+	if err != nil {
+		common.Logger(ctx).Warnf("listing stale docker proxy probe containers failed: %v", err)
+		return
+	}
+	listed.Items = slices.DeleteFunc(listed.Items, func(stale container.Summary) bool {
+		return stale.State != container.StateCreated || !slices.ContainsFunc(stale.Mounts, func(mountPoint container.MountPoint) bool {
+			return mountPoint.Type == mount.TypeBind && !mountPoint.RW && mountPoint.Destination == dockerProxyProbeTarget
+		})
+	})
+	if len(listed.Items) == 0 {
+		return
+	}
+	time.Sleep(dockerProxyProbeWorkerTimeout + dockerProxyProbeTimeout)
+	for _, stale := range listed.Items {
+		ctx, cancel := context.WithTimeout(context.Background(), dockerProxyProbeTimeout)
+		if err := (&containerReference{cli: cli, id: stale.ID}).remove()(ctx); err != nil {
+			common.Logger(ctx).Warnf("removing stale docker proxy probe container failed: %v", err)
+		}
+		cancel()
+	}
 }
 
 // StartDockerProxy serves a job's docker socket in dir, labelling what the job creates through it.

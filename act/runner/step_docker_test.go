@@ -14,6 +14,7 @@ import (
 	"gitea.dev/actionslib/pkg/model"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.yaml.in/yaml/v4"
 )
 
 func TestStepDockerMain(t *testing.T) {
@@ -36,6 +37,7 @@ func TestStepDockerMain(t *testing.T) {
 		RunContext: &RunContext{
 			StepResults: map[string]*model.StepResult{},
 			Config: &Config{
+				PresetGitHubContext: &model.GithubContext{},
 				Secrets: map[string]string{
 					"DOCKER_USERNAME": "docker-user",
 					"DOCKER_PASSWORD": "docker-password",
@@ -56,13 +58,16 @@ func TestStepDockerMain(t *testing.T) {
 				},
 			},
 			JobContainer: cm,
+			Env:          map[string]string{"GITHUB_ACTION_REPOSITORY": "other/composite", "GITHUB_ACTION_REF": "v1"},
 		},
 		Step: &model.Step{
 			ID:               "1",
 			Uses:             "docker://node:14",
 			WorkingDirectory: "workdir",
+			If:               yaml.Node{Value: "github.action_repository == 'other/composite' && github.action_ref == 'v1'"},
 		},
 	}
+	require.NoError(t, sd.Step.RawWith.Encode(map[string]string{"args": "identity:${{ github.action_repository }}:${{ github.action_ref }}"}))
 	sd.RunContext.ExprEval = sd.RunContext.NewExpressionEvaluator(ctx)
 
 	cm.On("Pull", false).Return(noopExecutor)
@@ -79,6 +84,11 @@ func TestStepDockerMain(t *testing.T) {
 	require.NoError(t, sd.main()(ctx))
 
 	assert.Equal(t, "node:14", input.Image)
+	assert.Equal(t, []string{"identity::"}, input.Cmd)
+	assert.Contains(t, input.Env, "GITHUB_ACTION_REPOSITORY=")
+	assert.Contains(t, input.Env, "GITHUB_ACTION_REF=")
+	assert.Equal(t, "other/composite", sd.RunContext.Env["GITHUB_ACTION_REPOSITORY"])
+	assert.Equal(t, "v1", sd.RunContext.Env["GITHUB_ACTION_REF"])
 
 	assert.Empty(t, input.Username)
 	assert.Empty(t, input.Password)
@@ -116,7 +126,8 @@ func TestStepDockerNewStepContainer(t *testing.T) {
 				RunContext: &RunContext{
 					StepResults: map[string]*model.StepResult{},
 					Config: &Config{
-						AllocatePTY: test.allocPTY,
+						PresetGitHubContext: &model.GithubContext{},
+						AllocatePTY:         test.allocPTY,
 						PlatformPicker: func(_platforms []string) string {
 							return test.platform
 						},

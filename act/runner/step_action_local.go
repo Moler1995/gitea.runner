@@ -42,10 +42,6 @@ func (sal *stepActionLocal) main() common.Executor {
 			return nil
 		}
 
-		printRunActionHeader(ctx, sal.Step, sal.env, sal.getRunContext())
-		rawLogger := common.Logger(ctx).With(rawOutputField, true)
-		defer rawLogger.Infof("::endgroup::")
-
 		actionDir := filepath.Join(sal.getRunContext().Config.Workdir, sal.Step.Uses)
 		_, containerActionPath := getContainerActionPaths(sal)
 
@@ -97,10 +93,6 @@ func (sal *stepActionLocal) post() common.Executor {
 
 func (sal *stepActionLocal) getRunContext() *RunContext {
 	return sal.RunContext
-}
-
-func (sal *stepActionLocal) getGithubContext(ctx context.Context) *model.GithubContext {
-	return sal.getRunContext().getGithubContext(ctx)
 }
 
 func (sal *stepActionLocal) getStepModel() *model.Step {

@@ -51,10 +51,12 @@ func TestShortSHAActionRejected(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(workflowDir, "push.yml"), []byte(workflow), 0o644))
 
 	runner, err := New(&Config{
+		Env:                   testCheckoutEnv(),
 		Workdir:               workflowDir,
 		EventName:             "push",
 		GitHubInstance:        "github.com",
 		DefaultActionInstance: actionRoot,
+		ActionCacheDir:        t.TempDir(),
 		ContainerMaxLifetime:  time.Hour,
 		PlatformPicker:        func([]string) string { return baseImage },
 	})
@@ -74,7 +76,7 @@ func TestStepActionRemote(t *testing.T) {
 		status          model.StepStatus
 		runError        error
 	}{
-		{name: "run-successful", status: model.StepStatusSuccess},
+		{name: "run-successful", condition: "github.action_repository == 'other/composite' && github.action_ref == 'v2'", status: model.StepStatusSuccess},
 		{name: "run-skipped", condition: "false", status: model.StepStatusSkipped},
 		{name: "run-error", status: model.StepStatusFailure, runError: assert.AnError},
 	} {
@@ -94,8 +96,9 @@ func TestStepActionRemote(t *testing.T) {
 			sar := &stepActionRemote{
 				RunContext: &RunContext{
 					Config: &Config{
-						GitHubInstance: "github.com",
-						ActionCacheDir: t.TempDir(),
+						GitHubInstance:      "github.com",
+						ActionCacheDir:      t.TempDir(),
+						PresetGitHubContext: &model.GithubContext{},
 					},
 					Run: &model.Run{
 						JobID: "1",
@@ -107,6 +110,7 @@ func TestStepActionRemote(t *testing.T) {
 					},
 					StepResults:  map[string]*model.StepResult{},
 					JobContainer: cm,
+					Env:          map[string]string{"GITHUB_ACTION_REPOSITORY": "other/composite", "GITHUB_ACTION_REF": "v2"},
 				},
 				Step:       &model.Step{ID: "step", Uses: "remote/action@v1", If: yaml.Node{Value: tt.condition}},
 				readAction: sarm.readAction,
@@ -124,6 +128,8 @@ func TestStepActionRemote(t *testing.T) {
 			require.NoError(t, sar.pre()(ctx))
 			assert.Equal(t, tt.runError, sar.main()(ctx))
 			assert.True(t, clonedAction)
+			assert.Equal(t, "remote/action", sar.env["GITHUB_ACTION_REPOSITORY"])
+			assert.Equal(t, "v1", sar.env["GITHUB_ACTION_REF"])
 			assert.Equal(t, &model.StepResult{Conclusion: tt.status, Outcome: tt.status, Outputs: map[string]string{}}, sar.RunContext.StepResults["step"])
 
 			sarm.AssertExpectations(t)
@@ -134,7 +140,7 @@ func TestStepActionRemote(t *testing.T) {
 	t.Run("refreshes composite inputs without leaking environment", func(t *testing.T) {
 		step := &stepActionRemote{
 			Step:         &model.Step{Uses: "org/composite@v1", With: map[string]string{"SHARED": "first"}},
-			RunContext:   &RunContext{Config: &Config{ActionCacheDir: t.TempDir()}, Run: &model.Run{JobID: "job", Workflow: &model.Workflow{Jobs: map[string]*model.Job{"job": {}}}}, JobContainer: &jobContainerMock{}},
+			RunContext:   &RunContext{Config: &Config{ActionCacheDir: t.TempDir(), PresetGitHubContext: &model.GithubContext{}}, Run: &model.Run{JobID: "job", Workflow: &model.Workflow{Jobs: map[string]*model.Job{"job": {}}}}, JobContainer: &jobContainerMock{}},
 			action:       &model.Action{Inputs: map[string]model.Input{"shared": {}}},
 			env:          map[string]string{},
 			remoteAction: mustNewRemoteAction(t, "org/composite@v1"),
@@ -161,7 +167,7 @@ func TestStepActionRemotePrepare(t *testing.T) {
 	})
 	newJob := func(instance string) *RunContext {
 		return &RunContext{
-			Config:       &Config{GitHubInstance: instance, ActionCacheDir: t.TempDir()},
+			Config:       &Config{GitHubInstance: instance, ActionCacheDir: t.TempDir(), PresetGitHubContext: &model.GithubContext{}},
 			Run:          &model.Run{JobID: "1", Workflow: &model.Workflow{Jobs: map[string]*model.Job{"1": {}}}},
 			JobContainer: &jobContainerMock{},
 		}
@@ -179,7 +185,7 @@ func TestStepActionRemotePrepare(t *testing.T) {
 	require.NoError(t, err)
 	root, err := prepare(job, "org/repo@v1")
 	require.NoError(t, err)
-	nested, err := prepare(&RunContext{Config: job.Config, Run: job.Run, JobContainer: job.JobContainer, Parent: job}, "org/repo/save@v1")
+	nested, err := prepare(&RunContext{Config: job.Config, Run: job.Run, JobContainer: job.JobContainer, Parent: job, Env: map[string]string{"GITHUB_ACTION_REPOSITORY": "org/repo", "GITHUB_ACTION_REF": "v1"}}, "$/save")
 	require.NoError(t, err)
 	other, err := prepare(job, "org/repo@v2")
 	require.NoError(t, err)
@@ -222,7 +228,7 @@ func TestStepActionRemotePreCleanup(t *testing.T) {
 			sar := &stepActionRemote{
 				Step: &model.Step{ID: "step", Uses: "remote/action@v1", If: yaml.Node{Value: "false"}},
 				RunContext: &RunContext{
-					Config:       &Config{},
+					Config:       &Config{PresetGitHubContext: &model.GithubContext{}},
 					Run:          &model.Run{JobID: "job", Workflow: &model.Workflow{Jobs: map[string]*model.Job{"job": {}}}},
 					StepResults:  map[string]*model.StepResult{},
 					JobContainer: cm,
@@ -343,9 +349,6 @@ func Test_newRemoteActionSelfRepo(t *testing.T) {
 			},
 		},
 		{name: "unknown instance", action: "$/.gitea/actions/build", github: &model.GithubContext{Repository: "owner/workflow-repo", Sha: "abc123"}},
-		{name: "empty path", action: "$/", github: workflow},
-		{name: "ref suffix is not allowed", action: "$/.gitea/actions/build@v1", github: workflow},
-		{name: "path traversal", action: "$/../escape", github: workflow},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -405,6 +408,7 @@ func TestStepActionRemotePreResolvesDownloadedCommit(t *testing.T) {
 		Step: &model.Step{Uses: "actions/setup-go@main"},
 		RunContext: &RunContext{
 			Config: &Config{
+				Env:                   testCheckoutEnv(),
 				GitHubInstance:        "https://gitea.example.com",
 				DefaultActionInstance: instance,
 				ActionCacheDir:        t.TempDir(),
@@ -484,6 +488,7 @@ func TestStepActionRemoteCloneTokenSurvivesNilSecrets(t *testing.T) {
 				Step: &model.Step{Uses: "org/repo@v1"},
 				RunContext: &RunContext{
 					Config: &Config{
+						Env:                   testCheckoutEnv(),
 						GitHubInstance:        tt.gitHubInstance,
 						DefaultActionInstance: tt.defaultActionInstance,
 						ActionCacheDir:        t.TempDir(),

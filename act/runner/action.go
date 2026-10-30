@@ -154,12 +154,17 @@ func maybeCopyToActionDir(ctx context.Context, step actionStep, actionDir, actio
 	}
 	defer unlock()
 
-	if !rc.Config.NoActionPatch {
-		// Other jobs share the directory, so patch under the copy's lock.
-		defer patchActions(ctx, actionScriptPaths(actionDir, filepath.Join(actionDir, actionPath), step.getActionModel()))()
+	if err := rc.JobContainer.CopyDir(containerActionDirCopy, actionDir+"/", false, true)(ctx); err != nil { // an exported commit has no .git to apply gitignore with
+		return err
 	}
-
-	return rc.JobContainer.CopyDir(containerActionDirCopy, actionDir+"/", false, true)(ctx) // an exported commit has no .git to apply gitignore with
+	if rc.Config.NoActionPatch {
+		return nil
+	}
+	patched := patchedScripts(ctx, actionDir, actionScriptPaths(actionDir, filepath.Join(actionDir, actionPath), step.getActionModel()))
+	if len(patched) == 0 {
+		return nil
+	}
+	return rc.JobContainer.Copy(containerActionDirCopy, patched...)(ctx)
 }
 
 func runActionImpl(step actionStep, actionDir string, remoteAction *remoteAction) common.Executor {
@@ -175,12 +180,13 @@ func runActionImpl(step actionStep, actionDir string, remoteAction *remoteAction
 
 		action := step.getActionModel()
 
-		rc.withGithubEnv(ctx, step.getGithubContext(ctx), *step.getEnv())
+		rc.withGithubEnv(ctx, getStepGithubContext(ctx, step), *step.getEnv())
 		populateEnvsFromSavedState(step.getEnv(), step, rc)
-		if err := populateEnvsFromInput(ctx, step.getEnv(), action, rc); err != nil {
+		if err := populateEnvsFromInput(ctx, step, action); err != nil {
 			return err
 		}
 		warnUnexpectedInputs(ctx, action, stepModel.With)
+		printRunActionHeader(ctx, stepModel, action, *step.getEnv(), rc)
 
 		actionName, containerActionDir := getContainerActionPaths(step)
 
@@ -277,7 +283,7 @@ func (rc *RunContext) dockerActionImage(ctx context.Context, step actionStep, ac
 	}
 	image, ok := job.dockerActionImages[step.getStepModel()]
 	if !ok {
-		image = dockerActionImageTag(step.getGithubContext(ctx).Repository, actionName, localAction) + "-" + strings.ToLower(rand.Text())
+		image = dockerActionImageTag(getStepGithubContext(ctx, step).Repository, actionName, localAction) + "-" + strings.ToLower(rand.Text())
 		if !common.Dryrun(ctx) { // a dry run builds nothing to remove
 			job.dockerActionImages[step.getStepModel()] = image
 		}
@@ -310,9 +316,12 @@ func execAsDocker(ctx context.Context, step actionStep, actionName, actionDir, b
 			return err
 		}
 
-		correctArchExists, err := ContainerImageExistsLocally(ctx, image, rc.Config.ContainerArchitecture)
-		if err != nil {
-			return err
+		correctArchExists := anyArchExists
+		if anyArchExists && rc.Config.ContainerArchitecture != "" && rc.Config.ContainerArchitecture != "any" {
+			correctArchExists, err = ContainerImageExistsLocally(ctx, image, rc.Config.ContainerArchitecture)
+			if err != nil {
+				return err
+			}
 		}
 
 		if anyArchExists && !correctArchExists {
@@ -428,7 +437,7 @@ func evalDockerEnv(ctx context.Context, step step, action *model.Action) (*expre
 	for key := range step.getStepModel().With {
 		providedInputs[strings.ToLower(key)] = true
 	}
-	eval := rc.NewExpressionEvaluator(ctx)
+	eval := rc.NewStepExpressionEvaluator(ctx, step)
 	for k, input := range action.Inputs {
 		if providedInputs[strings.ToLower(k)] {
 			continue
@@ -496,10 +505,15 @@ func populateEnvsFromSavedState(env *map[string]string, step actionStep, rc *Run
 	}
 }
 
-func populateEnvsFromInput(ctx context.Context, env *map[string]string, action *model.Action, rc *RunContext) error {
-	eval := rc.NewExpressionEvaluator(ctx)
+func inputEnvKey(inputID string) string {
+	return "INPUT_" + inputEnvPattern.ReplaceAllString(strings.ToUpper(inputID), "_")
+}
+
+func populateEnvsFromInput(ctx context.Context, step step, action *model.Action) error {
+	env := step.getEnv()
+	eval := step.getRunContext().NewStepExpressionEvaluator(ctx, step)
 	for inputID, input := range action.Inputs {
-		envKey := "INPUT_" + inputEnvPattern.ReplaceAllString(strings.ToUpper(inputID), "_")
+		envKey := inputEnvKey(inputID)
 		if _, ok := (*env)[envKey]; !ok {
 			var err error
 			if (*env)[envKey], err = eval.Interpolate(ctx, input.Default); err != nil {
@@ -639,10 +653,11 @@ func runPreStep(step actionStep) common.Executor {
 		x := action.Runs.Using
 		if !x.IsComposite() {
 			// defaults in pre steps were missing, however provided inputs are available
-			if err := populateEnvsFromInput(ctx, step.getEnv(), action, rc); err != nil {
+			if err := populateEnvsFromInput(ctx, step, action); err != nil {
 				return err
 			}
 		}
+		printRunActionHeader(ctx, step.getStepModel(), action, *step.getEnv(), rc)
 		switch {
 		case x.IsNode():
 			if err := maybeCopyToActionDir(ctx, step, actionDir, actionPath, containerActionDir); err != nil {
@@ -741,6 +756,9 @@ func runPostStep(step actionStep) common.Executor {
 		actionDir, actionPath, _, containerActionDir := actionStagePaths(step)
 
 		x := action.Runs.Using
+		if !x.IsComposite() { // a composite's children print their own
+			logger.With(rawOutputField, true).Info("Post job cleanup.")
+		}
 		switch {
 		case x.IsNode():
 

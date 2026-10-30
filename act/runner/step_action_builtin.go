@@ -33,15 +33,13 @@ func (sab *stepActionBuiltin) main() common.Executor {
 			return nil
 		}
 
-		printRunActionHeader(ctx, sab.Step, sab.env, sab.RunContext)
-		rawLogger := common.Logger(ctx).With(rawOutputField, true)
-		defer rawLogger.Infof("::endgroup::")
+		printRunActionHeader(ctx, sab.Step, nil, sab.env, sab.RunContext)
 
 		rc := sab.RunContext
 		rc.ApplyExtraPath(ctx, &sab.env)
 		return sab.run(ctx, &action.Context{
 			Container:       rc.JobContainer,
-			Github:          rc.getGithubContext(ctx),
+			Github:          getStepGithubContext(ctx, sab),
 			Inputs:          sab.Step.With,
 			HostWorkdir:     rc.Config.Workdir,
 			Workspace:       rc.JobContainer.ToContainerPath(rc.Config.Workdir),
@@ -59,10 +57,6 @@ func (sab *stepActionBuiltin) main() common.Executor {
 func (sab *stepActionBuiltin) post() common.Executor { return common.NewPipelineExecutor() }
 
 func (sab *stepActionBuiltin) getRunContext() *RunContext { return sab.RunContext }
-
-func (sab *stepActionBuiltin) getGithubContext(ctx context.Context) *model.GithubContext {
-	return sab.RunContext.getGithubContext(ctx)
-}
 
 func (sab *stepActionBuiltin) getStepModel() *model.Step { return sab.Step }
 
