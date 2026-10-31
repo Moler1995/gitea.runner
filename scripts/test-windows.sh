@@ -35,7 +35,7 @@ git -C "$oem/src" add -Af .
 git -C "$oem/src" -c user.name=test -c user.email=test@localhost -c commit.gpgsign=false -c core.hooksPath=/dev/null commit -qm test
 git -C "$oem/src" remote add origin https://gitea.com/gitea/runner
 cp scripts/test-windows-setup.ps1 scripts/test-windows.ps1 "$oem/"
-printf '%s\r\n' '@powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\OEM\test-windows-setup.ps1 && C:\pwsh\pwsh.exe -NoProfile -ExecutionPolicy Bypass -File C:\OEM\test-windows.ps1' \
+printf '%s\r\n' '@(powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\OEM\test-windows-setup.ps1 && C:\pwsh\pwsh.exe -NoProfile -ExecutionPolicy Bypass -File C:\OEM\test-windows.ps1) > \\host.lan\Data\install.log 2>&1' \
   '@shutdown.exe /s /t 600' > "$oem/install.bat" # the host normally removes the VM first
 
 kvm=Y
@@ -46,16 +46,16 @@ fi
 
 echo "==> Installing Windows"
 # the timeout stops the VM even when this script is killed before its cleanup runs
-docker create --rm --name "$name" --privileged -e VERSION=2025 -e EDITION=core -e KVM="$kvm" -e CPU_CORES=4 -e RAM_SIZE=4G \
-  --entrypoint timeout "$image" "$((timeout + 10))m" /usr/bin/tini -s /run/entry.sh >/dev/null
+docker create --rm --name "$name" --privileged -e VERSION=2025 -e EDITION=core -e KVM="$kvm" -e CPU_CORES="$(nproc)" -e RAM_SIZE=8G \
+  -e DISK_SIZE=32G -e DISK_CACHE=unsafe --entrypoint timeout "$image" "$((timeout + 10))m" /usr/bin/tini -s /run/entry.sh >/dev/null
 docker cp "$oem" "$name:/oem"
 docker cp "$work/shared" "$name:/shared"
 docker start "$name" >/dev/null
 docker logs -f "$name" &
-docker exec "$name" sh -c 'touch /shared/summary.txt && tail -f /shared/summary.txt' &
+docker exec "$name" sh -c 'cd /shared && touch install.log summary.txt && tail -qf install.log summary.txt' &
 
 if ! timeout "${timeout}m" docker exec "$name" sh -c 'until [ -f /shared/exitcode ]; do sleep 10; done'; then
-  echo "Windows did not finish the tests within $timeout minutes" >&2
+  echo "Windows stopped or did not finish the tests within $timeout minutes" >&2
   exit 1
 fi
 results="$work/results"
