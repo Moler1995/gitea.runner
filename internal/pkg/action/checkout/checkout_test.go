@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -193,6 +194,9 @@ exec sh -c "$(printf '%s' "$last" | sed "s#git-upload-pack '/\(.*\)\.git'#git up
 			t.Parallel()
 			if tc.inputs["lfs"] == "true" && lfsErr != nil {
 				t.Skip("needs git-lfs")
+			}
+			if tc.inputs["ssh-key"] != "" && runtime.GOOS == "windows" {
+				t.Skip("Git for Windows puts its own ssh ahead of the fake one on PATH")
 			}
 			workspace, runnerTemp := t.TempDir(), t.TempDir()
 			output := filepath.Join(runnerTemp, "output")
