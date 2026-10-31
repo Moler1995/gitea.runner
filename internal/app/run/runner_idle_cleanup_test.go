@@ -241,9 +241,6 @@ func TestRunnerShouldRunIdleCleanupSkipsWhenDisabled(t *testing.T) {
 	})
 }
 
-// TestRunnerOnIdleIntegratesCleanup wires the full OnIdle entry point and
-// confirms it walks workdir_parent (after the leading-slash trim that
-// matches the production path construction) and removes stale numeric dirs.
 func TestRunnerOnIdleIntegratesCleanup(t *testing.T) {
 	now := time.Date(2026, time.April, 29, 20, 0, 0, 0, time.UTC)
 	root := t.TempDir()
@@ -255,7 +252,7 @@ func TestRunnerOnIdleIntegratesCleanup(t *testing.T) {
 		cfg: &config.Config{
 			Container: config.Container{
 				BindWorkdir:   true,
-				WorkdirParent: root, // leading slash absent, OnIdle reattaches it
+				WorkdirParent: root,
 			},
 			Runner: config.Runner{
 				WorkdirCleanupAge:   24 * time.Hour,

@@ -1405,13 +1405,14 @@ func TestGetJobContextReportsContainers(t *testing.T) {
 }
 
 func TestCaptureJobContainerInfoExportsDockerWorkspace(t *testing.T) {
+	workdir := t.TempDir()
 	job := &containerMock{}
 	job.On("Inspect", mock.Anything).Return(&container.Info{
 		ID:     "job-container-id",
-		Mounts: map[string]string{"/workspace": "/var/lib/docker/volumes/job/_data"},
+		Mounts: map[string]string{job.ToContainerPath(workdir): "/var/lib/docker/volumes/job/_data"},
 	}, nil)
 	rc := &RunContext{
-		Config:       &Config{Workdir: "/workspace/owner/repo/"},
+		Config:       &Config{Workdir: filepath.Join(workdir, "owner", "repo") + string(filepath.Separator)},
 		Env:          map[string]string{},
 		JobContainer: job,
 	}
@@ -1421,7 +1422,7 @@ func TestCaptureJobContainerInfoExportsDockerWorkspace(t *testing.T) {
 	assert.Equal(t, "job-container-id", rc.jobContainerID)
 	assert.Equal(t, "/var/lib/docker/volumes/job/_data/owner/repo", rc.Env["GITEA_DOCKER_WORKSPACE"])
 
-	rc.Config.Workdir = "/elsewhere"
+	rc.Config.Workdir = filepath.Dir(workdir)
 	rc.Env = map[string]string{}
 	require.NoError(t, rc.captureJobContainerInfo()(t.Context()))
 	assert.NotContains(t, rc.Env, "GITEA_DOCKER_WORKSPACE")

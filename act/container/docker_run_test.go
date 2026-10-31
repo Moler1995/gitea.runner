@@ -27,6 +27,7 @@ import (
 	"gitea.com/gitea/runner/act/common/logging/logtest"
 
 	cerrdefs "github.com/containerd/errdefs"
+	"github.com/kballard/go-shellquote"
 	"github.com/moby/moby/api/pkg/stdcopy"
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/mount"
@@ -689,11 +690,11 @@ func TestMergeContainerConfigsDropsVolumeDriversFromWorkflows(t *testing.T) {
 }
 
 func TestMergeContainerConfigsKeepsTheRunnersFilesAndEnvToItself(t *testing.T) {
-	hostFile := filepath.Join(t.TempDir(), "host.env")
+	hostFile := filepath.Join(t.TempDir(), "host file.env")
 	require.NoError(t, os.WriteFile(hostFile, []byte("STOLEN=from-the-host\n"), 0o600))
 	t.Setenv("RUNNER_SECRET", "s3cr3t")
 
-	for _, option := range []string{"--env-file " + hostFile, "--label-file " + hostFile} {
+	for _, option := range []string{shellquote.Join("--env-file", hostFile), shellquote.Join("--label-file", hostFile)} {
 		logger := logging.New(logtest.New())
 		cr := &containerReference{input: &NewContainerInput{NetworkMode: "bridge", WorkflowOptions: option}}
 
@@ -933,6 +934,7 @@ func TestContainerInfoFromInspect(t *testing.T) {
 			"/etc/hosts":                "",
 			"/etc/hostname":             "",
 		}, info.Mounts)
+		assert.Equal(t, "/var/lib/docker/volumes/job/_data/subdir", info.DaemonPath("/workspace/owner/repo/subdir"))
 	})
 }
 

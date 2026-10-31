@@ -200,7 +200,7 @@ func TestGitCloneExecutor(t *testing.T) {
 	require.NoError(t, gitCmd("-C", workDir, "push", "origin", "main:refs/heads/"+fullSha[:4]))
 
 	hostConfig := filepath.Join(t.TempDir(), "gitconfig")
-	require.NoError(t, os.WriteFile(hostConfig, []byte("[core]\n\tautocrlf = true\n[url \""+remoteDir+"\"]\n\tinsteadOf = https://example.invalid/action\n"), 0o644))
+	require.NoError(t, os.WriteFile(hostConfig, []byte("[core]\n\tautocrlf = true\n[url "+strconv.Quote(remoteDir)+"]\n\tinsteadOf = https://example.invalid/action\n"), 0o644))
 	t.Setenv("GIT_CONFIG_GLOBAL", hostConfig)
 	t.Setenv("GIT_DIR", t.TempDir())
 
@@ -676,8 +676,8 @@ func TestNewGitCloneExecutorFetchSendsTokenAndHonoursContext(t *testing.T) {
 
 	select {
 	case <-reached:
-	case <-time.After(10 * time.Second):
-		t.Fatal("the executor never reached the remote")
+	case err := <-done:
+		t.Fatalf("the executor finished before reaching the remote: %v", err)
 	}
 	assert.Equal(t, "Basic "+base64.StdEncoding.EncodeToString([]byte("token:secret")), authorization)
 	cancel()

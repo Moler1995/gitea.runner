@@ -115,7 +115,7 @@ runs:
 					"cwd": {
 						Description: "(Actual working directory)",
 						Required:    false,
-						Default:     "actionDir/actionPath",
+						Default:     filepath.Join("actionDir", "actionPath"),
 					},
 					"command": {
 						Description: "(Actual program)",
@@ -144,7 +144,7 @@ runs:
 			}
 
 			writeFile := func(filename string, _data []byte, perm fs.FileMode) error {
-				assert.Equal(t, "actionDir/actionPath/trampoline.js", filename)
+				assert.Equal(t, filepath.Join("actionDir", "actionPath", "trampoline.js"), filename)
 				assert.Equal(t, fs.FileMode(0o644), perm)
 				return nil
 			}
