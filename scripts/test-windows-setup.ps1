@@ -14,11 +14,13 @@ try {
         if ((Get-FileHash "$env:TEMP\$($tool[0])").Hash -ne $tool[2]) { throw "checksum mismatch for $($tool[1])" }
     }
     Write-Output '==> Extracting git, node and pwsh'
-    Start-Process -FilePath "$env:TEMP\git.7z.exe" -ArgumentList '-oC:\git', '-y' -Wait
-    tar.exe -xf "$env:TEMP\node.zip" -C C:\
-    Rename-Item (Resolve-Path C:\node-*-win-x64).Path C:\node
     New-Item -ItemType Directory C:\pwsh | Out-Null
-    tar.exe -xf "$env:TEMP\pwsh.zip" -C C:\pwsh
+    @(
+        Start-Process "$env:TEMP\git.7z.exe" -ArgumentList '-oC:\git', '-y' -PassThru
+        Start-Process tar.exe -ArgumentList '-xf', "$env:TEMP\node.zip", '-C', 'C:\' -PassThru -NoNewWindow
+        Start-Process tar.exe -ArgumentList '-xf', "$env:TEMP\pwsh.zip", '-C', 'C:\pwsh' -PassThru -NoNewWindow
+    ) | Wait-Process
+    Rename-Item (Resolve-Path C:\node-*-win-x64).Path C:\node
     $env:Path = "C:\git\cmd;C:\git\bin;C:\pwsh;C:\node;$env:Path"
     Get-Command git, bash, node, pwsh | Out-Null
 } catch {
