@@ -5,6 +5,7 @@
 package git
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -27,6 +28,7 @@ import (
 	"gitea.com/gitea/runner/act/common"
 	"gitea.com/gitea/runner/act/common/logging"
 	"gitea.com/gitea/runner/internal/pkg/lock"
+	"gitea.com/gitea/runner/internal/pkg/process"
 )
 
 var (
@@ -464,15 +466,28 @@ func runGitWithStdin(ctx context.Context, dir string, input *NewGitCloneExecutor
 		cmd.Env = append(cmd.Env, key+"="+value)
 	}
 	cmd.Env = append(cmd.Env, "GIT_TERMINAL_PROMPT=0")
-	if runtime.GOOS != "windows" {
+	var treeKill *process.TreeKill
+	if runtime.GOOS == "windows" {
+		treeKill = process.NewTreeKill(cmd) // a cancelled git leaves its remote helper holding the repository otherwise
+	} else {
 		cmd.Cancel = func() error { return cmd.Process.Signal(os.Interrupt) } // lets git remove its lock files
 	}
 	cmd.WaitDelay = time.Second
+	var stdout bytes.Buffer
 	var stderr strings.Builder
+	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	output, err := cmd.Output()
-	if err != nil {
-		return output, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+	err := cmd.Start()
+	if err == nil {
+		if treeKill != nil {
+			if killer, captureErr := treeKill.Capture(cmd.Process); captureErr == nil {
+				defer killer.Close()
+			}
+		}
+		err = cmd.Wait()
 	}
-	return output, nil
+	if err != nil {
+		return stdout.Bytes(), fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+	}
+	return stdout.Bytes(), nil
 }
