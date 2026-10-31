@@ -8,6 +8,7 @@ try {
     $env:Path = "C:\git\cmd;C:\git\bin;C:\pwsh;C:\node;$env:Path"
 
     $failed = 0
+    Write-Output "==> Running $((Get-Content "$root\tests.txt").Count) test binaries on $([Environment]::ProcessorCount) cores"
     Get-Content "$root\tests.txt" | ForEach-Object -ThrottleLimit ([Environment]::ProcessorCount) -Parallel {
         $binary, $package = $_ -split ' ', 2
         $started = Get-Date
@@ -24,7 +25,7 @@ try {
     }
     Copy-Item "$root\logs\*" $results
 } catch {
-    $_ | Out-String | Set-Content "$results\error.txt"
+    $_ | Out-String | Tee-Object "$results\error.txt"
     $failed = 1
 }
 Set-Content "$results\exitcode" $failed

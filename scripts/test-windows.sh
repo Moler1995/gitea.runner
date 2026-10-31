@@ -47,11 +47,14 @@ fi
 echo "==> Installing Windows"
 # the timeout stops the VM even when this script is killed before its cleanup runs
 docker create --rm --name "$name" --privileged -e VERSION=2025 -e EDITION=core -e KVM="$kvm" -e CPU_CORES="$(nproc)" -e RAM_SIZE=8G \
-  -e DISK_SIZE=32G -e DISK_CACHE=unsafe --entrypoint timeout "$image" "$((timeout + 10))m" /usr/bin/tini -s /run/entry.sh >/dev/null
+  -e DISK_SIZE=32G -e DISK_CACHE=unsafe -e DISK_IO=threads --entrypoint timeout "$image" "$((timeout + 10))m" /usr/bin/tini -s /run/entry.sh >/dev/null
 docker cp "$oem" "$name:/oem"
 docker cp "$work/shared" "$name:/shared"
 docker start "$name" >/dev/null
 docker logs -f "$name" &
+while sleep 300 && docker container inspect "$name" >/dev/null 2>&1; do
+  echo "==> $((SECONDS / 60))m elapsed, VM disk $(docker exec "$name" du -sh /storage | cut -f1)"
+done &
 docker exec "$name" sh -c 'cd /shared && touch install.log summary.txt && tail -qf install.log summary.txt' &
 
 if ! timeout "${timeout}m" docker exec "$name" sh -c 'until [ -f /shared/exitcode ]; do sleep 10; done'; then
