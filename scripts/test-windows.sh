@@ -36,7 +36,8 @@ git -C "$oem/src" -c user.name=test -c user.email=test@localhost -c commit.gpgsi
 git -C "$oem/src" remote add origin https://gitea.com/gitea/runner
 cp scripts/test-windows-setup.ps1 scripts/test-windows.ps1 "$oem/"
 # real-time scanning costs minutes per test run and AMSI blocks a script that disables it, so a policy does
-printf '%s\r\n' '@(reg.exe add "HKLM\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection" /v DisableRealtimeMonitoring /t REG_DWORD /d 1 /f && powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\OEM\test-windows-setup.ps1 && C:\pwsh\pwsh.exe -NoProfile -ExecutionPolicy Bypass -File C:\OEM\test-windows.ps1) > \\host.lan\Data\install.log 2>&1' \
+printf '%s\r\n' '@reg.exe add HKCU\Software\Microsoft\Windows\CurrentVersion\RunOnce /v gitea-runner-tests /d C:\OEM\install.bat /f > nul' \
+  '@(reg.exe add "HKLM\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection" /v DisableRealtimeMonitoring /t REG_DWORD /d 1 /f && powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\OEM\test-windows-setup.ps1 && C:\pwsh\pwsh.exe -NoProfile -ExecutionPolicy Bypass -File C:\OEM\test-windows.ps1) > \\host.lan\Data\install.log 2>&1' \
   '@if not exist \\host.lan\Data\exitcode (echo 1)> \\host.lan\Data\exitcode' '@shutdown.exe /s /t 600' > "$oem/install.bat" # the host normally removes the VM first
 
 kvm=Y cores="$(nproc)"

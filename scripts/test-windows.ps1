@@ -4,7 +4,8 @@ $ProgressPreference = 'SilentlyContinue'
 $results = '\\host.lan\Data'
 $root = $PSScriptRoot
 try {
-    New-Item -ItemType Directory "$root\logs" | Out-Null
+    New-Item -ItemType Directory -Force "$root\logs" | Out-Null
+    Clear-Content "$results\summary.txt" -ErrorAction SilentlyContinue
     $env:Path = "C:\git\cmd;C:\git\bin;C:\pwsh;C:\node;$env:Path"
     git config --global --add safe.directory C:/OEM/src # setup copied it as SYSTEM, the tests run as the logged-on user
 
