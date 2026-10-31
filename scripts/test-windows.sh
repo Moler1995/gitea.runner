@@ -39,15 +39,15 @@ cp scripts/test-windows-setup.ps1 scripts/test-windows.ps1 "$oem/"
 printf '%s\r\n' '@(reg.exe add "HKLM\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection" /v DisableRealtimeMonitoring /t REG_DWORD /d 1 /f && powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\OEM\test-windows-setup.ps1 && C:\pwsh\pwsh.exe -NoProfile -ExecutionPolicy Bypass -File C:\OEM\test-windows.ps1) > \\host.lan\Data\install.log 2>&1' \
   '@if not exist \\host.lan\Data\exitcode (echo 1)> \\host.lan\Data\exitcode' '@shutdown.exe /s /t 600' > "$oem/install.bat" # the host normally removes the VM first
 
-kvm=Y
+kvm=Y cores="$(nproc)"
 if ! docker run --rm --privileged --entrypoint sh "$image" -c 'test -w /dev/kvm'; then
-  kvm=N
+  kvm=N cores=4 # more emulated vCPUs slow Windows down
   echo "==> The docker host has no usable /dev/kvm, Windows runs emulated and much slower"
 fi
 
 echo "==> Installing Windows"
 # the timeout stops the VM even when this script is killed before its cleanup runs
-docker create --rm --name "$name" --privileged -e VERSION=2025 -e EDITION=core -e KVM="$kvm" -e CPU_CORES="$(nproc)" -e RAM_SIZE=8G \
+docker create --rm --name "$name" --privileged -e VERSION=2025 -e EDITION=core -e KVM="$kvm" -e CPU_CORES="$cores" -e RAM_SIZE=8G \
   -e DISK_SIZE=32G -e DISK_CACHE=unsafe -e DISK_IO=threads --entrypoint timeout "$image" "$((timeout + 10))m" /usr/bin/tini -s /run/entry.sh >/dev/null
 docker cp "$oem" "$name:/oem"
 docker cp "$work/shared" "$name:/shared"
