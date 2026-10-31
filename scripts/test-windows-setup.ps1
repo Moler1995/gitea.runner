@@ -4,10 +4,6 @@ $ProgressPreference = 'SilentlyContinue'
 $shared = '\\host.lan\Data'
 try {
     Write-Output '==> Setting up Windows'
-    if (Get-Command Set-MpPreference -ErrorAction SilentlyContinue) {
-        Set-MpPreference -DisableRealtimeMonitoring $true # scanning every spawned test process costs minutes
-        Add-MpPreference -ExclusionPath C:\
-    }
     Set-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem LongPathsEnabled 1
     foreach ($tool in @(
             @('git.7z.exe', 'https://github.com/git-for-windows/git/releases/download/v2.56.0.windows.3/PortableGit-2.56.0.3-64-bit.7z.exe', '4fc27b779829a36df77911e3f4dea09c66c790dd6c5f7dfa3b6a5479f1fe354f'),
