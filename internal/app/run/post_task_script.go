@@ -8,6 +8,8 @@ import (
 	"errors"
 	"io"
 	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -40,8 +42,15 @@ func (r *Runner) runPostTaskScript(ctx context.Context, reporter *report.Reporte
 	logging.Infof("running post-task script %q for task %d", script, task.Id)
 
 	cmd := exec.CommandContext(scriptCtx, script)
+	cmd.SysProcAttr = process.SysProcAttr("", false)
+	if runtime.GOOS == "windows" {
+		switch strings.ToLower(filepath.Ext(script)) {
+		case ".bat", ".cmd":
+			cmd = exec.CommandContext(scriptCtx, "cmd.exe")
+			cmd.SysProcAttr = process.SysProcAttr(`cmd.exe /d /s /c ""`+script+`""`, false)
+		}
+	}
 	cmd.Env = envListFromMap(env)
-	cmd.SysProcAttr = process.SysProcAttr(script, false)
 
 	stdout := postTaskScriptLogWriter("stdout")
 	stderr := postTaskScriptLogWriter("stderr")

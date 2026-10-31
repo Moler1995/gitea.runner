@@ -446,6 +446,9 @@ func runGitWithStdin(ctx context.Context, dir string, input *NewGitCloneExecutor
 		config = append(config, RemoteConfig(input.Token, input.InsecureSkipTLS)...)
 		if input.ClientCertFile != "" {
 			config = append(config, "http.sslCert="+input.ClientCertFile, "http.sslKey="+input.ClientKeyFile)
+			if runtime.GOOS == "windows" {
+				config = append(config, "http.sslBackend=openssl")
+			}
 		}
 	}
 	if dir != "" {

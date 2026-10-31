@@ -226,7 +226,7 @@ func runActionImpl(step actionStep, actionDir string, remoteAction *remoteAction
 			execFileName := action.Runs.Main + ".out"
 			return common.NewPipelineExecutor(
 				rc.JobContainer.Exec([]string{"go", "build", "-o", execFileName, action.Runs.Main}, *step.getEnv(), "", containerActionDir),
-				rc.JobContainer.Exec([]string{filepath.Join(containerActionDir, execFileName)}, *step.getEnv(), "", ""),
+				rc.JobContainer.Exec([]string{path.Join(containerActionDir, execFileName)}, *step.getEnv(), "", ""),
 			)(ctx)
 		default:
 			return fmt.Errorf("the runs.using key must be one of: %v, got %s", []string{
@@ -697,7 +697,7 @@ func runPreStep(step actionStep) common.Executor {
 			execFileName := action.Runs.Pre + ".out"
 			return common.NewPipelineExecutor(
 				rc.JobContainer.Exec([]string{"go", "build", "-o", execFileName, action.Runs.Pre}, *step.getEnv(), "", containerActionDir),
-				rc.JobContainer.Exec([]string{filepath.Join(containerActionDir, execFileName)}, *step.getEnv(), "", ""),
+				rc.JobContainer.Exec([]string{path.Join(containerActionDir, execFileName)}, *step.getEnv(), "", ""),
 			)(ctx)
 		default:
 			return nil
@@ -794,7 +794,7 @@ func runPostStep(step actionStep) common.Executor {
 			execFileName := action.Runs.Post + ".out"
 			return common.NewPipelineExecutor(
 				rc.JobContainer.Exec([]string{"go", "build", "-o", execFileName, action.Runs.Post}, *step.getEnv(), "", containerActionDir),
-				rc.JobContainer.Exec([]string{filepath.Join(containerActionDir, execFileName)}, *step.getEnv(), "", ""),
+				rc.JobContainer.Exec([]string{path.Join(containerActionDir, execFileName)}, *step.getEnv(), "", ""),
 			)(ctx)
 
 		default:

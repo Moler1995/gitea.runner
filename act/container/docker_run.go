@@ -731,9 +731,7 @@ func (cr *containerReference) create(capAdd, capDrop []string) common.Executor {
 		cr.sanitizeConfig(ctx, hostConfig)
 
 		var networkingConfig *network.NetworkingConfig
-		n := hostConfig.NetworkMode
-		// IsUserDefined and IsHost are broken on windows
-		if n.IsUserDefined() && n != "host" && len(input.NetworkAliases) > 0 {
+		if isUserDefinedNetwork(hostConfig.NetworkMode) && len(input.NetworkAliases) > 0 {
 			networkingConfig = &network.NetworkingConfig{
 				EndpointsConfig: map[string]*network.EndpointSettings{
 					input.NetworkMode: {Aliases: input.NetworkAliases},

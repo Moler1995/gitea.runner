@@ -63,7 +63,7 @@ func Main(ctx context.Context, c *action.Context) (err error) {
 				return err
 			}
 		}
-		if output := c.Env["GITHUB_OUTPUT"]; output != "" {
+		if output := filepath.ToSlash(c.Env["GITHUB_OUTPUT"]); output != "" {
 			return c.Container.Copy(path.Dir(output), &container.FileEntry{Name: path.Base(output), Mode: 0o666, Body: fmt.Sprintf("ref=%s\ncommit=%s\n", ghc.Ref, ghc.Sha)})(ctx)
 		}
 		return nil
@@ -115,6 +115,7 @@ func Main(ctx context.Context, c *action.Context) (err error) {
 
 	// named like actions/checkout's, which create-pull-request knows to hide, and gone with the job
 	runnerTemp, _ := c.Container.GetRunnerContext(ctx)["temp"].(string)
+	runnerTemp = filepath.ToSlash(runnerTemp)
 	digest := sha256.Sum256([]byte(dst))
 	credentials := fmt.Sprintf("git-credentials-%x.config", digest[:8])
 	co.credentials = path.Join(runnerTemp, credentials)
@@ -142,6 +143,9 @@ func Main(ctx context.Context, c *action.Context) (err error) {
 		}
 		scope := "http." + strings.TrimSuffix(ghc.ServerURL, "/") + "/."
 		remoteConfig = append(remoteConfig, scope+"sslCert="+path.Join(runnerTemp, cert), scope+"sslKey="+path.Join(runnerTemp, key))
+		if _, host := c.Container.(*container.HostEnvironment); host && runtime.GOOS == "windows" {
+			remoteConfig = append(remoteConfig, scope+"sslBackend=openssl")
+		}
 	}
 	env := gitEnv(c, remoteConfig)
 	env["GIT_LFS_SKIP_SMUDGE"] = strconv.FormatBool(!co.lfs || len(co.sparse) == 0) // lfs pull fetches the objects of a full checkout in one go
