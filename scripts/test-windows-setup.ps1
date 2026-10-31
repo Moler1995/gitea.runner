@@ -25,6 +25,5 @@ try {
 } catch {
     $_ | Out-String | Set-Content "$shared\error.txt"
     Set-Content "$shared\exitcode" 1
-    Stop-Computer -Force
     exit 1
 }

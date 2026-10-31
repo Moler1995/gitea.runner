@@ -28,5 +28,3 @@ try {
     $failed = 1
 }
 Set-Content "$results\exitcode" $failed
-Start-Sleep -Seconds 600 # the host normally removes the VM first
-Stop-Computer -Force

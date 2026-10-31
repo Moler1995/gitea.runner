@@ -35,7 +35,8 @@ git -C "$oem/src" add -Af .
 git -C "$oem/src" -c user.name=test -c user.email=test@localhost -c commit.gpgsign=false -c core.hooksPath=/dev/null commit -qm test
 git -C "$oem/src" remote add origin https://gitea.com/gitea/runner
 cp scripts/test-windows-setup.ps1 scripts/test-windows.ps1 "$oem/"
-printf '%s\r\n' '@powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\OEM\test-windows-setup.ps1 && C:\pwsh\pwsh.exe -NoProfile -ExecutionPolicy Bypass -File C:\OEM\test-windows.ps1' > "$oem/install.bat"
+printf '%s\r\n' '@powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\OEM\test-windows-setup.ps1 && C:\pwsh\pwsh.exe -NoProfile -ExecutionPolicy Bypass -File C:\OEM\test-windows.ps1' \
+  '@shutdown.exe /s /t 600' > "$oem/install.bat" # the host normally removes the VM first
 
 kvm=Y
 if ! docker run --rm --privileged --entrypoint sh "$image" -c 'test -w /dev/kvm'; then
