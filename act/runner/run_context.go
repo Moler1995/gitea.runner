@@ -434,11 +434,9 @@ func (rc *RunContext) startHostEnvironment() common.Executor {
 			Workdir:      rc.Config.Workdir,
 			CleanWorkdir: rc.Config.CleanWorkdir,
 			ActPath:      actPath,
-			CleanUp: func() {
-				os.RemoveAll(miscpath)
-			},
-			StdOut:      logWriter,
-			AllocatePTY: rc.Config.AllocatePTY,
+			Root:         miscpath,
+			StdOut:       logWriter,
+			AllocatePTY:  rc.Config.AllocatePTY,
 		}
 		rc.cleanUpJobContainer = rc.JobContainer.Remove()
 		rc.setRunnerContextEnv(ctx)

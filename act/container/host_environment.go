@@ -41,7 +41,7 @@ type HostEnvironment struct {
 	// when Workdir points at a caller-owned checkout (e.g. `act` local mode).
 	CleanWorkdir bool
 	ActPath      string
-	CleanUp      func()
+	Root         string // per-job scratch directory holding Path and TmpDir, removed on teardown
 	StdOut       io.Writer
 	AllocatePTY  bool // allocate a pseudo-TTY for each step's process
 
@@ -384,7 +384,7 @@ var removeAll = os.RemoveAll
 
 // removeAllWithContext returns once the delete finishes or ctx is cancelled. On
 // cancellation the goroutine leaks: a delete inside a syscall cannot be
-// interrupted (see runWithTimeout).
+// interrupted, and leaking scratch state beats losing the runner's capacity slot.
 func removeAllWithContext(ctx context.Context, path string) error {
 	done := make(chan error, 1)
 	go func() { done <- removeAll(path) }()
@@ -470,26 +470,6 @@ func (e *HostEnvironment) terminateRunningProcesses(ctx context.Context) {
 // wedge the runner slot. A var so tests can shrink it.
 var hostCleanupTimeout = 30 * time.Second
 
-// runWithTimeout returns context.DeadlineExceeded once timeout elapses, leaking
-// the goroutine: a delete blocked in a syscall (AV filter driver, dead network
-// mount) cannot be interrupted, and leaking scratch state beats losing the
-// runner's capacity slot forever. The idle stale-dir sweep reclaims it later.
-func runWithTimeout(fn func(), timeout time.Duration) error {
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		fn()
-	}()
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-	select {
-	case <-done:
-		return nil
-	case <-timer.C:
-		return context.DeadlineExceeded
-	}
-}
-
 func (e *HostEnvironment) Remove() common.Executor {
 	return func(ctx context.Context) error {
 		logger := common.Logger(ctx)
@@ -501,25 +481,14 @@ func (e *HostEnvironment) Remove() common.Executor {
 		}
 		e.terminateRunningProcesses(ctx)
 
-		// Removes per-job misc state only, never the toolcache root. Bounded because
-		// CleanUp is a caller-supplied, typically unbounded os.RemoveAll.
-		if e.CleanUp != nil {
-			logger.Debugf("running host environment cleanup callback")
-			if err := runWithTimeout(e.CleanUp, hostCleanupTimeout); err != nil {
-				logger.Warnf("host environment cleanup did not finish within %s; continuing job completion, scratch state may be leaked and is reclaimed by the idle stale-dir sweep", hostCleanupTimeout)
-			} else {
-				logger.Debugf("host environment cleanup callback finished")
-			}
-		}
-
 		// Detach: a cancelled ctx would skip removePathWithRetry's retries,
 		// which absorb Windows file-handle release lag after the kill above.
 		rmCtx, rmCancel := context.WithTimeout(context.Background(), hostCleanupTimeout)
 		defer rmCancel()
 
 		var errs []error
-		if err := removePathWithRetry(rmCtx, e.Path); err != nil {
-			logger.Warnf("failed to remove host misc state %s: %v", e.Path, err)
+		if err := removePathWithRetry(rmCtx, cmp.Or(e.Root, e.Path)); err != nil {
+			logger.Warnf("failed to remove host misc state %s: %v", cmp.Or(e.Root, e.Path), err)
 			errs = append(errs, err)
 		}
 		if e.CleanWorkdir {

@@ -161,10 +161,12 @@ func TestHostEnvironmentRemoveWorkdir(t *testing.T) {
 				Path:         filepath.Join(miscRoot, "hostexecutor"),
 				Workdir:      workdir,
 				CleanWorkdir: owned,
-				CleanUp:      func() { _ = os.RemoveAll(miscRoot) },
+				Root:         miscRoot,
 			}
 			require.NoError(t, os.MkdirAll(e.Path, 0o700))
+			require.NoError(t, os.MkdirAll(filepath.Join(miscRoot, "tmp"), 0o700))
 			require.NoError(t, e.Remove()(t.Context()))
+			assert.NoDirExists(t, miscRoot)
 			_, err := os.Stat(workdir)
 			if owned {
 				assert.ErrorIs(t, err, os.ErrNotExist)
@@ -201,44 +203,31 @@ func TestRemoveAllWithContextDoesNotHangOnStuckDelete(t *testing.T) {
 }
 
 func TestHostEnvironmentRemoveDoesNotHang(t *testing.T) {
-	for _, phase := range []string{"CleanUp callback", "path removal"} {
-		t.Run(phase, func(t *testing.T) {
-			synctest.Test(t, func(t *testing.T) {
-				origTimeout := hostCleanupTimeout
-				hostCleanupTimeout = 100 * time.Millisecond
-				t.Cleanup(func() { hostCleanupTimeout = origTimeout })
-				release, stubDone := make(chan struct{}), make(chan struct{})
-				block := func() {
-					defer close(stubDone)
-					<-release
-				}
-				e := &HostEnvironment{Path: filepath.Join(t.TempDir(), "misc", "hostexecutor"), StdOut: os.Stdout}
-				if phase == "CleanUp callback" {
-					e.CleanUp = block
-				} else {
-					origRemoveAll := removeAll
-					removeAll = func(string) error {
-						block()
-						return nil
-					}
-					t.Cleanup(func() { removeAll = origRemoveAll })
-				}
-				t.Cleanup(func() {
-					close(release)
-					<-stubDone
-				})
-				require.NoError(t, os.MkdirAll(e.Path, 0o700))
-				done := make(chan error, 1)
-				go func() { done <- e.Remove()(common.WithLogger(t.Context(), logging.Default())) }()
-				select {
-				case err := <-done:
-					require.NoError(t, err)
-				case <-time.After(10 * time.Second):
-					t.Fatalf("Remove() hung on a stuck %s", phase)
-				}
-			})
+	synctest.Test(t, func(t *testing.T) {
+		origTimeout, origRemoveAll := hostCleanupTimeout, removeAll
+		hostCleanupTimeout = 100 * time.Millisecond
+		release, stubDone := make(chan struct{}), make(chan struct{})
+		removeAll = func(string) error {
+			defer close(stubDone)
+			<-release
+			return nil
+		}
+		t.Cleanup(func() {
+			close(release)
+			<-stubDone
+			hostCleanupTimeout, removeAll = origTimeout, origRemoveAll
 		})
-	}
+		e := &HostEnvironment{Path: filepath.Join(t.TempDir(), "misc", "hostexecutor"), StdOut: os.Stdout}
+		require.NoError(t, os.MkdirAll(e.Path, 0o700))
+		done := make(chan error, 1)
+		go func() { done <- e.Remove()(common.WithLogger(t.Context(), logging.Default())) }()
+		select {
+		case err := <-done:
+			require.NoError(t, err)
+		case <-time.After(10 * time.Second):
+			t.Fatal("Remove() hung on a stuck path removal")
+		}
+	})
 }
 
 func TestHostEnvironmentTrackingID(t *testing.T) {
