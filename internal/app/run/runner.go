@@ -648,10 +648,8 @@ func (r *Runner) run(ctx context.Context, task *runnerv1.Task, reporter *report.
 	reporter.SetOutputs(job.Outputs)
 
 	if r.cfg.Container.BindWorkdir {
-		// Remove the entire task-specific directory (e.g. /workspace/<task_id>).
-		taskDir := filepath.FromSlash("/" + workdirParent)
-		if err := os.RemoveAll(taskDir); err != nil {
-			logging.Warnf("failed to clean up workspace %s: %v", taskDir, err)
+		if err := os.RemoveAll(workdirParent); err != nil {
+			logging.Warnf("failed to clean up workspace %s: %v", workdirParent, err)
 		}
 	}
 

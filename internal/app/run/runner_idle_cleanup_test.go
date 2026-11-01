@@ -368,3 +368,16 @@ func TestRunnerOnIdleRemovesOrphanNetworks(t *testing.T) {
 	assert.Equal(t, []string{"a1b2c3d4e5f6", ""}, detached)
 	assert.Equal(t, []string{"runner-1"}, sweptPods)
 }
+
+func TestContainerWorkdirRoot(t *testing.T) {
+	absolute := t.TempDir()
+	rooted := filepath.Join(string(filepath.Separator), "workspace")
+	for input, want := range map[string]string{
+		"workspace":          rooted,
+		"/workspace/":        rooted,
+		absolute:             absolute,
+		absolute + "/nested": filepath.Join(absolute, "nested"),
+	} {
+		assert.Equal(t, want, containerWorkdirRoot(input), input)
+	}
+}
