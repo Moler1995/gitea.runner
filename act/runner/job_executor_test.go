@@ -34,6 +34,8 @@ import (
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	yaml "go.yaml.in/yaml/v4"
+	"golang.org/x/text/encoding"
+	"golang.org/x/text/encoding/unicode"
 )
 
 func TestJobExecutor(t *testing.T) {
@@ -952,13 +954,18 @@ func TestReadSingleFileFromContainerArchiveFindsMatchingRegularFile(t *testing.T
 }
 
 func TestReadSingleFileFromContainerArchiveSizeLimit(t *testing.T) {
+	retainedBytes := 200 - len(jobSummaryTruncationMarker)
 	for name, tt := range map[string]struct {
 		content  string
 		maxBytes int64
 		want     string
 	}{
-		"truncates oversized summary": {strings.Repeat("a", 300), 200, strings.Repeat("a", 200-len(jobSummaryTruncationMarker)) + jobSummaryTruncationMarker},
-		"keeps exact limit":           {"abc", 3, "abc"},
+		"truncates oversized summary":     {strings.Repeat("a", 300), 200, strings.Repeat("a", 200-len(jobSummaryTruncationMarker)) + jobSummaryTruncationMarker},
+		"keeps exact limit":               {"abc", 3, "abc"},
+		"strips UTF-8 BOM before limit":   {"\xef\xbb\xbfabc", 3, "abc"},
+		"decodes UTF-16 before limit":     {"\xff\xfea\x00b\x00c\x00", 3, "abc"},
+		"limits expanded UTF-16":          {"\xff\xfe" + strings.Repeat("\x2d\x4e", 150), 200, strings.Repeat("中", retainedBytes/3) + jobSummaryTruncationMarker},
+		"keeps complete UTF-8 characters": {strings.Repeat("a", retainedBytes-1) + "€" + strings.Repeat("a", 200), 200, strings.Repeat("a", retainedBytes-1) + jobSummaryTruncationMarker},
 	} {
 		t.Run(name, func(t *testing.T) {
 			logger, hook := logtest.NewLogger()
@@ -974,7 +981,7 @@ func TestReadSingleFileFromContainerArchiveSizeLimit(t *testing.T) {
 			assert.True(t, ok)
 			assert.Equal(t, []byte(tt.want), body)
 			assert.LessOrEqual(t, int64(len(body)), tt.maxBytes)
-			if int64(len(tt.content)) > tt.maxBytes {
+			if strings.HasSuffix(tt.want, jobSummaryTruncationMarker) {
 				if assert.Len(t, hook.AllRecords(), 1) {
 					assert.Contains(t, hook.LastRecord().Message, "job summary truncated")
 				}
@@ -1113,35 +1120,46 @@ func TestJobSetContinueOnError(t *testing.T) {
 }
 
 func TestTryUploadJobSummaryMasksSecrets(t *testing.T) {
-	var got string
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, err := io.ReadAll(r.Body)
-		assert.NoError(t, err)
-		got = string(body)
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	defer server.Close()
+	for name, encoding := range map[string]encoding.Encoding{
+		"UTF-8":        unicode.UTF8,
+		"UTF-8 BOM":    unicode.UTF8BOM,
+		"UTF-16LE BOM": unicode.UTF16(unicode.LittleEndian, unicode.UseBOM),
+		"UTF-16BE BOM": unicode.UTF16(unicode.BigEndian, unicode.UseBOM),
+	} {
+		t.Run(name, func(t *testing.T) {
+			var got string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, err := io.ReadAll(r.Body)
+				assert.NoError(t, err)
+				got = string(body)
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			defer server.Close()
 
-	cm := &containerMock{}
-	cm.On("GetContainerArchive", mock.Anything, "/var/run/act/workflow/step-summary-0.md").Return(
-		io.NopCloser(bytes.NewReader(tarArchive(t, tarEntry{
-			name: "step-summary-0.md", body: "deployed true with s3cr3t and runtime-added via pr0xypw",
-		}))),
-		nil,
-	).Once()
+			content, err := encoding.NewEncoder().Bytes([]byte("deployed true with s3cr3t and runtime-added via pr0xypw 😀"))
+			require.NoError(t, err)
+			cm := &containerMock{}
+			cm.On("GetContainerArchive", mock.Anything, "/var/run/act/workflow/step-summary-0.md").Return(
+				io.NopCloser(bytes.NewReader(tarArchive(t, tarEntry{
+					name: "step-summary-0.md", body: string(content),
+				}))),
+				nil,
+			).Once()
 
-	rc := newJobSummaryRC(map[string]string{
-		"GITEA_ACTIONS_CAPABILITIES": "job-summary",
-		"ACTIONS_RUNTIME_URL":        server.URL,
-		"ACTIONS_RUNTIME_TOKEN":      fakeRuntimeToken(34),
-		"GITEA_RUN_ID":               "12",
-	}, cm, 1)
-	rc.Config.Secrets = map[string]string{"TOK": "s3cr3t", "ACTIONS_STEP_DEBUG": "true"}
-	rc.Config.ExtraMasks = []string{"pr0xypw"}
-	rc.Masks = []string{"runtime-added"}
+			rc := newJobSummaryRC(map[string]string{
+				"GITEA_ACTIONS_CAPABILITIES": "job-summary",
+				"ACTIONS_RUNTIME_URL":        server.URL,
+				"ACTIONS_RUNTIME_TOKEN":      fakeRuntimeToken(34),
+				"GITEA_RUN_ID":               "12",
+			}, cm, 1)
+			rc.Config.Secrets = map[string]string{"TOK": "s3cr3t", "ACTIONS_STEP_DEBUG": "true"}
+			rc.Config.ExtraMasks = []string{"pr0xypw"}
+			rc.Masks = []string{"runtime-added"}
 
-	tryUploadJobSummary(t.Context(), rc)
+			tryUploadJobSummary(t.Context(), rc)
 
-	assert.Equal(t, "deployed true with *** and *** via ***", got)
-	cm.AssertExpectations(t)
+			assert.Equal(t, "deployed true with *** and *** via *** 😀", got)
+			cm.AssertExpectations(t)
+		})
+	}
 }

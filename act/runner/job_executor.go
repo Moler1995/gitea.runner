@@ -23,6 +23,7 @@ import (
 	"sync"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"gitea.com/gitea/runner/act/common"
 	"gitea.com/gitea/runner/act/common/logging"
@@ -30,6 +31,8 @@ import (
 
 	"gitea.dev/actionslib/pkg/exprparser"
 	"gitea.dev/actionslib/pkg/model"
+	unicodeencoding "golang.org/x/text/encoding/unicode"
+	"golang.org/x/text/transform"
 )
 
 const (
@@ -690,19 +693,16 @@ func readSingleFileFromContainerArchive(ctx context.Context, env container.Execu
 		if entryName != requestedPath && entryName != path.Base(requestedPath) {
 			continue
 		}
-		// Summaries larger than the limit are truncated rather than dropped, so the
-		// user still gets the leading content (mirroring how GitHub caps oversized
-		// step summaries instead of discarding them). Read one extra byte so an
-		// over-limit file is detected from the actual stream rather than trusting
-		// header.Size, then cap the returned content at maxBytes.
-		b, err := io.ReadAll(io.LimitReader(tr, maxBytes+1))
+		b, err := io.ReadAll(io.LimitReader(transform.NewReader(tr, unicodeencoding.BOMOverride(unicodeencoding.UTF8.NewDecoder())), maxBytes+1))
 		if err != nil {
 			return nil, false
 		}
 		if int64(len(b)) > maxBytes {
-			// Reserve room for the marker so the marked-up result still fits in maxBytes.
 			marker := []byte(jobSummaryTruncationMarker)
 			keep := max(maxBytes-int64(len(marker)), 0)
+			for keep > 0 && !utf8.RuneStart(b[keep]) {
+				keep--
+			}
 			b = append(b[:keep], marker...)
 			common.Logger(ctx).Warnf("job summary truncated: path=%s max=%d", p, maxBytes)
 		}
