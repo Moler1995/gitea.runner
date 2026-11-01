@@ -42,7 +42,9 @@ func Main(ctx context.Context, c *action.Context) (err error) {
 			return fmt.Errorf("checkout: unsupported input %q", name)
 		}
 	}
-	dst, err := workspaceDestination(c.Workspace, c.Inputs["path"])
+	executionOS, _ := c.Container.GetRunnerContext(ctx)["os"].(string)
+	windows := strings.EqualFold(executionOS, "windows")
+	dst, err := workspaceDestination(c.Workspace, c.Inputs["path"], windows)
 	if err != nil {
 		return err
 	}
@@ -72,6 +74,7 @@ func Main(ctx context.Context, c *action.Context) (err error) {
 	co := &checkout{
 		url:       strings.TrimSuffix(ghc.ServerURL, "/") + "/" + repository,
 		dst:       dst,
+		windows:   windows,
 		ref:       ref,
 		depth:     depth,
 		fetchTags: boolInput(c.Inputs, "fetch-tags", false),
@@ -141,7 +144,6 @@ func Main(ctx context.Context, c *action.Context) (err error) {
 		if err := c.Container.Copy(runnerTemp, &container.FileEntry{Name: cert, Mode: 0o600, Body: string(certPEM)}, &container.FileEntry{Name: key, Mode: 0o600, Body: string(keyPEM)})(ctx); err != nil {
 			return err
 		}
-		executionOS, _ := c.Container.GetRunnerContext(ctx)["os"].(string)
 		remoteConfig = append(remoteConfig, git.ClientCertConfig("http."+strings.TrimSuffix(ghc.ServerURL, "/")+"/.", tempPath(runnerTemp, cert), tempPath(runnerTemp, key), executionOS)...)
 	}
 	env := gitEnv(c, remoteConfig)
@@ -302,7 +304,7 @@ type checkout struct {
 	filter, submodules                                     string
 	sparse                                                 []string
 	depth                                                  int
-	fetchTags, clean, lfs, progress, cone                  bool
+	fetchTags, clean, lfs, progress, cone, windows         bool
 }
 
 const fullDepth = "2147483647" // git's INFINITE_DEPTH, also deepens a shallow dst
@@ -315,6 +317,9 @@ func (co *checkout) commands() (commands [][]string, fetched int) {
 		repo("config", "remote.origin.url", co.url), // `remote add` fails on a repeated checkout
 		repo("config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"),
 		repo("config", "--replace-all", "--fixed-value", credentialsInclude, co.credentials, co.credentials),
+	}
+	if co.windows {
+		commands = append(commands, repo("config", "core.longpaths", "true")) // later steps run git on the checkout too
 	}
 	if co.lfs {
 		commands = append(commands, repo("lfs", "install", "--local"))
@@ -452,9 +457,13 @@ func boolInput(inputs map[string]string, name string, fallback bool) bool {
 	return strings.EqualFold(value, "true") || value == "" && fallback
 }
 
-func workspaceDestination(workspace, checkoutPath string) (string, error) {
-	cleanPath := path.Clean(strings.ReplaceAll(strings.TrimSpace(checkoutPath), `\`, "/")) // Windows hosts also split on backslashes
-	if path.IsAbs(cleanPath) || cleanPath == ".." || strings.HasPrefix(cleanPath, "../") || len(cleanPath) > 1 && cleanPath[1] == ':' {
+func workspaceDestination(workspace, checkoutPath string, windows bool) (string, error) {
+	cleanPath := strings.TrimSpace(checkoutPath)
+	if windows {
+		cleanPath = strings.ReplaceAll(cleanPath, `\`, "/")
+	}
+	cleanPath = path.Clean(cleanPath)
+	if path.IsAbs(cleanPath) || cleanPath == ".." || strings.HasPrefix(cleanPath, "../") || windows && len(cleanPath) > 1 && cleanPath[1] == ':' {
 		return "", fmt.Errorf("checkout: path %q must be relative to the workspace", checkoutPath)
 	}
 	return path.Join(workspace, cleanPath), nil
