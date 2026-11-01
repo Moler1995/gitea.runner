@@ -157,24 +157,29 @@ func TestWindowsService(t *testing.T) {
 		serviceExecutable, mgr.Config{StartType: mgr.StartManual}, "-test.run=^TestWindowsService$", "-test.timeout=1m",
 	)
 	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, service.Close()) })
+	t.Cleanup(func() { require.NoError(t, service.Delete()) })
 	var process windows.Handle
 	t.Cleanup(func() {
-		defer func() { require.NoError(t, service.Close()) }()
-		defer func() { require.NoError(t, service.Delete()) }()
 		if process != 0 {
-			defer func() {
-				defer func() { require.NoError(t, windows.CloseHandle(process)) }()
-				result, err := windows.WaitForSingleObject(process, 20000)
-				require.NoError(t, err)
-				if result == uint32(windows.WAIT_TIMEOUT) {
-					t.Error("service process did not exit after stopping")
-					require.NoError(t, windows.TerminateProcess(process, 1))
-					result, err = windows.WaitForSingleObject(process, 20000)
-					require.NoError(t, err)
-				}
-				require.Equal(t, uint32(windows.WAIT_OBJECT_0), result)
-			}()
+			require.NoError(t, windows.CloseHandle(process))
 		}
+	})
+	t.Cleanup(func() {
+		if process == 0 {
+			return
+		}
+		result, err := windows.WaitForSingleObject(process, 20000)
+		require.NoError(t, err)
+		if result == uint32(windows.WAIT_TIMEOUT) {
+			t.Error("service process did not exit after stopping")
+			require.NoError(t, windows.TerminateProcess(process, 1))
+			result, err = windows.WaitForSingleObject(process, 20000)
+			require.NoError(t, err)
+		}
+		require.Equal(t, uint32(windows.WAIT_OBJECT_0), result)
+	})
+	t.Cleanup(func() {
 		status, err := service.Query()
 		require.NoError(t, err)
 		if status.State != svc.Stopped {

@@ -454,6 +454,13 @@ func (cr *containerReference) targetOS(ctx context.Context) string {
 	return cr.daemonOS
 }
 
+func (cr *containerReference) copyTargetOS(ctx context.Context, hostOS string) string {
+	if hostOS == "windows" {
+		return cr.targetOS(ctx)
+	}
+	return ""
+}
+
 func (cr *containerReference) connect() common.Executor {
 	return func(ctx context.Context) error {
 		if cr.cli != nil {
@@ -933,7 +940,7 @@ func (cr *containerReference) copyDir(dstPath, srcPath string, useGitIgnore, ski
 		if actPath := cr.GetActPath(); strings.HasPrefix(dstPath+"/", actPath+"/") {
 			extractionRoot = actPath // keeps tar entries from crossing the image's /var/run symlink
 		}
-		if err := writeDirTar(ctx, tarFile, path.Join("/", strings.TrimPrefix(dstPath, extractionRoot)), srcPath, useGitIgnore, skipGitDir, cr.UID, cr.GID, hostOS, cr.targetOS(ctx)); err != nil {
+		if err := writeDirTar(ctx, tarFile, path.Join("/", strings.TrimPrefix(dstPath, extractionRoot)), srcPath, useGitIgnore, skipGitDir, cr.UID, cr.GID, hostOS, cr.copyTargetOS(ctx, hostOS)); err != nil {
 			return err
 		}
 
@@ -951,7 +958,7 @@ func (cr *containerReference) copyContent(dstPath, hostOS string, files ...*File
 			return cr.missingContainerError("copy to %s", dstPath)
 		}
 		var buf bytes.Buffer
-		if err := writeFilesTar(ctx, &buf, cr.UID, cr.GID, containerCopyFiles(files, hostOS, cr.targetOS(ctx))...); err != nil {
+		if err := writeFilesTar(ctx, &buf, cr.UID, cr.GID, containerCopyFiles(files, hostOS, cr.copyTargetOS(ctx, hostOS))...); err != nil {
 			return err
 		}
 
@@ -961,6 +968,9 @@ func (cr *containerReference) copyContent(dstPath, hostOS string, files ...*File
 }
 
 func containerCopyFiles(files []*FileEntry, hostOS, serverOS string) []*FileEntry {
+	if hostOS != "windows" || serverOS != "linux" {
+		return files
+	}
 	normalized := make([]*FileEntry, 0, len(files))
 	for _, file := range files {
 		entry := *file

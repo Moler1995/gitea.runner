@@ -68,6 +68,7 @@ func terminateIfPathsMatch(pid uint32, dirs []string, trackingID string) (bool, 
 		return false, nil
 	}
 	matches := false
+fields:
 	for _, field := range []struct {
 		offset  uintptr
 		wow64   uintptr
@@ -84,6 +85,7 @@ func terminateIfPathsMatch(pid uint32, dirs []string, trackingID string) (bool, 
 		for _, dir := range dirs {
 			if !field.command && dirContainsPath(dir, value) || field.command && strings.Contains(strings.ToLower(value), strings.ToLower(strings.TrimRight(dir, `\/`)+`\`)) {
 				matches = true
+				break fields
 			}
 		}
 	}
@@ -169,18 +171,19 @@ func (p remoteParameters) offset(native, wow64 uintptr) uintptr {
 }
 
 func (p remoteParameters) pointer(h windows.Handle, address uintptr) (uintptr, error) {
+	var value uintptr
+	size := unsafe.Sizeof(value)
 	if p.wow64 {
-		var value uint32
-		var read uintptr
-		if err := windows.ReadProcessMemory(h, address, (*byte)(unsafe.Pointer(&value)), 4, &read); err != nil {
-			return 0, err
-		}
-		if read != 4 {
-			return 0, errors.New("short pointer read")
-		}
-		return uintptr(value), nil
+		size = 4
 	}
-	return readRemotePtr(h, address)
+	var read uintptr
+	if err := windows.ReadProcessMemory(h, address, (*byte)(unsafe.Pointer(&value)), size, &read); err != nil {
+		return 0, err
+	}
+	if read != size {
+		return 0, errors.New("short pointer read")
+	}
+	return value, nil
 }
 
 func (p remoteParameters) unicodeString(h windows.Handle, native, wow64 uintptr) (string, error) {
@@ -244,27 +247,6 @@ func (p remoteParameters) environmentVariable(h windows.Handle, name string) (st
 		consumed += read
 	}
 	return "", errors.New("environment exceeds read limit")
-}
-
-func processCWDHandle(h windows.Handle) (string, error) {
-	params, err := processParametersHandle(h)
-	if err != nil {
-		return "", err
-	}
-	return params.unicodeString(h, unsafe.Offsetof(windows.RTL_USER_PROCESS_PARAMETERS{}.CurrentDirectory), 0x24)
-}
-
-// readRemotePtr reads a single pointer-sized value from another process.
-func readRemotePtr(h windows.Handle, addr uintptr) (uintptr, error) {
-	var v uintptr
-	var n uintptr
-	if err := windows.ReadProcessMemory(h, addr, (*byte)(unsafe.Pointer(&v)), unsafe.Sizeof(v), &n); err != nil {
-		return 0, err
-	}
-	if n != unsafe.Sizeof(v) {
-		return 0, errors.New("short pointer read")
-	}
-	return v, nil
 }
 
 // readRemoteU16 reads a single uint16 from another process.

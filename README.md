@@ -248,7 +248,7 @@ Whenever the resulting labels differ from the ones in the registration file, the
 
 > **Note:** A runner that only exposes `host` labels still needs access to a Docker daemon (e.g. a mounted `/var/run/docker.sock`) whenever a job uses a `docker://` action or a service container. `host` labels only change where the job's own steps run; container-based steps and actions are still executed with Docker.
 
-On Windows hosts, background step processes are cleaned up at job completion by default. A step can set `env: {RUNNER_TRACKING_ID: ""}` to keep its helpers alive after normal completion. See [host-mode background processes](docs/host-mode.md) for the guarantees and workspace cleanup behavior.
+On Windows hosts, background step processes are cleaned up at job completion by default. A step can set `env: {RUNNER_TRACKING_ID: ""}` at step start to keep its helpers alive after normal cleanup. Cancellation still terminates the active step's process tree, and workspace and temporary files are not preserved. See [host-mode background processes](docs/host-mode.md) for the guarantees and workspace cleanup behavior.
 
 #### Service containers
 

@@ -1104,6 +1104,14 @@ func TestContainerCopyModes(t *testing.T) {
 			require.NoError(t, os.WriteFile(filepath.Join(source, "run.sh"), []byte("#!/bin/sh\n"), 0o666))
 			require.NoError(t, os.Chmod(filepath.Join(source, "run.sh"), 0o666))
 			file := &FileEntry{Name: "run.sh", Mode: 0o666, Body: "#!/bin/sh\n"}
+			files := []*FileEntry{file}
+			normalized := containerCopyFiles(files, testcase.hostOS, testcase.serverOS)
+			if testcase.hostOS == "windows" && testcase.serverOS == "linux" {
+				assert.NotSame(t, file, normalized[0])
+				assert.Equal(t, testcase.expected, normalized[0].Mode)
+			} else {
+				assert.Same(t, &files[0], &normalized[0])
+			}
 			cli := &mockDockerClient{info: system.Info{OSType: testcase.serverOS}}
 			cli.On("CopyToContainer", mock.Anything, "job", mock.Anything).
 				Run(func(args mock.Arguments) {
@@ -1122,7 +1130,11 @@ func TestContainerCopyModes(t *testing.T) {
 			require.NoError(t, cr.copyContent("/workspace", testcase.hostOS, file)(t.Context()))
 			require.NoError(t, cr.copyDir("/workspace", source+string(filepath.Separator), false, true, testcase.hostOS)(t.Context()))
 			assert.EqualValues(t, 0o666, file.Mode)
-			assert.Equal(t, 1, cli.infoCalls)
+			if testcase.hostOS == "windows" {
+				assert.Equal(t, 1, cli.infoCalls)
+			} else {
+				assert.Zero(t, cli.infoCalls)
+			}
 			cli.AssertExpectations(t)
 		})
 	}

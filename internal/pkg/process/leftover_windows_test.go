@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/windows"
@@ -37,7 +38,11 @@ func processCWD(pid uint32) (string, error) {
 		return "", err
 	}
 	defer func() { _ = windows.CloseHandle(h) }()
-	return processCWDHandle(h)
+	params, err := processParametersHandle(h)
+	if err != nil {
+		return "", err
+	}
+	return params.unicodeString(h, unsafe.Offsetof(windows.RTL_USER_PROCESS_PARAMETERS{}.CurrentDirectory), 0x24)
 }
 
 func awaitCWD(t *testing.T, pid int) string {

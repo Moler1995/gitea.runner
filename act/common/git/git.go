@@ -389,6 +389,17 @@ func RemoteConfig(token string, insecureSkipTLS bool) []string {
 	return config
 }
 
+func ClientCertConfig(prefix, certFile, keyFile, executionOS string) []string {
+	if certFile == "" {
+		return nil
+	}
+	config := []string{prefix + "sslCert=" + certFile, prefix + "sslKey=" + keyFile}
+	if strings.EqualFold(executionOS, "windows") {
+		config = append(config, prefix+"sslBackend=openssl")
+	}
+	return config
+}
+
 // ConfigEnv applies `-c` style entries through the environment, keeping secrets out of argv.
 func ConfigEnv(config ...string) map[string]string {
 	env := map[string]string{"GIT_CONFIG_COUNT": strconv.Itoa(len(config))}
@@ -446,12 +457,7 @@ func runGitWithStdin(ctx context.Context, dir string, input *NewGitCloneExecutor
 	config := []string{"core.autocrlf=false", "core.eol=lf"} // keep action files LF
 	if input != nil {
 		config = append(config, RemoteConfig(input.Token, input.InsecureSkipTLS)...)
-		if input.ClientCertFile != "" {
-			config = append(config, "http.sslCert="+input.ClientCertFile, "http.sslKey="+input.ClientKeyFile)
-			if runtime.GOOS == "windows" {
-				config = append(config, "http.sslBackend=openssl")
-			}
-		}
+		config = append(config, ClientCertConfig("http.", input.ClientCertFile, input.ClientKeyFile, runtime.GOOS)...)
 	}
 	if dir != "" {
 		args = append([]string{"-C", dir}, args...)

@@ -141,11 +141,8 @@ func Main(ctx context.Context, c *action.Context) (err error) {
 		if err := c.Container.Copy(runnerTemp, &container.FileEntry{Name: cert, Mode: 0o600, Body: string(certPEM)}, &container.FileEntry{Name: key, Mode: 0o600, Body: string(keyPEM)})(ctx); err != nil {
 			return err
 		}
-		scope := "http." + strings.TrimSuffix(ghc.ServerURL, "/") + "/."
-		remoteConfig = append(remoteConfig, scope+"sslCert="+tempPath(runnerTemp, cert), scope+"sslKey="+tempPath(runnerTemp, key))
-		if _, host := c.Container.(*container.HostEnvironment); host && runtime.GOOS == "windows" {
-			remoteConfig = append(remoteConfig, scope+"sslBackend=openssl")
-		}
+		executionOS, _ := c.Container.GetRunnerContext(ctx)["os"].(string)
+		remoteConfig = append(remoteConfig, git.ClientCertConfig("http."+strings.TrimSuffix(ghc.ServerURL, "/")+"/.", tempPath(runnerTemp, cert), tempPath(runnerTemp, key), executionOS)...)
 	}
 	env := gitEnv(c, remoteConfig)
 	env["GIT_LFS_SKIP_SMUDGE"] = strconv.FormatBool(!co.lfs || len(co.sparse) == 0) // lfs pull fetches the objects of a full checkout in one go
