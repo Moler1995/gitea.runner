@@ -159,3 +159,35 @@ func TestStepDockerNewStepContainer(t *testing.T) {
 		})
 	}
 }
+
+func TestWindowsHostContainerActions(t *testing.T) {
+	for _, test := range []struct {
+		name, hostOS string
+		jobContainer container.ExecutionsEnvironment
+		wantError    bool
+	}{
+		{name: "Windows host", hostOS: "windows", jobContainer: &container.HostEnvironment{}, wantError: true},
+		{name: "Linux host", hostOS: "linux", jobContainer: &container.HostEnvironment{}},
+		{name: "macOS host", hostOS: "darwin", jobContainer: &container.HostEnvironment{}},
+		{name: "Windows with Linux job container", hostOS: "windows", jobContainer: &containerMock{}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			rc := &RunContext{JobContainer: test.jobContainer, kubernetes: true}
+			wantError := errKubernetesDocker.Error()
+			if test.wantError {
+				wantError = "container actions and docker:// steps are not supported in Windows host jobs"
+			}
+			t.Run("docker step", func(t *testing.T) {
+				require.EqualError(t, (&stepDocker{RunContext: rc}).runUsesContainerForOS(test.hostOS)(t.Context()), wantError)
+			})
+			for _, image := range []string{"docker://alpine:3.20", "Dockerfile"} {
+				t.Run(image, func(t *testing.T) {
+					require.EqualError(t, execAsDockerForOS(t.Context(), &stepActionRemote{
+						RunContext: rc,
+						action:     &model.Action{Runs: model.ActionRuns{Using: "docker", Image: image}},
+					}, "action", "", "", false, stepStageMain, test.hostOS), wantError)
+				})
+			}
+		})
+	}
+}

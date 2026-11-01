@@ -83,6 +83,7 @@ func TestStepRunShellParity(t *testing.T) {
 	const powershellScript = "$ErrorActionPreference = 'stop'\n$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)\necho 你好，世界\nif ((Test-Path -LiteralPath variable:/LASTEXITCODE)) { exit $LASTEXITCODE }"
 	tests := []struct {
 		name, run, shell, workingDir string
+		hostOS, wantCmdline          string
 		actPath                      string
 		env                          map[string]string
 		host                         bool
@@ -110,17 +111,18 @@ func TestStepRunShellParity(t *testing.T) {
 			name:       "builtin pwsh",
 			run:        "echo 你好，世界",
 			shell:      "pwsh",
-			actPath:    "/var/run/act with spaces",
+			actPath:    "/var/run/act with spaces/O'Brien",
 			wantExt:    ".ps1",
-			wantCmd:    []string{"pwsh", "-command", ". '/var/run/act with spaces/workflow/1.ps1'"},
+			wantCmd:    []string{"pwsh", "-command", ". '/var/run/act with spaces/O''Brien/workflow/1.ps1'"},
 			wantScript: powershellScript,
 		},
 		{
 			name:       "builtin powershell",
+			actPath:    "/var/run/act/O'Brien",
 			run:        "echo 你好，世界",
 			shell:      "powershell",
 			wantExt:    ".ps1",
-			wantCmd:    []string{"powershell", "-command", ". '/var/run/act/workflow/1.ps1'"},
+			wantCmd:    []string{"powershell", "-command", ". '/var/run/act/O''Brien/workflow/1.ps1'"},
 			wantScript: "\ufeff" + powershellScript,
 		},
 		{
@@ -138,6 +140,40 @@ func TestStepRunShellParity(t *testing.T) {
 			wantExt:    ".cmd",
 			wantCmd:    []string{"cmd", "/D", "/E:ON", "/V:OFF", "/S", "/C", "CALL /var/run/act/workflow/1.cmd"},
 			wantScript: "@echo off\nchcp 65001 >nul\necho 你好，世界\n",
+		},
+		{
+			name:        "Windows custom executable preserves backslashes and raw arguments",
+			shell:       `C:\Python313\python.exe -X 'utf8' "{0}"`,
+			actPath:     `C:\runner\O'Brien`,
+			hostOS:      "windows",
+			wantCmd:     []string{`C:\Python313\python.exe`},
+			wantCmdline: `C:\Python313\python.exe -X 'utf8' "C:\runner\O'Brien/workflow/1"`,
+		},
+		{
+			name:        "Windows quoted custom executable preserves spaces and backslashes",
+			shell:       `"C:\Program Files\Python313\python.exe" "{0}"`,
+			actPath:     `C:\runner`,
+			hostOS:      "windows",
+			wantCmd:     []string{`C:\Program Files\Python313\python.exe`},
+			wantCmdline: `"C:\Program Files\Python313\python.exe" "C:\runner/workflow/1"`,
+		},
+		{
+			name:        "Windows PowerShell escapes apostrophes in the raw command line",
+			run:         "echo 你好，世界",
+			shell:       "pwsh",
+			actPath:     `C:\runner\O'Brien`,
+			hostOS:      "windows",
+			wantExt:     ".ps1",
+			wantCmd:     []string{"pwsh"},
+			wantCmdline: `pwsh -command ". 'C:\runner\O''Brien/workflow/1.ps1'"`,
+			wantScript:  powershellScript,
+		},
+		{
+			name:    "Windows unclosed executable quote",
+			shell:   `"C:\Program Files\python.exe {0}`,
+			actPath: `C:\runner`,
+			hostOS:  "windows",
+			wantErr: "expected a double-quoted executable",
 		},
 		{
 			name:    "missing placeholder",
@@ -205,18 +241,21 @@ func TestStepRunShellParity(t *testing.T) {
 				env:  test.env,
 			}
 
-			name, script, err := sr.setupShellCommand(t.Context())
+			name, script, err := sr.setupShellCommandForOS(t.Context(), cmp.Or(test.hostOS, "linux"))
 			if test.wantErr != "" {
 				require.ErrorContains(t, err, test.wantErr)
 				return
 			}
 			require.NoError(t, err)
-			if test.wantExt == "" {
+			if test.wantExt == "" && test.hostOS != "windows" {
 				test.wantExt = ".sh"
 			}
 			assert.Equal(t, "workflow/1"+test.wantExt, name)
 			assert.Equal(t, cmp.Or(test.wantScript, "\necho hi\n"), script)
 			assert.Equal(t, test.wantCmd, sr.cmd)
+			if test.wantCmdline != "" {
+				assert.Equal(t, test.wantCmdline, sr.cmdline)
+			}
 			assert.Equal(t, test.env["DIR"], sr.WorkingDirectory)
 			cm.AssertExpectations(t)
 		})

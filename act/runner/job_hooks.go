@@ -109,7 +109,7 @@ func hookCommand(hookPath string) (cmd []string, shell string) {
 	case ".sh":
 		return []string{"bash", "-e", hookPath}, "bash -e {0}"
 	case ".ps1":
-		return []string{"pwsh", "-command", ". '" + hookPath + "'"}, `pwsh -command ". '{0}'"`
+		return []string{"pwsh", "-command", ". '" + strings.ReplaceAll(hookPath, "'", "''") + "'"}, `pwsh -command ". '{0}'"`
 	default:
 		return []string{hookPath}, ""
 	}

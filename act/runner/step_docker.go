@@ -6,6 +6,7 @@ package runner
 
 import (
 	"context"
+	"runtime"
 	"strings"
 
 	"gitea.com/gitea/runner/act/common"
@@ -48,10 +49,17 @@ func (sd *stepDocker) getIfExpression(_ context.Context, _ stepStage) string {
 }
 
 func (sd *stepDocker) runUsesContainer() common.Executor {
+	return sd.runUsesContainerForOS(runtime.GOOS)
+}
+
+func (sd *stepDocker) runUsesContainerForOS(hostOS string) common.Executor {
 	rc := sd.RunContext
 	step := sd.Step
 
 	return func(ctx context.Context) error {
+		if err := checkContainerActionSupport(rc, hostOS); err != nil {
+			return err
+		}
 		if rc.kubernetes {
 			return errKubernetesDocker
 		}

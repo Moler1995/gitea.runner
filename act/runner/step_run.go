@@ -240,6 +240,10 @@ func (sr *stepRun) getIfExpression(_ context.Context, _ stepStage) string {
 // it will error anyway with:
 // OCI runtime exec failed: exec failed: container_linux.go:380: starting container process caused: exec: "${{": executable file not found in $PATH: unknown
 func (sr *stepRun) setupShellCommand(ctx context.Context) (name, script string, err error) {
+	return sr.setupShellCommandForOS(ctx, runtime.GOOS)
+}
+
+func (sr *stepRun) setupShellCommandForOS(ctx context.Context, hostOS string) (name, script string, err error) {
 	logger := common.Logger(ctx)
 	eval := sr.RunContext.NewStepExpressionEvaluator(ctx, sr)
 	implicitShell, err := sr.setupShell(ctx, eval)
@@ -314,7 +318,23 @@ func (sr *stepRun) setupShellCommand(ctx context.Context) (name, script string, 
 
 	rc := sr.getRunContext()
 	scriptPath := fmt.Sprintf("%s/%s", rc.JobContainer.GetActPath(), name)
+	if step.Shell == "pwsh" || step.Shell == "powershell" {
+		scriptPath = strings.ReplaceAll(scriptPath, "'", "''")
+	}
 	sr.cmdline = strings.ReplaceAll(scCmd, `{0}`, scriptPath)
+	if _, host := rc.JobContainer.(*container.HostEnvironment); host && hostOS == "windows" {
+		command := strings.TrimSpace(sr.cmdline)
+		if strings.HasPrefix(command, `"`) {
+			executable, _, closed := strings.Cut(command[1:], `"`)
+			if !closed || executable == "" {
+				return "", "", fmt.Errorf("invalid shell option %q: expected a double-quoted executable", step.Shell)
+			}
+			sr.cmd = []string{executable}
+		} else {
+			sr.cmd = strings.Fields(command)[:1]
+		}
+		return name, script, nil
+	}
 	sr.cmd, err = shellquote.Split(sr.cmdline)
 
 	return name, script, err

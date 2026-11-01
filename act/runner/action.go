@@ -293,8 +293,15 @@ func (rc *RunContext) dockerActionImage(ctx context.Context, step actionStep, ac
 
 // TODO: break out parts of function to reduce complexicity
 func execAsDocker(ctx context.Context, step actionStep, actionName, actionDir, basedir string, localAction bool, stage stepStage) error {
+	return execAsDockerForOS(ctx, step, actionName, actionDir, basedir, localAction, stage, runtime.GOOS)
+}
+
+func execAsDockerForOS(ctx context.Context, step actionStep, actionName, actionDir, basedir string, localAction bool, stage stepStage, hostOS string) error {
 	logger := common.Logger(ctx)
 	rc := step.getRunContext()
+	if err := checkContainerActionSupport(rc, hostOS); err != nil {
+		return err
+	}
 	action := step.getActionModel()
 	if rc.kubernetes {
 		return errKubernetesDocker
@@ -458,6 +465,13 @@ func evalDockerEnv(ctx context.Context, step step, action *model.Action) (*expre
 	mergeIntoMap(step, step.getEnv(), runsEnv, maps.Clone(*step.getEnv()))
 	aliasGiteaEnv(*step.getEnv())
 	return ee, nil
+}
+
+func checkContainerActionSupport(rc *RunContext, hostOS string) error {
+	if _, host := rc.JobContainer.(*container.HostEnvironment); host && hostOS == "windows" {
+		return errors.New("container actions and docker:// steps are not supported in Windows host jobs")
+	}
+	return nil
 }
 
 func newStepContainer(ctx context.Context, step step, image string, cmd, entrypoint []string, runnerOptions string) container.Container {
