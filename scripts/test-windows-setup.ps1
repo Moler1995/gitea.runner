@@ -14,7 +14,6 @@ try {
         if ((Get-FileHash "$env:TEMP\$($tool[0])").Hash -ne $tool[2]) { throw "checksum mismatch for $($tool[1])" }
     }
     Write-Output '==> Extracting git, node and pwsh'
-    Remove-Item -Recurse -Force C:\git, C:\node, C:\node-*-win-x64, C:\pwsh -ErrorAction SilentlyContinue # left over when a reboot interrupted an earlier attempt
     New-Item -ItemType Directory C:\pwsh | Out-Null
     @(
         Start-Process "$env:TEMP\git.7z.exe" -ArgumentList '-oC:\git', '-y' -PassThru

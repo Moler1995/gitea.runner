@@ -35,10 +35,19 @@ git -C "$oem/src" add -Af .
 git -C "$oem/src" -c user.name=test -c user.email=test@localhost -c commit.gpgsign=false -c core.hooksPath=/dev/null commit -qm test
 git -C "$oem/src" remote add origin https://gitea.com/gitea/runner
 cp scripts/test-windows-setup.ps1 scripts/test-windows.ps1 "$oem/"
-# real-time scanning costs minutes per test run and AMSI blocks a script that disables it, so a policy does
-printf '%s\r\n' '@reg.exe add HKCU\Software\Microsoft\Windows\CurrentVersion\RunOnce /v gitea-runner-tests /d C:\OEM\install.bat /f > nul' \
-  '@(reg.exe add "HKLM\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection" /v DisableRealtimeMonitoring /t REG_DWORD /d 1 /f && powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\OEM\test-windows-setup.ps1 && C:\pwsh\pwsh.exe -NoProfile -ExecutionPolicy Bypass -File C:\OEM\test-windows.ps1) > \\host.lan\Data\install.log 2>&1' \
-  '@if not exist \\host.lan\Data\exitcode (echo 1)> \\host.lan\Data\exitcode' '@shutdown.exe /s /t 600' > "$oem/install.bat" # the host normally removes the VM first
+# AMSI blocks a script that turns off real-time scanning, which costs minutes per test run, so a policy does it
+# the delayed shutdown only matters when the host never removes the VM
+sed 's/$/\r/' > "$oem/install.bat" <<'EOF'
+@echo off
+set log=\\host.lan\Data\install.log
+echo ==^> install.bat started at %TIME% >> %log%
+reg.exe add "HKLM\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection" /v DisableRealtimeMonitoring /t REG_DWORD /d 1 /f > nul
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\OEM\test-windows-setup.ps1 >> %log% 2>&1
+echo ==^> setup exited with %ERRORLEVEL% >> %log%
+if %ERRORLEVEL% equ 0 C:\pwsh\pwsh.exe -NoProfile -ExecutionPolicy Bypass -File C:\OEM\test-windows.ps1 >> %log% 2>&1
+if not exist \\host.lan\Data\exitcode (echo 1)> \\host.lan\Data\exitcode
+shutdown.exe /s /t 600
+EOF
 
 kvm=Y cores="$(nproc)"
 if ! docker run --rm --privileged --entrypoint sh "$image" -c 'test -w /dev/kvm'; then
