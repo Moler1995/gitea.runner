@@ -296,11 +296,11 @@ func (sr *stepRun) setupShellCommandForOS(ctx context.Context, hostOS string) (n
 		name += ".sh"
 	case "pwsh", "powershell":
 		name += ".ps1"
-		runPrepend = "$ErrorActionPreference = 'stop'\n$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)"
+		runPrepend = "$ErrorActionPreference = 'stop'\n$OutputEncoding = [System.Text.UTF8Encoding]::new($false)\ntry { [Console]::OutputEncoding = $OutputEncoding } catch {}"
 		runAppend = "if ((Test-Path -LiteralPath variable:/LASTEXITCODE)) { exit $LASTEXITCODE }"
 	case "cmd":
 		name += ".cmd"
-		runPrepend = "@echo off\nchcp 65001 >nul"
+		runPrepend = "@echo off\nchcp 65001 >nul 2>&1\n(call )"
 	case "python":
 		name += ".py"
 	}

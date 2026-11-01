@@ -15,6 +15,14 @@ import (
 
 func TestRunEventHostEnvironmentUTF8(t *testing.T) {
 	handler := logtest.New()
+	t.Cleanup(func() {
+		if t.Failed() {
+			for _, record := range handler.AllRecords() {
+				stepIDs, _ := record.Attr("stepID")
+				t.Logf("stepID=%v: %s", stepIDs, record.Message)
+			}
+		}
+	})
 	table := TestJobFileInfo{
 		workdir:      workdir,
 		workflowPath: "windows-utf8",
