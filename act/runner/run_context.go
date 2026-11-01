@@ -456,15 +456,7 @@ func (rc *RunContext) isEnvCaseInsensitive() bool {
 func (rc *RunContext) importHostEnv(environ []string) {
 	for _, env := range environ {
 		if key, value, ok := strings.Cut(env, "="); ok {
-			_, exists := rc.Env[key]
-			if rc.isEnvCaseInsensitive() {
-				for existing := range rc.Env {
-					if strings.EqualFold(existing, key) {
-						exists = true
-						break
-					}
-				}
-			}
+			_, exists := lookupFold(rc.Env, key, rc.isEnvCaseInsensitive())
 			if !exists {
 				rc.Env[key] = value
 			}

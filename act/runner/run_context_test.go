@@ -1089,21 +1089,30 @@ func TestRunContextEnvCaseSensitivity(t *testing.T) {
 			rc := createIfTestRunContext(map[string]*model.Job{
 				"job1": createJob(t, "runs-on: self-hosted\nenv:\n  build_mode: job\n  config_value: job", ""),
 			})
-			rc.Run.Workflow.Env = map[string]string{"BUILD_MODE": "workflow", "CONFIG_VALUE": "workflow", "PATH": "workflow-path"}
-			rc.Config.Env = map[string]string{"Config_Value": "config"}
+			rc.Run.Workflow.Env = map[string]string{"BUILD_MODE": "workflow", "CONFIG_VALUE": "workflow", "PATH": "workflow-path", "runner_tool_cache": "workflow-cache"}
+			rc.Config.Env = map[string]string{"CONFIG_VALUE": "config", "RUNNER_TOOL_CACHE": "configured-cache"}
 			rc.Config.DisableActEnv, rc.Config.NoSkipCheckout = true, true
 			rc.Env = nil
 			rc.GetEnv()
 			rc.JobContainer = fakeContainer{ExecutionsEnvironment: &container.HostEnvironment{}, caseInsensitive: caseInsensitive}
 			require.NoError(t, rc.resolvePlatformImage(t.Context()))
 			if caseInsensitive {
-				assert.Equal(t, map[string]string{"BUILD_MODE": "job", "CONFIG_VALUE": "config", "PATH": "workflow-path"}, rc.GetEnv())
+				assert.Equal(t, map[string]string{"build_mode": "job", "CONFIG_VALUE": "config", "PATH": "workflow-path", "RUNNER_TOOL_CACHE": "configured-cache"}, rc.GetEnv())
 			} else {
 				assert.Equal(t, map[string]string{
-					"BUILD_MODE": "workflow", "build_mode": "job", "CONFIG_VALUE": "workflow",
-					"config_value": "job", "Config_Value": "config", "PATH": "workflow-path",
+					"BUILD_MODE": "workflow", "build_mode": "job", "CONFIG_VALUE": "config",
+					"config_value": "job", "PATH": "workflow-path", "runner_tool_cache": "workflow-cache", "RUNNER_TOOL_CACHE": "configured-cache",
 				}, rc.GetEnv())
 			}
+			want := maps.Clone(rc.GetEnv())
+			rc.Run.Workflow.Env = nil
+			require.NoError(t, rc.Run.Workflow.RawEnv.Encode(`${{ fromJSON('{"BUILD_MODE":"workflow","CONFIG_VALUE":"workflow","PATH":"workflow-path","runner_tool_cache":"workflow-cache"}') }}`))
+			rc.Env = nil
+			evaluated, err := evaluateJobEnv(t.Context(), rc)
+			require.NoError(t, err)
+			assert.Equal(t, want, evaluated)
+			rc.Env = evaluated
+
 			rc.importHostEnv([]string{"Path=host-path", "HOST_ONLY=value"})
 			assert.Equal(t, "workflow-path", rc.Env["PATH"])
 			assert.Equal(t, "value", rc.Env["HOST_ONLY"])
