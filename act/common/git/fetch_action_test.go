@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/cgi"
@@ -390,6 +391,74 @@ func TestExtractTreeConfinesEntries(t *testing.T) {
 			require.Error(t, err)
 			assert.NoFileExists(t, filepath.Join(dir, "escape"))
 			assert.NoFileExists(t, filepath.Join(outside, "escape"))
+		})
+	}
+}
+
+func TestExtractTreeCopiesDeferredLinks(t *testing.T) {
+	originalSymlink, originalFallback := symlink, symlinkFallback
+	symlink = func(_root *os.Root, _target, _name string) error { return errors.New("symlink privilege unavailable") }
+	symlinkFallback = true
+	t.Cleanup(func() { symlink, symlinkFallback = originalSymlink, originalFallback })
+
+	for _, test := range []struct {
+		name    string
+		links   [][2]string
+		files   []string
+		wantErr string
+	}{
+		{name: "file chain", links: [][2]string{{"index.js", "entry.js"}, {"entry.js", "dist/index.js"}}, files: []string{"index.js", "entry.js"}},
+		{name: "directory chain", links: [][2]string{{"lib", "bundle"}, {"bundle", "dist"}, {"dist/entry.js", "index.js"}}, files: []string{"lib/index.js", "lib/entry.js", "lib/nested/index.js", "bundle/index.js", "bundle/entry.js", "bundle/nested/index.js"}},
+		{name: "directory in target path", links: [][2]string{{"index.js", "bundle/nested/index.js"}, {"bundle", "dist"}}, files: []string{"index.js", "bundle/nested/index.js"}},
+		{name: "parent after directory link", links: [][2]string{{"index.js", "bundle/../index.js"}, {"bundle", "dist/nested"}}, files: []string{"index.js", "bundle/index.js"}},
+		{name: "outside", links: [][2]string{{"index.js", "../outside.js"}}, wantErr: "outside the extracted tree"},
+		{name: "absolute", links: [][2]string{{"index.js", t.TempDir()}}, wantErr: "outside the extracted tree"},
+		{name: "dangling", links: [][2]string{{"index.js", "missing.js"}}, wantErr: "missing.js"},
+		{name: "cycle", links: [][2]string{{"index.js", "entry.js"}, {"entry.js", "index.js"}}, wantErr: "cyclic"},
+		{name: "directory cycle", links: [][2]string{{"dist/loop", "."}}, wantErr: "cyclic"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			sha := strings.Repeat("a", 40)
+			var archive bytes.Buffer
+			writer := tar.NewWriter(&archive)
+			require.NoError(t, writer.WriteHeader(&tar.Header{Typeflag: tar.TypeXGlobalHeader, PAXRecords: map[string]string{"comment": sha}}))
+			require.NoError(t, writer.WriteHeader(&tar.Header{Name: "dist", Typeflag: tar.TypeDir, Mode: 0o755}))
+			require.NoError(t, writer.WriteHeader(&tar.Header{Name: "dist/nested", Typeflag: tar.TypeDir, Mode: 0o755}))
+			for _, link := range test.links {
+				require.NoError(t, writer.WriteHeader(&tar.Header{Name: link[0], Typeflag: tar.TypeSymlink, Linkname: link[1]}))
+			}
+			content := "console.log('action');\n"
+			for _, name := range []string{"dist/index.js", "dist/nested/index.js"} {
+				require.NoError(t, writer.WriteHeader(&tar.Header{Name: name, Typeflag: tar.TypeReg, Mode: 0o755, Size: int64(len(content))}))
+				_, err := writer.Write([]byte(content))
+				require.NoError(t, err)
+			}
+			require.NoError(t, writer.Close())
+
+			dir := t.TempDir()
+			_, err := extractTree(t.Context(), &archive, dir, false)
+			if test.wantErr != "" {
+				require.ErrorContains(t, err, test.wantErr)
+				require.ErrorContains(t, err, test.links[0][0])
+				assert.NoDirExists(t, filepath.Join(dir, sha))
+				return
+			}
+			require.NoError(t, err)
+			assert.True(t, treeIntact(dir, sha))
+			for _, name := range test.files {
+				data, err := os.ReadFile(filepath.Join(dir, sha, name))
+				require.NoError(t, err)
+				assert.Equal(t, content, string(data))
+				info, err := os.Lstat(filepath.Join(dir, sha, name))
+				require.NoError(t, err)
+				assert.True(t, info.Mode().IsRegular())
+				if runtime.GOOS != "windows" {
+					assert.Equal(t, os.FileMode(0o755), info.Mode().Perm())
+				}
+				require.NoError(t, os.WriteFile(filepath.Join(dir, sha, name), nil, 0o644))
+				assert.False(t, treeIntact(dir, sha), name)
+				require.NoError(t, os.WriteFile(filepath.Join(dir, sha, name), []byte(content), 0o755))
+			}
 		})
 	}
 }

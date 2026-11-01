@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"math/rand/v2"
 	"net"
@@ -28,6 +29,10 @@ import (
 )
 
 var actionFetches sync.Map
+
+var symlink = (*os.Root).Symlink
+
+var symlinkFallback = runtime.GOOS == "windows"
 
 const treeSizes = ".sizes" // beside the tree rather than in it, which is copied into job containers as it is
 
@@ -229,6 +234,8 @@ func extractTree(ctx context.Context, archive io.Reader, dir string, strip bool)
 
 	sha := ""
 	sizes := map[string]int64{}
+	links := map[string]string{}
+	var deferred []string
 	reader := tar.NewReader(archive)
 	for {
 		header, err := reader.Next()
@@ -257,9 +264,8 @@ func extractTree(ctx context.Context, archive io.Reader, dir string, strip bool)
 		case tar.TypeReg:
 			sizes[name], err = writeTreeFile(root, name, header.Mode, reader)
 		case tar.TypeSymlink:
-			if err = root.Symlink(header.Linkname, name); err != nil && runtime.GOOS == "windows" {
-				sizes[name], err = writeTreeFile(root, name, 0, strings.NewReader(header.Linkname))
-			}
+			links[filepath.Clean(name)] = header.Linkname
+			deferred = append(deferred, filepath.Clean(name)) // after their targets, so Windows can tell file from directory links
 		}
 		if err != nil {
 			return "", err
@@ -268,10 +274,115 @@ func extractTree(ctx context.Context, archive io.Reader, dir string, strip bool)
 	if !isFullObjectID(sha) {
 		return "", errors.New("the archive names no commit")
 	}
+	for _, name := range deferred {
+		if err := symlink(root, links[name], name); err == nil || !symlinkFallback {
+			if err != nil {
+				return "", err
+			}
+			continue
+		}
+		if err := copyTreeLink(root, name, links, sizes); err != nil {
+			return "", fmt.Errorf("materialize symlink %q: %w", name, err)
+		}
+	}
 	if err := root.Close(); err != nil {
 		return "", err
 	}
 	return sha, installTree(ctx, dir, sha, temp, sizes)
+}
+
+func resolveTreeLink(name string, links map[string]string) (string, error) {
+	if !filepath.IsLocal(name) {
+		return "", errors.New("target is outside the extracted tree")
+	}
+	parts := strings.Split(name, string(filepath.Separator))
+	var resolved []string
+	for count := 0; len(parts) > 0; {
+		part := parts[0]
+		parts = parts[1:]
+		switch part {
+		case "", ".":
+			continue
+		case "..":
+			if len(resolved) == 0 {
+				return "", errors.New("target is outside the extracted tree")
+			}
+			resolved = resolved[:len(resolved)-1]
+			continue
+		}
+		target, ok := links[filepath.Join(append(resolved, part)...)]
+		if !ok {
+			resolved = append(resolved, part)
+			continue
+		}
+		if target == "" {
+			return "", errors.New("empty symlink target")
+		}
+		if os.IsPathSeparator(target[0]) || filepath.VolumeName(target) != "" {
+			return "", errors.New("target is outside the extracted tree")
+		}
+		count++
+		if count > 255 {
+			return "", errors.New("cyclic or excessive symlink chain")
+		}
+		parts = append(strings.Split(filepath.FromSlash(target), string(filepath.Separator)), parts...)
+	}
+	return filepath.Join(append([]string{"."}, resolved...)...), nil
+}
+
+func copyTreeLink(root *os.Root, name string, links map[string]string, sizes map[string]int64) error {
+	active := map[string]bool{}
+	var copyTarget func(string, string) error
+	copyTarget = func(source, destination string) error {
+		source, err := resolveTreeLink(source, links)
+		if err != nil {
+			return err
+		}
+		file, err := root.Open(source)
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+		info, err := file.Stat()
+		if err != nil {
+			return err
+		}
+		if info.Mode().IsRegular() {
+			sizes[destination], err = writeTreeFile(root, destination, int64(info.Mode().Perm()), file)
+			return err
+		}
+		if !info.IsDir() {
+			return errors.New("target is not a regular file or directory")
+		}
+		if active[source] {
+			return errors.New("cyclic directory link")
+		}
+		active[source] = true
+		defer delete(active, source)
+		entries, err := file.ReadDir(-1)
+		if err != nil {
+			return err
+		}
+		children := map[string]bool{}
+		for _, entry := range entries {
+			children[entry.Name()] = true
+		}
+		for link := range links {
+			if filepath.Dir(link) == source {
+				children[filepath.Base(link)] = true
+			}
+		}
+		if err := root.MkdirAll(destination, info.Mode().Perm()); err != nil {
+			return err
+		}
+		for child := range children {
+			if err := copyTarget(filepath.Join(source, child), filepath.Join(destination, child)); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	return copyTarget(name, name)
 }
 
 var lockTree = AcquireCloneLock // replaced in tests to see installTree wait for a job holding the tree
