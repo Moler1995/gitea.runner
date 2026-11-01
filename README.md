@@ -2,6 +2,8 @@
 
 ## Installation
 
+The runner runs on Linux, macOS and Windows.
+
 ### Prerequisites
 
 On the runner:
