@@ -24,6 +24,7 @@ try {
         }
         Add-Content "$results\summary.txt" $line
     }
+    Get-Process -Name *.test -ErrorAction SilentlyContinue | Wait-Process -Timeout 1800 -ErrorAction SilentlyContinue # outlives cmd.exe when only that was killed
     Copy-Item "$root\logs\*" $results
 } catch {
     $_ | Out-String | Tee-Object "$results\error.txt"
