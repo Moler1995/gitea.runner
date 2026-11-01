@@ -4,6 +4,7 @@
 package runner
 
 import (
+	"strings"
 	"testing"
 
 	"gitea.com/gitea/runner/act/common/logging"
@@ -32,7 +33,7 @@ func TestRunEventHostEnvironmentUTF8(t *testing.T) {
 	table.runTest(WithJobLoggerFactory(t.Context(), factoryFunc(func() logging.Handler { return handler })), t, &Config{Env: testCheckoutEnv()})
 	var outputSteps []string
 	for _, record := range handler.AllRecords() {
-		if record.Message == "你好，世界" {
+		if strings.TrimRight(record.Message, "\r\n") == "你好，世界" {
 			stepIDs, ok := record.Attr("stepID")
 			require.True(t, ok)
 			outputSteps = append(outputSteps, stepIDs.([]string)...)
