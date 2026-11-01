@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestLookPathWindowsFallsBackToGitBash(t *testing.T) {
@@ -48,7 +49,7 @@ func TestLookPathWindowsFallsBackToGitBash(t *testing.T) {
 				return "", fs.ErrNotExist
 			}
 			got, err := lookPathWindows(test.command, map[string]string{"PATH": strings.Join(test.path, ";")}, lookup)
-			assert.NoError(t, err)
+			require.NoError(t, err)
 			assert.Equal(t, test.want, got)
 		})
 	}
