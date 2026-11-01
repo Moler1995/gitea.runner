@@ -464,7 +464,12 @@ func evaluateJobEnv(ctx context.Context, rc *RunContext) (map[string]string, err
 		}
 	}
 	if workflowEnv != nil {
-		evaluated = mergeMaps(workflowEnv, env)
+		if rc.isEnvCaseInsensitive() {
+			evaluated = map[string]string{}
+			mergeIntoMapCaseInsensitive(evaluated, workflowEnv, env)
+		} else {
+			evaluated = mergeMaps(workflowEnv, env)
+		}
 		evaluator = rc.NewExpressionEvaluatorWithEnv(ctx, evaluated)
 	}
 	var err error
@@ -574,12 +579,12 @@ func tryUploadJobSummary(ctx context.Context, rc *RunContext) {
 	client := &http.Client{Timeout: jobSummaryUploadRequestTimeout, Transport: rc.Config.instanceTransportFor(base)}
 	for i := range rc.Run.Job().Steps {
 		summaryPath := path.Join(actPath, "workflow", "step-summary-"+strconv.Itoa(i)+".md")
-		body, ok := readSingleFileFromContainerArchive(ctx, rc.JobContainer, summaryPath, maxJobSummaryBytes)
+		body, ok := readSingleFileFromContainerArchive(ctx, rc.JobContainer, summaryPath)
 		if !ok || len(body) == 0 {
 			continue
 		}
-		// Gitea renders summaries on the run page, so mask before the upload.
-		uploadJobSummary(ctx, client, base+strconv.Itoa(i)+"/summary", runtimeToken, []byte(rc.maskSecrets(string(body))))
+		body = truncateJobSummary(ctx, []byte(rc.maskSecrets(string(body))), summaryPath, maxJobSummaryBytes)
+		uploadJobSummary(ctx, client, base+strconv.Itoa(i)+"/summary", runtimeToken, body)
 	}
 }
 
@@ -672,7 +677,7 @@ func isTransientJobSummaryUploadFailure(status int, err error) bool {
 	return err != nil || status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || status/100 == 5
 }
 
-func readSingleFileFromContainerArchive(ctx context.Context, env container.ExecutionsEnvironment, p string, maxBytes int64) ([]byte, bool) {
+func readSingleFileFromContainerArchive(ctx context.Context, env container.ExecutionsEnvironment, p string) ([]byte, bool) {
 	rc, err := env.GetContainerArchive(ctx, p)
 	if err != nil {
 		return nil, false
@@ -693,21 +698,25 @@ func readSingleFileFromContainerArchive(ctx context.Context, env container.Execu
 		if entryName != requestedPath && entryName != path.Base(requestedPath) {
 			continue
 		}
-		b, err := io.ReadAll(io.LimitReader(transform.NewReader(tr, unicodeencoding.BOMOverride(unicodeencoding.UTF8.NewDecoder())), maxBytes+1))
+		b, err := io.ReadAll(transform.NewReader(tr, unicodeencoding.BOMOverride(unicodeencoding.UTF8.NewDecoder())))
 		if err != nil {
 			return nil, false
 		}
-		if int64(len(b)) > maxBytes {
-			marker := []byte(jobSummaryTruncationMarker)
-			keep := max(maxBytes-int64(len(marker)), 0)
-			for keep > 0 && !utf8.RuneStart(b[keep]) {
-				keep--
-			}
-			b = append(b[:keep], marker...)
-			common.Logger(ctx).Warnf("job summary truncated: path=%s max=%d", p, maxBytes)
-		}
 		return b, true
 	}
+}
+
+func truncateJobSummary(ctx context.Context, body []byte, summaryPath string, maxBytes int64) []byte {
+	if int64(len(body)) > maxBytes {
+		marker := []byte(jobSummaryTruncationMarker)
+		keep := max(maxBytes-int64(len(marker)), 0)
+		for keep > 0 && !utf8.RuneStart(body[keep]) {
+			keep--
+		}
+		body = append(body[:keep], marker...)
+		common.Logger(ctx).Warnf("job summary truncated: path=%s max=%d", summaryPath, maxBytes)
+	}
+	return body
 }
 
 // useJobStageLogger tags the log entries of a job level executor with the stage they belong to.

@@ -946,7 +946,7 @@ func TestReadSingleFileFromContainerArchiveFindsMatchingRegularFile(t *testing.T
 		nil,
 	).Once()
 
-	body, ok := readSingleFileFromContainerArchive(ctx, cm, "/var/run/act/workflow/SUMMARY.md", 1024)
+	body, ok := readSingleFileFromContainerArchive(ctx, cm, "/var/run/act/workflow/SUMMARY.md")
 
 	assert.True(t, ok)
 	assert.Equal(t, []byte("right"), body)
@@ -976,7 +976,8 @@ func TestReadSingleFileFromContainerArchiveSizeLimit(t *testing.T) {
 				nil,
 			).Once()
 
-			body, ok := readSingleFileFromContainerArchive(ctx, cm, "/var/run/act/workflow/SUMMARY.md", tt.maxBytes)
+			body, ok := readSingleFileFromContainerArchive(ctx, cm, "/var/run/act/workflow/SUMMARY.md")
+			body = truncateJobSummary(ctx, body, "/var/run/act/workflow/SUMMARY.md", tt.maxBytes)
 
 			assert.True(t, ok)
 			assert.Equal(t, []byte(tt.want), body)
@@ -1120,6 +1121,9 @@ func TestJobSetContinueOnError(t *testing.T) {
 }
 
 func TestTryUploadJobSummaryMasksSecrets(t *testing.T) {
+	const prefix = "deployed true with s3cr3t and runtime-added via pr0xypw 😀"
+	const maskedPrefix = "deployed true with *** and *** via *** 😀"
+	padding := strings.Repeat("a", maxJobSummaryBytes-len(jobSummaryTruncationMarker)-len(prefix)-2)
 	for name, encoding := range map[string]encoding.Encoding{
 		"UTF-8":        unicode.UTF8,
 		"UTF-8 BOM":    unicode.UTF8BOM,
@@ -1136,7 +1140,7 @@ func TestTryUploadJobSummaryMasksSecrets(t *testing.T) {
 			}))
 			defer server.Close()
 
-			content, err := encoding.NewEncoder().Bytes([]byte("deployed true with s3cr3t and runtime-added via pr0xypw 😀"))
+			content, err := encoding.NewEncoder().Bytes([]byte(prefix + padding + "s3cr3t" + strings.Repeat("中", 100)))
 			require.NoError(t, err)
 			cm := &containerMock{}
 			cm.On("GetContainerArchive", mock.Anything, "/var/run/act/workflow/step-summary-0.md").Return(
@@ -1158,7 +1162,7 @@ func TestTryUploadJobSummaryMasksSecrets(t *testing.T) {
 
 			tryUploadJobSummary(t.Context(), rc)
 
-			assert.Equal(t, "deployed true with *** and *** via *** 😀", got)
+			assert.Equal(t, maskedPrefix+padding+"***"+strings.Repeat("中", (len(prefix)-len(maskedPrefix)-1)/3)+jobSummaryTruncationMarker, got)
 			cm.AssertExpectations(t)
 		})
 	}
