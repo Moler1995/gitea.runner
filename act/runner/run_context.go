@@ -192,7 +192,11 @@ func (rc *RunContext) GetEnv() map[string]string {
 		if rc.Run != nil && rc.Run.Workflow != nil && rc.Config != nil {
 			job := rc.Run.Job()
 			if job != nil {
-				rc.Env = mergeMaps(rc.Run.Workflow.Env, job.Environment(), rc.Config.Env)
+				if rc.isEnvCaseInsensitive() {
+					mergeIntoMapCaseInsensitive(rc.Env, rc.Run.Workflow.Env, job.Environment(), rc.Config.Env)
+				} else {
+					rc.Env = mergeMaps(rc.Run.Workflow.Env, job.Environment(), rc.Config.Env)
+				}
 			}
 		}
 		if rc.runtimeToken != "" {
@@ -438,16 +442,35 @@ func (rc *RunContext) startHostEnvironment() common.Executor {
 		}
 		rc.cleanUpJobContainer = rc.JobContainer.Remove()
 		rc.setRunnerContextEnv(ctx)
-		for _, env := range os.Environ() {
-			if k, v, ok := strings.Cut(env, "="); ok {
-				// don't override
-				if _, ok := rc.Env[k]; !ok {
-					rc.Env[k] = v
-				}
-			}
-		}
+		rc.importHostEnv(os.Environ())
 
 		return rc.copyWorkflowFiles()(ctx)
+	}
+}
+
+func (rc *RunContext) isEnvCaseInsensitive() bool {
+	if rc.JobContainer != nil {
+		return rc.JobContainer.IsEnvironmentCaseInsensitive()
+	}
+	return runtime.GOOS == "windows" && rc.IsHostEnv()
+}
+
+func (rc *RunContext) importHostEnv(environ []string) {
+	for _, env := range environ {
+		if key, value, ok := strings.Cut(env, "="); ok {
+			_, exists := rc.Env[key]
+			if rc.isEnvCaseInsensitive() {
+				for existing := range rc.Env {
+					if strings.EqualFold(existing, key) {
+						exists = true
+						break
+					}
+				}
+			}
+			if !exists {
+				rc.Env[key] = value
+			}
+		}
 	}
 }
 
@@ -1312,6 +1335,10 @@ func (rc *RunContext) resolvePlatformImage(ctx context.Context) error {
 	}
 	image, rc.kubernetes = strings.CutPrefix(image, "kubernetes://")
 	rc.platformImage = cmp.Or(rc.containerSpec.Image, image)
+	if rc.isEnvCaseInsensitive() {
+		rc.Env = nil // Rebuild scopes after the host platform is known.
+		rc.GetEnv()
+	}
 	return nil
 }
 

@@ -69,10 +69,18 @@ func (s stepStage) String() string {
 }
 
 func processRunnerEnvFileCommand(ctx context.Context, fileName string, rc *RunContext, setter func(context.Context, map[string]string, string)) error {
+	if rc.JobContainer.IsEnvironmentCaseInsensitive() {
+		var entries []container.EnvFileEntry
+		err := container.ParseEnvFile(rc.JobContainer, path.Join(rc.JobContainer.GetActPath(), fileName), &entries, true)(ctx)
+		for _, entry := range entries {
+			setter(ctx, map[string]string{"name": entry.Name}, entry.Value)
+		}
+		return err
+	}
 	env := map[string]string{}
 	err := rc.JobContainer.UpdateFromEnv(path.Join(rc.JobContainer.GetActPath(), fileName), &env)(ctx)
-	for k, v := range env {
-		setter(ctx, map[string]string{"name": k}, v)
+	for key, value := range env {
+		setter(ctx, map[string]string{"name": key}, value)
 	}
 	return err
 }

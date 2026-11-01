@@ -411,6 +411,29 @@ func (c *fileCommandTestContainer) GetContainerArchive(ctx context.Context, srcP
 	return c.HostEnvironment.GetContainerArchive(ctx, srcPath)
 }
 
+type windowsFileCommandTestContainer struct {
+	*container.HostEnvironment
+}
+
+func (*windowsFileCommandTestContainer) IsEnvironmentCaseInsensitive() bool { return true }
+
+func TestProcessRunnerEnvFileCommandOrder(t *testing.T) {
+	rc := &RunContext{
+		JobContainer: &windowsFileCommandTestContainer{&container.HostEnvironment{ActPath: t.TempDir()}},
+	}
+	require.NoError(t, os.WriteFile(filepath.Join(rc.JobContainer.GetActPath(), "envs.txt"), []byte("BUILD_MODE=first\nbuild_mode<<EOF\nmiddle\nEOF\nBUILD_MODE=last\n"), 0o600))
+	var entries []container.EnvFileEntry
+	require.NoError(t, processRunnerEnvFileCommand(t.Context(), "envs.txt", rc, func(ctx context.Context, params map[string]string, value string) {
+		entries = append(entries, container.EnvFileEntry{Name: params["name"], Value: value})
+		rc.setEnvFile(ctx, params, value)
+	}))
+	assert.Equal(t, []container.EnvFileEntry{
+		{Name: "BUILD_MODE", Value: "first"}, {Name: "build_mode", Value: "middle"}, {Name: "BUILD_MODE", Value: "last"},
+	}, entries)
+	assert.Equal(t, map[string]string{"BUILD_MODE": "last"}, rc.Env)
+	assert.Equal(t, rc.Env, rc.GlobalEnv)
+}
+
 func TestRunStepExecutorParity(t *testing.T) {
 	newStep := func(t *testing.T, stepModel *model.Step) *stepRun {
 		rc := createRunContext(t)

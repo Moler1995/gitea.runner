@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -1078,6 +1079,39 @@ func TestRunContextGetEnv(t *testing.T) {
 				},
 			}
 			assert.Equal(t, testcase.want, rc.GetEnv()["OVERWRITTEN"])
+		})
+	}
+}
+
+func TestRunContextEnvCaseSensitivity(t *testing.T) {
+	for _, caseInsensitive := range []bool{false, true} {
+		t.Run(strconv.FormatBool(caseInsensitive), func(t *testing.T) {
+			rc := createIfTestRunContext(map[string]*model.Job{
+				"job1": createJob(t, "runs-on: self-hosted\nenv:\n  build_mode: job\n  config_value: job", ""),
+			})
+			rc.Run.Workflow.Env = map[string]string{"BUILD_MODE": "workflow", "CONFIG_VALUE": "workflow", "PATH": "workflow-path"}
+			rc.Config.Env = map[string]string{"Config_Value": "config"}
+			rc.Config.DisableActEnv, rc.Config.NoSkipCheckout = true, true
+			rc.Env = nil
+			rc.GetEnv()
+			rc.JobContainer = fakeContainer{ExecutionsEnvironment: &container.HostEnvironment{}, caseInsensitive: caseInsensitive}
+			require.NoError(t, rc.resolvePlatformImage(t.Context()))
+			if caseInsensitive {
+				assert.Equal(t, map[string]string{"BUILD_MODE": "job", "CONFIG_VALUE": "config", "PATH": "workflow-path"}, rc.GetEnv())
+			} else {
+				assert.Equal(t, map[string]string{
+					"BUILD_MODE": "workflow", "build_mode": "job", "CONFIG_VALUE": "workflow",
+					"config_value": "job", "Config_Value": "config", "PATH": "workflow-path",
+				}, rc.GetEnv())
+			}
+			rc.importHostEnv([]string{"Path=host-path", "HOST_ONLY=value"})
+			assert.Equal(t, "workflow-path", rc.Env["PATH"])
+			assert.Equal(t, "value", rc.Env["HOST_ONLY"])
+			if caseInsensitive {
+				assert.NotContains(t, rc.Env, "Path")
+			} else {
+				assert.Equal(t, "host-path", rc.Env["Path"])
+			}
 		})
 	}
 }

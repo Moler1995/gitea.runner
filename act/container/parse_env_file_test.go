@@ -34,6 +34,7 @@ func TestParseEnvFile(t *testing.T) {
 		want          map[string]string
 	}{
 		{"single line", "FOO=bar\nBAZ=qux\n", map[string]string{"FOO": "bar", "BAZ": "qux"}},
+		{"repeated names", "FOO=first\nfoo=middle\nFOO=last\n", map[string]string{"FOO": "last", "foo": "middle"}},
 		{"single line CRLF and final bare CR", "FOO=bar\r\nBAZ=qux\r", map[string]string{"FOO": "bar\r", "BAZ": "qux\r"}},
 		{"single line without final newline", "FOO=bar", map[string]string{"FOO": "bar"}},
 		{"blank lines", "\nFOO=bar\n\n   \nBAZ=qux\n\n", map[string]string{"FOO": "bar", "BAZ": "qux"}},
@@ -57,6 +58,15 @@ func TestParseEnvFile(t *testing.T) {
 			assert.Equal(t, test.want, env)
 		})
 	}
+	t.Run("ordered entries preserve repeated names", func(t *testing.T) {
+		hostEnv, envPath := newTestHostEnv(t)
+		require.NoError(t, os.WriteFile(envPath, []byte("FOO=first\r\nfoo<<EOF\r\nmiddle\r\nEOF\r\nFOO=last\r\n"), 0o600))
+		var entries []EnvFileEntry
+		require.NoError(t, ParseEnvFile(hostEnv, envPath, &entries, true)(t.Context()))
+		assert.Equal(t, []EnvFileEntry{
+			{Name: "FOO", Value: "first"}, {Name: "foo", Value: "middle"}, {Name: "FOO", Value: "last"},
+		}, entries)
+	})
 	t.Run("Windows line endings", func(t *testing.T) {
 		hostEnv, envPath := newTestHostEnv(t)
 		require.NoError(t, os.WriteFile(envPath, []byte("FOO=bar\r\nMULTI<<EOF\r\nline1\r\nline2\nEOF\r\n"), 0o600))
