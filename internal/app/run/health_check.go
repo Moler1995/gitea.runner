@@ -61,7 +61,7 @@ func executeHealthCheck(ctx context.Context, script string, timeout time.Duratio
 	defer cancel()
 	cmd := exec.CommandContext(checkCtx, script)
 	cmd.Env = envListFromMap(env)
-	cmd.SysProcAttr = process.SysProcAttr(script, false)
+	cmd.SysProcAttr = process.SysProcAttr("", false)
 	writer := common.NewLineWriter(func(line string) bool {
 		line = strings.TrimRight(line, "\r\n")
 		if line != "" {
