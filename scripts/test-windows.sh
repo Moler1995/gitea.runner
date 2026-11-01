@@ -27,7 +27,7 @@ for package in $packages; do
   echo "${package##*/}.test.exe ${package#"$module"/}"
 done > "$oem/tests.txt"
 git ls-files -z --cached --others --exclude-standard | while IFS= read -r -d '' file; do
-  [ -e "$file" ] && printf '%s\0' "$file"
+  if [ -e "$file" ]; then printf '%s\0' "$file"; fi
 done | tar --null -T - -cf - | tar -xf - -C "$oem/src"
 # a repository like the CI checkout, for the tests that read the github context from it
 git -C "$oem/src" init -q -b main
@@ -63,8 +63,10 @@ docker cp "$oem" "$name:/oem"
 docker cp "$work/shared" "$name:/shared"
 docker start "$name" >/dev/null
 docker logs -f "$name" &
-while sleep 300 && docker container inspect "$name" >/dev/null 2>&1; do
-  echo "==> $((SECONDS / 60))m elapsed, VM disk $(docker exec "$name" du -sh /storage | cut -f1)"
+while sleep 10 && docker container inspect "$name" >/dev/null 2>&1; do # short sleeps end the loop soon after cleanup
+  if ((SECONDS % 300 < 10)); then
+    echo "==> $((SECONDS / 60))m elapsed, VM disk $(docker exec "$name" du -sh /storage | cut -f1)"
+  fi
 done &
 docker exec "$name" sh -c 'cd /shared && touch install.log summary.txt && tail -qf install.log summary.txt' &
 
