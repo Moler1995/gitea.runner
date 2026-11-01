@@ -40,6 +40,7 @@ func TestFetchAction(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(remote, "run.sh"), []byte("#!/bin/sh\n"), 0o755))
 	require.NoError(t, os.Symlink("action.yml", filepath.Join(remote, "link")))
 	require.NoError(t, gitCmd("-C", remote, "add", "."))
+	require.NoError(t, gitCmd("-C", remote, "update-index", "--chmod=+x", "run.sh"))
 	require.NoError(t, gitCmd("-C", remote, "commit", "-m", "initial"))
 	require.NoError(t, gitCmd("-C", remote, "tag", "v1"))
 	expectedSha := gitRevParse(t, remote, "main")
@@ -192,9 +193,9 @@ func TestFetchAction(t *testing.T) {
 		assert.NoDirExists(t, filepath.Join(tree, ".git"))
 		info, err := os.Stat(filepath.Join(tree, "run.sh"))
 		require.NoError(t, err)
-		sourceInfo, err := os.Stat(filepath.Join(remote, "run.sh"))
-		require.NoError(t, err)
-		assert.Equal(t, sourceInfo.Mode().Perm(), info.Mode().Perm())
+		if runtime.GOOS != "windows" {
+			assert.EqualValues(t, 0o755, info.Mode().Perm())
+		}
 		link, err := os.Readlink(filepath.Join(tree, "link"))
 		require.NoError(t, err)
 		assert.Equal(t, "action.yml", link)

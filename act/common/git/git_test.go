@@ -185,7 +185,8 @@ func TestGitFindRef(t *testing.T) {
 func TestGitCloneExecutor(t *testing.T) {
 	remoteDir, workDir := newGitRemote(t)
 	require.NoError(t, os.WriteFile(filepath.Join(workDir, "action.sh"), []byte("#!/bin/sh\necho hi\n"), 0o755))
-	require.NoError(t, gitCmd("-C", workDir, "add", "action.sh"))
+	require.NoError(t, os.WriteFile(filepath.Join(workDir, ".gitattributes"), []byte("*.sh text\n"), 0o644))
+	require.NoError(t, gitCmd("-C", workDir, "add", "action.sh", ".gitattributes"))
 	require.NoError(t, gitCmd("-C", workDir, "commit", "-m", "initial"))
 	require.NoError(t, gitCmd("-C", workDir, "tag", "v2"))
 	require.NoError(t, gitCmd("-C", workDir, "push", "-u", "origin", "main"))
@@ -200,7 +201,7 @@ func TestGitCloneExecutor(t *testing.T) {
 	require.NoError(t, gitCmd("-C", workDir, "push", "origin", "main:refs/heads/"+fullSha[:4]))
 
 	hostConfig := filepath.Join(t.TempDir(), "gitconfig")
-	require.NoError(t, os.WriteFile(hostConfig, []byte("[core]\n\tautocrlf = true\n[url "+strconv.Quote(remoteDir)+"]\n\tinsteadOf = https://example.invalid/action\n"), 0o644))
+	require.NoError(t, os.WriteFile(hostConfig, []byte("[core]\n\tautocrlf = true\n\teol = crlf\n[url "+strconv.Quote(remoteDir)+"]\n\tinsteadOf = https://example.invalid/action\n"), 0o644))
 	t.Setenv("GIT_CONFIG_GLOBAL", hostConfig)
 	t.Setenv("GIT_DIR", t.TempDir())
 
