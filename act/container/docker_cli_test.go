@@ -40,6 +40,24 @@ func mustParseMAC(s string) networktypes.HardwareAddr {
 	return networktypes.HardwareAddr(mac)
 }
 
+func TestIsUserDefinedNetwork(t *testing.T) {
+	for _, test := range []struct {
+		mode container.NetworkMode
+		want bool
+	}{
+		{"job-network", true},
+		{"host", false},
+		{"bridge", false},
+		{"default", false},
+		{"none", false},
+		{"container:x", false},
+	} {
+		t.Run(string(test.mode), func(t *testing.T) {
+			assert.Equal(t, test.want, isUserDefinedNetwork(test.mode))
+		})
+	}
+}
+
 func TestValidateAttach(t *testing.T) {
 	valid := []string{
 		"stdin",

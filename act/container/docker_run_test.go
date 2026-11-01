@@ -1000,6 +1000,39 @@ func TestDockerCreateKeepsInputEntrypoint(t *testing.T) {
 	}
 }
 
+func TestDockerCreateNetworkAliases(t *testing.T) {
+	for _, test := range []struct {
+		networkMode string
+		wantAliases bool
+	}{
+		{"job-network", true},
+		{"host", false},
+		{"bridge", false},
+		{"default", false},
+		{"none", false},
+		{"container:x", false},
+	} {
+		t.Run(test.networkMode, func(t *testing.T) {
+			cr := &containerReference{
+				input: &NewContainerInput{NetworkMode: test.networkMode, NetworkAliases: []string{"service"}},
+				cli: &probeClient{create: func(_ctx context.Context, opts mobyclient.ContainerCreateOptions) (mobyclient.ContainerCreateResult, error) {
+					assert.Equal(t, container.NetworkMode(test.networkMode), opts.HostConfig.NetworkMode)
+					if test.wantAliases {
+						assert.Equal(t, &network.NetworkingConfig{EndpointsConfig: map[string]*network.EndpointSettings{
+							"job-network": {Aliases: []string{"service"}},
+						}}, opts.NetworkingConfig)
+					} else {
+						assert.Nil(t, opts.NetworkingConfig)
+					}
+					return mobyclient.ContainerCreateResult{ID: "created"}, nil
+				}},
+			}
+			require.NoError(t, cr.create(nil, nil)(t.Context()))
+			assert.Equal(t, "created", cr.id)
+		})
+	}
+}
+
 func TestMergeContainerConfigsKeepsNetworkAliasesFromOptions(t *testing.T) {
 	logger := logging.New(logtest.New())
 	cr := &containerReference{input: &NewContainerInput{
