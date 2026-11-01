@@ -484,6 +484,10 @@ type probeClient struct {
 	containers []container.Summary
 }
 
+func (c *probeClient) Info(_ctx context.Context, _opts mobyclient.InfoOptions) (mobyclient.SystemInfoResult, error) {
+	return mobyclient.SystemInfoResult{}, nil
+}
+
 func (c *probeClient) Close() error {
 	return nil
 }
