@@ -306,8 +306,11 @@ func (sr *stepRun) setupShellCommandForOS(ctx context.Context, hostOS string) (n
 	}
 
 	script = fmt.Sprintf("%s\n%s\n%s", runPrepend, script, runAppend)
-	if shellCommand == "powershell" {
+	switch shellCommand {
+	case "powershell":
 		script = "\ufeff" + script // Windows PowerShell reads BOM-less scripts using the ANSI code page.
+	case "cmd":
+		script = strings.ReplaceAll(strings.ReplaceAll(script, "\r\n", "\n"), "\n", "\r\n") // cmd misreads UTF-8 lines that end in a bare LF
 	}
 
 	if !strings.Contains(script, "::add-mask::") && !sr.RunContext.Config.InsecureSecrets {
