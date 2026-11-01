@@ -291,7 +291,7 @@ func extractTree(ctx context.Context, archive io.Reader, dir string, strip bool)
 				continue
 			}
 			if err := copyTreeLink(ctx, root, name, links, sizes); err != nil {
-				return "", fmt.Errorf("materialize symlink %q: %w", name, err)
+				return "", fmt.Errorf("materialize symlink %q: %w", filepath.ToSlash(name), err)
 			}
 		}
 		if len(unresolved) == len(deferred) {

@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"runtime"
 	"testing"
 	"time"
@@ -113,20 +114,29 @@ func newTestProcess(t *testing.T, mode string) (*exec.Cmd, func() int) {
 
 func TestProcessHelper(t *testing.T) {
 	mode := os.Getenv("GITEA_PROCESS_HELPER")
-	if mode == "" {
+	switch mode {
+	case "":
 		return
-	}
-	if mode == "child" {
+	case "orphan-child":
+		interrupt := make(chan os.Signal, 1)
+		signal.Notify(interrupt, os.Interrupt)
+		_, err := fmt.Fprintln(os.Stdout, os.Getpid())
+		require.NoError(t, err)
+		<-interrupt
+	case "child":
 		_, err := fmt.Fprintln(os.Stdout, os.Getpid())
 		require.NoError(t, err)
 		_, err = io.Copy(io.Discard, os.Stdin)
 		require.NoError(t, err)
-	} else {
+	default:
 		var start [1]byte
 		_, err := io.ReadFull(os.Stdin, start[:])
 		require.NoError(t, err)
 		child := exec.Command(os.Args[0], "-test.run=^TestProcessHelper$")
 		child.Env = append(os.Environ(), "GITEA_PROCESS_HELPER=child")
+		if mode == "orphan" {
+			child.Env = append(os.Environ(), "GITEA_PROCESS_HELPER=orphan-child")
+		}
 		child.Stdin = os.Stdin
 		child.Stdout = os.Stdout
 		child.Stderr = os.Stderr
