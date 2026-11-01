@@ -81,7 +81,8 @@ type RunContext struct {
 	jobRunDefaults      model.RunDefaults // defaults.run, resolved once at job setup as GitHub does
 	platformImage       string            // container.image or the runs-on pick, resolved once by isEnabled
 	jobIndex, jobTotal  int               // strategy.job-index and job-total, total 0 when unknown
-	runtimeToken        string            // ACTIONS_RUNTIME_TOKEN of the workflow run, shared with its called workflows and composite actions
+	trackingID          string
+	runtimeToken        string // ACTIONS_RUNTIME_TOKEN of the workflow run, shared with its called workflows and composite actions
 
 	jobEnv             map[string]string          // workflow and job env as evaluated for the container and service specs
 	dockerActionImages map[*model.Step]string     // Dockerfile action images built for this job, removed when it ends
@@ -1509,7 +1510,6 @@ func (rc *RunContext) getGithubContext(ctx context.Context) *model.GithubContext
 		RepositoryOwner:  rc.Config.Env["GITHUB_REPOSITORY_OWNER"],
 		RetentionDays:    cmp.Or(rc.Config.Env["GITHUB_RETENTION_DAYS"], "0"),
 		RunnerPerflog:    cmp.Or(rc.Config.Env["RUNNER_PERFLOG"], "/dev/null"),
-		RunnerTrackingID: rc.Config.Env["RUNNER_TRACKING_ID"],
 		Repository:       rc.Config.Env["GITHUB_REPOSITORY"],
 		Ref:              rc.Config.Env["GITHUB_REF"],
 		Sha:              rc.Config.Env["SHA_REF"],
@@ -1521,6 +1521,16 @@ func (rc *RunContext) getGithubContext(ctx context.Context) *model.GithubContext
 	}
 	if rc.JobContainer != nil {
 		ghc.EventPath = rc.JobContainer.GetActPath() + "/workflow/event.json"
+	}
+
+	if hostEnv, ok := rc.JobContainer.(*container.HostEnvironment); ok {
+		ghc.RunnerTrackingID = hostEnv.TrackingID()
+	} else {
+		job := rc.topLevelRunContext()
+		if job.trackingID == "" {
+			job.trackingID = "gitea_" + rand.Text()
+		}
+		ghc.RunnerTrackingID = job.trackingID
 	}
 
 	if preset := rc.Config.PresetGitHubContext; preset != nil {

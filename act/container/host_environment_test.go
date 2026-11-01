@@ -241,47 +241,10 @@ func TestHostEnvironmentRemoveDoesNotHang(t *testing.T) {
 	}
 }
 
-func TestBuildWindowsWorkspaceKillScript(t *testing.T) {
-	t.Run("single dir", func(t *testing.T) {
-		s := buildWindowsWorkspaceKillScript([]string{`C:\workspace\job1`})
-		assert.Contains(t, s, `$paths = @('C:\workspace\job1')`)
-		assert.Contains(t, s, "$selfPid = $PID")
-		assert.Contains(t, s, "$_.ProcessId -eq $selfPid")
-		assert.Contains(t, s, `$prefix = $p + '\'`)
-		assert.Contains(t, s, "$_.ExecutablePath.StartsWith($prefix")
-		assert.Contains(t, s, "$_.CommandLine.IndexOf($prefix")
-		assert.Contains(t, s, "taskkill.exe /PID $_.ProcessId /T /F")
-	})
-
-	t.Run("multiple dirs comma-separated", func(t *testing.T) {
-		s := buildWindowsWorkspaceKillScript([]string{
-			`C:\work\path`,
-			`C:\work\workdir`,
-			`C:\Users\runner\AppData\Local\Temp\job-42`,
-		})
-		assert.Contains(t, s, `'C:\work\path'`)
-		assert.Contains(t, s, `'C:\work\workdir'`)
-		assert.Contains(t, s, `'C:\Users\runner\AppData\Local\Temp\job-42'`)
-		assert.Contains(t, s, `'C:\work\path','C:\work\workdir',`)
-	})
-
-	t.Run("path with single quote is escaped", func(t *testing.T) {
-		s := buildWindowsWorkspaceKillScript([]string{`C:\work\it's\path`})
-		assert.Contains(t, s, `'C:\work\it''s\path'`)
-		assert.NotContains(t, s, `'C:\work\it's\path'`)
-	})
-
-	t.Run("path with wildcard metacharacters is matched literally", func(t *testing.T) {
-		s := buildWindowsWorkspaceKillScript([]string{`C:\work\[job]?1`})
-		assert.Contains(t, s, `'C:\work\[job]?1'`)
-		assert.NotContains(t, s, "-like")
-		assert.Contains(t, s, "StartsWith")
-		assert.Contains(t, s, "IndexOf")
-	})
-
-	t.Run("empty dir list still produces a valid script", func(t *testing.T) {
-		s := buildWindowsWorkspaceKillScript(nil)
-		assert.Contains(t, s, "$paths = @()")
-		assert.Contains(t, s, "Get-CimInstance Win32_Process")
-	})
+func TestHostEnvironmentTrackingID(t *testing.T) {
+	first, second := &HostEnvironment{}, &HostEnvironment{}
+	trackingID := first.TrackingID()
+	require.NotEmpty(t, trackingID)
+	require.Equal(t, trackingID, first.TrackingID())
+	require.NotEqual(t, first.TrackingID(), second.TrackingID())
 }

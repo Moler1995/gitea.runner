@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
@@ -44,10 +45,15 @@ type HostEnvironment struct {
 	StdOut       io.Writer
 	AllocatePTY  bool // allocate a pseudo-TTY for each step's process
 
-	// procGroup owns every process the job's steps start. Atomic: Remove may read
-	// it while a step is still starting.
+	trackingOnce  sync.Once
+	trackingID    string
 	procGroupOnce sync.Once
-	procGroup     atomic.Pointer[process.Group]
+	procGroup     atomic.Pointer[process.Group] // Remove may run while a tracked step starts.
+}
+
+func (e *HostEnvironment) TrackingID() string {
+	e.trackingOnce.Do(func() { e.trackingID = "gitea_" + rand.Text() })
+	return e.trackingID
 }
 
 // processGroup returns the job-scoped process group, creating it on first use.
@@ -271,6 +277,16 @@ func (e *HostEnvironment) exec(ctx context.Context, command []string, cmdline st
 	cmd.Args = command
 	cmd.Stdout = e.StdOut
 	cmd.Env = getEnvListFromMap(env)
+	trackingID := e.TrackingID()
+	effectiveTrackingID := trackingID
+	for _, entry := range cmd.Env {
+		name, value, _ := strings.Cut(entry, "=")
+		if name == "RUNNER_TRACKING_ID" || runtime.GOOS == "windows" && strings.EqualFold(name, "RUNNER_TRACKING_ID") {
+			effectiveTrackingID = value
+		}
+	}
+	cmd.Env = append(cmd.Env, "RUNNER_TRACKING_ID="+effectiveTrackingID)
+	tracked := strings.EqualFold(effectiveTrackingID, trackingID)
 	cmd.Stderr = e.StdOut
 	cmd.Dir = wd
 	cmd.SysProcAttr = process.SysProcAttr(cmdline, false)
@@ -278,6 +294,7 @@ func (e *HostEnvironment) exec(ctx context.Context, command []string, cmdline st
 	// Kills the step's whole tree on cancellation and bounds the post-exit I/O
 	// wait, so an orphan holding cmd's stdout pipe cannot hang cmd.Wait().
 	treeKill := process.NewTreeKill(cmd)
+	treeKill.KeepLeftovers = !tracked
 
 	var ppty *os.File
 	var tty *os.File
@@ -311,10 +328,10 @@ func (e *HostEnvironment) exec(ctx context.Context, command []string, cmdline st
 	if err := cmd.Start(); err != nil {
 		return err
 	}
-	// Assign before the step's Killer so the step's job nests inside the group's;
-	// cancellation still scopes to this step's tree.
-	if err := e.processGroup(ctx).Assign(cmd.Process); err != nil {
-		common.Logger(ctx).Warnf("could not assign the step's process to the job's process group; a process it leaves behind may outlive the job: %v", err)
+	if tracked {
+		if err := e.processGroup(ctx).Assign(cmd.Process); err != nil {
+			common.Logger(ctx).Warnf("could not assign the step's process to the job's process group, a process it leaves behind may outlive the job: %v", err)
+		}
 	}
 	if k, kerr := treeKill.Capture(cmd.Process); kerr != nil {
 		common.Logger(ctx).Warnf("process tree kill setup failed, falling back to single-process kill: %v", kerr)
@@ -409,35 +426,6 @@ func removePathWithRetry(ctx context.Context, path string) error {
 	return lastErr
 }
 
-// buildWindowsWorkspaceKillScript builds a PowerShell command that taskkills
-// every process tree whose ExecutablePath or CommandLine references one of the
-// given workspace dirs, releasing file handles for cleanup. Win32_Process
-// exposes both fields (Get-Process doesn't, wmic is deprecated); matching is on
-// the dir+separator prefix via ordinal String methods, so a name-prefix sibling
-// (job1 vs job10) is spared and path metacharacters stay literal.
-func buildWindowsWorkspaceKillScript(dirs []string) string {
-	quoted := make([]string, len(dirs))
-	for i, d := range dirs {
-		// Single-quoted PowerShell literal; escape ' by doubling it.
-		quoted[i] = "'" + strings.ReplaceAll(d, "'", "''") + "'"
-	}
-
-	return `$paths = @(` + strings.Join(quoted, ",") + `)
-$selfPid = $PID
-Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
-    if ($_.ProcessId -eq $selfPid) { return $false }
-    foreach ($p in $paths) {
-        $prefix = $p + '\'
-        if ($_.ExecutablePath -and $_.ExecutablePath.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
-        if ($_.CommandLine -and $_.CommandLine.IndexOf($prefix, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { return $true }
-    }
-    return $false
-} | ForEach-Object {
-    & taskkill.exe /PID $_.ProcessId /T /F 2>$null | Out-Null
-}
-`
-}
-
 func (e *HostEnvironment) terminateRunningProcesses(ctx context.Context) {
 	if runtime.GOOS != "windows" {
 		return
@@ -471,20 +459,10 @@ func (e *HostEnvironment) terminateRunningProcesses(ctx context.Context) {
 		return
 	}
 
-	script := buildWindowsWorkspaceKillScript(dirs)
-
-	cmd := exec.CommandContext(killCtx, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		logger.Debugf("workspace process-tree kill via PowerShell failed: %v output=%s", err, strings.TrimSpace(string(out)))
-	}
-
-	// Win32_Process exposes no working directory, so the scan above misses a
-	// process that merely runs in a workspace dir while pinning a handle on it.
-	if killed, err := process.KillProcessesWithCWDUnder(killCtx, dirs); err != nil {
-		logger.Debugf("workspace process kill by working directory reported errors: %v", err)
+	if killed, err := process.KillProcessesWithPaths(killCtx, dirs, e.TrackingID()); err != nil {
+		logger.Debugf("workspace process cleanup reported errors: %v", err)
 	} else if killed > 0 {
-		logger.Debugf("terminated %d leftover process(es) by workspace working directory", killed)
+		logger.Debugf("terminated %d leftover workspace process(es)", killed)
 	}
 }
 

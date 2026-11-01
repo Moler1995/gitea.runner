@@ -188,8 +188,9 @@ func TestSetupEnv(t *testing.T) {
 		"RC_KEY":                   "rcvalue",
 		"RUNNER_ENVIRONMENT":       "self-hosted",
 		"RUNNER_PERFLOG":           "/dev/null",
-		"RUNNER_TRACKING_ID":       "",
+		"RUNNER_TRACKING_ID":       env["RUNNER_TRACKING_ID"],
 	}
+	assert.Regexp(t, `^gitea_[A-Z2-7]{26}$`, env["RUNNER_TRACKING_ID"])
 	for name, value := range expected {
 		if suffix, ok := strings.CutPrefix(name, "GITHUB_"); ok {
 			expected["GITEA_"+suffix] = value
