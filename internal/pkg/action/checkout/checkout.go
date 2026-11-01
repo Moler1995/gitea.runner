@@ -219,7 +219,7 @@ func gitEnv(c *action.Context, config []string) map[string]string {
 	env := map[string]string{"GIT_TERMINAL_PROMPT": "0"}
 	maps.Copy(env, c.Env)
 	maps.DeleteFunc(env, func(name, _ string) bool { return slices.Contains(git.LocalEnvVars, name) })
-	maps.Copy(env, git.ConfigEnv(append([]string{"protocol.version=2", "init.defaultBranch=main", "advice.detachedHead=false", "maintenance.auto=false"}, config...)...))
+	maps.Copy(env, git.ConfigEnv(append([]string{"protocol.version=2", "init.defaultBranch=main", "advice.detachedHead=false", "maintenance.auto=false", "core.longpaths=true"}, config...)...))
 	return env
 }
 
@@ -453,8 +453,8 @@ func boolInput(inputs map[string]string, name string, fallback bool) bool {
 }
 
 func workspaceDestination(workspace, checkoutPath string) (string, error) {
-	cleanPath := path.Clean(strings.TrimSpace(checkoutPath))
-	if path.IsAbs(cleanPath) || cleanPath == ".." || strings.HasPrefix(cleanPath, "../") {
+	cleanPath := path.Clean(strings.ReplaceAll(strings.TrimSpace(checkoutPath), `\`, "/")) // Windows hosts also split on backslashes
+	if path.IsAbs(cleanPath) || cleanPath == ".." || strings.HasPrefix(cleanPath, "../") || len(cleanPath) > 1 && cleanPath[1] == ':' {
 		return "", fmt.Errorf("checkout: path %q must be relative to the workspace", checkoutPath)
 	}
 	return path.Join(workspace, cleanPath), nil

@@ -188,6 +188,8 @@ exec sh -c "$(printf '%s' "$last" | sed "s#git-upload-pack '/\(.*\)\.git'#git up
 		{name: "unsupported input", inputs: map[string]string{"github-server-url": "https://example.com"}, err: "unsupported input"},
 		{name: "relative path escaping workspace", inputs: map[string]string{"path": "../x"}, err: "must be relative"},
 		{name: "absolute path", inputs: map[string]string{"path": "/x"}, err: "must be relative"},
+		{name: "backslash path escaping workspace", inputs: map[string]string{"path": `..\x`}, err: "must be relative"},
+		{name: "drive relative path", inputs: map[string]string{"path": `C:x`}, err: "must be relative"},
 		{name: "negative fetch-depth", inputs: map[string]string{"fetch-depth": "-1"}, err: "non-negative"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
