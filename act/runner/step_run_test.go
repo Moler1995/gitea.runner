@@ -80,6 +80,7 @@ func TestStepRun(t *testing.T) {
 }
 
 func TestStepRunShellParity(t *testing.T) {
+	const powershellScript = "$ErrorActionPreference = 'stop'\n$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)\necho 你好，世界\nif ((Test-Path -LiteralPath variable:/LASTEXITCODE)) { exit $LASTEXITCODE }"
 	tests := []struct {
 		name, run, shell, workingDir string
 		actPath                      string
@@ -88,6 +89,7 @@ func TestStepRunShellParity(t *testing.T) {
 		probeErr                     error
 		wantExt                      string
 		wantCmd                      []string
+		wantScript                   string
 		wantErr                      string
 	}{
 		{
@@ -105,23 +107,37 @@ func TestStepRunShellParity(t *testing.T) {
 			wantCmd:  []string{"sh", "-e", "/var/run/act/workflow/1.sh"},
 		},
 		{
-			name:    "builtin pwsh",
-			shell:   "pwsh",
-			actPath: "/var/run/act with spaces",
-			wantExt: ".ps1",
-			wantCmd: []string{"pwsh", "-command", ". '/var/run/act with spaces/workflow/1.ps1'"},
+			name:       "builtin pwsh",
+			run:        "echo 你好，世界",
+			shell:      "pwsh",
+			actPath:    "/var/run/act with spaces",
+			wantExt:    ".ps1",
+			wantCmd:    []string{"pwsh", "-command", ". '/var/run/act with spaces/workflow/1.ps1'"},
+			wantScript: powershellScript,
 		},
 		{
-			name:    "builtin powershell",
-			shell:   "powershell",
-			wantExt: ".ps1",
-			wantCmd: []string{"powershell", "-command", ". '/var/run/act/workflow/1.ps1'"},
+			name:       "builtin powershell",
+			run:        "echo 你好，世界",
+			shell:      "powershell",
+			wantExt:    ".ps1",
+			wantCmd:    []string{"powershell", "-command", ". '/var/run/act/workflow/1.ps1'"},
+			wantScript: "\ufeff" + powershellScript,
 		},
 		{
-			name:    "custom pwsh template",
-			shell:   "pwsh -NoProfile -File {0}",
-			wantExt: ".ps1",
-			wantCmd: []string{"pwsh", "-NoProfile", "-File", "/var/run/act/workflow/1.ps1"},
+			name:       "custom pwsh template",
+			run:        "echo 你好，世界",
+			shell:      "pwsh -NoProfile -File {0}",
+			wantExt:    ".ps1",
+			wantCmd:    []string{"pwsh", "-NoProfile", "-File", "/var/run/act/workflow/1.ps1"},
+			wantScript: powershellScript,
+		},
+		{
+			name:       "builtin cmd reads and emits UTF-8 without a BOM",
+			run:        "echo 你好，世界",
+			shell:      "cmd",
+			wantExt:    ".cmd",
+			wantCmd:    []string{"cmd", "/D", "/E:ON", "/V:OFF", "/S", "/C", "CALL /var/run/act/workflow/1.cmd"},
+			wantScript: "@echo off\nchcp 65001 >nul\necho 你好，世界\n",
 		},
 		{
 			name:    "missing placeholder",
@@ -198,12 +214,8 @@ func TestStepRunShellParity(t *testing.T) {
 			if test.wantExt == "" {
 				test.wantExt = ".sh"
 			}
-			wantScript := "\necho hi\n"
-			if test.wantExt == ".ps1" {
-				wantScript = "$ErrorActionPreference = 'stop'\necho hi\nif ((Test-Path -LiteralPath variable:/LASTEXITCODE)) { exit $LASTEXITCODE }"
-			}
 			assert.Equal(t, "workflow/1"+test.wantExt, name)
-			assert.Equal(t, wantScript, script)
+			assert.Equal(t, cmp.Or(test.wantScript, "\necho hi\n"), script)
 			assert.Equal(t, test.wantCmd, sr.cmd)
 			assert.Equal(t, test.env["DIR"], sr.WorkingDirectory)
 			cm.AssertExpectations(t)

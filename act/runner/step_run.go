@@ -292,16 +292,19 @@ func (sr *stepRun) setupShellCommand(ctx context.Context) (name, script string, 
 		name += ".sh"
 	case "pwsh", "powershell":
 		name += ".ps1"
-		runPrepend = "$ErrorActionPreference = 'stop'"
+		runPrepend = "$ErrorActionPreference = 'stop'\n$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)"
 		runAppend = "if ((Test-Path -LiteralPath variable:/LASTEXITCODE)) { exit $LASTEXITCODE }"
 	case "cmd":
 		name += ".cmd"
-		runPrepend = "@echo off"
+		runPrepend = "@echo off\nchcp 65001 >nul"
 	case "python":
 		name += ".py"
 	}
 
 	script = fmt.Sprintf("%s\n%s\n%s", runPrepend, script, runAppend)
+	if shellCommand == "powershell" {
+		script = "\ufeff" + script // Windows PowerShell reads BOM-less scripts using the ANSI code page.
+	}
 
 	if !strings.Contains(script, "::add-mask::") && !sr.RunContext.Config.InsecureSecrets {
 		logger.Debugf("Wrote command \n%s\n to '%s'", script, name)
