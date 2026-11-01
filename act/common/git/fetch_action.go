@@ -355,12 +355,12 @@ func copyTreeLink(ctx context.Context, root *os.Root, name string, links map[str
 		}
 		source, err := resolveTreeLink(source, links)
 		if err != nil {
-			return errors.Join(errTreeLinkTarget, err)
+			return errTreeLinkTarget
 		}
 		file, err := root.Open(source)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
-				return errors.Join(errTreeLinkTarget, err)
+				return errTreeLinkTarget
 			}
 			return err
 		}

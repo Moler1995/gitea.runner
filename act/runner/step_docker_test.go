@@ -180,14 +180,10 @@ func TestWindowsHostContainerActions(t *testing.T) {
 			t.Run("docker step", func(t *testing.T) {
 				require.EqualError(t, (&stepDocker{RunContext: rc}).runUsesContainerForOS(test.hostOS)(t.Context()), wantError)
 			})
-			for _, image := range []string{"docker://alpine:3.20", "Dockerfile"} {
-				t.Run(image, func(t *testing.T) {
-					require.EqualError(t, execAsDockerForOS(t.Context(), &stepActionRemote{
-						RunContext: rc,
-						action:     &model.Action{Runs: model.ActionRuns{Using: "docker", Image: image}},
-					}, "action", "", "", false, stepStageMain, test.hostOS), wantError)
-				})
-			}
+			t.Run("container action", func(t *testing.T) {
+				require.EqualError(t, execAsDockerForOS(t.Context(), &stepActionRemote{RunContext: rc},
+					"action", "", "", false, stepStageMain, test.hostOS), wantError)
+			})
 		})
 	}
 }

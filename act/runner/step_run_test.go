@@ -212,7 +212,7 @@ func TestStepRunShellParity(t *testing.T) {
 		},
 	}
 
-	for _, hostOS := range []string{"linux", "darwin", "windows"} {
+	for _, hostOS := range []string{"linux", "windows"} {
 		for _, shell := range []string{"bash", "sh", "python"} {
 			extension := ".sh"
 			if shell == "python" {

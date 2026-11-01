@@ -464,12 +464,7 @@ func evaluateJobEnv(ctx context.Context, rc *RunContext) (map[string]string, err
 		}
 	}
 	if workflowEnv != nil {
-		if rc.isEnvCaseInsensitive() {
-			evaluated = map[string]string{}
-			mergeIntoMapCaseInsensitive(evaluated, workflowEnv, env)
-		} else {
-			evaluated = mergeMaps(workflowEnv, env)
-		}
+		evaluated = rc.mergeEnv(workflowEnv, env)
 		evaluator = rc.NewExpressionEvaluatorWithEnv(ctx, evaluated)
 	}
 	var err error
@@ -577,13 +572,19 @@ func tryUploadJobSummary(ctx context.Context, rc *RunContext) {
 	actPath := rc.JobContainer.GetActPath()
 	// Reuse a single client across all step uploads so connections can be pooled.
 	client := &http.Client{Timeout: jobSummaryUploadRequestTimeout, Transport: rc.Config.instanceTransportFor(base)}
+	maskers := rc.secretMaskers()
+	longestMask := 0
+	for i := 0; i < len(maskers); i += 2 {
+		longestMask = max(longestMask, len(maskers[i]))
+	}
+	masker := NewSecretReplacer(maskers)
 	for i := range rc.Run.Job().Steps {
 		summaryPath := path.Join(actPath, "workflow", "step-summary-"+strconv.Itoa(i)+".md")
-		body, ok := readSingleFileFromContainerArchive(ctx, rc.JobContainer, summaryPath)
+		body, ok := readSingleFileFromContainerArchive(ctx, rc.JobContainer, summaryPath, int64(maxJobSummaryBytes+longestMask+len(jobSummaryTruncationMarker)+1))
 		if !ok || len(body) == 0 {
 			continue
 		}
-		body = truncateJobSummary(ctx, []byte(rc.maskSecrets(string(body))), summaryPath, maxJobSummaryBytes)
+		body = truncateJobSummary(ctx, []byte(masker.Replace(string(body))), summaryPath, maxJobSummaryBytes)
 		uploadJobSummary(ctx, client, base+strconv.Itoa(i)+"/summary", runtimeToken, body)
 	}
 }
@@ -677,7 +678,7 @@ func isTransientJobSummaryUploadFailure(status int, err error) bool {
 	return err != nil || status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || status/100 == 5
 }
 
-func readSingleFileFromContainerArchive(ctx context.Context, env container.ExecutionsEnvironment, p string) ([]byte, bool) {
+func readSingleFileFromContainerArchive(ctx context.Context, env container.ExecutionsEnvironment, p string, maxBytes int64) ([]byte, bool) {
 	rc, err := env.GetContainerArchive(ctx, p)
 	if err != nil {
 		return nil, false
@@ -698,7 +699,7 @@ func readSingleFileFromContainerArchive(ctx context.Context, env container.Execu
 		if entryName != requestedPath && entryName != path.Base(requestedPath) {
 			continue
 		}
-		b, err := io.ReadAll(transform.NewReader(tr, unicodeencoding.BOMOverride(unicodeencoding.UTF8.NewDecoder())))
+		b, err := io.ReadAll(io.LimitReader(transform.NewReader(tr, unicodeencoding.BOMOverride(unicodeencoding.UTF8.NewDecoder())), maxBytes))
 		if err != nil {
 			return nil, false
 		}

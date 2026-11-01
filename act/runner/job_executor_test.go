@@ -946,7 +946,7 @@ func TestReadSingleFileFromContainerArchiveFindsMatchingRegularFile(t *testing.T
 		nil,
 	).Once()
 
-	body, ok := readSingleFileFromContainerArchive(ctx, cm, "/var/run/act/workflow/SUMMARY.md")
+	body, ok := readSingleFileFromContainerArchive(ctx, cm, "/var/run/act/workflow/SUMMARY.md", maxJobSummaryBytes)
 
 	assert.True(t, ok)
 	assert.Equal(t, []byte("right"), body)
@@ -960,7 +960,7 @@ func TestReadSingleFileFromContainerArchiveSizeLimit(t *testing.T) {
 		maxBytes int64
 		want     string
 	}{
-		"truncates oversized summary":     {strings.Repeat("a", 300), 200, strings.Repeat("a", 200-len(jobSummaryTruncationMarker)) + jobSummaryTruncationMarker},
+		"truncates oversized summary without reading entire file": {strings.Repeat("a", 100000), 200, strings.Repeat("a", 200-len(jobSummaryTruncationMarker)) + jobSummaryTruncationMarker},
 		"keeps exact limit":               {"abc", 3, "abc"},
 		"strips UTF-8 BOM before limit":   {"\xef\xbb\xbfabc", 3, "abc"},
 		"decodes UTF-16 before limit":     {"\xff\xfea\x00b\x00c\x00", 3, "abc"},
@@ -971,17 +971,21 @@ func TestReadSingleFileFromContainerArchiveSizeLimit(t *testing.T) {
 			logger, hook := logtest.NewLogger()
 			ctx := common.WithLogger(t.Context(), logger)
 			cm := &containerMock{}
+			archive := bytes.NewReader(tarArchive(t, tarEntry{name: "SUMMARY.md", body: tt.content}))
 			cm.On("GetContainerArchive", ctx, "/var/run/act/workflow/SUMMARY.md").Return(
-				io.NopCloser(bytes.NewReader(tarArchive(t, tarEntry{name: "SUMMARY.md", body: tt.content}))),
+				io.NopCloser(archive),
 				nil,
 			).Once()
 
-			body, ok := readSingleFileFromContainerArchive(ctx, cm, "/var/run/act/workflow/SUMMARY.md")
+			body, ok := readSingleFileFromContainerArchive(ctx, cm, "/var/run/act/workflow/SUMMARY.md", tt.maxBytes+1)
 			body = truncateJobSummary(ctx, body, "/var/run/act/workflow/SUMMARY.md", tt.maxBytes)
 
 			assert.True(t, ok)
 			assert.Equal(t, []byte(tt.want), body)
 			assert.LessOrEqual(t, int64(len(body)), tt.maxBytes)
+			if len(tt.content) > 8192 {
+				assert.Positive(t, archive.Len())
+			}
 			if strings.HasSuffix(tt.want, jobSummaryTruncationMarker) {
 				if assert.Len(t, hook.AllRecords(), 1) {
 					assert.Contains(t, hook.LastRecord().Message, "job summary truncated")

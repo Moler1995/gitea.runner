@@ -192,11 +192,7 @@ func (rc *RunContext) GetEnv() map[string]string {
 		if rc.Run != nil && rc.Run.Workflow != nil && rc.Config != nil {
 			job := rc.Run.Job()
 			if job != nil {
-				if rc.isEnvCaseInsensitive() {
-					mergeIntoMapCaseInsensitive(rc.Env, rc.Run.Workflow.Env, job.Environment(), rc.Config.Env)
-				} else {
-					rc.Env = mergeMaps(rc.Run.Workflow.Env, job.Environment(), rc.Config.Env)
-				}
+				rc.Env = rc.mergeEnv(rc.Run.Workflow.Env, job.Environment(), rc.Config.Env)
 			}
 		}
 		if rc.runtimeToken != "" {
@@ -461,6 +457,16 @@ func (rc *RunContext) importHostEnv(environ []string) {
 				rc.Env[key] = value
 			}
 		}
+	}
+}
+
+func (rc *RunContext) mergeEnv(envs ...map[string]string) map[string]string {
+	if rc.isEnvCaseInsensitive() {
+		env := map[string]string{}
+		mergeIntoMapCaseInsensitive(env, envs...)
+		return env
+	} else {
+		return mergeMaps(envs...)
 	}
 }
 
