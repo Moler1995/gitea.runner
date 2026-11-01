@@ -91,6 +91,17 @@ If the registry succeed, it will run immediately. Next time, you could run the r
 ./gitea-runner daemon
 ```
 
+### Windows service
+
+Register the runner first, keeping `gitea-runner.exe`, `config.yaml` and the `.runner` registration file in the same directory. From an elevated Command Prompt, install and start the service with absolute paths:
+
+```bat
+sc.exe create gitea-runner binPath= "\"C:\gitea-runner\gitea-runner.exe\" daemon --config \"C:\gitea-runner\config.yaml\"" start= auto
+sc.exe start gitea-runner
+```
+
+The service runs from the executable's directory and appends its logs to `gitea-runner.log` there. Its account needs write access to that directory and access to the tools used by jobs. Use `sc.exe stop gitea-runner` to stop it, allowing running jobs to finish according to `runner.shutdown_timeout`.
+
 ### Run with docker
 
 The recommended Docker-in-Docker image runs its own Docker daemon for jobs. Jobs never get the host's Docker socket, which is equivalent to root access on the host.
