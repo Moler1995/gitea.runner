@@ -21,22 +21,12 @@ import (
 
 // parseEnvFile reads a GITHUB_ENV style file, splitting lines like GitHub's runner on Windows or elsewhere.
 func parseEnvFile(e Container, srcPath string, env *map[string]string, windows bool) common.Executor {
-	return func(ctx context.Context) error {
-		var entries []EnvFileEntry
-		err := ParseEnvFile(e, srcPath, &entries, windows)(ctx)
-		for _, entry := range entries {
-			(*env)[entry.Name] = entry.Value
-		}
-		return err
-	}
+	return ParseEnvFile(e, srcPath, func(name, value string) {
+		(*env)[name] = value
+	}, windows)
 }
 
-type EnvFileEntry struct {
-	Name  string
-	Value string
-}
-
-func ParseEnvFile(e Container, srcPath string, entries *[]EnvFileEntry, windows bool) common.Executor {
+func ParseEnvFile(e Container, srcPath string, setEnv func(name, value string), windows bool) common.Executor {
 	return func(ctx context.Context) error {
 		envTar, err := e.GetContainerArchive(ctx, srcPath)
 		if err != nil {
@@ -79,7 +69,7 @@ func ParseEnvFile(e Container, srcPath string, entries *[]EnvFileEntry, windows 
 			multiLineEnv := strings.Index(line, "<<")
 			switch {
 			case singleLineEnv != -1 && (multiLineEnv == -1 || singleLineEnv < multiLineEnv):
-				*entries = append(*entries, EnvFileEntry{Name: line[:singleLineEnv], Value: line[singleLineEnv+1:]})
+				setEnv(line[:singleLineEnv], line[singleLineEnv+1:])
 			case multiLineEnv != -1:
 				var multiLineEnvContent []string
 				multiLineEnvDelimiter := line[multiLineEnv+2:]
@@ -101,7 +91,7 @@ func ParseEnvFile(e Container, srcPath string, entries *[]EnvFileEntry, windows 
 				if !delimiterFound {
 					return fmt.Errorf("invalid format delimiter '%v' not found before end of file", multiLineEnvDelimiter)
 				}
-				*entries = append(*entries, EnvFileEntry{Name: line[:multiLineEnv], Value: trimEnvLineEnding(strings.Join(multiLineEnvContent, ""), windows)})
+				setEnv(line[:multiLineEnv], trimEnvLineEnding(strings.Join(multiLineEnvContent, ""), windows))
 			default:
 				return fmt.Errorf("invalid format '%v', expected a line with '=' or '<<'", line)
 			}

@@ -422,13 +422,13 @@ func TestProcessRunnerEnvFileCommandOrder(t *testing.T) {
 		JobContainer: &windowsFileCommandTestContainer{&container.HostEnvironment{ActPath: t.TempDir()}},
 	}
 	require.NoError(t, os.WriteFile(filepath.Join(rc.JobContainer.GetActPath(), "envs.txt"), []byte("BUILD_MODE=first\nbuild_mode<<EOF\nmiddle\nEOF\nBUILD_MODE=last\n"), 0o600))
-	var entries []container.EnvFileEntry
+	var entries [][2]string
 	require.NoError(t, processRunnerEnvFileCommand(t.Context(), "envs.txt", rc, func(ctx context.Context, params map[string]string, value string) {
-		entries = append(entries, container.EnvFileEntry{Name: params["name"], Value: value})
+		entries = append(entries, [2]string{params["name"], value})
 		rc.setEnvFile(ctx, params, value)
 	}))
-	assert.Equal(t, []container.EnvFileEntry{
-		{Name: "BUILD_MODE", Value: "first"}, {Name: "build_mode", Value: "middle"}, {Name: "BUILD_MODE", Value: "last"},
+	assert.Equal(t, [][2]string{
+		{"BUILD_MODE", "first"}, {"build_mode", "middle"}, {"BUILD_MODE", "last"},
 	}, entries)
 	assert.Equal(t, map[string]string{"BUILD_MODE": "last"}, rc.Env)
 	assert.Equal(t, rc.Env, rc.GlobalEnv)

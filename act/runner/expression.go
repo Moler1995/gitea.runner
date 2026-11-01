@@ -161,7 +161,7 @@ func getHashFilesFunction(ctx context.Context, rc *RunContext) func(v []reflect.
 				Mode: 0o644,
 				Body: hashfiles,
 			}).Then(rc.JobContainer.Exec([]string{"node", path.Join(rc.JobContainer.GetActPath(), name)}, env, "", ""))(timeoutCtx)
-			quotedPatterns := expressionStringEscape(strings.Join(patterns, ", "))
+			quotedPatterns := doubleSingleQuotes(strings.Join(patterns, ", "))
 			switch {
 			case err == nil:
 			case ctx.Err() != nil:

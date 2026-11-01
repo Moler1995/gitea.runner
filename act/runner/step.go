@@ -70,12 +70,9 @@ func (s stepStage) String() string {
 
 func processRunnerEnvFileCommand(ctx context.Context, fileName string, rc *RunContext, setter func(context.Context, map[string]string, string)) error {
 	if rc.JobContainer.IsEnvironmentCaseInsensitive() {
-		var entries []container.EnvFileEntry
-		err := container.ParseEnvFile(rc.JobContainer, path.Join(rc.JobContainer.GetActPath(), fileName), &entries, true)(ctx)
-		for _, entry := range entries {
-			setter(ctx, map[string]string{"name": entry.Name}, entry.Value)
-		}
-		return err
+		return container.ParseEnvFile(rc.JobContainer, path.Join(rc.JobContainer.GetActPath(), fileName), func(name, value string) {
+			setter(ctx, map[string]string{"name": name}, value)
+		}, true)(ctx)
 	}
 	env := map[string]string{}
 	err := rc.JobContainer.UpdateFromEnv(path.Join(rc.JobContainer.GetActPath(), fileName), &env)(ctx)
@@ -359,17 +356,14 @@ func mergeIntoMapCaseInsensitive(target map[string]string, maps ...map[string]st
 	for k := range target {
 		foldKeys[strings.ToLower(k)] = k
 	}
-	toKey := func(s string) string {
-		foldKey := strings.ToLower(s)
-		if k, ok := foldKeys[foldKey]; ok {
-			return k
-		}
-		foldKeys[foldKey] = s
-		return s
-	}
 	for _, m := range maps {
-		for k, v := range m {
-			target[toKey(k)] = v
+		for key, value := range m {
+			foldKey := strings.ToLower(key)
+			if previous, ok := foldKeys[foldKey]; ok {
+				delete(target, previous)
+			}
+			foldKeys[foldKey] = key
+			target[key] = value
 		}
 	}
 }
