@@ -27,6 +27,7 @@ import (
 
 	"gitea.com/gitea/runner/act/common"
 	"gitea.com/gitea/runner/act/common/logging"
+	"gitea.com/gitea/runner/act/filecollector"
 
 	"github.com/bmatcuk/doublestar/v4"
 	cerrdefs "github.com/containerd/errdefs"
@@ -126,7 +127,7 @@ func (cr *containerReference) Copy(destPath string, files ...*FileEntry) common.
 	return common.NewPipelineExecutor(
 		cr.connect(),
 		cr.find(),
-		cr.copyContent(destPath, files...),
+		cr.copyContent(destPath, runtime.GOOS, files...),
 	).IfNot(common.Dryrun)
 }
 
@@ -135,7 +136,7 @@ func (cr *containerReference) CopyDir(destPath, srcPath string, useGitIgnore, sk
 		common.NewInfoExecutor("docker cp src=%s dst=%s", srcPath, destPath),
 		cr.connect(),
 		cr.find(),
-		cr.copyDir(destPath, srcPath, useGitIgnore, skipGitDir),
+		cr.copyDir(destPath, srcPath, useGitIgnore, skipGitDir, runtime.GOOS),
 		func(ctx context.Context) error {
 			// If this fails, then folders have wrong permissions on non root container
 			if cr.UID != 0 || cr.GID != 0 {
@@ -366,6 +367,7 @@ type containerReference struct {
 	id         string
 	input      *NewContainerInput
 	pullPolicy string
+	daemonOS   string
 	UID        int
 	GID        int
 	// attachDone is closed by the attach() streaming goroutine once it has
@@ -440,6 +442,18 @@ func RunnerArch(ctx context.Context) string {
 	return info.Architecture
 }
 
+func (cr *containerReference) targetOS(ctx context.Context) string {
+	if cr.daemonOS == "" {
+		cr.daemonOS = "linux"
+		if cr.cli != nil {
+			if result, err := cr.cli.Info(ctx, client.InfoOptions{}); err == nil && result.Info.OSType != "" {
+				cr.daemonOS = result.Info.OSType
+			}
+		}
+	}
+	return cr.daemonOS
+}
+
 func (cr *containerReference) connect() common.Executor {
 	return func(ctx context.Context) error {
 		if cr.cli != nil {
@@ -459,6 +473,7 @@ func (cr *containerReference) Close() common.Executor {
 		if cr.cli != nil {
 			err := cr.cli.Close()
 			cr.cli = nil
+			cr.daemonOS = ""
 			if err != nil {
 				return fmt.Errorf("failed to close client: %w", err)
 			}
@@ -603,7 +618,8 @@ func (cr *containerReference) mergeContainerConfigs(ctx context.Context, config 
 		copts.privileged = false
 	}
 
-	containerConfig, err := parse(flags, copts, runtime.GOOS)
+	serverOS := cr.targetOS(ctx)
+	containerConfig, err := parse(flags, copts, serverOS)
 	if err != nil {
 		return fmt.Errorf("cannot process container options: '%s': '%w'", options, err)
 	}
@@ -618,7 +634,7 @@ func (cr *containerReference) mergeContainerConfigs(ctx context.Context, config 
 
 	// For Gitea, forcing --privileged off is not enough, other options reach the host too
 	if !hostConfig.Privileged {
-		trusted, err := parseOptionsHostConfig(cr.input.RunnerOptions)
+		trusted, err := parseOptionsHostConfig(cr.input.RunnerOptions, serverOS)
 		if err != nil {
 			return err
 		}
@@ -893,7 +909,7 @@ func (cr *containerReference) waitForCommand(ctx context.Context, resp client.Hi
 	}
 }
 
-func (cr *containerReference) copyDir(dstPath, srcPath string, useGitIgnore, skipGitDir bool) common.Executor {
+func (cr *containerReference) copyDir(dstPath, srcPath string, useGitIgnore, skipGitDir bool, hostOS string) common.Executor {
 	dstPath = path.Clean(dstPath)
 	return func(ctx context.Context) error {
 		if cr.id == "" {
@@ -917,7 +933,7 @@ func (cr *containerReference) copyDir(dstPath, srcPath string, useGitIgnore, ski
 		if actPath := cr.GetActPath(); strings.HasPrefix(dstPath+"/", actPath+"/") {
 			extractionRoot = actPath // keeps tar entries from crossing the image's /var/run symlink
 		}
-		if err := writeDirTar(ctx, tarFile, path.Join("/", strings.TrimPrefix(dstPath, extractionRoot)), srcPath, useGitIgnore, skipGitDir, cr.UID, cr.GID); err != nil {
+		if err := writeDirTar(ctx, tarFile, path.Join("/", strings.TrimPrefix(dstPath, extractionRoot)), srcPath, useGitIgnore, skipGitDir, cr.UID, cr.GID, hostOS, cr.targetOS(ctx)); err != nil {
 			return err
 		}
 
@@ -929,19 +945,29 @@ func (cr *containerReference) copyDir(dstPath, srcPath string, useGitIgnore, ski
 	}
 }
 
-func (cr *containerReference) copyContent(dstPath string, files ...*FileEntry) common.Executor {
+func (cr *containerReference) copyContent(dstPath, hostOS string, files ...*FileEntry) common.Executor {
 	return func(ctx context.Context) error {
 		if cr.id == "" {
 			return cr.missingContainerError("copy to %s", dstPath)
 		}
 		var buf bytes.Buffer
-		if err := writeFilesTar(ctx, &buf, cr.UID, cr.GID, files...); err != nil {
+		if err := writeFilesTar(ctx, &buf, cr.UID, cr.GID, containerCopyFiles(files, hostOS, cr.targetOS(ctx))...); err != nil {
 			return err
 		}
 
 		common.Logger(ctx).Debugf("Extracting content to '%s'", dstPath)
 		return cr.upload(ctx, dstPath, &buf)
 	}
+}
+
+func containerCopyFiles(files []*FileEntry, hostOS, serverOS string) []*FileEntry {
+	normalized := make([]*FileEntry, 0, len(files))
+	for _, file := range files {
+		entry := *file
+		entry.Mode = filecollector.ContainerMode(entry.Mode, hostOS, serverOS)
+		normalized = append(normalized, &entry)
+	}
+	return normalized
 }
 
 func (cr *containerReference) upload(ctx context.Context, dstPath string, content io.Reader) error {
@@ -1088,12 +1114,12 @@ func resetOption[T any](logger *logging.Logger, option string, field *T, trusted
 
 // parseOptionsHostConfig parses one options string on its own, to see what it alone asks for.
 // Even "" goes through the parser, or its empty slices and maps would differ from a real parse.
-func parseOptionsHostConfig(options string) (*container.HostConfig, error) {
+func parseOptionsHostConfig(options, serverOS string) (*container.HostConfig, error) {
 	flags, copts, _, err := parseContainerOptions(options)
 	if err != nil {
 		return nil, err
 	}
-	containerConfig, err := parse(flags, copts, runtime.GOOS)
+	containerConfig, err := parse(flags, copts, serverOS)
 	if err != nil {
 		return nil, fmt.Errorf("cannot process container options: '%s': '%w'", options, err)
 	}

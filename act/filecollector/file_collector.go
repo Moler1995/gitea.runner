@@ -27,10 +27,12 @@ type Handler interface {
 }
 
 type TarCollector struct {
-	TarWriter *tar.Writer
-	UID       int
-	GID       int
-	DstDir    string
+	TarWriter   *tar.Writer
+	UID         int
+	GID         int
+	DstDir      string
+	HostOS      string
+	ContainerOS string
 }
 
 func (tc TarCollector) WriteFile(fpath string, fi fs.FileInfo, linkName string, f io.Reader) error {
@@ -42,7 +44,7 @@ func (tc TarCollector) WriteFile(fpath string, fi fs.FileInfo, linkName string, 
 
 	// update the name to correctly reflect the desired destination when untaring
 	header.Name = path.Join(tc.DstDir, fpath)
-	header.Mode = int64(fi.Mode())
+	header.Mode = ContainerMode(int64(fi.Mode()), tc.HostOS, tc.ContainerOS)
 	header.Uid = tc.UID
 	header.Gid = tc.GID
 
@@ -59,6 +61,13 @@ func (tc TarCollector) WriteFile(fpath string, fi fs.FileInfo, linkName string, 
 	// copy file data into tar writer
 	_, err = io.Copy(tc.TarWriter, f)
 	return err
+}
+
+func ContainerMode(mode int64, hostOS, containerOS string) int64 { // Windows loses executable bits, so match Docker build.
+	if hostOS == "windows" && containerOS == "linux" {
+		return mode&0o755 | 0o111
+	}
+	return mode
 }
 
 type CopyCollector struct {
