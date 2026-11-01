@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"gitea.com/gitea/runner/act/container"
@@ -81,7 +82,7 @@ func TestStepRun(t *testing.T) {
 
 func TestStepRunShellParity(t *testing.T) {
 	const powershellScript = "$ErrorActionPreference = 'stop'\n$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)\necho 你好，世界\nif ((Test-Path -LiteralPath variable:/LASTEXITCODE)) { exit $LASTEXITCODE }"
-	tests := []struct {
+	type shellTest struct {
 		name, run, shell, workingDir string
 		hostOS, wantCmdline          string
 		actPath                      string
@@ -92,7 +93,8 @@ func TestStepRunShellParity(t *testing.T) {
 		wantCmd                      []string
 		wantScript                   string
 		wantErr                      string
-	}{
+	}
+	tests := []shellTest{
 		{
 			name:    "implicit host bash",
 			host:    true,
@@ -208,6 +210,38 @@ func TestStepRunShellParity(t *testing.T) {
 			workingDir: "${{ DIR }}",
 			wantErr:    "unable to interpolate the working directory:",
 		},
+	}
+
+	for _, hostOS := range []string{"linux", "darwin", "windows"} {
+		for _, shell := range []string{"bash", "sh", "python"} {
+			extension := ".sh"
+			if shell == "python" {
+				extension = ".py"
+			}
+			command := []string{shell}
+			switch shell {
+			case "bash":
+				command = append(command, "--noprofile", "--norc", "-e", "-o", "pipefail")
+			case "sh":
+				command = append(command, "-e")
+			}
+			actPath := `C:/Users/Jane Doe/O'Brien`
+			if hostOS == "windows" {
+				actPath = `C:\Users\Jane Doe\O'Brien`
+			}
+			scriptPath := actPath + "/workflow/1" + extension
+			cmdline := ""
+			if hostOS == "windows" {
+				cmdline = strings.Join(command, " ") + ` "` + scriptPath + `"`
+				command = command[:1]
+			} else {
+				command = append(command, scriptPath)
+			}
+			tests = append(tests, shellTest{
+				name: hostOS + " builtin " + shell + " quotes script path", shell: shell, hostOS: hostOS,
+				actPath: actPath, wantExt: extension, wantCmd: command, wantCmdline: cmdline,
+			})
+		}
 	}
 
 	for _, test := range tests {

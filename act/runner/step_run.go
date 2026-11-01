@@ -319,7 +319,14 @@ func (sr *stepRun) setupShellCommandForOS(ctx context.Context, hostOS string) (n
 	rc := sr.getRunContext()
 	scriptPath := fmt.Sprintf("%s/%s", rc.JobContainer.GetActPath(), name)
 	if step.Shell == "pwsh" || step.Shell == "powershell" {
-		scriptPath = strings.ReplaceAll(scriptPath, "'", "''")
+		scriptPath = doubleSingleQuotes(scriptPath)
+	}
+	if step.Shell == "bash" || step.Shell == "sh" || step.Shell == "python" {
+		if _, host := rc.JobContainer.(*container.HostEnvironment); host && hostOS == "windows" {
+			scriptPath = `"` + scriptPath + `"`
+		} else {
+			scriptPath = shellquote.Join(scriptPath)
+		}
 	}
 	sr.cmdline = strings.ReplaceAll(scCmd, `{0}`, scriptPath)
 	if _, host := rc.JobContainer.(*container.HostEnvironment); host && hostOS == "windows" {
