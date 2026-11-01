@@ -360,3 +360,8 @@ func fileExists(name string) bool {
 	_, err := os.Stat(name)
 	return err == nil
 }
+
+func TestTempPath(t *testing.T) {
+	assert.Equal(t, "//server/share/tmp/key", tempPath("//server/share/tmp", "key"))
+	assert.Equal(t, "/tmp/key", tempPath("/tmp/", "key"))
+}

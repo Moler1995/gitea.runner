@@ -118,7 +118,7 @@ func Main(ctx context.Context, c *action.Context) (err error) {
 	runnerTemp = filepath.ToSlash(runnerTemp)
 	digest := sha256.Sum256([]byte(dst))
 	credentials := fmt.Sprintf("git-credentials-%x.config", digest[:8])
-	co.credentials = path.Join(runnerTemp, credentials)
+	co.credentials = tempPath(runnerTemp, credentials)
 	persist := boolInput(c.Inputs, "persist-credentials", true)
 	config, remoteConfig := serverConfig(ghc.ServerURL, cmp.Or(c.Inputs["token"], ghc.Token), c.InsecureSkipTLS, co.submodules != "" && sshKey == "")
 	if boolInput(c.Inputs, "set-safe-directory", true) {
@@ -142,7 +142,7 @@ func Main(ctx context.Context, c *action.Context) (err error) {
 			return err
 		}
 		scope := "http." + strings.TrimSuffix(ghc.ServerURL, "/") + "/."
-		remoteConfig = append(remoteConfig, scope+"sslCert="+path.Join(runnerTemp, cert), scope+"sslKey="+path.Join(runnerTemp, key))
+		remoteConfig = append(remoteConfig, scope+"sslCert="+tempPath(runnerTemp, cert), scope+"sslKey="+tempPath(runnerTemp, key))
 		if _, host := c.Container.(*container.HostEnvironment); host && runtime.GOOS == "windows" {
 			remoteConfig = append(remoteConfig, scope+"sslBackend=openssl")
 		}
@@ -152,14 +152,14 @@ func Main(ctx context.Context, c *action.Context) (err error) {
 	if sshKey != "" {
 		key := fmt.Sprintf("git-ssh-key-%x", digest[:8])
 		files := []*container.FileEntry{{Name: key, Mode: 0o600, Body: sshKey + "\n"}}
-		ssh := []string{"ssh", "-i", path.Join(runnerTemp, key)}
+		ssh := []string{"ssh", "-i", tempPath(runnerTemp, key)}
 		if boolInput(c.Inputs, "ssh-strict", true) {
 			ssh = append(ssh, "-o", "StrictHostKeyChecking=yes", "-o", "CheckHostIP=no")
 		}
 		if knownHosts := strings.TrimSpace(c.Inputs["ssh-known-hosts"]); knownHosts != "" {
 			name := fmt.Sprintf("git-ssh-known-hosts-%x", digest[:8])
 			files = append(files, &container.FileEntry{Name: name, Mode: 0o600, Body: knownHosts + "\n"})
-			ssh = append(ssh, "-o", "UserKnownHostsFile=~/.ssh/known_hosts "+strconv.Quote(path.Join(runnerTemp, name)))
+			ssh = append(ssh, "-o", "UserKnownHostsFile=~/.ssh/known_hosts "+strconv.Quote(tempPath(runnerTemp, name)))
 		}
 		if !persist {
 			defer func() {
@@ -473,4 +473,8 @@ func fetchDepth(input string) (int, error) {
 		return 0, fmt.Errorf("checkout: fetch-depth %q must be a non-negative integer", input)
 	}
 	return depth, nil
+}
+
+func tempPath(dir, name string) string { // path.Join would collapse the leading // of a UNC directory
+	return strings.TrimSuffix(dir, "/") + "/" + name
 }
