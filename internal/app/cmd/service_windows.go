@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"gitea.com/gitea/runner/act/common/logging"
 
@@ -62,12 +63,18 @@ type daemonService struct {
 }
 
 func (s *daemonService) Execute(_args []string, requests <-chan svc.ChangeRequest, changes chan<- svc.Status) (bool, uint32) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	return s.execute(requests, changes, ticker.C)
+}
+
+func (s *daemonService) execute(requests <-chan svc.ChangeRequest, changes chan<- svc.Status, ticks <-chan time.Time) (bool, uint32) {
 	changes <- svc.Status{State: svc.StartPending}
 	ctx, cancel := context.WithCancel(s.ctx)
 	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- s.run(ctx) }()
-	status := svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptShutdown}
+	status := svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptShutdown | svc.AcceptPreShutdown}
 	changes <- status
 	for {
 		select {
@@ -79,13 +86,18 @@ func (s *daemonService) Execute(_args []string, requests <-chan svc.ChangeReques
 				return true, 1
 			}
 			return false, 0
+		case <-ticks:
+			if status.State == svc.StopPending {
+				status.CheckPoint++
+				changes <- status
+			}
 		case request := <-requests:
 			switch request.Cmd {
 			case svc.Interrogate:
 				changes <- status
-			case svc.Stop, svc.Shutdown:
+			case svc.Stop, svc.Shutdown, svc.PreShutdown:
 				if status.State != svc.StopPending {
-					status = svc.Status{State: svc.StopPending}
+					status = svc.Status{State: svc.StopPending, CheckPoint: 1, WaitHint: 10000}
 					changes <- status
 					cancel()
 				}

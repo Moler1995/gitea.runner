@@ -39,7 +39,7 @@ func receiveServiceValue[T any](ctx context.Context, t *testing.T, values <-chan
 }
 
 func TestDaemonServiceControl(t *testing.T) {
-	for _, command := range []svc.Cmd{svc.Stop, svc.Shutdown} {
+	for _, command := range []svc.Cmd{svc.Stop, svc.Shutdown, svc.PreShutdown} {
 		t.Run(fmt.Sprint(command), func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 			defer cancel()
@@ -47,6 +47,7 @@ func TestDaemonServiceControl(t *testing.T) {
 			defer finish()
 			cancelled := make(chan struct{})
 			requests := make(chan svc.ChangeRequest, 1)
+			ticks := make(chan time.Time)
 			changes := make(chan svc.Status, 8)
 			done := make(chan serviceExit, 1)
 			handler := &daemonService{ctx: ctx, run: func(ctx context.Context) error {
@@ -56,20 +57,31 @@ func TestDaemonServiceControl(t *testing.T) {
 				return nil
 			}}
 			go func() {
-				specific, code := handler.Execute(nil, requests, changes)
+				specific, code := handler.execute(requests, changes, ticks)
 				done <- serviceExit{specific, code}
 			}()
 
 			require.Equal(t, svc.Status{State: svc.StartPending}, receiveServiceValue(ctx, t, changes))
-			running := svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptShutdown}
+			running := svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptShutdown | svc.AcceptPreShutdown}
 			require.Equal(t, running, receiveServiceValue(ctx, t, changes))
 			requests <- svc.ChangeRequest{Cmd: svc.Interrogate}
 			require.Equal(t, running, receiveServiceValue(ctx, t, changes))
 			requests <- svc.ChangeRequest{Cmd: command}
-			require.Equal(t, svc.Status{State: svc.StopPending}, receiveServiceValue(ctx, t, changes))
+			stopping := svc.Status{State: svc.StopPending, CheckPoint: 1, WaitHint: 10000}
+			require.Equal(t, stopping, receiveServiceValue(ctx, t, changes))
 			receiveServiceValue(ctx, t, cancelled)
+			for range 2 {
+				select {
+				case ticks <- time.Time{}:
+				case <-ctx.Done():
+					t.Fatal(ctx.Err())
+				}
+				stopping.CheckPoint++
+				require.Equal(t, stopping, receiveServiceValue(ctx, t, changes))
+			}
+			requests <- svc.ChangeRequest{Cmd: command}
 			requests <- svc.ChangeRequest{Cmd: svc.Interrogate}
-			require.Equal(t, svc.Status{State: svc.StopPending}, receiveServiceValue(ctx, t, changes))
+			require.Equal(t, stopping, receiveServiceValue(ctx, t, changes))
 			finish()
 			require.Equal(t, serviceExit{}, receiveServiceValue(ctx, t, done))
 			require.NoError(t, handler.err)

@@ -102,6 +102,12 @@ sc.exe start gitea-runner
 
 The service runs from the executable's directory and appends its logs to `gitea-runner.log` there. Its account needs write access to that directory and access to the tools used by jobs. Use `sc.exe stop gitea-runner` to stop it, allowing running jobs to finish according to `runner.shutdown_timeout`.
 
+On shutdown or reboot, Windows waits for the service's preshutdown timeout at most, so set it above `runner.shutdown_timeout`, here six minutes for `5m`. It takes effect after the next reboot:
+
+```bat
+reg.exe add HKLM\SYSTEM\CurrentControlSet\Services\gitea-runner /v PreshutdownTimeout /t REG_DWORD /d 360000 /f
+```
+
 ### Run with docker
 
 The recommended Docker-in-Docker image runs its own Docker daemon for jobs. Jobs never get the host's Docker socket, which is equivalent to root access on the host.
