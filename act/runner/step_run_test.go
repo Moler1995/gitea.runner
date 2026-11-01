@@ -141,7 +141,7 @@ func TestStepRunShellParity(t *testing.T) {
 			shell:      "cmd",
 			wantExt:    ".cmd",
 			wantCmd:    []string{"cmd", "/D", "/E:ON", "/V:OFF", "/S", "/C", "CALL /var/run/act/workflow/1.cmd"},
-			wantScript: "@echo off\nchcp 65001 >nul 2>&1\n(call )\necho 你好，世界\n",
+			wantScript: "@echo off\necho 你好，世界\n",
 		},
 		{
 			name:        "Windows custom executable preserves backslashes and raw arguments",

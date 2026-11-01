@@ -300,7 +300,7 @@ func (sr *stepRun) setupShellCommandForOS(ctx context.Context, hostOS string) (n
 		runAppend = "if ((Test-Path -LiteralPath variable:/LASTEXITCODE)) { exit $LASTEXITCODE }"
 	case "cmd":
 		name += ".cmd"
-		runPrepend = "@echo off\nchcp 65001 >nul 2>&1\n(call )"
+		runPrepend = "@echo off"
 	case "python":
 		name += ".py"
 	}
