@@ -86,7 +86,7 @@ if [ -f "$results/error.txt" ]; then
   cat "$results/error.txt" >&2
 fi
 echo "==> Slowest tests"
-find "$results" -name '*.log' -exec cat {} + | tr -d '\r' | sed -nE 's/^--- (PASS|FAIL): (\S+) \(([0-9.]+)s\)$/\3 \2/p' | sort -rn | head -20
+find "$results" -name '*.log' -exec cat {} + | tr -d '\r' | sed -nE 's/^--- (PASS|FAIL): (\S+) \(([0-9.]+)s\)$/\3 \2/p' | sort -rn | awk 'NR <= 20'
 echo "==> Packages"
 tr -d '\r' < "$results/summary.txt"
 exit "$(tr -d '\r\n' < "$results/exitcode")"
