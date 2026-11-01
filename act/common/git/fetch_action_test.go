@@ -402,20 +402,20 @@ func TestExtractTreeCopiesDeferredLinks(t *testing.T) {
 	t.Cleanup(func() { symlink, symlinkFallback = originalSymlink, originalFallback })
 
 	for _, test := range []struct {
-		name    string
-		links   [][2]string
-		files   []string
-		wantErr string
+		name  string
+		links [][2]string
+		files []string
+		text  bool
 	}{
 		{name: "file chain", links: [][2]string{{"index.js", "entry.js"}, {"entry.js", "dist/index.js"}}, files: []string{"index.js", "entry.js"}},
 		{name: "directory chain", links: [][2]string{{"lib", "bundle"}, {"bundle", "dist"}, {"dist/entry.js", "index.js"}}, files: []string{"lib/index.js", "lib/entry.js", "lib/nested/index.js", "bundle/index.js", "bundle/entry.js", "bundle/nested/index.js"}},
 		{name: "directory in target path", links: [][2]string{{"index.js", "bundle/nested/index.js"}, {"bundle", "dist"}}, files: []string{"index.js", "bundle/nested/index.js"}},
 		{name: "parent after directory link", links: [][2]string{{"index.js", "bundle/../index.js"}, {"bundle", "dist/nested"}}, files: []string{"index.js", "bundle/index.js"}},
-		{name: "outside", links: [][2]string{{"index.js", "../outside.js"}}, wantErr: "outside the extracted tree"},
-		{name: "absolute", links: [][2]string{{"index.js", t.TempDir()}}, wantErr: "outside the extracted tree"},
-		{name: "dangling", links: [][2]string{{"index.js", "missing.js"}}, wantErr: "missing.js"},
-		{name: "cycle", links: [][2]string{{"index.js", "entry.js"}, {"entry.js", "index.js"}}, wantErr: "cyclic"},
-		{name: "directory cycle", links: [][2]string{{"dist/loop", "."}}, wantErr: "cyclic"},
+		{name: "outside", links: [][2]string{{"index.js", "../outside.js"}}, text: true},
+		{name: "absolute", links: [][2]string{{"index.js", t.TempDir()}}, text: true},
+		{name: "dangling", links: [][2]string{{"index.js", "missing.js"}}, text: true},
+		{name: "cycle", links: [][2]string{{"index.js", "entry.js"}, {"entry.js", "index.js"}}, text: true},
+		{name: "directory cycle", links: [][2]string{{"dist/loop", "."}}, text: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			sha := strings.Repeat("a", 40)
@@ -437,14 +437,18 @@ func TestExtractTreeCopiesDeferredLinks(t *testing.T) {
 
 			dir := t.TempDir()
 			_, err := extractTree(t.Context(), &archive, dir, false)
-			if test.wantErr != "" {
-				require.ErrorContains(t, err, test.wantErr)
-				require.ErrorContains(t, err, test.links[0][0])
-				assert.NoDirExists(t, filepath.Join(dir, sha))
-				return
-			}
 			require.NoError(t, err)
 			assert.True(t, treeIntact(dir, sha))
+			if test.text {
+				for _, link := range test.links {
+					data, err := os.ReadFile(filepath.Join(dir, sha, link[0]))
+					require.NoError(t, err)
+					assert.Equal(t, link[1], string(data))
+					info, err := os.Lstat(filepath.Join(dir, sha, link[0]))
+					require.NoError(t, err)
+					assert.True(t, info.Mode().IsRegular())
+				}
+			}
 			for _, name := range test.files {
 				data, err := os.ReadFile(filepath.Join(dir, sha, name))
 				require.NoError(t, err)
@@ -481,4 +485,64 @@ func TestTreeIntactFindsNamesThatAreNotUTF8(t *testing.T) {
 	require.NoError(t, err)
 	require.FileExists(t, filepath.Join(dir, sha, "caf\xe9.js"))
 	assert.True(t, treeIntact(dir, sha))
+}
+
+func TestExtractTreeCreatesLinksInDependencyOrder(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires symlink privileges")
+	}
+	original := symlink
+	var created []string
+	symlink = func(root *os.Root, target, name string) error {
+		created = append(created, name)
+		return root.Symlink(target, name)
+	}
+	t.Cleanup(func() { symlink = original })
+
+	var archive bytes.Buffer
+	writer := tar.NewWriter(&archive)
+	require.NoError(t, writer.WriteHeader(&tar.Header{Typeflag: tar.TypeXGlobalHeader, PAXRecords: map[string]string{"comment": strings.Repeat("a", 40)}}))
+	for _, entry := range []*tar.Header{
+		{Name: "a", Typeflag: tar.TypeSymlink, Linkname: "b"},
+		{Name: "b", Typeflag: tar.TypeSymlink, Linkname: "dist"},
+		{Name: "dangling", Typeflag: tar.TypeSymlink, Linkname: "missing"},
+		{Name: "dist", Typeflag: tar.TypeDir, Mode: 0o755},
+	} {
+		require.NoError(t, writer.WriteHeader(entry))
+	}
+	require.NoError(t, writer.Close())
+	_, err := extractTree(t.Context(), &archive, t.TempDir(), false)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"b", "a", "dangling"}, created)
+}
+
+func TestCopyTreeLinkCancellationBetweenEntries(t *testing.T) {
+	root, err := os.OpenRoot(t.TempDir())
+	require.NoError(t, err)
+	defer root.Close()
+	require.NoError(t, root.Mkdir("source", 0o755))
+	for _, name := range []string{"first", "second"} {
+		_, err := writeTreeFile(root, filepath.Join("source", name), 0o644, strings.NewReader("content"))
+		require.NoError(t, err)
+	}
+	sizes := map[string]int64{}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	observed := &treeCopyContext{Context: ctx, check: func() {
+		if len(sizes) == 1 {
+			cancel()
+		}
+	}}
+	require.ErrorIs(t, copyTreeLink(observed, root, "copy", map[string]string{"copy": "source"}, sizes), context.Canceled)
+	assert.Len(t, sizes, 1)
+}
+
+type treeCopyContext struct {
+	context.Context
+	check func()
+}
+
+func (ctx *treeCopyContext) Err() error {
+	ctx.check()
+	return ctx.Context.Err()
 }
