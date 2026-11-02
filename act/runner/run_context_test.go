@@ -1428,6 +1428,26 @@ func TestGetJobContextReportsContainers(t *testing.T) {
 	}, jobContext.Services)
 }
 
+func TestCopyWorkflowFilesHandsJobsTheRunnerCA(t *testing.T) {
+	caFile := filepath.Join(t.TempDir(), "ca.crt")
+	require.NoError(t, os.WriteFile(caFile, []byte("PEM\n"), 0o600))
+	copyFiles := func(caFile string, env map[string]string) *RunContext {
+		rc := &RunContext{Config: &Config{CAFile: caFile}, Env: env, JobContainer: &container.HostEnvironment{Path: t.TempDir(), ActPath: t.TempDir(), StdOut: io.Discard}}
+		require.NoError(t, rc.copyWorkflowFiles()(t.Context()))
+		return rc
+	}
+
+	rc := copyFiles(caFile, map[string]string{})
+	caPath := rc.JobContainer.GetActPath() + "/ca.crt"
+	assert.Equal(t, caPath, rc.Env["NODE_EXTRA_CA_CERTS"])
+	ca, err := os.ReadFile(caPath)
+	require.NoError(t, err)
+	assert.Equal(t, "PEM\n", string(ca))
+
+	assert.Equal(t, "/own.pem", copyFiles(caFile, map[string]string{"NODE_EXTRA_CA_CERTS": "/own.pem"}).Env["NODE_EXTRA_CA_CERTS"])
+	assert.NotContains(t, copyFiles("", map[string]string{}).Env, "NODE_EXTRA_CA_CERTS")
+}
+
 func TestCaptureJobContainerInfoExportsDockerWorkspace(t *testing.T) {
 	job := &containerMock{}
 	job.On("Inspect", mock.Anything).Return(&container.Info{

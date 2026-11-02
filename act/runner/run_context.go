@@ -1113,10 +1113,23 @@ func (svc *serviceContainer) healthOutputSuffix() string {
 }
 
 func (rc *RunContext) copyWorkflowFiles() common.Executor {
-	return rc.JobContainer.Copy(rc.JobContainer.GetActPath()+"/",
-		&container.FileEntry{Name: "workflow/event.json", Mode: 0o644, Body: rc.EventJSON},
-		&container.FileEntry{Name: "workflow/envs.txt", Mode: 0o666},
-	)
+	return func(ctx context.Context) error {
+		files := []*container.FileEntry{
+			{Name: "workflow/event.json", Mode: 0o644, Body: rc.EventJSON},
+			{Name: "workflow/envs.txt", Mode: 0o666},
+		}
+		if rc.Config.CAFile != "" {
+			ca, err := os.ReadFile(rc.Config.CAFile)
+			if err != nil {
+				return fmt.Errorf("read runner CA file: %w", err)
+			}
+			files = append(files, &container.FileEntry{Name: "ca.crt", Mode: 0o644, Body: string(ca)})
+			if _, ok := rc.Env["NODE_EXTRA_CA_CERTS"]; !ok { // adds to Node's own CA list, which ignores the image's bundle
+				rc.Env["NODE_EXTRA_CA_CERTS"] = rc.JobContainer.GetActPath() + "/ca.crt"
+			}
+		}
+		return rc.JobContainer.Copy(rc.JobContainer.GetActPath()+"/", files...)(ctx)
+	}
 }
 
 // captureJobContainerInfo is a convenience: failing to describe the container must not

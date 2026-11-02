@@ -46,7 +46,8 @@ runner:
   #client_key_file: /etc/gitea-runner/client.key
   # PEM CA certificates of a Gitea instance with a private CA, trusted besides the system's.
   # Runner-side git and builtin:checkout use it instead of the system's bundle for the instance.
-  # Other tools in jobs do not, mount the CA into them with container.volumes.
+  # Jobs get it at /var/run/act/ca.crt, with NODE_EXTRA_CA_CERTS pointing there unless already set,
+  # so JavaScript actions trust it. Other tools in jobs, such as git, need it mounted with container.volumes.
   #ca_file: /etc/gitea-runner/ca.crt
   # The timeout for fetching the job from the Gitea instance.
   # Values above the 60s RPC timeout are capped to it.
