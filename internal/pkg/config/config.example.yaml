@@ -44,6 +44,10 @@ runner:
   # PEM client certificate and key for a Gitea instance that requires mutual TLS.
   #client_cert_file: /etc/gitea-runner/client.crt
   #client_key_file: /etc/gitea-runner/client.key
+  # PEM CA certificates of a Gitea instance with a private CA, trusted besides the system's.
+  # Runner-side git and builtin:checkout use it instead of the system's bundle for the instance.
+  # Other tools in jobs do not, mount the CA into them with container.volumes.
+  #ca_file: /etc/gitea-runner/ca.crt
   # The timeout for fetching the job from the Gitea instance.
   # Values above the 60s RPC timeout are capped to it.
   #fetch_timeout: 5s
@@ -264,6 +268,14 @@ container:
   # valid_volumes:
   #   - '**'
   #valid_volumes: []
+  # Volumes and bind mounts the runner adds to every job, service and docker action container, as in
+  # `docker run --volume`. One the workflow mounts on the same container path takes its place.
+  # Their sources need no valid_volumes entry, and workflows may mount them only with the same access,
+  # so a `:ro` source stays read-only. Docker only, use pod_template on Kubernetes. For example, to
+  # trust a private CA in Debian and Ubuntu based images:
+  # volumes:
+  #   - /etc/ssl/certs/ca-certificates.crt:/etc/ssl/certs/ca-certificates.crt:ro
+  #volumes: []
   # Overrides the docker client host with the specified one.
   # If it's empty, runner will find an available docker host automatically.
   # If it's "-", runner will find an available docker host automatically, but won't mount it into the job and action containers.

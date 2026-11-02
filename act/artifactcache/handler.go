@@ -10,6 +10,8 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json/v2"
@@ -106,6 +108,8 @@ type Handler struct {
 
 	outboundIP string
 
+	instanceTransport http.RoundTripper // nil is http.DefaultTransport
+
 	// internalSecret guards /_internal/{register,revoke}. When set, a remote
 	// runner can use these endpoints to pre-register per-job
 	// ACTIONS_RUNTIME_TOKENs against this server, enabling the same
@@ -143,8 +147,9 @@ type Options struct {
 	// in-process RegisterJob method directly.
 	InternalSecret string
 
-	Policy Policy
-	Logger *logging.Logger
+	Policy  Policy
+	Logger  *logging.Logger
+	RootCAs *x509.CertPool // verify the instance artifact requests are forwarded to, nil for the system's
 }
 
 // StartHandler starts an embedded cache or forwards cache requests to Upstream.
@@ -163,6 +168,10 @@ func StartHandler(opts Options) (*Handler, error) {
 	}
 	logger = logger.With("module", "artifactcache")
 	h.logger = logger
+
+	if opts.RootCAs != nil {
+		h.instanceTransport = &http.Transport{Proxy: http.ProxyFromEnvironment, TLSClientConfig: &tls.Config{RootCAs: opts.RootCAs}}
+	}
 
 	if opts.OutboundIP != "" {
 		h.outboundIP = opts.OutboundIP

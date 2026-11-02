@@ -143,6 +143,17 @@ func Main(ctx context.Context, c *action.Context) (err error) {
 		scope := "http." + strings.TrimSuffix(ghc.ServerURL, "/") + "/."
 		remoteConfig = append(remoteConfig, scope+"sslCert="+path.Join(runnerTemp, cert), scope+"sslKey="+path.Join(runnerTemp, key))
 	}
+	if c.CAFile != "" {
+		caPEM, err := os.ReadFile(c.CAFile)
+		if err != nil {
+			return err
+		}
+		ca := fmt.Sprintf("git-ca-%x.pem", digest[:8])
+		if err := c.Container.Copy(runnerTemp, &container.FileEntry{Name: ca, Mode: 0o644, Body: string(caPEM)})(ctx); err != nil {
+			return err
+		}
+		remoteConfig = append(remoteConfig, "http."+strings.TrimSuffix(ghc.ServerURL, "/")+"/.sslCAInfo="+path.Join(runnerTemp, ca))
+	}
 	env := gitEnv(c, remoteConfig)
 	env["GIT_LFS_SKIP_SMUDGE"] = strconv.FormatBool(!co.lfs || len(co.sparse) == 0) // lfs pull fetches the objects of a full checkout in one go
 	if sshKey != "" {

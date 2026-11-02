@@ -22,5 +22,6 @@ type Context struct {
 	InsecureSkipTLS bool
 	ClientCertFile  string
 	ClientKeyFile   string
+	CAFile          string
 	Env             map[string]string
 }

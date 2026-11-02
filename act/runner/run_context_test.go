@@ -297,6 +297,30 @@ jobs:
 	require.Nil(t, redis.Cmd)
 }
 
+func TestStartJobContainerMountsContainerVolumesOnUnclaimedTargets(t *testing.T) {
+	const ca, certs = "/host/ca.crt:/etc/ssl/certs/ca-certificates.crt:ro", "/host/certs:/certs"
+	inputs := startJobContainerInputs(t, `
+jobs:
+  job:
+    container:
+      image: node:24
+      volumes:
+        - /job/certs:/certs
+    services:
+      redis:
+        image: redis:latest
+`, &Config{ValidVolumes: []string{"/job/certs"}, ContainerVolumes: []string{ca, certs}})
+	require.Len(t, inputs, 2)
+	redis, job := inputs[0], inputs[1]
+
+	assert.Equal(t, []string{ca, certs}, redis.Binds)
+	assert.Equal(t, []string{"/job/certs", "/host/ca.crt:ro", "/host/certs"}, redis.ValidVolumes)
+	assert.Subset(t, job.Binds, []string{"/job/certs:/certs", ca})
+	assert.NotContains(t, job.Binds, certs)
+	assert.Subset(t, job.ValidVolumes, []string{"/job/certs", "/host/ca.crt:ro", "/host/certs"})
+	assert.NotContains(t, job.ValidVolumes, "/host/ca.crt", "a workflow must not mount a read-only source writable")
+}
+
 func TestStartJobContainerBuildsEvaluatedJobAndServiceInputs(t *testing.T) {
 	inputs := startJobContainerInputs(t, `
 jobs:

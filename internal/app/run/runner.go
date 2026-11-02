@@ -110,6 +110,7 @@ func NewRunner(cfg *config.Config, reg *config.Registration, cli client.Client) 
 			S3:         cacheS3(cfg),
 			Policy:     CachePolicy(cfg),
 			Logger:     logging.Default().With("module", "cache_request"),
+			RootCAs:    cfg.Runner.RootCAs(),
 		})
 		if err != nil {
 			logging.Errorf("cannot init cache server, it will be disabled: %v", err)
@@ -620,10 +621,12 @@ func (r *Runner) run(ctx context.Context, task *runnerv1.Task, reporter *report.
 		JobCompletedHook:                  r.cfg.Runner.Hooks.JobCompleted,
 		Vars:                              task.Vars,
 		ValidVolumes:                      r.cfg.Container.ValidVolumes,
+		ContainerVolumes:                  r.cfg.Container.Volumes,
 		SharedToolCache:                   r.cfg.Runner.ToolCacheMode == config.ToolCacheModeShared,
 		InsecureSkipTLS:                   r.cfg.Runner.Insecure,
 		ClientCertFile:                    r.cfg.Runner.ClientCertFile,
 		ClientKeyFile:                     r.cfg.Runner.ClientKeyFile,
+		CAFile:                            r.cfg.Runner.CAFile,
 		InstanceTransport:                 r.instanceTransport,
 		RunnerName:                        r.name,
 		KubernetesPicker:                  r.kubernetesOptions,

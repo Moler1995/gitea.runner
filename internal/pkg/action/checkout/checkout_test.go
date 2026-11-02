@@ -326,6 +326,28 @@ func TestCheckoutOffersClientCertOnlyDuringTheStep(t *testing.T) {
 	require.Empty(t, key)
 }
 
+func TestCheckoutTrustsTheRunnerCA(t *testing.T) {
+	var reached bool
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		reached = true
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+	workspace, runnerTemp := t.TempDir(), t.TempDir()
+	caFile := filepath.Join(t.TempDir(), "ca.crt")
+	require.NoError(t, os.WriteFile(caFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}), 0o600))
+
+	require.ErrorContains(t, Main(t.Context(), &action.Context{
+		Container: &container.HostEnvironment{Path: workspace, TmpDir: runnerTemp, StdOut: io.Discard},
+		Github:    &model.GithubContext{Repository: "org/repo", Ref: "refs/heads/main", ServerURL: server.URL},
+		Inputs:    map[string]string{"repository": "other/repo"},
+		Workspace: workspace,
+		CAFile:    caFile,
+		Env:       map[string]string{"PATH": os.Getenv("PATH"), "GIT_CONFIG_GLOBAL": os.DevNull, "GIT_CONFIG_NOSYSTEM": "1"},
+	}), "checkout: other/repo@")
+	require.True(t, reached)
+}
+
 func publish(t *testing.T, server, name string, files, submodules map[string]string) {
 	work := t.TempDir()
 	runGit(t, "init", "--initial-branch=main", work)

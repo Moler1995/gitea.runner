@@ -277,9 +277,38 @@ func (rc *RunContext) validVolumes() []string {
 	if rc.dockerProxy != nil {
 		volumes = append(volumes, rc.dockerProxy.Socket)
 	}
+	volumes = append(volumes, rc.Config.containerVolumeSources()...)
 	// TODO: add a new configuration to control whether the docker daemon can be mounted
 	return append(volumes, name, name+"-env",
 		getDockerDaemonSocketMountPath(rc.containerDaemonSocket()))
+}
+
+// containerVolumeSources allows the sources of container.volumes, read-only ones only read-only,
+// so a workflow cannot mount them with more access than every container already gets.
+func (c *Config) containerVolumeSources() []string {
+	var sources []string
+	for _, spec := range c.ContainerVolumes {
+		parsed, err := container.ParseVolume(spec)
+		switch {
+		case err != nil || parsed.Source == "":
+		case parsed.ReadOnly:
+			sources = append(sources, parsed.Source+":ro")
+		default:
+			sources = append(sources, parsed.Source)
+		}
+	}
+	return sources
+}
+
+// appendContainerVolumes adds the container.volumes on targets left unclaimed, and claims them.
+func (rc *RunContext) appendContainerVolumes(binds []string, claimed map[string]bool) []string {
+	for _, spec := range rc.Config.ContainerVolumes {
+		if parsed, err := container.ParseVolume(spec); err == nil && !claimed[parsed.Target] {
+			claimed[parsed.Target] = true
+			binds = append(binds, spec)
+		}
+	}
+	return binds
 }
 
 func (rc *RunContext) workdirMountRoot() string {
@@ -357,6 +386,7 @@ func (rc *RunContext) GetBindsAndMounts(ctx context.Context) ([]string, map[stri
 
 	// the runner's own mounts below yield to the targets the job claims
 	binds, mounts, claimed := splitVolumes(container.SanitizeBinds(ctx, rc.validVolumes(), rc.containerSpec.Volumes))
+	binds = rc.appendContainerVolumes(binds, claimed)
 
 	if rc.containerDaemonSocket() != "-" && !claimed["/var/run/docker.sock"] {
 		binds = append(binds, rc.jobDockerSocket()+":/var/run/docker.sock")
@@ -664,7 +694,12 @@ func (rc *RunContext) jobServices(ctx context.Context, networkName string) (map[
 			entrypoint = []string{spec.Entrypoint}
 		}
 
-		serviceBinds, serviceMounts, _ := splitVolumes(spec.Volumes)
+		serviceBinds, serviceMounts, claimed := splitVolumes(spec.Volumes)
+		validVolumes := rc.Config.ValidVolumes // not validVolumes(), a service gets no docker socket
+		if !rc.kubernetes {
+			serviceBinds = rc.appendContainerVolumes(serviceBinds, claimed)
+			validVolumes = append(slices.Clone(validVolumes), rc.Config.containerVolumeSources()...)
+		}
 
 		exposedPorts, portBindings, err := nat.ParsePortSpecs(spec.Ports)
 		if err != nil {
@@ -693,7 +728,7 @@ func (rc *RunContext) jobServices(ctx context.Context, networkName string) (map[
 			NetworkAliases:  []string{serviceID},
 			ExposedPorts:    exposedPorts,
 			PortBindings:    portBindings,
-			ValidVolumes:    rc.Config.ValidVolumes, // not validVolumes(), a service gets no docker socket
+			ValidVolumes:    validVolumes,
 			AllocatePTY:     rc.Config.AllocatePTY,
 		}
 	}

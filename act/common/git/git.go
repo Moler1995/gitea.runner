@@ -183,6 +183,7 @@ type NewGitCloneExecutorInput struct {
 	// For Gitea
 	InsecureSkipTLS               bool
 	ClientCertFile, ClientKeyFile string            // PEM, absolute as git runs in other directories
+	CAFile                        string            // PEM, absolute, replaces git's CA bundle
 	Transport                     http.RoundTripper // for FetchAction's archive downloads, nil for http.DefaultTransport
 }
 
@@ -446,6 +447,9 @@ func runGitWithStdin(ctx context.Context, dir string, input *NewGitCloneExecutor
 		config = append(config, RemoteConfig(input.Token, input.InsecureSkipTLS)...)
 		if input.ClientCertFile != "" {
 			config = append(config, "http.sslCert="+input.ClientCertFile, "http.sslKey="+input.ClientKeyFile)
+		}
+		if input.CAFile != "" {
+			config = append(config, "http.sslCAInfo="+input.CAFile)
 		}
 	}
 	if dir != "" {
