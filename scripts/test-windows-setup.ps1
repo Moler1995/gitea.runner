@@ -1,4 +1,3 @@
-# Installs the tools the tests need at the first logon of the VM from scripts/test-windows.sh.
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $shared = '\\host.lan\Data'

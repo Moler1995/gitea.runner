@@ -361,11 +361,6 @@ func fileExists(name string) bool {
 	return err == nil
 }
 
-func TestTempPath(t *testing.T) {
-	assert.Equal(t, "//server/share/tmp/key", tempPath("//server/share/tmp", "key"))
-	assert.Equal(t, "/tmp/key", tempPath("/tmp/", "key"))
-}
-
 func TestWorkspaceDestination(t *testing.T) {
 	for _, tc := range []struct {
 		path    string

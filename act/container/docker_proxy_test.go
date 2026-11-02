@@ -770,16 +770,19 @@ func TestDaemonSeesDir(t *testing.T) {
 }
 
 func TestRunnerContainerWorkdir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("a runner container is Linux")
+	}
 	workdir := t.TempDir()
 	t.Chdir(workdir)
-	volume := container.MountPoint{Type: mount.TypeVolume, Source: "/daemon/_data", Destination: workdir}
+	volume := container.MountPoint{Type: mount.TypeVolume, Source: "/daemon/_data", Destination: filepath.Dir(workdir)}
 	for _, testCase := range []struct {
 		name      string
 		mount     container.MountPoint
 		foreign   bool
 		daemonDir string
 	}{
-		{name: "volume at the working directory", mount: volume, daemonDir: volume.Source},
+		{name: "volume above the working directory", mount: volume, daemonDir: filepath.Join(volume.Source, filepath.Base(workdir))},
 		{name: "tmpfs", mount: container.MountPoint{Type: mount.TypeTmpfs, Destination: volume.Destination}},
 		{name: "hostname of another container", mount: volume, foreign: true},
 	} {

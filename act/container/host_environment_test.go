@@ -230,10 +230,11 @@ func TestHostEnvironmentRemoveDoesNotHang(t *testing.T) {
 	})
 }
 
-func TestHostEnvironmentTrackingID(t *testing.T) {
-	first, second := &HostEnvironment{}, &HostEnvironment{}
-	trackingID := first.TrackingID()
-	require.NotEmpty(t, trackingID)
-	require.Equal(t, trackingID, first.TrackingID())
-	require.NotEqual(t, first.TrackingID(), second.TrackingID())
+func TestJoinPath(t *testing.T) {
+	assert.Equal(t, "//server/share/act/workflow/envs.txt", JoinPath("//server/share/act", "workflow/envs.txt"))
+	assert.Equal(t, "/var/run/act/workflow/envs.txt", JoinPath("/var/run/act/", "workflow", "envs.txt"))
+	for _, root := range []string{"//server/share/act", "/var/run/act", "C:/act"} {
+		assert.Equal(t, root+"/actions/key/main.go.out", JoinPath(root+"/actions/key", "main.go.out"))
+		assert.Equal(t, root+"/workflow", JoinPath(root+"/workflow/outputcmd.txt", ".."))
+	}
 }

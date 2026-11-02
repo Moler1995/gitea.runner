@@ -73,7 +73,8 @@ repository runners. A run path is `<workflow>@<ref>` and a log row is `<timestam
 ## Windows tests
 
 `make test-windows` cross-compiles the test binaries, installs Windows Server 2025 Core in a
-[dockur/windows](https://github.com/dockur/windows) QEMU VM on the docker host and runs them
-there. The host must allow privileged containers. The VM uses KVM when the host has `/dev/kvm`,
-otherwise Windows is emulated and much slower. Docker-backed tests skip in the VM and the race
-detector is off, it needs cgo. CI runs this weekly and on demand.
+[dockur/windows](https://github.com/dockur/windows) QEMU VM on the docker host and runs them there.
+The host must be amd64 and allow privileged containers. `WINDOWS_TEST_TIMEOUT` sets the minutes
+allowed for installing Windows and running the tests, 165 by default. The VM uses KVM when the host
+has `/dev/kvm`, otherwise Windows is emulated and much slower. Docker-backed tests skip in the VM
+and the race detector is off, it needs cgo. CI runs this weekly and on demand.

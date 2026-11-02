@@ -523,8 +523,8 @@ func TestRejectsMissingContainer(t *testing.T) {
 		require.ErrorIs(t, err, ErrContainerNotFound, op)
 		assert.Contains(t, err.Error(), `container "job-1" does not exist`, op)
 	}
-	check("copyContent", cr.copyContent("/var/run/act", "windows", &FileEntry{Name: "x", Mode: 0o644})(ctx))
-	check("copyDir", cr.copyDir("/var/run/act", "/src", false, false, "windows")(ctx))
+	check("copyContent", cr.copyContent("/var/run/act", &FileEntry{Name: "x", Mode: 0o644})(ctx))
+	check("copyDir", cr.copyDir("/var/run/act", "/src", false, false)(ctx))
 	check("exec", cr.exec([]string{"echo"}, nil, "", "")(ctx))
 	_, err := cr.GetContainerArchive(ctx, "/var/run/act/x")
 	check("GetContainerArchive", err)
@@ -1090,6 +1090,23 @@ func TestContainerOptionsUseDaemonOS(t *testing.T) {
 	}
 }
 
+func TestConnectTakesDaemonOSFromPing(t *testing.T) {
+	var infos atomic.Int32
+	daemon := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("API-Version", "1.47")
+		writer.Header().Set("OSType", "windows")
+		if strings.HasSuffix(request.URL.Path, "/info") {
+			infos.Add(1)
+		}
+	}))
+	t.Cleanup(daemon.Close)
+	t.Setenv("DOCKER_HOST", daemon.URL)
+	cr := &containerReference{input: &NewContainerInput{}}
+	require.NoError(t, cr.connect()(t.Context()))
+	assert.Equal(t, "windows", cr.targetOS(t.Context()))
+	assert.Zero(t, infos.Load())
+}
+
 func TestContainerCopyModes(t *testing.T) {
 	for _, testcase := range []struct {
 		hostOS, serverOS string
@@ -1103,22 +1120,18 @@ func TestContainerCopyModes(t *testing.T) {
 			source := t.TempDir()
 			require.NoError(t, os.WriteFile(filepath.Join(source, "run.sh"), []byte("#!/bin/sh\n"), 0o666))
 			require.NoError(t, os.Chmod(filepath.Join(source, "run.sh"), 0o666))
-			file := &FileEntry{Name: "run.sh", Mode: 0o666, Body: "#!/bin/sh\n"}
-			files := []*FileEntry{file}
-			normalized := containerCopyFiles(files, testcase.hostOS, testcase.serverOS)
-			if testcase.hostOS == "windows" && testcase.serverOS == "linux" {
-				assert.NotSame(t, file, normalized[0])
-				assert.Equal(t, testcase.expected, normalized[0].Mode)
-			} else {
-				assert.Same(t, &files[0], &normalized[0])
-			}
+			file := &FileEntry{Name: "run.sh", Mode: 0o600, Body: "#!/bin/sh\n"}
+			original := hostOS
+			hostOS = testcase.hostOS
+			t.Cleanup(func() { hostOS = original })
 			cli := &mockDockerClient{info: system.Info{OSType: testcase.serverOS}}
+			var modes []int64
 			cli.On("CopyToContainer", mock.Anything, "job", mock.Anything).
 				Run(func(args mock.Arguments) {
 					reader := tar.NewReader(args.Get(2).(mobyclient.CopyToContainerOptions).Content)
 					header, err := reader.Next()
 					require.NoError(t, err)
-					assert.Equal(t, testcase.expected, header.Mode)
+					modes = append(modes, header.Mode)
 					assert.Equal(t, "run.sh", filepath.Base(header.Name))
 					content, err := io.ReadAll(reader)
 					require.NoError(t, err)
@@ -1127,9 +1140,9 @@ func TestContainerCopyModes(t *testing.T) {
 					require.ErrorIs(t, err, io.EOF)
 				}).Return(mobyclient.CopyToContainerResult{}, nil).Twice()
 			cr := &containerReference{cli: cli, id: "job", input: &NewContainerInput{}}
-			require.NoError(t, cr.copyContent("/workspace", testcase.hostOS, file)(t.Context()))
-			require.NoError(t, cr.copyDir("/workspace", source+string(filepath.Separator), false, true, testcase.hostOS)(t.Context()))
-			assert.EqualValues(t, 0o666, file.Mode)
+			require.NoError(t, cr.copyContent("/workspace", file)(t.Context()))
+			require.NoError(t, cr.copyDir("/workspace", source+string(filepath.Separator), false, true)(t.Context()))
+			assert.Equal(t, []int64{0o600, testcase.expected}, modes)
 			if testcase.hostOS == "windows" {
 				assert.Equal(t, 1, cli.infoCalls)
 			} else {

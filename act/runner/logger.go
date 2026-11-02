@@ -169,7 +169,7 @@ var secretValueEncoders = []func(string) string{
 	base64InteriorEncoder(0),
 	base64InteriorEncoder(1),
 	base64InteriorEncoder(2),
-	doubleSingleQuotes,
+	expressionStringEscape,
 	jsonStringEscape,
 	jsonStringEscapeNoHTML,
 	uriDataEscape,
@@ -206,7 +206,7 @@ func base64InteriorEncoder(shift int) func(string) string {
 	}
 }
 
-func doubleSingleQuotes(v string) string {
+func expressionStringEscape(v string) string {
 	return strings.ReplaceAll(v, "'", "''")
 }
 

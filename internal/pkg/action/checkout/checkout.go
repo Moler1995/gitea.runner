@@ -42,7 +42,8 @@ func Main(ctx context.Context, c *action.Context) (err error) {
 			return fmt.Errorf("checkout: unsupported input %q", name)
 		}
 	}
-	executionOS, _ := c.Container.GetRunnerContext(ctx)["os"].(string)
+	runnerContext := c.Container.GetRunnerContext(ctx)
+	executionOS, _ := runnerContext["os"].(string)
 	windows := strings.EqualFold(executionOS, "windows")
 	dst, err := workspaceDestination(c.Workspace, c.Inputs["path"], windows)
 	if err != nil {
@@ -66,7 +67,7 @@ func Main(ctx context.Context, c *action.Context) (err error) {
 			}
 		}
 		if output := filepath.ToSlash(c.Env["GITHUB_OUTPUT"]); output != "" {
-			return c.Container.Copy(path.Dir(output), &container.FileEntry{Name: path.Base(output), Mode: 0o666, Body: fmt.Sprintf("ref=%s\ncommit=%s\n", ghc.Ref, ghc.Sha)})(ctx)
+			return c.Container.Copy(container.JoinPath(output, ".."), &container.FileEntry{Name: path.Base(output), Mode: 0o666, Body: fmt.Sprintf("ref=%s\ncommit=%s\n", ghc.Ref, ghc.Sha)})(ctx)
 		}
 		return nil
 	}
@@ -117,11 +118,11 @@ func Main(ctx context.Context, c *action.Context) (err error) {
 	}
 
 	// named like actions/checkout's, which create-pull-request knows to hide, and gone with the job
-	runnerTemp, _ := c.Container.GetRunnerContext(ctx)["temp"].(string)
+	runnerTemp, _ := runnerContext["temp"].(string)
 	runnerTemp = filepath.ToSlash(runnerTemp)
 	digest := sha256.Sum256([]byte(dst))
 	credentials := fmt.Sprintf("git-credentials-%x.config", digest[:8])
-	co.credentials = tempPath(runnerTemp, credentials)
+	co.credentials = container.JoinPath(runnerTemp, credentials)
 	persist := boolInput(c.Inputs, "persist-credentials", true)
 	config, remoteConfig := serverConfig(ghc.ServerURL, cmp.Or(c.Inputs["token"], ghc.Token), c.InsecureSkipTLS, co.submodules != "" && sshKey == "")
 	if boolInput(c.Inputs, "set-safe-directory", true) {
@@ -144,21 +145,21 @@ func Main(ctx context.Context, c *action.Context) (err error) {
 		if err := c.Container.Copy(runnerTemp, &container.FileEntry{Name: cert, Mode: 0o600, Body: string(certPEM)}, &container.FileEntry{Name: key, Mode: 0o600, Body: string(keyPEM)})(ctx); err != nil {
 			return err
 		}
-		remoteConfig = append(remoteConfig, git.ClientCertConfig("http."+strings.TrimSuffix(ghc.ServerURL, "/")+"/.", tempPath(runnerTemp, cert), tempPath(runnerTemp, key), executionOS)...)
+		remoteConfig = append(remoteConfig, git.ClientCertConfig("http."+strings.TrimSuffix(ghc.ServerURL, "/")+"/.", container.JoinPath(runnerTemp, cert), container.JoinPath(runnerTemp, key), executionOS)...)
 	}
 	env := gitEnv(c, remoteConfig)
 	env["GIT_LFS_SKIP_SMUDGE"] = strconv.FormatBool(!co.lfs || len(co.sparse) == 0) // lfs pull fetches the objects of a full checkout in one go
 	if sshKey != "" {
 		key := fmt.Sprintf("git-ssh-key-%x", digest[:8])
 		files := []*container.FileEntry{{Name: key, Mode: 0o600, Body: sshKey + "\n"}}
-		ssh := []string{"ssh", "-i", tempPath(runnerTemp, key)}
+		ssh := []string{"ssh", "-i", container.JoinPath(runnerTemp, key)}
 		if boolInput(c.Inputs, "ssh-strict", true) {
 			ssh = append(ssh, "-o", "StrictHostKeyChecking=yes", "-o", "CheckHostIP=no")
 		}
 		if knownHosts := strings.TrimSpace(c.Inputs["ssh-known-hosts"]); knownHosts != "" {
 			name := fmt.Sprintf("git-ssh-known-hosts-%x", digest[:8])
 			files = append(files, &container.FileEntry{Name: name, Mode: 0o600, Body: knownHosts + "\n"})
-			ssh = append(ssh, "-o", "UserKnownHostsFile=~/.ssh/known_hosts "+strconv.Quote(tempPath(runnerTemp, name)))
+			ssh = append(ssh, "-o", "UserKnownHostsFile=~/.ssh/known_hosts "+strconv.Quote(container.JoinPath(runnerTemp, name)))
 		}
 		if !persist {
 			defer func() {
@@ -479,8 +480,4 @@ func fetchDepth(input string) (int, error) {
 		return 0, fmt.Errorf("checkout: fetch-depth %q must be a non-negative integer", input)
 	}
 	return depth, nil
-}
-
-func tempPath(dir, name string) string { // path.Join would collapse the leading // of a UNC directory
-	return strings.TrimSuffix(dir, "/") + "/" + name
 }

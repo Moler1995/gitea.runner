@@ -1113,13 +1113,16 @@ func TestRunContextEnvCaseSensitivity(t *testing.T) {
 			assert.Equal(t, want, evaluated)
 			rc.Env = evaluated
 
-			rc.importHostEnv([]string{"Path=host-path", "HOST_ONLY=value"})
+			rc.importHostEnv([]string{"Path=host-path", "HOST_ONLY=value", "RUNNER_TRACKING_ID=parent", "runner_tracking_id=parent-lower"})
+			assert.NotContains(t, rc.Env, "RUNNER_TRACKING_ID")
 			assert.Equal(t, "workflow-path", rc.Env["PATH"])
 			assert.Equal(t, "value", rc.Env["HOST_ONLY"])
 			if caseInsensitive {
 				assert.NotContains(t, rc.Env, "Path")
+				assert.NotContains(t, rc.Env, "runner_tracking_id")
 			} else {
 				assert.Equal(t, "host-path", rc.Env["Path"])
+				assert.Equal(t, "parent-lower", rc.Env["runner_tracking_id"])
 			}
 		})
 	}

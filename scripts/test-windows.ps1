@@ -1,4 +1,3 @@
-# Runs the test binaries after scripts/test-windows-setup.ps1, reports to the VM's shared folder.
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $results = '\\host.lan\Data'

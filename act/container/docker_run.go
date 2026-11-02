@@ -27,7 +27,6 @@ import (
 
 	"gitea.com/gitea/runner/act/common"
 	"gitea.com/gitea/runner/act/common/logging"
-	"gitea.com/gitea/runner/act/filecollector"
 
 	"github.com/bmatcuk/doublestar/v4"
 	cerrdefs "github.com/containerd/errdefs"
@@ -127,7 +126,7 @@ func (cr *containerReference) Copy(destPath string, files ...*FileEntry) common.
 	return common.NewPipelineExecutor(
 		cr.connect(),
 		cr.find(),
-		cr.copyContent(destPath, runtime.GOOS, files...),
+		cr.copyContent(destPath, files...),
 	).IfNot(common.Dryrun)
 }
 
@@ -136,7 +135,7 @@ func (cr *containerReference) CopyDir(destPath, srcPath string, useGitIgnore, sk
 		common.NewInfoExecutor("docker cp src=%s dst=%s", srcPath, destPath),
 		cr.connect(),
 		cr.find(),
-		cr.copyDir(destPath, srcPath, useGitIgnore, skipGitDir, runtime.GOOS),
+		cr.copyDir(destPath, srcPath, useGitIgnore, skipGitDir),
 		func(ctx context.Context) error {
 			// If this fails, then folders have wrong permissions on non root container
 			if cr.UID != 0 || cr.GID != 0 {
@@ -377,13 +376,18 @@ type containerReference struct {
 	LinuxContainerEnvironmentExtensions
 }
 
-func GetDockerClient(ctx context.Context) (cli client.APIClient, err error) {
+func GetDockerClient(ctx context.Context) (client.APIClient, error) {
+	cli, _, err := newDockerClient(ctx)
+	return cli, err
+}
+
+func newDockerClient(ctx context.Context) (cli client.APIClient, daemonOS string, err error) {
 	dockerHost := os.Getenv("DOCKER_HOST")
 
 	if strings.HasPrefix(dockerHost, "ssh://") {
 		var args []string
 		if args, err = sshArgs(dockerHost); err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		cli, err = client.New(
 			client.WithHost("http://docker.example.com"), // the dialer below ignores the address
@@ -393,16 +397,17 @@ func GetDockerClient(ctx context.Context) (cli client.APIClient, err error) {
 		cli, err = client.New(client.FromEnv)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to docker daemon: %w", err)
+		return nil, "", fmt.Errorf("failed to connect to docker daemon: %w", err)
 	}
 	// Best-effort API version negotiation, matching the old client.NegotiateAPIVersion
 	// behaviour. Ping failures here are non-fatal: the connection is exercised again on
 	// the first real call, and the client falls back to the daemon's default API version.
-	if _, err := cli.Ping(ctx, client.PingOptions{NegotiateAPIVersion: true}); err != nil {
+	ping, err := cli.Ping(ctx, client.PingOptions{NegotiateAPIVersion: true})
+	if err != nil {
 		common.Logger(ctx).Warnf("docker daemon ping during version negotiation failed, continuing: %v", err)
 	}
 
-	return cli, nil
+	return cli, ping.OSType, nil
 }
 
 func GetHostInfo(ctx context.Context) (system.Info, error) {
@@ -454,11 +459,8 @@ func (cr *containerReference) targetOS(ctx context.Context) string {
 	return cr.daemonOS
 }
 
-func (cr *containerReference) copyTargetOS(ctx context.Context, hostOS string) string {
-	if hostOS == "windows" {
-		return cr.targetOS(ctx)
-	}
-	return ""
+func (cr *containerReference) markExecutable(ctx context.Context) bool {
+	return hostOS == "windows" && cr.targetOS(ctx) == "linux"
 }
 
 func (cr *containerReference) connect() common.Executor {
@@ -466,11 +468,11 @@ func (cr *containerReference) connect() common.Executor {
 		if cr.cli != nil {
 			return nil
 		}
-		cli, err := GetDockerClient(ctx)
+		cli, daemonOS, err := newDockerClient(ctx)
 		if err != nil {
 			return err
 		}
-		cr.cli = cli
+		cr.cli, cr.daemonOS = cli, daemonOS
 		return nil
 	}
 }
@@ -916,7 +918,7 @@ func (cr *containerReference) waitForCommand(ctx context.Context, resp client.Hi
 	}
 }
 
-func (cr *containerReference) copyDir(dstPath, srcPath string, useGitIgnore, skipGitDir bool, hostOS string) common.Executor {
+func (cr *containerReference) copyDir(dstPath, srcPath string, useGitIgnore, skipGitDir bool) common.Executor {
 	dstPath = path.Clean(dstPath)
 	return func(ctx context.Context) error {
 		if cr.id == "" {
@@ -940,7 +942,7 @@ func (cr *containerReference) copyDir(dstPath, srcPath string, useGitIgnore, ski
 		if actPath := cr.GetActPath(); strings.HasPrefix(dstPath+"/", actPath+"/") {
 			extractionRoot = actPath // keeps tar entries from crossing the image's /var/run symlink
 		}
-		if err := writeDirTar(ctx, tarFile, path.Join("/", strings.TrimPrefix(dstPath, extractionRoot)), srcPath, useGitIgnore, skipGitDir, cr.UID, cr.GID, hostOS, cr.copyTargetOS(ctx, hostOS)); err != nil {
+		if err := writeDirTar(ctx, tarFile, path.Join("/", strings.TrimPrefix(dstPath, extractionRoot)), srcPath, useGitIgnore, skipGitDir, cr.UID, cr.GID, cr.markExecutable(ctx)); err != nil {
 			return err
 		}
 
@@ -952,32 +954,19 @@ func (cr *containerReference) copyDir(dstPath, srcPath string, useGitIgnore, ski
 	}
 }
 
-func (cr *containerReference) copyContent(dstPath, hostOS string, files ...*FileEntry) common.Executor {
+func (cr *containerReference) copyContent(dstPath string, files ...*FileEntry) common.Executor {
 	return func(ctx context.Context) error {
 		if cr.id == "" {
 			return cr.missingContainerError("copy to %s", dstPath)
 		}
 		var buf bytes.Buffer
-		if err := writeFilesTar(ctx, &buf, cr.UID, cr.GID, containerCopyFiles(files, hostOS, cr.copyTargetOS(ctx, hostOS))...); err != nil {
+		if err := writeFilesTar(ctx, &buf, cr.UID, cr.GID, files...); err != nil {
 			return err
 		}
 
 		common.Logger(ctx).Debugf("Extracting content to '%s'", dstPath)
 		return cr.upload(ctx, dstPath, &buf)
 	}
-}
-
-func containerCopyFiles(files []*FileEntry, hostOS, serverOS string) []*FileEntry {
-	if hostOS != "windows" || serverOS != "linux" {
-		return files
-	}
-	normalized := make([]*FileEntry, 0, len(files))
-	for _, file := range files {
-		entry := *file
-		entry.Mode = filecollector.ContainerMode(entry.Mode, hostOS, serverOS)
-		normalized = append(normalized, &entry)
-	}
-	return normalized
 }
 
 func (cr *containerReference) upload(ctx context.Context, dstPath string, content io.Reader) error {

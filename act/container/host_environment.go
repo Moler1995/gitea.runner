@@ -9,7 +9,6 @@ import (
 	"bytes"
 	"cmp"
 	"context"
-	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
@@ -41,19 +40,15 @@ type HostEnvironment struct {
 	// when Workdir points at a caller-owned checkout (e.g. `act` local mode).
 	CleanWorkdir bool
 	ActPath      string
-	Root         string // per-job scratch directory holding Path and TmpDir, removed on teardown
+	Root         string
+	TrackingID   string // RUNNER_TRACKING_ID of the job, a step with another value keeps its leftovers
 	StdOut       io.Writer
 	AllocatePTY  bool // allocate a pseudo-TTY for each step's process
 
-	trackingOnce  sync.Once
-	trackingID    string
+	// procGroup owns every process the job's steps start. Atomic: Remove may read
+	// it while a step is still starting.
 	procGroupOnce sync.Once
-	procGroup     atomic.Pointer[process.Group] // Remove may run while a tracked step starts.
-}
-
-func (e *HostEnvironment) TrackingID() string {
-	e.trackingOnce.Do(func() { e.trackingID = "gitea_" + rand.Text() })
-	return e.trackingID
+	procGroup     atomic.Pointer[process.Group]
 }
 
 // processGroup returns the job-scoped process group, creating it on first use.
@@ -277,17 +272,12 @@ func (e *HostEnvironment) exec(ctx context.Context, command []string, cmdline st
 	cmd.Path = f
 	cmd.Args = command
 	cmd.Stdout = e.StdOut
-	cmd.Env = getEnvListFromMap(env)
-	trackingID := e.TrackingID()
-	effectiveTrackingID := trackingID
-	for _, entry := range cmd.Env {
-		name, value, _ := strings.Cut(entry, "=")
-		if name == "RUNNER_TRACKING_ID" || runtime.GOOS == "windows" && strings.EqualFold(name, "RUNNER_TRACKING_ID") {
-			effectiveTrackingID = value
-		}
+	trackingID := e.TrackingID
+	if value, ok := common.LookupFold(env, "RUNNER_TRACKING_ID", e.IsEnvironmentCaseInsensitive()); ok {
+		trackingID = value
 	}
-	cmd.Env = append(cmd.Env, "RUNNER_TRACKING_ID="+effectiveTrackingID)
-	tracked := strings.EqualFold(effectiveTrackingID, trackingID)
+	tracked := trackingID == e.TrackingID
+	cmd.Env = append(getEnvListFromMap(env), "RUNNER_TRACKING_ID="+trackingID)
 	cmd.Stderr = e.StdOut
 	cmd.Dir = wd
 	cmd.SysProcAttr = process.SysProcAttr(cmdline, false)
@@ -383,9 +373,7 @@ func (e *HostEnvironment) UpdateFromEnv(srcPath string, env *map[string]string) 
 // removeAll is a var so tests can substitute a blocking stub.
 var removeAll = os.RemoveAll
 
-// removeAllWithContext returns once the delete finishes or ctx is cancelled. On
-// cancellation the goroutine leaks: a delete inside a syscall cannot be
-// interrupted, and leaking scratch state beats losing the runner's capacity slot.
+// Returns on cancel while an uninterruptible delete keeps running, freeing the runner's capacity slot.
 func removeAllWithContext(ctx context.Context, path string) error {
 	done := make(chan error, 1)
 	go func() { done <- removeAll(path) }()
@@ -460,7 +448,7 @@ func (e *HostEnvironment) terminateRunningProcesses(ctx context.Context) {
 		return
 	}
 
-	if killed, err := process.KillProcessesWithPaths(killCtx, dirs, e.TrackingID()); err != nil {
+	if killed, err := process.KillProcessesWithPaths(killCtx, dirs, e.TrackingID); err != nil {
 		logger.Debugf("workspace process cleanup reported errors: %v", err)
 	} else if killed > 0 {
 		logger.Debugf("terminated %d leftover workspace process(es)", killed)

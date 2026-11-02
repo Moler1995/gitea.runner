@@ -172,17 +172,19 @@ func TestWindowsHostContainerActions(t *testing.T) {
 		{name: "Windows with Linux job container", hostOS: "windows", jobContainer: &containerMock{}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			original := hostOS
+			hostOS = test.hostOS
+			t.Cleanup(func() { hostOS = original })
 			rc := &RunContext{JobContainer: test.jobContainer, kubernetes: true}
 			wantError := errKubernetesDocker.Error()
 			if test.wantError {
-				wantError = "container actions and docker:// steps are not supported in Windows host jobs"
+				wantError = errWindowsHostContainer.Error()
 			}
 			t.Run("docker step", func(t *testing.T) {
-				require.EqualError(t, (&stepDocker{RunContext: rc}).runUsesContainerForOS(test.hostOS)(t.Context()), wantError)
+				require.EqualError(t, (&stepDocker{RunContext: rc}).runUsesContainer()(t.Context()), wantError)
 			})
 			t.Run("container action", func(t *testing.T) {
-				require.EqualError(t, execAsDockerForOS(t.Context(), &stepActionRemote{RunContext: rc},
-					"action", "", "", false, stepStageMain, test.hostOS), wantError)
+				require.EqualError(t, execAsDocker(t.Context(), &stepActionRemote{RunContext: rc}, "action", "", "", false, stepStageMain), wantError)
 			})
 		})
 	}

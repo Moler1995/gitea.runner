@@ -578,13 +578,27 @@ func tryUploadJobSummary(ctx context.Context, rc *RunContext) {
 		longestMask = max(longestMask, len(maskers[i]))
 	}
 	masker := NewSecretReplacer(maskers)
+	limit := maxJobSummaryBytes + longestMask
 	for i := range rc.Run.Job().Steps {
-		summaryPath := path.Join(actPath, "workflow", "step-summary-"+strconv.Itoa(i)+".md")
-		body, ok := readSingleFileFromContainerArchive(ctx, rc.JobContainer, summaryPath, int64(maxJobSummaryBytes+longestMask+len(jobSummaryTruncationMarker)+1))
+		summaryPath := container.JoinPath(actPath, "workflow", "step-summary-"+strconv.Itoa(i)+".md")
+		body, ok := readSingleFileFromContainerArchive(ctx, rc.JobContainer, summaryPath, int64(limit+1))
 		if !ok || len(body) == 0 {
 			continue
 		}
-		body = truncateJobSummary(ctx, []byte(masker.Replace(string(body))), summaryPath, maxJobSummaryBytes)
+		masked := masker.Replace(string(body))
+		split := len(body) > limit
+		if split { // the read can end inside a secret, so keep only what masks alike without the lookahead
+			unsplit := masker.Replace(string(body[:maxJobSummaryBytes]))
+			kept := 0
+			for kept < len(unsplit) && kept < len(masked) && unsplit[kept] == masked[kept] {
+				kept++
+			}
+			for kept > 0 && kept < len(masked) && !utf8.RuneStart(masked[kept]) {
+				kept--
+			}
+			masked = masked[:kept]
+		}
+		body = truncateJobSummary(ctx, []byte(masked), summaryPath, maxJobSummaryBytes, split)
 		uploadJobSummary(ctx, client, base+strconv.Itoa(i)+"/summary", runtimeToken, body)
 	}
 }
@@ -707,17 +721,16 @@ func readSingleFileFromContainerArchive(ctx context.Context, env container.Execu
 	}
 }
 
-func truncateJobSummary(ctx context.Context, body []byte, summaryPath string, maxBytes int64) []byte {
-	if int64(len(body)) > maxBytes {
-		marker := []byte(jobSummaryTruncationMarker)
-		keep := max(maxBytes-int64(len(marker)), 0)
-		for keep > 0 && !utf8.RuneStart(body[keep]) {
-			keep--
-		}
-		body = append(body[:keep], marker...)
-		common.Logger(ctx).Warnf("job summary truncated: path=%s max=%d", summaryPath, maxBytes)
+func truncateJobSummary(ctx context.Context, body []byte, summaryPath string, maxBytes int, split bool) []byte {
+	if !split && len(body) <= maxBytes {
+		return body
 	}
-	return body
+	keep := max(min(len(body), maxBytes-len(jobSummaryTruncationMarker)), 0)
+	for keep > 0 && keep < len(body) && !utf8.RuneStart(body[keep]) {
+		keep--
+	}
+	common.Logger(ctx).Warnf("job summary truncated: path=%s max=%d", summaryPath, maxBytes)
+	return append(body[:keep], jobSummaryTruncationMarker...)
 }
 
 // useJobStageLogger tags the log entries of a job level executor with the stage they belong to.

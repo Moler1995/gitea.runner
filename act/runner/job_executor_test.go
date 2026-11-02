@@ -934,26 +934,7 @@ func TestExtractJobIDFromRuntimeToken(t *testing.T) {
 	assert.Equal(t, int64(0), extractJobIDFromRuntimeToken(""))
 }
 
-func TestReadSingleFileFromContainerArchiveFindsMatchingRegularFile(t *testing.T) {
-	ctx := t.Context()
-	cm := &containerMock{}
-	cm.On("GetContainerArchive", ctx, "/var/run/act/workflow/SUMMARY.md").Return(
-		io.NopCloser(bytes.NewReader(tarArchive(t,
-			tarEntry{name: "workflow", typeflag: tar.TypeDir},
-			tarEntry{name: "other.md", body: "wrong"},
-			tarEntry{name: "SUMMARY.md", body: "right"},
-		))),
-		nil,
-	).Once()
-
-	body, ok := readSingleFileFromContainerArchive(ctx, cm, "/var/run/act/workflow/SUMMARY.md", maxJobSummaryBytes)
-
-	assert.True(t, ok)
-	assert.Equal(t, []byte("right"), body)
-	cm.AssertExpectations(t)
-}
-
-func TestReadSingleFileFromContainerArchiveSizeLimit(t *testing.T) {
+func TestReadSingleFileFromContainerArchive(t *testing.T) {
 	retainedBytes := 200 - len(jobSummaryTruncationMarker)
 	for name, tt := range map[string]struct {
 		content  string
@@ -971,21 +952,23 @@ func TestReadSingleFileFromContainerArchiveSizeLimit(t *testing.T) {
 			logger, hook := logtest.NewLogger()
 			ctx := common.WithLogger(t.Context(), logger)
 			cm := &containerMock{}
-			archive := bytes.NewReader(tarArchive(t, tarEntry{name: "SUMMARY.md", body: tt.content}))
+			archive := bytes.NewReader(tarArchive(t,
+				tarEntry{name: "workflow", typeflag: tar.TypeDir},
+				tarEntry{name: "other.md", body: "wrong"},
+				tarEntry{name: "SUMMARY.md", body: tt.content},
+			))
 			cm.On("GetContainerArchive", ctx, "/var/run/act/workflow/SUMMARY.md").Return(
 				io.NopCloser(archive),
 				nil,
 			).Once()
 
 			body, ok := readSingleFileFromContainerArchive(ctx, cm, "/var/run/act/workflow/SUMMARY.md", tt.maxBytes+1)
-			body = truncateJobSummary(ctx, body, "/var/run/act/workflow/SUMMARY.md", tt.maxBytes)
+			assert.LessOrEqual(t, int64(len(body)), tt.maxBytes+1)
+			body = truncateJobSummary(ctx, body, "/var/run/act/workflow/SUMMARY.md", int(tt.maxBytes), false)
 
 			assert.True(t, ok)
 			assert.Equal(t, []byte(tt.want), body)
 			assert.LessOrEqual(t, int64(len(body)), tt.maxBytes)
-			if len(tt.content) > 8192 {
-				assert.Positive(t, archive.Len())
-			}
 			if strings.HasSuffix(tt.want, jobSummaryTruncationMarker) {
 				if assert.Len(t, hook.AllRecords(), 1) {
 					assert.Contains(t, hook.LastRecord().Message, "job summary truncated")
@@ -1128,11 +1111,33 @@ func TestTryUploadJobSummaryMasksSecrets(t *testing.T) {
 	const prefix = "deployed true with s3cr3t and runtime-added via pr0xypw 😀"
 	const maskedPrefix = "deployed true with *** and *** via *** 😀"
 	padding := strings.Repeat("a", maxJobSummaryBytes-len(jobSummaryTruncationMarker)-len(prefix)-2)
-	for name, encoding := range map[string]encoding.Encoding{
-		"UTF-8":        unicode.UTF8,
-		"UTF-8 BOM":    unicode.UTF8BOM,
-		"UTF-16LE BOM": unicode.UTF16(unicode.LittleEndian, unicode.UseBOM),
-		"UTF-16BE BOM": unicode.UTF16(unicode.BigEndian, unicode.UseBOM),
+	content := prefix + padding + "s3cr3t" + strings.Repeat("中", 100)
+	want := maskedPrefix + padding + "***" + strings.Repeat("中", (len(prefix)-len(maskedPrefix)-1)/3) + jobSummaryTruncationMarker
+	longSecret := "PREFIX" + strings.Repeat("xy", 100) + "Z"
+	readLimit := maxJobSummaryBytes + base64.StdEncoding.EncodedLen(len(longSecret)) + 1
+	shrinkingPrefix := strings.Repeat(longSecret, (readLimit-len(longSecret)+1)/len(longSecret))
+	for name, testcase := range map[string]struct {
+		encoding      encoding.Encoding
+		content, want string
+		masks         []string
+	}{
+		"UTF-8":                    {unicode.UTF8, content, want, nil},
+		"UTF-8 BOM":                {unicode.UTF8BOM, content, want, nil},
+		"UTF-16LE BOM":             {unicode.UTF16(unicode.LittleEndian, unicode.UseBOM), content, want, nil},
+		"UTF-16BE BOM":             {unicode.UTF16(unicode.BigEndian, unicode.UseBOM), content, want, nil},
+		"secret split by the read": {unicode.UTF8, strings.Repeat("s3cr3t", maxJobSummaryBytes/3), "", nil},
+		"split read keeps every masked secret before the limit": {
+			unicode.UTF8,
+			"# public\n" + strings.Repeat(longSecret, readLimit/len(longSecret)+1),
+			"# public\n" + strings.Repeat("***", (maxJobSummaryBytes-len("# public\n"))/len(longSecret)) + jobSummaryTruncationMarker,
+			[]string{longSecret},
+		},
+		"nested secret expands the split tail": {
+			unicode.UTF8,
+			shrinkingPrefix + strings.Repeat("*", readLimit-len(shrinkingPrefix)-len(longSecret)+1) + longSecret,
+			"",
+			[]string{"xy", longSecret},
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			var got string
@@ -1144,7 +1149,7 @@ func TestTryUploadJobSummaryMasksSecrets(t *testing.T) {
 			}))
 			defer server.Close()
 
-			content, err := encoding.NewEncoder().Bytes([]byte(prefix + padding + "s3cr3t" + strings.Repeat("中", 100)))
+			content, err := testcase.encoding.NewEncoder().Bytes([]byte(testcase.content))
 			require.NoError(t, err)
 			cm := &containerMock{}
 			cm.On("GetContainerArchive", mock.Anything, "/var/run/act/workflow/step-summary-0.md").Return(
@@ -1161,12 +1166,16 @@ func TestTryUploadJobSummaryMasksSecrets(t *testing.T) {
 				"GITEA_RUN_ID":               "12",
 			}, cm, 1)
 			rc.Config.Secrets = map[string]string{"TOK": "s3cr3t", "ACTIONS_STEP_DEBUG": "true"}
-			rc.Config.ExtraMasks = []string{"pr0xypw"}
+			rc.Config.ExtraMasks = append([]string{"pr0xypw"}, testcase.masks...)
 			rc.Masks = []string{"runtime-added"}
 
 			tryUploadJobSummary(t.Context(), rc)
 
-			assert.Equal(t, maskedPrefix+padding+"***"+strings.Repeat("中", (len(prefix)-len(maskedPrefix)-1)/3)+jobSummaryTruncationMarker, got)
+			if testcase.want == "" {
+				assert.Equal(t, jobSummaryTruncationMarker, strings.TrimLeft(got, "*"))
+			} else {
+				assert.Equal(t, testcase.want, got)
+			}
 			cm.AssertExpectations(t)
 		})
 	}

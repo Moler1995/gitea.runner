@@ -81,8 +81,8 @@ type RunContext struct {
 	jobRunDefaults      model.RunDefaults // defaults.run, resolved once at job setup as GitHub does
 	platformImage       string            // container.image or the runs-on pick, resolved once by isEnabled
 	jobIndex, jobTotal  int               // strategy.job-index and job-total, total 0 when unknown
-	trackingID          string
-	runtimeToken        string // ACTIONS_RUNTIME_TOKEN of the workflow run, shared with its called workflows and composite actions
+	trackingID          string            // RUNNER_TRACKING_ID of the job, generated on first use
+	runtimeToken        string            // ACTIONS_RUNTIME_TOKEN of the workflow run, shared with its called workflows and composite actions
 
 	jobEnv             map[string]string          // workflow and job env as evaluated for the container and service specs
 	dockerActionImages map[*model.Step]string     // Dockerfile action images built for this job, removed when it ends
@@ -431,6 +431,7 @@ func (rc *RunContext) startHostEnvironment() common.Executor {
 			CleanWorkdir: rc.Config.CleanWorkdir,
 			ActPath:      actPath,
 			Root:         miscpath,
+			TrackingID:   rc.runnerTrackingID(),
 			StdOut:       logWriter,
 			AllocatePTY:  rc.Config.AllocatePTY,
 		}
@@ -440,6 +441,14 @@ func (rc *RunContext) startHostEnvironment() common.Executor {
 
 		return rc.copyWorkflowFiles()(ctx)
 	}
+}
+
+func (rc *RunContext) runnerTrackingID() string {
+	job := rc.topLevelRunContext()
+	if job.trackingID == "" {
+		job.trackingID = "gitea_" + rand.Text()
+	}
+	return job.trackingID
 }
 
 func (rc *RunContext) isEnvCaseInsensitive() bool {
@@ -452,7 +461,10 @@ func (rc *RunContext) isEnvCaseInsensitive() bool {
 func (rc *RunContext) importHostEnv(environ []string) {
 	for _, env := range environ {
 		if key, value, ok := strings.Cut(env, "="); ok {
-			_, exists := lookupFold(rc.Env, key, rc.isEnvCaseInsensitive())
+			if key == "RUNNER_TRACKING_ID" || rc.isEnvCaseInsensitive() && strings.EqualFold(key, "RUNNER_TRACKING_ID") {
+				continue
+			}
+			_, exists := common.LookupFold(rc.Env, key, rc.isEnvCaseInsensitive())
 			if !exists {
 				rc.Env[key] = value
 			}
@@ -479,6 +491,15 @@ func (rc *RunContext) setRunnerContextEnv(ctx context.Context) {
 }
 
 var errKubernetesDocker = errors.New("docker actions and docker:// steps are not supported on Kubernetes")
+
+var errWindowsHostContainer = errors.New("container actions and docker:// steps are not supported in Windows host jobs")
+
+var hostOS = runtime.GOOS // replaced in tests
+
+func (rc *RunContext) isWindowsHost() bool {
+	_, host := rc.JobContainer.(*container.HostEnvironment)
+	return host && hostOS == "windows"
+}
 
 func (rc *RunContext) startKubernetesPod() common.Executor {
 	return func(ctx context.Context) error {
@@ -1546,15 +1567,7 @@ func (rc *RunContext) getGithubContext(ctx context.Context) *model.GithubContext
 		ghc.EventPath = rc.JobContainer.GetActPath() + "/workflow/event.json"
 	}
 
-	if hostEnv, ok := rc.JobContainer.(*container.HostEnvironment); ok {
-		ghc.RunnerTrackingID = hostEnv.TrackingID()
-	} else {
-		job := rc.topLevelRunContext()
-		if job.trackingID == "" {
-			job.trackingID = "gitea_" + rand.Text()
-		}
-		ghc.RunnerTrackingID = job.trackingID
-	}
+	ghc.RunnerTrackingID = rc.runnerTrackingID()
 
 	if preset := rc.Config.PresetGitHubContext; preset != nil {
 		merged := *preset
@@ -1678,7 +1691,9 @@ func (rc *RunContext) withGithubEnv(ctx context.Context, github *model.GithubCon
 	env["GITHUB_REPOSITORY_OWNER"] = github.RepositoryOwner
 	env["GITHUB_RETENTION_DAYS"] = github.RetentionDays
 	env["RUNNER_PERFLOG"] = github.RunnerPerflog
-	env["RUNNER_TRACKING_ID"] = github.RunnerTrackingID
+	if _, ok := common.LookupFold(env, "RUNNER_TRACKING_ID", rc.isEnvCaseInsensitive()); !ok {
+		env["RUNNER_TRACKING_ID"] = github.RunnerTrackingID
+	}
 	env["GITHUB_BASE_REF"] = github.BaseRef
 	env["GITHUB_HEAD_REF"] = github.HeadRef
 	env["GITHUB_SERVER_URL"] = github.ServerURL

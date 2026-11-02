@@ -8,11 +8,10 @@ import (
 	"strings"
 )
 
-// lookPathWindows falls back to Git's bash when PATH has no bash or only the System32 WSL launcher.
 func lookPathWindows(file string, env map[string]string, lookup func(string, map[string]string) (string, error)) (string, error) {
 	found, err := lookup(file, env)
 	isBash := strings.EqualFold(file, "bash") || strings.EqualFold(file, "bash.exe")
-	if !isBash || err == nil && !strings.EqualFold(filepath.Base(filepath.Dir(found)), "System32") {
+	if !isBash || err == nil && !strings.EqualFold(filepath.Base(filepath.Dir(found)), "System32") { // System32's bash is the WSL launcher, Git's bash replaces it
 		return found, err
 	}
 	if git, gitErr := lookup("git.exe", env); gitErr == nil {

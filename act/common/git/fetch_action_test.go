@@ -414,6 +414,7 @@ func TestExtractTreeCopiesDeferredLinks(t *testing.T) {
 		{name: "outside", links: [][2]string{{"index.js", "../outside.js"}}, text: true},
 		{name: "absolute", links: [][2]string{{"index.js", t.TempDir()}}, text: true},
 		{name: "dangling", links: [][2]string{{"index.js", "missing.js"}}, text: true},
+		{name: "dangling child of directory link", links: [][2]string{{"lib", "dist"}, {"dist/optional", "missing.js"}}, files: []string{"lib/index.js", "lib/nested/index.js"}},
 		{name: "cycle", links: [][2]string{{"index.js", "entry.js"}, {"entry.js", "index.js"}}, text: true},
 		{name: "directory cycle", links: [][2]string{{"dist/loop", "."}}, text: true},
 	} {
@@ -487,17 +488,17 @@ func TestTreeIntactFindsNamesThatAreNotUTF8(t *testing.T) {
 	assert.True(t, treeIntact(dir, sha))
 }
 
-func TestExtractTreeCreatesLinksInDependencyOrder(t *testing.T) {
+func TestExtractTreeCreatesLinksInPlatformOrder(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("requires symlink privileges")
 	}
-	original := symlink
+	original, originalFallback := symlink, symlinkFallback
 	var created []string
 	symlink = func(root *os.Root, target, name string) error {
 		created = append(created, name)
 		return root.Symlink(target, name)
 	}
-	t.Cleanup(func() { symlink = original })
+	t.Cleanup(func() { symlink, symlinkFallback = original, originalFallback })
 
 	var archive bytes.Buffer
 	writer := tar.NewWriter(&archive)
@@ -511,9 +512,22 @@ func TestExtractTreeCreatesLinksInDependencyOrder(t *testing.T) {
 		require.NoError(t, writer.WriteHeader(entry))
 	}
 	require.NoError(t, writer.Close())
-	_, err := extractTree(t.Context(), &archive, t.TempDir(), false)
-	require.NoError(t, err)
-	assert.Equal(t, []string{"b", "a", "dangling"}, created)
+	for _, test := range []struct {
+		name     string
+		fallback bool
+		want     []string
+	}{
+		{name: "native", want: []string{"a", "b", "dangling"}},
+		{name: "fallback", fallback: true, want: []string{"b", "a", "dangling"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			symlinkFallback = test.fallback
+			created = nil
+			_, err := extractTree(t.Context(), bytes.NewReader(archive.Bytes()), t.TempDir(), false)
+			require.NoError(t, err)
+			assert.Equal(t, test.want, created)
+		})
+	}
 }
 
 func TestCopyTreeLinkCancellationBetweenEntries(t *testing.T) {
@@ -533,7 +547,7 @@ func TestCopyTreeLinkCancellationBetweenEntries(t *testing.T) {
 			cancel()
 		}
 	}}
-	require.ErrorIs(t, copyTreeLink(observed, root, "copy", map[string]string{"copy": "source"}, sizes), context.Canceled)
+	require.ErrorIs(t, copyTreeLink(observed, root, "copy", map[string]string{"copy": "source"}, nil, sizes), context.Canceled)
 	assert.Len(t, sizes, 1)
 }
 

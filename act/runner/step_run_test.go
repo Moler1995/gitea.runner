@@ -82,7 +82,7 @@ func TestStepRun(t *testing.T) {
 
 func TestStepRunShellParity(t *testing.T) {
 	const powershellScript = "$ErrorActionPreference = 'stop'\n$OutputEncoding = [System.Text.UTF8Encoding]::new($false)\ntry { [Console]::OutputEncoding = $OutputEncoding } catch {}\necho 你好，世界\nif ((Test-Path -LiteralPath variable:/LASTEXITCODE)) { exit $LASTEXITCODE }"
-	type shellTest struct {
+	for _, test := range []struct {
 		name, run, shell, workingDir string
 		hostOS, wantCmdline          string
 		actPath                      string
@@ -93,8 +93,7 @@ func TestStepRunShellParity(t *testing.T) {
 		wantCmd                      []string
 		wantScript                   string
 		wantErr                      string
-	}
-	tests := []shellTest{
+	}{
 		{
 			name:    "implicit host bash",
 			host:    true,
@@ -177,6 +176,12 @@ func TestStepRunShellParity(t *testing.T) {
 			hostOS:  "windows",
 			wantErr: "expected a double-quoted executable",
 		},
+		{name: "linux builtin bash quotes script path", shell: "bash", actPath: `C:/Users/Jane Doe/O'Brien`, wantCmd: []string{"bash", "--noprofile", "--norc", "-e", "-o", "pipefail", `C:/Users/Jane Doe/O'Brien/workflow/1.sh`}},
+		{name: "linux builtin sh quotes script path", shell: "sh", actPath: `C:/Users/Jane Doe/O'Brien`, wantCmd: []string{"sh", "-e", `C:/Users/Jane Doe/O'Brien/workflow/1.sh`}},
+		{name: "linux builtin python quotes script path", shell: "python", actPath: `C:/Users/Jane Doe/O'Brien`, wantExt: ".py", wantCmd: []string{"python", `C:/Users/Jane Doe/O'Brien/workflow/1.py`}},
+		{name: "windows builtin bash quotes script path", shell: "bash", hostOS: "windows", actPath: `C:\Users\Jane Doe\O'Brien`, wantExt: ".sh", wantCmd: []string{"bash"}, wantCmdline: `bash --noprofile --norc -e -o pipefail "{0}"`},
+		{name: "windows builtin sh quotes script path", shell: "sh", hostOS: "windows", actPath: `C:\Users\Jane Doe\O'Brien`, wantExt: ".sh", wantCmd: []string{"sh"}, wantCmdline: `sh -e "{0}"`},
+		{name: "windows builtin python quotes script path", shell: "python", hostOS: "windows", actPath: `C:\Users\Jane Doe\O'Brien`, wantExt: ".py", wantCmd: []string{"python"}, wantCmdline: `python "{0}"`},
 		{
 			name:    "missing placeholder",
 			shell:   "bash -e",
@@ -210,41 +215,7 @@ func TestStepRunShellParity(t *testing.T) {
 			workingDir: "${{ DIR }}",
 			wantErr:    "unable to interpolate the working directory:",
 		},
-	}
-
-	for _, hostOS := range []string{"linux", "windows"} {
-		for _, shell := range []string{"bash", "sh", "python"} {
-			extension := ".sh"
-			if shell == "python" {
-				extension = ".py"
-			}
-			command := []string{shell}
-			switch shell {
-			case "bash":
-				command = append(command, "--noprofile", "--norc", "-e", "-o", "pipefail")
-			case "sh":
-				command = append(command, "-e")
-			}
-			actPath := `C:/Users/Jane Doe/O'Brien`
-			if hostOS == "windows" {
-				actPath = `C:\Users\Jane Doe\O'Brien`
-			}
-			scriptPath := (&container.HostEnvironment{ActPath: actPath}).GetActPath() + "/workflow/1" + extension
-			cmdline := ""
-			if hostOS == "windows" {
-				cmdline = strings.Join(command, " ") + ` "` + scriptPath + `"`
-				command = command[:1]
-			} else {
-				command = append(command, scriptPath)
-			}
-			tests = append(tests, shellTest{
-				name: hostOS + " builtin " + shell + " quotes script path", shell: shell, hostOS: hostOS,
-				actPath: actPath, wantExt: extension, wantCmd: command, wantCmdline: cmdline,
-			})
-		}
-	}
-
-	for _, test := range tests {
+	} {
 		t.Run(test.name, func(t *testing.T) {
 			cm := &containerMock{}
 			var jobContainer container.ExecutionsEnvironment = &shellContainerMock{cm}
@@ -275,7 +246,10 @@ func TestStepRunShellParity(t *testing.T) {
 				env:  test.env,
 			}
 
-			name, script, err := sr.setupShellCommandForOS(t.Context(), cmp.Or(test.hostOS, "linux"))
+			original := hostOS
+			hostOS = cmp.Or(test.hostOS, "linux")
+			t.Cleanup(func() { hostOS = original })
+			name, script, err := sr.setupShellCommand(t.Context())
 			if test.wantErr != "" {
 				require.ErrorContains(t, err, test.wantErr)
 				return

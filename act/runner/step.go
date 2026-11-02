@@ -70,12 +70,12 @@ func (s stepStage) String() string {
 
 func processRunnerEnvFileCommand(ctx context.Context, fileName string, rc *RunContext, setter func(context.Context, map[string]string, string)) error {
 	if rc.JobContainer.IsEnvironmentCaseInsensitive() {
-		return container.ParseEnvFile(rc.JobContainer, path.Join(rc.JobContainer.GetActPath(), fileName), func(name, value string) {
+		return container.ParseEnvFile(rc.JobContainer, container.JoinPath(rc.JobContainer.GetActPath(), fileName), func(name, value string) {
 			setter(ctx, map[string]string{"name": name}, value)
 		}, true)(ctx)
 	}
 	env := map[string]string{}
-	err := rc.JobContainer.UpdateFromEnv(path.Join(rc.JobContainer.GetActPath(), fileName), &env)(ctx)
+	err := rc.JobContainer.UpdateFromEnv(container.JoinPath(rc.JobContainer.GetActPath(), fileName), &env)(ctx)
 	for key, value := range env {
 		setter(ctx, map[string]string{"name": key}, value)
 	}
@@ -144,16 +144,16 @@ func runStepExecutor(step step, stage stepStage, executor common.Executor) commo
 		actPath := rc.JobContainer.GetActPath()
 
 		outputFileCommand := path.Join("workflow", "outputcmd.txt")
-		(*step.getEnv())["GITHUB_OUTPUT"] = path.Join(actPath, outputFileCommand)
+		(*step.getEnv())["GITHUB_OUTPUT"] = container.JoinPath(actPath, outputFileCommand)
 
 		stateFileCommand := path.Join("workflow", "statecmd.txt")
-		(*step.getEnv())["GITHUB_STATE"] = path.Join(actPath, stateFileCommand)
+		(*step.getEnv())["GITHUB_STATE"] = container.JoinPath(actPath, stateFileCommand)
 
 		pathFileCommand := path.Join("workflow", "pathcmd.txt")
-		(*step.getEnv())["GITHUB_PATH"] = path.Join(actPath, pathFileCommand)
+		(*step.getEnv())["GITHUB_PATH"] = container.JoinPath(actPath, pathFileCommand)
 
 		envFileCommand := path.Join("workflow", "envs.txt")
-		(*step.getEnv())["GITHUB_ENV"] = path.Join(actPath, envFileCommand)
+		(*step.getEnv())["GITHUB_ENV"] = container.JoinPath(actPath, envFileCommand)
 
 		// Per-step summary file. Composite sub-steps share the outer job step's index
 		// via the Parent chain so all writes from within a composite action accumulate
@@ -161,7 +161,7 @@ func runStepExecutor(step step, stage stepStage, executor common.Executor) commo
 		topRC := rc.topLevelRunContext()
 		stepSummaryIndex := topRC.CurrentStepIndex
 		summaryFileCommand := path.Join("workflow", "step-summary-"+strconv.Itoa(stepSummaryIndex)+".md")
-		(*step.getEnv())["GITHUB_STEP_SUMMARY"] = path.Join(actPath, summaryFileCommand)
+		(*step.getEnv())["GITHUB_STEP_SUMMARY"] = container.JoinPath(actPath, summaryFileCommand)
 		aliasGiteaEnv(*step.getEnv())
 
 		// Reset the per-phase file-command files. GITHUB_STEP_SUMMARY is intentionally
@@ -208,7 +208,7 @@ func runStepExecutor(step step, stage stepStage, executor common.Executor) commo
 			if fileErr := processRunnerEnvFileCommand(fileCommandCtx, outputFileCommand, rc, rc.setOutput); fileErr != nil && err == nil {
 				err = fileErr
 			}
-			if fileErr := rc.UpdateExtraPath(fileCommandCtx, path.Join(actPath, pathFileCommand)); fileErr != nil && err == nil {
+			if fileErr := rc.UpdateExtraPath(fileCommandCtx, container.JoinPath(actPath, pathFileCommand)); fileErr != nil && err == nil {
 				err = fileErr
 			}
 		}

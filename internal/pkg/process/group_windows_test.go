@@ -16,7 +16,7 @@ func TestGroupClosePropagatesToOrphan(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = group.Close() })
 
-	cmd, ready := newTestProcess(t, "orphan")
+	cmd, ready := newTestProcess(t, "orphan", false)
 	require.NoError(t, cmd.Start())
 	require.NoError(t, group.Assign(cmd.Process))
 

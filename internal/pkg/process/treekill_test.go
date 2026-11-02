@@ -63,7 +63,7 @@ func TestTreeKillWaitWithLeftoverHoldingOutput(t *testing.T) {
 }
 
 func TestTreeKillCaptureStoresKiller(t *testing.T) {
-	cmd, ready := newTestProcess(t, "child")
+	cmd, ready := newTestProcess(t, "child", false)
 	tk := NewTreeKill(cmd)
 	require.NoError(t, cmd.Start())
 	ready()
@@ -75,7 +75,7 @@ func TestTreeKillCaptureStoresKiller(t *testing.T) {
 	require.NoError(t, killer.Close())
 }
 
-func newTestProcess(t *testing.T, mode string) (*exec.Cmd, func() int) {
+func newTestProcess(t *testing.T, mode string, copiedOutput bool) (*exec.Cmd, func() int) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 	t.Cleanup(cancel)
@@ -85,8 +85,15 @@ func newTestProcess(t *testing.T, mode string) (*exec.Cmd, func() int) {
 	cmd.Stderr = os.Stderr
 	input, err := cmd.StdinPipe()
 	require.NoError(t, err)
-	output, err := cmd.StdoutPipe()
-	require.NoError(t, err)
+	var output io.ReadCloser
+	if copiedOutput {
+		var writer *io.PipeWriter
+		output, writer = io.Pipe()
+		cmd.Stdout = writer
+	} else {
+		output, err = cmd.StdoutPipe()
+		require.NoError(t, err)
+	}
 	stop := context.AfterFunc(ctx, func() {
 		_ = input.Close()
 		_ = output.Close()

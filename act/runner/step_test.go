@@ -198,6 +198,14 @@ func TestSetupEnv(t *testing.T) {
 	}
 	assert.Equal(t, expected, env)
 
+	t.Run("keeps an inherited RUNNER_TRACKING_ID opt-out", func(t *testing.T) {
+		rc.Env["RUNNER_TRACKING_ID"] = ""
+		optedOut := map[string]string{}
+		require.NoError(t, setupEnv(t.Context(), &stepRun{RunContext: rc, Step: step, env: optedOut}))
+		assert.Contains(t, optedOut, "RUNNER_TRACKING_ID")
+		assert.Empty(t, optedOut["RUNNER_TRACKING_ID"])
+	})
+
 	for _, expression := range []string{"inputs.args", "env.ARGS"} {
 		t.Run("deferred inputs from "+expression, func(t *testing.T) {
 			workflow, err := model.ReadWorkflow(strings.NewReader(`

@@ -32,7 +32,7 @@ func TestHostEnvironmentTrackingCleanup(t *testing.T) {
 			stop := context.AfterFunc(ctx, func() { _ = listener.Close() })
 			defer stop()
 			workspace := t.TempDir()
-			environment := &HostEnvironment{Path: t.TempDir(), TmpDir: workspace, Workdir: workspace, StdOut: io.Discard}
+			environment := &HostEnvironment{Path: t.TempDir(), TmpDir: workspace, Workdir: workspace, TrackingID: "gitea_test", StdOut: io.Discard}
 			env := map[string]string{}
 			for _, entry := range os.Environ() {
 				if name, value, ok := strings.Cut(entry, "="); ok && !strings.EqualFold(name, "RUNNER_TRACKING_ID") {
@@ -43,7 +43,8 @@ func TestHostEnvironmentTrackingCleanup(t *testing.T) {
 			env["GITEA_TRACKING_WORKSPACE"] = workspace
 			env["GITEA_TRACKING_ADDRESS"] = listener.Addr().String()
 			if tracking == "default" {
-				env["RUNNER_TRACKING_ID"] = environment.TrackingID()
+				env["RUNNER_TRACKING_ID"] = environment.TrackingID
+				env["runner_tracking_id"] = "shared-helper"
 			} else {
 				env["runner_tracking_id"] = tracking
 			}

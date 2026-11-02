@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"gitea.com/gitea/runner/act/common"
-	"gitea.com/gitea/runner/act/filecollector"
 
 	"github.com/moby/moby/client"
 	"github.com/moby/patternmatcher"
@@ -214,7 +213,7 @@ func addBuildContextEntry(ctx context.Context, tw *tar.Writer, file, rel string,
 			return leaveOut(ctx, file, err)
 		}
 	}
-	header, err := tar.FileInfoHeader(noNameLookups{info}, link)
+	header, err := tar.FileInfoHeader(noNameLookups{info}, filepath.ToSlash(link))
 	if err != nil {
 		return err
 	}
@@ -239,7 +238,9 @@ func addBuildContextEntry(ctx context.Context, tw *tar.Writer, file, rel string,
 	header.Format = tar.FormatPAX
 	header.ModTime = header.ModTime.Truncate(time.Second)
 	header.AccessTime, header.ChangeTime = time.Time{}, time.Time{}
-	header.Mode = filecollector.ContainerMode(header.Mode, runtime.GOOS, "linux")
+	if runtime.GOOS == "windows" {
+		header.Mode = header.Mode&0o755 | 0o111 // Windows has no exec bit, so mark everything executable like docker build
+	}
 	if err := tw.WriteHeader(header); err != nil {
 		return err
 	}

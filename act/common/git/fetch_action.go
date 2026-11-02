@@ -274,15 +274,23 @@ func extractTree(ctx context.Context, archive io.Reader, dir string, strip bool)
 	if !isFullObjectID(sha) {
 		return "", errors.New("the archive names no commit")
 	}
-	for requireTarget := true; len(deferred) > 0; {
+	linksByParent := map[string][]string{}
+	if symlinkFallback {
+		for name := range links {
+			linksByParent[filepath.Dir(name)] = append(linksByParent[filepath.Dir(name)], filepath.Base(name))
+		}
+	}
+	for requireTarget := symlinkFallback; len(deferred) > 0; {
 		unresolved := deferred[:0]
 		for _, name := range deferred {
 			if err := ctx.Err(); err != nil {
 				return "", err
 			}
-			if _, err := root.Stat(filepath.Dir(name) + string(filepath.Separator) + links[name]); err != nil && requireTarget {
-				unresolved = append(unresolved, name)
-				continue
+			if requireTarget {
+				if _, err := root.Stat(filepath.Dir(name) + string(filepath.Separator) + links[name]); err != nil {
+					unresolved = append(unresolved, name)
+					continue
+				}
 			}
 			if err := symlink(root, links[name], name); err == nil || !symlinkFallback {
 				if err != nil {
@@ -290,7 +298,7 @@ func extractTree(ctx context.Context, archive io.Reader, dir string, strip bool)
 				}
 				continue
 			}
-			if err := copyTreeLink(ctx, root, name, links, sizes); err != nil {
+			if err := copyTreeLink(ctx, root, name, links, linksByParent, sizes); err != nil {
 				return "", fmt.Errorf("materialize symlink %q: %w", filepath.ToSlash(name), err)
 			}
 		}
@@ -305,9 +313,9 @@ func extractTree(ctx context.Context, archive io.Reader, dir string, strip bool)
 	return sha, installTree(ctx, dir, sha, temp, sizes)
 }
 
-func resolveTreeLink(name string, links map[string]string) (string, error) {
+func resolveTreeLink(name string, links map[string]string) (string, bool) {
 	if !filepath.IsLocal(name) {
-		return "", errors.New("target is outside the extracted tree")
+		return "", false
 	}
 	parts := strings.Split(name, string(filepath.Separator))
 	var resolved []string
@@ -319,7 +327,7 @@ func resolveTreeLink(name string, links map[string]string) (string, error) {
 			continue
 		case "..":
 			if len(resolved) == 0 {
-				return "", errors.New("target is outside the extracted tree")
+				return "", false
 			}
 			resolved = resolved[:len(resolved)-1]
 			continue
@@ -329,32 +337,42 @@ func resolveTreeLink(name string, links map[string]string) (string, error) {
 			resolved = append(resolved, part)
 			continue
 		}
-		if target == "" {
-			return "", errors.New("empty symlink target")
-		}
-		if os.IsPathSeparator(target[0]) || filepath.VolumeName(target) != "" {
-			return "", errors.New("target is outside the extracted tree")
-		}
 		count++
-		if count > 255 {
-			return "", errors.New("cyclic or excessive symlink chain")
+		if target == "" || os.IsPathSeparator(target[0]) || filepath.VolumeName(target) != "" || count > 255 {
+			return "", false
 		}
 		parts = append(strings.Split(filepath.FromSlash(target), string(filepath.Separator)), parts...)
 	}
-	return filepath.Join(append([]string{"."}, resolved...)...), nil
+	return filepath.Join(append([]string{"."}, resolved...)...), true
 }
 
-var errTreeLinkTarget = errors.New("unmaterializable symlink target")
+var (
+	errTreeLinkTarget = errors.New("unmaterializable symlink target")
+	errTreeLinkCycle  = fmt.Errorf("cyclic %w", errTreeLinkTarget)
+)
 
-func copyTreeLink(ctx context.Context, root *os.Root, name string, links map[string]string, sizes map[string]int64) error {
+func copyTreeLink(ctx context.Context, root *os.Root, name string, links map[string]string, linksByParent map[string][]string, sizes map[string]int64) error {
+	writeLinkText := func(destination, target string) error { // as git writes links it cannot create
+		if err := root.RemoveAll(destination); err != nil {
+			return err
+		}
+		for written := range sizes {
+			if written == destination || strings.HasPrefix(written, destination+string(filepath.Separator)) {
+				delete(sizes, written)
+			}
+		}
+		size, err := writeTreeFile(root, destination, 0o644, strings.NewReader(target))
+		sizes[destination] = size
+		return err
+	}
 	active := map[string]bool{}
 	var copyTarget func(string, string) error
 	copyTarget = func(source, destination string) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		source, err := resolveTreeLink(source, links)
-		if err != nil {
+		source, ok := resolveTreeLink(source, links)
+		if !ok {
 			return errTreeLinkTarget
 		}
 		file, err := root.Open(source)
@@ -377,7 +395,7 @@ func copyTreeLink(ctx context.Context, root *os.Root, name string, links map[str
 			return errTreeLinkTarget
 		}
 		if active[source] {
-			return errTreeLinkTarget
+			return errTreeLinkCycle
 		}
 		active[source] = true
 		defer delete(active, source)
@@ -389,16 +407,19 @@ func copyTreeLink(ctx context.Context, root *os.Root, name string, links map[str
 		for _, entry := range entries {
 			children[entry.Name()] = true
 		}
-		for link := range links {
-			if filepath.Dir(link) == source {
-				children[filepath.Base(link)] = true
-			}
+		for _, child := range linksByParent[source] {
+			children[child] = true
 		}
 		if err := root.MkdirAll(destination, info.Mode().Perm()); err != nil {
 			return err
 		}
 		for child := range children {
-			if err := copyTarget(filepath.Join(source, child), filepath.Join(destination, child)); err != nil {
+			childSource, childDestination := filepath.Join(source, child), filepath.Join(destination, child)
+			err := copyTarget(childSource, childDestination)
+			if target, isLink := links[childSource]; isLink && errors.Is(err, errTreeLinkTarget) && !errors.Is(err, errTreeLinkCycle) {
+				err = writeLinkText(childDestination, target)
+			}
+			if err != nil {
 				return err
 			}
 		}
@@ -410,17 +431,7 @@ func copyTreeLink(ctx context.Context, root *os.Root, name string, links map[str
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := root.RemoveAll(name); err != nil {
-		return err
-	}
-	for destination := range sizes {
-		if destination == name || strings.HasPrefix(destination, name+string(filepath.Separator)) {
-			delete(sizes, destination)
-		}
-	}
-	size, err := writeTreeFile(root, name, 0o644, strings.NewReader(links[name]))
-	sizes[name] = size
-	return err
+	return writeLinkText(name, links[name])
 }
 
 var lockTree = AcquireCloneLock // replaced in tests to see installTree wait for a job holding the tree

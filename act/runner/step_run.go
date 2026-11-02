@@ -100,7 +100,7 @@ func printRunActionHeader(ctx context.Context, step *model.Step, action *model.A
 	maps.Copy(inputs, step.With)
 	if action != nil {
 		for name := range action.Inputs {
-			if _, provided := lookupFold(step.With, name, true); !provided {
+			if _, provided := common.LookupFold(step.With, name, true); !provided {
 				inputs[name] = env[inputEnvKey(name)]
 			}
 		}
@@ -240,10 +240,6 @@ func (sr *stepRun) getIfExpression(_ context.Context, _ stepStage) string {
 // it will error anyway with:
 // OCI runtime exec failed: exec failed: container_linux.go:380: starting container process caused: exec: "${{": executable file not found in $PATH: unknown
 func (sr *stepRun) setupShellCommand(ctx context.Context) (name, script string, err error) {
-	return sr.setupShellCommandForOS(ctx, runtime.GOOS)
-}
-
-func (sr *stepRun) setupShellCommandForOS(ctx context.Context, hostOS string) (name, script string, err error) {
 	logger := common.Logger(ctx)
 	eval := sr.RunContext.NewStepExpressionEvaluator(ctx, sr)
 	implicitShell, err := sr.setupShell(ctx, eval)
@@ -308,9 +304,9 @@ func (sr *stepRun) setupShellCommandForOS(ctx context.Context, hostOS string) (n
 	script = fmt.Sprintf("%s\n%s\n%s", runPrepend, script, runAppend)
 	switch shellCommand {
 	case "powershell":
-		script = "\ufeff" + script // Windows PowerShell reads BOM-less scripts using the ANSI code page.
+		script = "\ufeff" + script
 	case "cmd":
-		script = strings.ReplaceAll(strings.ReplaceAll(script, "\r\n", "\n"), "\n", "\r\n") // cmd misreads UTF-8 lines that end in a bare LF
+		script = strings.ReplaceAll(strings.ReplaceAll(script, "\r\n", "\n"), "\n", "\r\n")
 	}
 
 	if !strings.Contains(script, "::add-mask::") && !sr.RunContext.Config.InsecureSecrets {
@@ -322,17 +318,17 @@ func (sr *stepRun) setupShellCommandForOS(ctx context.Context, hostOS string) (n
 	rc := sr.getRunContext()
 	scriptPath := fmt.Sprintf("%s/%s", rc.JobContainer.GetActPath(), name)
 	if step.Shell == "pwsh" || step.Shell == "powershell" {
-		scriptPath = doubleSingleQuotes(scriptPath)
+		scriptPath = expressionStringEscape(scriptPath)
 	}
 	if step.Shell == "bash" || step.Shell == "sh" || step.Shell == "python" {
-		if _, host := rc.JobContainer.(*container.HostEnvironment); host && hostOS == "windows" {
+		if rc.isWindowsHost() {
 			scriptPath = `"` + scriptPath + `"`
 		} else {
 			scriptPath = shellquote.Join(scriptPath)
 		}
 	}
 	sr.cmdline = strings.ReplaceAll(scCmd, `{0}`, scriptPath)
-	if _, host := rc.JobContainer.(*container.HostEnvironment); host && hostOS == "windows" {
+	if rc.isWindowsHost() {
 		command := strings.TrimSpace(sr.cmdline)
 		if strings.HasPrefix(command, `"`) {
 			executable, _, closed := strings.Cut(command[1:], `"`)

@@ -26,7 +26,7 @@ func processAlive(pid int) bool {
 }
 
 func TestKillerKillsTree(t *testing.T) {
-	cmd, ready := newTestProcess(t, "parent")
+	cmd, ready := newTestProcess(t, "parent", false)
 	require.NoError(t, cmd.Start())
 
 	killer, err := NewKiller(cmd.Process)
