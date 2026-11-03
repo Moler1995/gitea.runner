@@ -5,7 +5,7 @@ $root = $PSScriptRoot
 try {
     New-Item -ItemType Directory "$root\logs" | Out-Null
     $env:Path = "C:\git\cmd;C:\git\bin;C:\pwsh;C:\node;$env:Path"
-    git config --global --add safe.directory C:/OEM/src # setup copied it as SYSTEM, the tests run as the logged-on user
+    git config --global --add safe.directory C:/tests/src
 
     $failed = 0
     Write-Output "==> Running $((Get-Content "$root\tests.txt").Count) test binaries on $([Environment]::ProcessorCount) cores"
