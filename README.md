@@ -8,7 +8,7 @@ Gitea Runner runs the jobs of Gitea Actions workflows. Register it with a Gitea 
 
 - Linux, macOS or Windows, or FreeBSD.
 - `git` 2.34.1 or newer.
-- `docker`, or `podman` with `podman.socket` enabled, for container jobs and Docker actions. See Docker's [install instructions](https://docs.docker.com/engine/install/).
+- `docker`, or `podman` with `podman.socket` enabled, for `docker` labels and Docker actions. See Docker's [install instructions](https://docs.docker.com/engine/install/).
 
 In the job image, or on the host for host jobs:
 
