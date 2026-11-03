@@ -6,8 +6,6 @@ The runner executes the jobs of Gitea Actions workflows. Register it with a Gite
 
 ### Prerequisites
 
-On the runner:
-
 - Linux, macOS or Windows.
 - `git` 2.34.1 or newer.
 - `docker`, or `podman` with `podman.socket` enabled, for container jobs and Docker actions. See Docker's [install instructions](https://docs.docker.com/engine/install/).
