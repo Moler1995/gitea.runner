@@ -1,6 +1,6 @@
 # Gitea Runner
 
-The runner executes the jobs of Gitea Actions workflows. Register it with a Gitea instance to run jobs in Docker containers, Kubernetes pods or directly on the host.
+Gitea Runner runs the jobs of Gitea Actions workflows. Register it with a Gitea instance to run jobs in Docker containers, Kubernetes pods or directly on the host.
 
 ## Installation
 
