@@ -14,7 +14,9 @@ In the job image, or on the host for host jobs:
 
 - `bash` or `sh`, or `pwsh` or `powershell` on Windows.
 - `node` for JavaScript actions and `hashFiles()`.
-- `git` 2.34.1 or newer for [`builtin:checkout`](docs/builtin-actions.md), plus `git-lfs` and `ssh` when its `lfs` or `ssh-key` input is used.
+- `git` 2.34.1 or newer for [`builtin:checkout`](docs/builtin-actions.md).
+- `git-lfs` for `builtin:checkout` with `lfs: true`.
+- `ssh` for `builtin:checkout` with `ssh-key`.
 
 Kubernetes mode needs [a few more tools](docs/kubernetes.md) in job images.
 
