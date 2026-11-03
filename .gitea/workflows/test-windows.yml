@@ -3,6 +3,7 @@ on:
   schedule:
     - cron: '0 3 * * 1'
   workflow_dispatch:
+  pull_request: # For test only
 
 env:
   DOCKER_CONFIG: /tmp/docker-noauth # see test.yml
@@ -10,7 +11,7 @@ env:
 jobs:
   test:
     name: test on windows
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest-kvm
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
