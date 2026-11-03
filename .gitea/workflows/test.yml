@@ -14,7 +14,7 @@ env:
 jobs:
   lint:
     name: check and test
-    runs-on: ubuntu-latest-kvm
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.gitea/actions/go-setup
@@ -56,6 +56,15 @@ jobs:
         run: |
           make coverage-report
           cat .tmp/coverage.md >> "$GITHUB_STEP_SUMMARY"
+
+  windows:
+    name: test on windows
+    runs-on: ubuntu-latest-kvm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: ./.gitea/actions/go-setup
+      - name: prepare anonymous docker config
+        run: mkdir -p "$DOCKER_CONFIG" && echo '{}' > "$DOCKER_CONFIG/config.json"
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/windows-vm
