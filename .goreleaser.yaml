@@ -38,6 +38,8 @@ builds:
       goarch: s390x
     - goos: freebsd
       goarch: arm
+    - goos: freebsd
+      goarch: arm64
   flags:
   - -trimpath
   ldflags:
