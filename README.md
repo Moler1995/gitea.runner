@@ -10,7 +10,7 @@ The runner executes the jobs of Gitea Actions workflows. Register it with a Gite
 - `git` 2.34.1 or newer.
 - `docker`, or `podman` with `podman.socket` enabled, for container jobs and Docker actions. See Docker's [install instructions](https://docs.docker.com/engine/install/).
 
-Where steps run, in the job image or on the host:
+In the job image, or on the host for host jobs:
 
 - `bash` or `sh`, or `pwsh` or `powershell` on Windows.
 - `node` for JavaScript actions and `hashFiles()`.
