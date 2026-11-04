@@ -427,6 +427,11 @@ func (e *HostEnvironment) Remove() common.Executor {
 		if err := e.procGroup.Load().Close(); err != nil {
 			logger.Debugf("closing the job's process group failed: %v", err)
 		}
+		if killed, err := process.KillTrackedProcesses(e.TrackingID); err != nil {
+			logger.Debugf("killing the job's leftover processes reported errors: %v", err)
+		} else if killed > 0 {
+			logger.Debugf("killed %d leftover process(es) of the job", killed)
+		}
 
 		// Detach: a cancelled ctx would skip removePathWithRetry's retries,
 		// which absorb Windows file-handle release lag after the kill above.
