@@ -16,8 +16,7 @@ import (
 )
 
 func TestConfiguredHealthCheckCachesAndRecovers(t *testing.T) {
-	cfg, err := config.LoadDefault("")
-	require.NoError(t, err)
+	cfg := newHostTestConfig(t)
 	cfg.HealthCheck.Enabled = true
 	cfg.HealthCheck.Script = "/health-check"
 	cfg.HealthCheck.Interval = time.Minute
@@ -78,8 +77,7 @@ func TestConfiguredHealthCheckDisabled(t *testing.T) {
 }
 
 func TestConfiguredHealthCheckDeferredWhileJobRuns(t *testing.T) {
-	cfg, err := config.LoadDefault("")
-	require.NoError(t, err)
+	cfg := newHostTestConfig(t)
 	cfg.HealthCheck.Enabled = true
 	cfg.HealthCheck.Script = "/health-check"
 	cfg.HealthCheck.Interval = time.Minute
@@ -120,8 +118,7 @@ func TestConfiguredHealthCheckDeferredWhileJobRuns(t *testing.T) {
 }
 
 func TestConfiguredHealthCheckInitialRunDeferredWhileJobRuns(t *testing.T) {
-	cfg, err := config.LoadDefault("")
-	require.NoError(t, err)
+	cfg := newHostTestConfig(t)
 	cfg.HealthCheck.Enabled = true
 	cfg.HealthCheck.Script = "/health-check"
 

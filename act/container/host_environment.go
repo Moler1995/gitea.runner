@@ -24,6 +24,7 @@ import (
 	"gitea.com/gitea/runner/act/common"
 	"gitea.com/gitea/runner/act/filecollector"
 	"gitea.com/gitea/runner/act/lookpath"
+	"gitea.com/gitea/runner/internal/pkg/pathguard"
 	"gitea.com/gitea/runner/internal/pkg/process"
 
 	"github.com/creack/pty"
@@ -38,11 +39,13 @@ type HostEnvironment struct {
 	// CleanWorkdir means teardown owns Workdir and may delete it. Leave false
 	// when Workdir points at a caller-owned checkout (e.g. `act` local mode).
 	CleanWorkdir bool
-	ActPath      string
-	Root         string
-	TrackingID   string // RUNNER_TRACKING_ID of the job, a step with another value keeps its leftovers
-	StdOut       io.Writer
-	AllocatePTY  bool // allocate a pseudo-TTY for each step's process
+	// WorkdirParent is the directory Workdir must be strictly inside for teardown to delete it.
+	WorkdirParent string
+	ActPath       string
+	Root          string
+	TrackingID    string // RUNNER_TRACKING_ID of the job, a step with another value keeps its leftovers
+	StdOut        io.Writer
+	AllocatePTY   bool // allocate a pseudo-TTY for each step's process
 
 	// procGroup owns every process the job's steps start. Atomic: Remove may read
 	// it while a step is still starting.
@@ -416,6 +419,27 @@ func removePathWithRetry(ctx context.Context, path string) error {
 // wedge the runner slot. A var so tests can shrink it.
 var hostCleanupTimeout = 30 * time.Second
 
+// userHome is empty when the home directory is unknown, which only skips the home check.
+func userHome() string {
+	home, _ := os.UserHomeDir()
+	return home
+}
+
+// checkWorkdirRemovable refuses a Workdir that is not strictly inside WorkdirParent, or is
+// empty, the filesystem root or the home directory. Nil when the workdir is not ours to clean.
+func (e *HostEnvironment) checkWorkdirRemovable() error {
+	if !e.CleanWorkdir {
+		return nil
+	}
+	if e.WorkdirParent == "" {
+		return errors.New("host workspace: refusing to delete the workdir: no WorkdirParent says which directory owns it")
+	}
+	if err := pathguard.CheckRemovable(e.Workdir, e.WorkdirParent, userHome()); err != nil {
+		return fmt.Errorf("host workspace: %w", err)
+	}
+	return nil
+}
+
 func (e *HostEnvironment) Remove() common.Executor {
 	return func(ctx context.Context) error {
 		logger := common.Logger(ctx)
@@ -436,12 +460,19 @@ func (e *HostEnvironment) Remove() common.Executor {
 		defer rmCancel()
 
 		var errs []error
-		if err := removePathWithRetry(rmCtx, cmp.Or(e.Root, e.Path)); err != nil {
-			logger.Warnf("failed to remove host misc state %s: %v", cmp.Or(e.Root, e.Path), err)
+		misc := cmp.Or(e.Root, e.Path)
+		if err := pathguard.CheckRemovable(misc, "", userHome()); err != nil {
+			logger.Errorf("host misc state: %v", err)
+			errs = append(errs, fmt.Errorf("host misc state: %w", err))
+		} else if err := removePathWithRetry(rmCtx, misc); err != nil {
+			logger.Warnf("failed to remove host misc state %s: %v", misc, err)
 			errs = append(errs, err)
 		}
 		if e.CleanWorkdir {
-			if err := removePathWithRetry(rmCtx, e.Workdir); err != nil {
+			if err := e.checkWorkdirRemovable(); err != nil {
+				logger.Errorf("%v", err)
+				errs = append(errs, err)
+			} else if err := removePathWithRetry(rmCtx, e.Workdir); err != nil {
 				logger.Warnf("failed to remove host workspace %s: %v", e.Workdir, err)
 				errs = append(errs, err)
 			}

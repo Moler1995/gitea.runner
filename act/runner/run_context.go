@@ -468,16 +468,17 @@ func (rc *RunContext) startHostEnvironment() common.Executor {
 			return err
 		}
 		rc.JobContainer = &container.HostEnvironment{
-			Path:         path,
-			TmpDir:       runnerTmp,
-			ToolCache:    toolCache,
-			Workdir:      rc.Config.Workdir,
-			CleanWorkdir: rc.Config.CleanWorkdir,
-			ActPath:      actPath,
-			Root:         miscpath,
-			TrackingID:   rc.runnerTrackingID(),
-			StdOut:       logWriter,
-			AllocatePTY:  rc.Config.AllocatePTY,
+			Path:          path,
+			TmpDir:        runnerTmp,
+			ToolCache:     toolCache,
+			Workdir:       rc.Config.Workdir,
+			CleanWorkdir:  rc.Config.CleanWorkdir,
+			WorkdirParent: rc.Config.WorkdirParent,
+			ActPath:       actPath,
+			Root:          miscpath,
+			TrackingID:    rc.runnerTrackingID(),
+			StdOut:        logWriter,
+			AllocatePTY:   rc.Config.AllocatePTY,
 		}
 		rc.cleanUpJobContainer = rc.JobContainer.Remove()
 		rc.setRunnerContextEnv(ctx)

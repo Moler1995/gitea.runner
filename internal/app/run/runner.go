@@ -37,6 +37,7 @@ import (
 	"gitea.com/gitea/runner/internal/pkg/envcheck"
 	"gitea.com/gitea/runner/internal/pkg/labels"
 	"gitea.com/gitea/runner/internal/pkg/metrics"
+	"gitea.com/gitea/runner/internal/pkg/pathguard"
 	"gitea.com/gitea/runner/internal/pkg/report"
 	"gitea.com/gitea/runner/internal/pkg/telemetry"
 	"gitea.com/gitea/runner/internal/pkg/ver"
@@ -452,6 +453,10 @@ func (r *Runner) run(ctx context.Context, task *runnerv1.Task, reporter *report.
 		}
 	}()
 
+	if err := ValidateWorkdirConfig(r.cfg); err != nil {
+		return err
+	}
+
 	slot := r.slots.acquire()
 	defer r.slots.release(slot)
 
@@ -567,10 +572,19 @@ func (r *Runner) run(ctx context.Context, task *runnerv1.Task, reporter *report.
 		// Append the task ID to isolate concurrent jobs from the same repo.
 		workdirParent = filepath.Join(workdirParent, strconv.FormatInt(task.Id, 10))
 	}
+	if err := pathguard.CheckRepository(preset.Repository); err != nil {
+		return err
+	}
 	workdir := filepath.Join(workdirParent, filepath.FromSlash(preset.Repository))
+	if err := pathguard.ValidateWorkdir(workdirParent, workdir); err != nil {
+		return err
+	}
 	if runtime.GOOS == "windows" {
 		if abs, err := filepath.Abs(workdir); err == nil {
 			workdir = abs
+		}
+		if abs, err := filepath.Abs(workdirParent); err == nil {
+			workdirParent = abs
 		}
 	}
 	// Without bind_workdir, the workspace path omits the task id; concurrent host-mode jobs
@@ -582,6 +596,7 @@ func (r *Runner) run(ctx context.Context, task *runnerv1.Task, reporter *report.
 		// On Linux, Workdir will be like "/<parent_directory>/<owner>/<repo>"
 		// On Windows, Workdir will be like "\<parent_directory>\<owner>\<repo>"
 		Workdir:           workdir,
+		WorkdirParent:     workdirParent,
 		BindWorkdir:       r.cfg.Container.BindWorkdir,
 		ActionCacheDir:    filepath.FromSlash(r.cfg.Host.WorkdirParent),
 		AllocatePTY:       r.cfg.Runner.AllocatePTY,
@@ -852,6 +867,16 @@ func checkFreeDisk(cfg *config.Config) (bool, string) {
 		return false, fmt.Sprintf("low disk space on %s: %d MiB available, %d MiB required", root, availableMB, cfg.HealthCheck.MinFreeDiskSpaceMB)
 	}
 	return true, "ok"
+}
+
+// ValidateWorkdirConfig rejects a config whose workdir parents are empty or the filesystem root,
+// before a job's teardown can be pointed at them.
+func ValidateWorkdirConfig(cfg *config.Config) error {
+	if err := pathguard.CheckParent("container.workdir_parent", cfg.Container.WorkdirParent, containerWorkdirRoot(cfg.Container.WorkdirParent)); err != nil {
+		return err
+	}
+	hostParent := filepath.FromSlash(cfg.Host.WorkdirParent)
+	return pathguard.CheckParent("host.workdir_parent", cfg.Host.WorkdirParent, hostParent)
 }
 
 func containerWorkdirRoot(parent string) string {

@@ -84,11 +84,10 @@ func TestRunnerRunningCountAndNullLogger(t *testing.T) {
 func TestRunnerReclaimsVolumesAfterReporting(t *testing.T) {
 	for _, mode := range []string{"deferred", "post-task script"} {
 		t.Run(mode, func(t *testing.T) {
-			cfg := &config.Config{
-				Cache:     config.Cache{Enabled: new(false)},
-				Runner:    config.Runner{Timeout: time.Minute, LogReportInterval: time.Minute, StateReportInterval: time.Minute},
-				Container: config.Container{Network: "host", DockerHost: "-"},
-			}
+			cfg := newHostTestConfig(t)
+			cfg.Cache.Enabled = new(false)
+			cfg.Runner = config.Runner{Timeout: time.Minute, LogReportInterval: time.Minute, StateReportInterval: time.Minute}
+			cfg.Container.Network, cfg.Container.DockerHost = "host", "-"
 			if mode == "post-task script" {
 				if runtime.GOOS == "windows" {
 					t.Skip("uses a POSIX script")
@@ -163,7 +162,7 @@ func TestRunnerReclaimsVolumesAfterReporting(t *testing.T) {
 			t.Cleanup(daemon.Close)
 			t.Setenv("DOCKER_HOST", daemon.URL)
 			require.NoError(t, r.Run(t.Context(), &runnerv1.Task{
-				Context:         &structpb.Struct{},
+				Context:         &structpb.Struct{Fields: map[string]*structpb.Value{"repository": structpb.NewStringValue("owner/repo")}},
 				WorkflowPayload: []byte("jobs:\n  job:\n    runs-on: ubuntu\n    steps:\n      - run: exit 0\n        if: false\n"),
 			}))
 			assert.True(t, reported.Load())
