@@ -21,15 +21,7 @@ type interfaceIP struct {
 // If the machine cannot access the internet, it returns a preferred IP address from network interfaces.
 // It returns nil if no IP address is found.
 func GetOutboundIP() net.IP {
-	// See https://stackoverflow.com/a/37382208
-	conn, err := net.Dial("udp", "8.8.8.8:80")
-	if err == nil {
-		defer conn.Close()
-		if addr, ok := conn.LocalAddr().(*net.UDPAddr); ok {
-			return addr.IP
-		}
-	}
-	return outboundIPFromInterfaces()
+	return GetOutboundIPWithRetry(0)
 }
 
 // GetOutboundIPWithRetry is GetOutboundIP with a bounded retry budget for the
@@ -43,7 +35,7 @@ func GetOutboundIP() net.IP {
 // address still applies until restart — the lazy re-evaluation alternative is
 // tracked in the issue.
 func GetOutboundIPWithRetry(wait time.Duration) net.IP {
-	if ip := probeOutboundIP(wait); ip != nil {
+	if ip := probeOutboundIP(wait, outboundIPLocalAddr); ip != nil {
 		return ip
 	}
 	return outboundIPFromInterfaces()
@@ -101,53 +93,34 @@ func preferredIP(ips []interfaceIP) net.IP {
 	return ips[0].IP
 }
 
-// Injection points for tests.
-var (
-	outboundNow          = time.Now
-	outboundSleep        = time.Sleep
-	outboundDialTimeout  = net.DialTimeout
+const (
 	outboundDialInterval = 500 * time.Millisecond
 	outboundDialBudget   = 2 * time.Second
 )
 
-// probeOutboundIP runs the UDP probe until it returns an address or the
-// budget is spent. The deadline is taken before the first dial, and each
-// dial's own timeout plus the sleep between dials never exceed the remaining
-// budget, so the whole probe stays within wait.
-func probeOutboundIP(wait time.Duration) net.IP {
+func probeOutboundIP(wait time.Duration, probe func(time.Duration) net.IP) net.IP {
 	if wait <= 0 {
-		if ip := outboundIPLocalAddr(0); ip != nil {
-			return ip
-		}
-		return nil
+		return probe(0)
 	}
-	deadline := outboundNow().Add(wait)
+	deadline := time.Now().Add(wait)
 	for {
-		remaining := deadline.Sub(outboundNow())
+		remaining := time.Until(deadline)
 		if remaining <= 0 {
 			return nil
 		}
-		timeout := outboundDialBudget
-		if remaining < timeout {
-			timeout = remaining
-		}
-		if ip := outboundIPLocalAddr(timeout); ip != nil {
+		if ip := probe(min(outboundDialBudget, remaining)); ip != nil {
 			return ip
 		}
-		remaining = deadline.Sub(outboundNow())
+		remaining = time.Until(deadline)
 		if remaining <= 0 {
 			return nil
 		}
-		interval := outboundDialInterval
-		if remaining < interval {
-			interval = remaining
-		}
-		outboundSleep(interval)
+		time.Sleep(min(outboundDialInterval, remaining))
 	}
 }
 
 func outboundIPLocalAddr(timeout time.Duration) net.IP {
-	conn, err := outboundDialTimeout("udp", "8.8.8.8:80", timeout)
+	conn, err := net.DialTimeout("udp", "8.8.8.8:80", timeout)
 	if err != nil {
 		return nil
 	}
