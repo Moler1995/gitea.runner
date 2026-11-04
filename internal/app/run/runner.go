@@ -105,11 +105,15 @@ func NewRunner(cfg *config.Config, reg *config.Registration, cli client.Client) 
 		handler, err := artifactcache.StartHandler(artifactcache.Options{
 			Dir:        cfg.Cache.Dir,
 			OutboundIP: cfg.Cache.Host,
-			Port:       cfg.Cache.Port,
-			Upstream:   cfg.Cache.ExternalServer,
-			S3:         cacheS3(cfg),
-			Policy:     CachePolicy(cfg),
-			Logger:     logging.Default().With("module", "cache_request"),
+			// Outlast the DHCPv4-vs-SLAAC boot race before the interface
+			// fallback bakes an unreachable IPv6 address into job URLs
+			// (gitea/runner#1379).
+			OutboundRetry: 10 * time.Second,
+			Port:          cfg.Cache.Port,
+			Upstream:      cfg.Cache.ExternalServer,
+			S3:            cacheS3(cfg),
+			Policy:        CachePolicy(cfg),
+			Logger:        logging.Default().With("module", "cache_request"),
 		})
 		if err != nil {
 			logging.Errorf("cannot init cache server, it will be disabled: %v", err)

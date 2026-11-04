@@ -132,9 +132,15 @@ type Handler struct {
 type Options struct {
 	Dir        string
 	OutboundIP string
-	Port       uint16
-	S3         *S3Options
-	Upstream   string
+
+	// OutboundRetry is the budget the daemon grants the outbound-IP probe to
+	// outlast the DHCPv4-vs-SLAAC boot race before falling back to interface
+	// addresses (see common.GetOutboundIPWithRetry). Zero keeps the immediate
+	// fallback of common.GetOutboundIP for interactive callers.
+	OutboundRetry time.Duration
+	Port          uint16
+	S3            *S3Options
+	Upstream      string
 
 	// InternalSecret, when non-empty, enables a control-plane API at
 	// /_internal/{register,revoke} that lets a remote runner pre-register the
@@ -166,7 +172,7 @@ func StartHandler(opts Options) (*Handler, error) {
 
 	if opts.OutboundIP != "" {
 		h.outboundIP = opts.OutboundIP
-	} else if ip := common.GetOutboundIP(); ip == nil {
+	} else if ip := common.GetOutboundIPWithRetry(opts.OutboundRetry); ip == nil {
 		return nil, errors.New("unable to determine outbound IP address")
 	} else {
 		h.outboundIP = ip.String()
