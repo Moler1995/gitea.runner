@@ -66,11 +66,11 @@ func TestTreeKillCaptureStoresKiller(t *testing.T) {
 	cmd, ready := newTestProcess(t, "child", false)
 	tk := NewTreeKill(cmd)
 	require.NoError(t, cmd.Start())
-	ready()
 
 	killer, err := tk.Capture(cmd.Process)
 	require.NoError(t, err)
 	require.NotNil(t, killer)
+	ready()
 	require.NoError(t, cmd.Cancel())
 	require.NoError(t, killer.Close())
 }
