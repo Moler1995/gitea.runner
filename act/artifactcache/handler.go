@@ -171,6 +171,7 @@ func StartHandler(opts Options) (*Handler, error) {
 	} else {
 		h.outboundIP = ip.String()
 	}
+	logger.Infof("outbound address advertised to jobs for artifact/cache: %s", h.outboundIP)
 
 	if opts.Upstream != "" {
 		handler, err := h.cacheForwarder(opts.Upstream)
