@@ -33,14 +33,13 @@ func TestTreeKillWaitWithLeftoverHoldingOutput(t *testing.T) {
 	}
 	for _, tc := range []struct {
 		name    string
-		timeout time.Duration
 		wantErr bool
 	}{
-		{name: "succeeds", timeout: time.Minute},
-		{name: "fails once the context is done", timeout: 10 * time.Millisecond, wantErr: true},
+		{name: "succeeds"},
+		{name: "fails once the context is done", wantErr: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			ctx, cancel := context.WithTimeout(t.Context(), tc.timeout)
+			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
 			cmd := exec.CommandContext(ctx, "sh", "-c", "sleep 30 &")
 			cmd.Stdout = io.Discard
@@ -51,6 +50,9 @@ func TestTreeKillWaitWithLeftoverHoldingOutput(t *testing.T) {
 			killer, err := tk.Capture(cmd.Process)
 			require.NoError(t, err)
 			t.Cleanup(func() { _ = killer.Kill() })
+			if tc.wantErr {
+				cancel()
+			}
 
 			err = tk.Wait(ctx, cmd)
 			if tc.wantErr {
