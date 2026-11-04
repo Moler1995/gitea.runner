@@ -191,8 +191,15 @@ func Main(ctx context.Context, c *action.Context) (err error) {
 	if ref != co.sha {
 		co.outputRef = cmp.Or(ref, co.ref) // as given, like actions/checkout
 	}
-	if err := c.Container.Copy(runnerTemp, &container.FileEntry{Name: credentials, Mode: 0o600, Body: config})(ctx); err != nil {
+	if err := c.Container.Copy(runnerTemp, &container.FileEntry{Name: credentials, Mode: 0o600})(ctx); err != nil {
 		return err
+	}
+	if config != "" {
+		defer func() { // after the clone, git-lfs before 3.8.0 sends a header set both here and in the env twice
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+			defer cancel()
+			err = errors.Join(err, c.Container.Copy(runnerTemp, &container.FileEntry{Name: credentials, Mode: 0o600, Body: config})(cleanupCtx))
+		}()
 	}
 
 	clone := func(commands [][]string) error {

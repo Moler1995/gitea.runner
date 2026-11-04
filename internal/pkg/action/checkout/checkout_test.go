@@ -332,6 +332,30 @@ func TestCheckoutOffersClientCertOnlyDuringTheStep(t *testing.T) {
 	require.Empty(t, key)
 }
 
+func TestCheckoutGivesGitLFSTheTokenOnce(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Git for Windows puts its own git-lfs ahead of the fake one on PATH")
+	}
+	server, tools, workspace, runnerTemp := t.TempDir(), t.TempDir(), t.TempDir(), t.TempDir()
+	publish(t, server, "org/repo", map[string]string{"file.txt": "file"}, nil)
+	require.NoError(t, os.WriteFile(filepath.Join(tools, "git-lfs"), []byte("#!/bin/sh\ntest \"$1\" != pull || git config --get-regexp extraheader > \"$HEADERS\"\n"), 0o755))
+	headers := filepath.Join(tools, "headers")
+	require.NoError(t, Main(t.Context(), &action.Context{
+		Container: &container.HostEnvironment{Path: workspace, TmpDir: runnerTemp, StdOut: io.Discard},
+		Github: &model.GithubContext{
+			Repository: "org/workflow", ServerURL: (&url.URL{Scheme: "file", Path: "/" + strings.TrimPrefix(filepath.ToSlash(server), "/")}).String(), Token: "tok",
+		},
+		Inputs:    map[string]string{"repository": "org/repo", "lfs": "true"},
+		Workspace: workspace,
+		Env: map[string]string{
+			"PATH": tools + string(os.PathListSeparator) + os.Getenv("PATH"), "GIT_CONFIG_GLOBAL": os.DevNull, "GIT_CONFIG_NOSYSTEM": "1", "HEADERS": headers,
+		},
+	}))
+	configured, err := os.ReadFile(headers)
+	require.NoError(t, err)
+	assert.Equal(t, 1, strings.Count(string(configured), "Authorization"), string(configured))
+}
+
 func publish(t *testing.T, server, name string, files, submodules map[string]string) {
 	work := t.TempDir()
 	runGit(t, "init", "--initial-branch=main", work)
