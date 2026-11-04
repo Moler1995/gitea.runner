@@ -223,6 +223,36 @@ func TestHostEnvironmentRemoveRefusesUnsafeWorkdir(t *testing.T) {
 	}
 }
 
+// A workdir inside the owning root that is a symlink out of it must be refused. Everything,
+// including the fake HOME, is inside t.TempDir().
+func TestHostEnvironmentRemoveRefusesSymlinkedWorkdir(t *testing.T) {
+	base := t.TempDir()
+	parent, bait, home := filepath.Join(base, "root"), filepath.Join(base, "bait"), filepath.Join(base, "home")
+	for _, dir := range []string{parent, bait, home} {
+		require.NoError(t, os.MkdirAll(dir, 0o700))
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	baitFile, homeFile := filepath.Join(bait, "keep.txt"), filepath.Join(home, "keep.txt")
+	require.NoError(t, os.WriteFile(baitFile, []byte("keep"), 0o600))
+	require.NoError(t, os.WriteFile(homeFile, []byte("keep"), 0o600))
+
+	for name, target := range map[string]string{"link to a sibling dir": bait, "link to the home dir": home} {
+		t.Run(name, func(t *testing.T) {
+			link := filepath.Join(parent, "link")
+			if err := os.Symlink(target, link); err != nil {
+				t.Skipf("cannot create symlinks: %v", err)
+			}
+			t.Cleanup(func() { _ = os.Remove(link) })
+			misc := t.TempDir()
+			e := &HostEnvironment{Path: filepath.Join(misc, "hostexecutor"), Workdir: link, CleanWorkdir: true, WorkdirParent: parent, Root: misc}
+			require.ErrorContains(t, e.Remove()(t.Context()), "refusing to delete")
+			assert.FileExists(t, baitFile)
+			assert.FileExists(t, homeFile)
+		})
+	}
+}
+
 func TestHostEnvironmentRemoveRefusesHomeAsMiscRoot(t *testing.T) {
 	// A temp dir stands in for the home directory, so no real home is named.
 	home := t.TempDir()

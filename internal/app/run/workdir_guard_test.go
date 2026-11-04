@@ -36,6 +36,51 @@ func TestValidateWorkdirConfigRefusesIncidentConfig(t *testing.T) {
 		"container.workdir_parent is empty; set it to a dedicated directory the runner may fill and delete")
 }
 
+// A relative host.workdir_parent is judged by, and rewritten to, the absolute path it names.
+// No job runs; t.Chdir only moves the test process.
+func TestHostWorkdirParentIsResolvedToAbsolute(t *testing.T) {
+	fakeHome := func(t *testing.T) string {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		t.Setenv("USERPROFILE", home)
+		return home
+	}
+	root := func(*testing.T) string { return string(filepath.Separator) }
+	scratch := func(t *testing.T) string { return t.TempDir() }
+	for name, tc := range map[string]struct {
+		cwd   func(t *testing.T) string
+		value string
+		want  string // error substring, or "" for accepted
+	}{
+		"dot in a scratch dir": {cwd: scratch, value: "."},
+		"relative subdir":      {cwd: scratch, value: "cache/act"},
+		"dot at the root":      {cwd: root, value: ".", want: "filesystem root"},
+		"dotdot to the root":   {cwd: root, value: "..", want: "filesystem root"},
+		"dot in the home dir":  {cwd: fakeHome, value: ".", want: "home directory"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Chdir(tc.cwd(t))
+			cfg := &config.Config{Container: config.Container{WorkdirParent: "workspace"}, Host: config.Host{WorkdirParent: tc.value}}
+			err := ResolveWorkdirConfig(cfg)
+			if tc.want != "" {
+				require.ErrorContains(t, err, "host.workdir_parent")
+				require.ErrorContains(t, err, tc.want)
+				return
+			}
+			require.NoError(t, err)
+			require.True(t, filepath.IsAbs(cfg.Host.WorkdirParent), cfg.Host.WorkdirParent)
+		})
+	}
+}
+
+func TestValidateWorkdirConfigRefusesHomeAsContainerParent(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	cfg := &config.Config{Container: config.Container{WorkdirParent: home}, Host: config.Host{WorkdirParent: t.TempDir()}}
+	require.ErrorContains(t, ValidateWorkdirConfig(cfg), "container.workdir_parent")
+}
+
 func TestValidateWorkdirConfig(t *testing.T) {
 	sep := string(filepath.Separator)
 	for name, tc := range map[string]struct {

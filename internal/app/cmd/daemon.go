@@ -43,7 +43,7 @@ func runDaemon(ctx context.Context, daemArgs *daemonArgs, configFile *string) fu
 		if err != nil {
 			return fmt.Errorf("invalid configuration: %w", err)
 		}
-		if err := run.ValidateWorkdirConfig(cfg); err != nil {
+		if err := run.ResolveWorkdirConfig(cfg); err != nil {
 			return fmt.Errorf("invalid configuration: %w", err)
 		}
 

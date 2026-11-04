@@ -7,6 +7,7 @@ package pathguard
 import (
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 )
@@ -19,14 +20,18 @@ func IsFilesystemRoot(path string) bool {
 	return rest == string(filepath.Separator) || (rest == "" && volume != "")
 }
 
-// CheckParent rejects a workdir parent setting that is empty or resolves to the filesystem root.
-// setting names the config key, raw is the configured value and resolved the path the runner uses.
-func CheckParent(setting, raw, resolved string) error {
+// CheckParent rejects a workdir parent setting that is empty or resolves to the filesystem root
+// or the home directory. setting names the config key, raw is the configured value and resolved
+// the absolute path the runner uses. An empty home skips the home check.
+func CheckParent(setting, raw, resolved, home string) error {
 	if raw == "" {
 		return fmt.Errorf("%s is empty; set it to a dedicated directory the runner may fill and delete", setting)
 	}
 	if IsFilesystemRoot(resolved) {
 		return fmt.Errorf("%s %q is the filesystem root; set it to a dedicated directory the runner may fill and delete", setting, raw)
+	}
+	if home != "" && filepath.Clean(resolved) == filepath.Clean(home) {
+		return fmt.Errorf("%s %q is the home directory; set it to a dedicated directory the runner may fill and delete", setting, raw)
 	}
 	return nil
 }
@@ -58,10 +63,27 @@ func ValidateWorkdir(parent, workdir string) error {
 // CheckRemovable returns an error unless path is safe for teardown to delete: not empty,
 // not the filesystem root, not home, and, when owner is set, strictly inside owner.
 // An empty owner skips the containment check, for a path the caller made itself.
+// The checks run on the path as given and again with symlinks resolved, so a link
+// that points at the root, home or outside owner is refused too.
 func CheckRemovable(path, owner, home string) error {
-	switch {
-	case path == "":
+	if path == "" {
 		return errors.New("refusing to delete an empty path")
+	}
+	if err := checkRemovable(path, "", home); err != nil {
+		return err
+	}
+	resolved := resolve(path)
+	if err := checkRemovable(resolved, resolveIfSet(owner), resolveIfSet(home)); err != nil {
+		if resolved == filepath.Clean(path) {
+			return err
+		}
+		return fmt.Errorf("%w (%q resolves through a symlink to %q)", err, path, resolved)
+	}
+	return nil
+}
+
+func checkRemovable(path, owner, home string) error {
+	switch {
 	case IsFilesystemRoot(path):
 		return fmt.Errorf("refusing to delete the filesystem root %q", path)
 	case home != "" && filepath.Clean(path) == filepath.Clean(home):
@@ -70,6 +92,45 @@ func CheckRemovable(path, owner, home string) error {
 		return fmt.Errorf("refusing to delete %q: it is not strictly inside %q", path, owner)
 	}
 	return nil
+}
+
+func resolveIfSet(path string) string {
+	if path == "" {
+		return ""
+	}
+	return resolve(path)
+}
+
+// resolve returns path with symlinks resolved. A path that does not exist yet is resolved
+// through its nearest existing ancestor, and the missing tail is appended unchanged.
+func resolve(path string) string {
+	return resolveDepth(path, 0)
+}
+
+// maxLinkDepth bounds dangling-link chains, which EvalSymlinks cannot follow.
+const maxLinkDepth = 40
+
+func resolveDepth(path string, depth int) string {
+	clean := filepath.Clean(path)
+	tail := ""
+	for current := clean; ; {
+		if resolved, err := filepath.EvalSymlinks(current); err == nil {
+			return filepath.Join(resolved, tail)
+		}
+		// A dangling link still names where it points, and a later write through it would go there.
+		if target, err := os.Readlink(current); err == nil && depth < maxLinkDepth {
+			if !filepath.IsAbs(target) {
+				target = filepath.Join(filepath.Dir(current), target)
+			}
+			return filepath.Join(resolveDepth(target, depth+1), tail)
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return clean
+		}
+		tail = filepath.Join(filepath.Base(current), tail)
+		current = parent
+	}
 }
 
 func strictlyInside(parent, path string) bool {
