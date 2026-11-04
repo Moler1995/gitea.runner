@@ -2,7 +2,7 @@
 // Copyright 2020 The nektos/act Authors. All rights reserved.
 // SPDX-License-Identifier: MIT
 
-//go:build !(WITHOUT_DOCKER || !(linux || darwin || windows || netbsd))
+//go:build !(WITHOUT_DOCKER || !(linux || darwin || windows || netbsd || freebsd))
 
 package container
 
@@ -48,6 +48,7 @@ func NewDockerBuildExecutor(input NewDockerBuildExecutorInput) common.Executor {
 
 		options := client.ImageBuildOptions{
 			Tags:        []string{input.ImageTag},
+			Labels:      map[string]string{"com.gitea.runner.image": input.ImageTag}, // own image ID per tag, so removing one never deletes another job's identical build
 			Remove:      true,
 			AuthConfigs: LoadDockerAuthConfigs(ctx),
 			Dockerfile:  input.Dockerfile,
@@ -125,6 +126,10 @@ func createBuildContext(ctx context.Context, contextDir, relDockerfile string) (
 }
 
 func writeBuildContext(ctx context.Context, w io.Writer, contextDir string, includes []string, pm *patternmatcher.PatternMatcher) error {
+	contextDir, err := filepath.EvalSymlinks(contextDir)
+	if err != nil {
+		return err
+	}
 	tw := tar.NewWriter(w)
 	seen := map[string]bool{}
 	hardlinks := map[uint64]string{}
@@ -132,8 +137,7 @@ func writeBuildContext(ctx context.Context, w io.Writer, contextDir string, incl
 	for _, include := range includes {
 		include = filepath.FromSlash(include)
 		var parents []parentMatch
-		root := strings.TrimSuffix(contextDir, string(filepath.Separator)) + string(filepath.Separator) + include // unlike filepath.Join, follows a symlinked context dir as docker build does
-		err := filepath.WalkDir(root, func(file string, entry fs.DirEntry, err error) error {
+		err := filepath.WalkDir(filepath.Join(contextDir, include), func(file string, entry fs.DirEntry, err error) error {
 			if err != nil {
 				return leaveOut(ctx, file, err)
 			}
@@ -210,7 +214,7 @@ func addBuildContextEntry(ctx context.Context, tw *tar.Writer, file, rel string,
 			return leaveOut(ctx, file, err)
 		}
 	}
-	header, err := tar.FileInfoHeader(noNameLookups{info}, link)
+	header, err := tar.FileInfoHeader(noNameLookups{info}, filepath.ToSlash(link))
 	if err != nil {
 		return err
 	}

@@ -5,6 +5,7 @@
 package git
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -27,6 +28,7 @@ import (
 	"gitea.com/gitea/runner/act/common"
 	"gitea.com/gitea/runner/act/common/logging"
 	"gitea.com/gitea/runner/internal/pkg/lock"
+	"gitea.com/gitea/runner/internal/pkg/process"
 )
 
 var (
@@ -388,6 +390,21 @@ func RemoteConfig(token string, insecureSkipTLS bool) []string {
 	return config
 }
 
+// SSLConfig uses OpenSSL on Windows, as Schannel takes no PEM key and ignores sslCAInfo.
+func SSLConfig(prefix, certFile, keyFile, caFile, executionOS string) []string {
+	var config []string
+	if certFile != "" {
+		config = append(config, prefix+"sslCert="+certFile, prefix+"sslKey="+keyFile)
+	}
+	if caFile != "" {
+		config = append(config, prefix+"sslCAInfo="+caFile)
+	}
+	if config != nil && strings.EqualFold(executionOS, "windows") {
+		config = append(config, prefix+"sslBackend=openssl")
+	}
+	return config
+}
+
 // ConfigEnv applies `-c` style entries through the environment, keeping secrets out of argv.
 func ConfigEnv(config ...string) map[string]string {
 	env := map[string]string{"GIT_CONFIG_COUNT": strconv.Itoa(len(config))}
@@ -445,12 +462,7 @@ func runGitWithStdin(ctx context.Context, dir string, input *NewGitCloneExecutor
 	config := []string{"core.autocrlf=false", "core.eol=lf"} // keep action files LF
 	if input != nil {
 		config = append(config, RemoteConfig(input.Token, input.InsecureSkipTLS)...)
-		if input.ClientCertFile != "" {
-			config = append(config, "http.sslCert="+input.ClientCertFile, "http.sslKey="+input.ClientKeyFile)
-		}
-		if input.CAFile != "" {
-			config = append(config, "http.sslCAInfo="+input.CAFile)
-		}
+		config = append(config, SSLConfig("http.", input.ClientCertFile, input.ClientKeyFile, input.CAFile, runtime.GOOS)...)
 	}
 	if dir != "" {
 		args = append([]string{"-C", dir}, args...)
@@ -465,15 +477,28 @@ func runGitWithStdin(ctx context.Context, dir string, input *NewGitCloneExecutor
 		cmd.Env = append(cmd.Env, key+"="+value)
 	}
 	cmd.Env = append(cmd.Env, "GIT_TERMINAL_PROMPT=0")
-	if runtime.GOOS != "windows" {
+	var treeKill *process.TreeKill
+	if runtime.GOOS == "windows" {
+		treeKill = process.NewTreeKill(cmd) // a cancelled git leaves its remote helper holding the repository otherwise
+	} else {
 		cmd.Cancel = func() error { return cmd.Process.Signal(os.Interrupt) } // lets git remove its lock files
 	}
 	cmd.WaitDelay = time.Second
+	var stdout bytes.Buffer
 	var stderr strings.Builder
+	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	output, err := cmd.Output()
-	if err != nil {
-		return output, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+	err := cmd.Start()
+	if err == nil {
+		if treeKill != nil {
+			if killer, captureErr := treeKill.Capture(cmd.Process); captureErr == nil {
+				defer killer.Close()
+			}
+		}
+		err = cmd.Wait()
 	}
-	return output, nil
+	if err != nil {
+		return stdout.Bytes(), fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+	}
+	return stdout.Bytes(), nil
 }
