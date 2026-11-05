@@ -128,7 +128,7 @@ type Handler struct {
 
 	policy Policy
 
-	// freeDisk is a field so tests can drive evictForFreeSpace without a full volume.
+	// freeDisk is a field so tests can drive makeRoom without a full volume.
 	freeDisk func(string) (uint64, error)
 }
 
@@ -782,6 +782,7 @@ func (h *Handler) upload(w http.ResponseWriter, r *http.Request) {
 		h.responseJSON(w, r, 400, err)
 		return
 	}
+	h.makeRoom(r.ContentLength)
 	if err := h.storage.Write(cache.ID, start, r.Body); err != nil {
 		h.responseJSON(w, r, 500, err)
 		return
@@ -884,11 +885,8 @@ func (h *Handler) commitCache(cache *Cache) error {
 	if h.s3 != nil {
 		return nil // lifecycle rules on the bucket bound its size
 	}
-	// A commit is the only thing that grows the store, so the only thing that can push the
-	// volume under the floor.
 	h.evictRepo(db, cache.Repo)
 	h.evictTotal(db)
-	h.evictForFreeSpace(db)
 	return nil
 }
 
@@ -1182,9 +1180,6 @@ func (h *Handler) touchCache(id uint64, requireIncomplete bool) error {
 	defer db.Close()
 
 	cache, err := db.get(id)
-	if errors.Is(err, errCacheNotFound) {
-		return nil
-	}
 	if err != nil {
 		return err
 	}
@@ -1269,23 +1264,29 @@ func (h *Handler) gcCache() {
 	h.evictExpired(db)
 	h.evictSuperseded(db)
 	h.evictOversized(db)
-	h.evictForFreeSpace(db)
+	_ = db.Close()
+	h.makeRoom(0)
 }
 
-// evictForFreeSpace bounds the volume itself, so it also covers bytes the cache never
-// accounted for.
-func (h *Handler) evictForFreeSpace(db *cacheDB) {
+// makeRoom evicts the least recently used entries to keep need bytes above the floor, as GitHub saves new over old.
+func (h *Handler) makeRoom(need int64) {
 	free, err := h.freeDisk(h.dir)
 	if err != nil {
 		h.logger.Debugf("free disk check: %v", err) // unsupported platform, treat as unavailable rather than full
 		return
 	}
-	if free >= uint64(h.policy.MinFreeDisk) {
+	shortfall := h.policy.MinFreeDisk + max(need, 0) - int64(free)
+	if h.s3 != nil || shortfall <= 0 {
 		return
 	}
+	db, err := h.openDB()
+	if err != nil {
+		return
+	}
+	defer db.Close()
 
 	caches := h.completedByUse(db)
-	total, shortfall := totalSize(caches), h.policy.MinFreeDisk-int64(free)
+	total := totalSize(caches)
 	if total <= shortfall {
 		// Say so, or shedding everything and still being short reads as the backstop working.
 		h.logger.Warnf("cache volume is %d MiB short of the free space floor with only %d MiB of cache on it; something else is filling it", shortfall/miB, total/miB)

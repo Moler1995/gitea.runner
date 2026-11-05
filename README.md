@@ -95,7 +95,7 @@ The recommended Docker-in-Docker image runs its own Docker daemon for jobs. Jobs
 
 ```bash
 docker run --privileged -e GITEA_INSTANCE_URL=https://your_gitea.com -e GITEA_RUNNER_REGISTRATION_TOKEN=<your_token> \
-  -v "$PWD/data:/data" -v runner-docker:/var/lib/docker --name my_runner gitea/runner:nightly-dind
+  -v "$PWD/data:/data" -v runner-docker:/var/lib/docker --name my_runner gitea/runner:latest-dind
 ```
 
 The volumes keep the registration and the image cache across container recreation. The image reads more variables, such as `GITEA_RUNNER_LABELS` and `CONFIG_FILE`, see [scripts/run.sh](scripts/run.sh) and the [Docker example](examples/docker/README.md).
@@ -164,7 +164,7 @@ ubuntu-latest:docker://docker.gitea.com/runner-images:ubuntu-latest,macos:host
 
 [gitea/runner-images](https://gitea.com/gitea/runner-images) has suitable images. Jobs matching no label run in `runner.default_image`, or on the host when docker is unavailable.
 
-Host jobs still need a Docker daemon for Docker actions and `docker://` steps. Windows hosts do not support those, as on GitHub. On Windows, a step's background processes end with the job unless it opts out, see [host mode](docs/host-mode.md).
+Host jobs still need a Docker daemon for Docker actions and `docker://` steps. Windows hosts do not support those, as on GitHub. A step's background processes end with the job unless it opts out, see [host mode](docs/host-mode.md).
 
 #### Registration vs config labels
 
