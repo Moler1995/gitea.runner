@@ -49,7 +49,7 @@ func (sab *stepActionBuiltin) main() common.Executor {
 			InsecureSkipTLS: rc.Config.InsecureSkipTLS,
 			ClientCertFile:  rc.Config.ClientCertFile,
 			ClientKeyFile:   rc.Config.ClientKeyFile,
-			CAFile:          rc.Config.CAFile,
+			CAFile:          rc.jobCAFile(),
 			Env:             sab.env,
 		})
 	})

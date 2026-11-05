@@ -215,6 +215,7 @@ exec "$LFS" "$@"
 					Workspace:      workspace,
 					BindWorkdir:    tc.bind,
 					NoSkipCheckout: tc.noSkip,
+					CAFile:         "ca.crt",
 					Env: map[string]string{
 						"PATH": tools + string(os.PathListSeparator) + os.Getenv("PATH"), "GIT_CONFIG_GLOBAL": globalConfig, "GIT_CONFIG_NOSYSTEM": "1",
 						"GIT_DIR": host, "GITHUB_OUTPUT": output, "SSH_SERVER": filepath.ToSlash(server), "SSH_ARGS": filepath.Join(runnerTemp, "ssh-args"),
@@ -283,6 +284,7 @@ exec "$LFS" "$@"
 				assert.Len(t, strings.Fields(gitOutput(repo, "config", "--local", "--get-all", credentialsInclude)), 1, repo)
 				headers, _ := exec.Command("git", "-C", repo, "config", "--get-all", "http."+serverURL+"/.extraheader").Output()
 				assert.Equal(t, persisted, string(headers) == "\nAuthorization: Basic dG9rZW46dG9r\n", repo)
+				assert.Equal(t, persisted, gitOutput(repo, "config", "http."+serverURL+"/.sslcainfo") != "", repo)
 			}
 			if tc.inputs["lfs"] == "true" && runtime.GOOS != "windows" {
 				headers, _ := os.ReadFile(filepath.Join(runnerTemp, "lfs-headers"))
@@ -306,7 +308,7 @@ exec "$LFS" "$@"
 	}
 }
 
-func TestCheckoutOffersClientCertOnlyDuringTheStep(t *testing.T) {
+func TestCheckoutTrustsTheRunnerCAAndOffersClientCertOnlyDuringTheStep(t *testing.T) {
 	var gotCert bool
 	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotCert = len(r.TLS.PeerCertificates) > 0
@@ -324,14 +326,14 @@ func TestCheckoutOffersClientCertOnlyDuringTheStep(t *testing.T) {
 	require.NoError(t, os.WriteFile(keyFile, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}), 0o600))
 
 	require.ErrorContains(t, Main(t.Context(), &action.Context{
-		Container:       &container.HostEnvironment{Path: workspace, TmpDir: runnerTemp, StdOut: io.Discard},
-		Github:          &model.GithubContext{Repository: "org/repo", Ref: "refs/heads/main", ServerURL: server.URL},
-		Inputs:          map[string]string{"repository": "other/repo"},
-		Workspace:       workspace,
-		InsecureSkipTLS: true,
-		ClientCertFile:  certFile,
-		ClientKeyFile:   keyFile,
-		Env:             map[string]string{"PATH": os.Getenv("PATH"), "GIT_CONFIG_GLOBAL": os.DevNull, "GIT_CONFIG_NOSYSTEM": "1"},
+		Container:      &container.HostEnvironment{Path: workspace, TmpDir: runnerTemp, StdOut: io.Discard},
+		Github:         &model.GithubContext{Repository: "org/repo", Ref: "refs/heads/main", ServerURL: server.URL},
+		Inputs:         map[string]string{"repository": "other/repo"},
+		Workspace:      workspace,
+		ClientCertFile: certFile,
+		ClientKeyFile:  keyFile,
+		CAFile:         certFile,
+		Env:            map[string]string{"PATH": os.Getenv("PATH"), "GIT_CONFIG_GLOBAL": os.DevNull, "GIT_CONFIG_NOSYSTEM": "1"},
 	}), "checkout: other/repo@")
 	require.True(t, gotCert)
 	keys, _ := filepath.Glob(filepath.Join(runnerTemp, "git-client-key-*"))
@@ -339,28 +341,6 @@ func TestCheckoutOffersClientCertOnlyDuringTheStep(t *testing.T) {
 	key, err := os.ReadFile(keys[0])
 	require.NoError(t, err)
 	require.Empty(t, key)
-}
-
-func TestCheckoutTrustsTheRunnerCA(t *testing.T) {
-	var reached bool
-	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		reached = true
-		w.WriteHeader(http.StatusNotFound)
-	}))
-	defer server.Close()
-	workspace, runnerTemp := t.TempDir(), t.TempDir()
-	caFile := filepath.Join(t.TempDir(), "ca.crt")
-	require.NoError(t, os.WriteFile(caFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}), 0o600))
-
-	require.ErrorContains(t, Main(t.Context(), &action.Context{
-		Container: &container.HostEnvironment{Path: workspace, TmpDir: runnerTemp, StdOut: io.Discard},
-		Github:    &model.GithubContext{Repository: "org/repo", Ref: "refs/heads/main", ServerURL: server.URL},
-		Inputs:    map[string]string{"repository": "other/repo"},
-		Workspace: workspace,
-		CAFile:    caFile,
-		Env:       map[string]string{"PATH": os.Getenv("PATH"), "GIT_CONFIG_GLOBAL": os.DevNull, "GIT_CONFIG_NOSYSTEM": "1"},
-	}), "checkout: other/repo@")
-	require.True(t, reached)
 }
 
 func publish(t *testing.T, server, name string, files, submodules map[string]string) {

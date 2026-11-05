@@ -5,7 +5,6 @@ package artifactcache
 
 import (
 	"cmp"
-	"crypto/x509"
 	"encoding/json/v2"
 	"io"
 	"net/http"
@@ -135,13 +134,11 @@ func TestFrontResultsService(t *testing.T) {
 	}
 }
 
-func TestFrontResultsServiceTrustsRootCAs(t *testing.T) {
+func TestFrontResultsServiceForwardsThroughTheInstanceTransport(t *testing.T) {
 	t.Parallel()
-	gitea := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "{}") }))
+	gitea := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, _request *http.Request) { _, _ = io.WriteString(writer, "{}") }))
 	defer gitea.Close()
-	pool := x509.NewCertPool()
-	pool.AddCert(gitea.Certificate())
-	handler, err := StartHandler(Options{Dir: t.TempDir(), OutboundIP: "127.0.0.1", RootCAs: pool})
+	handler, err := StartHandler(Options{Dir: t.TempDir(), OutboundIP: "127.0.0.1", InstanceTransport: gitea.Client().Transport})
 	require.NoError(t, err)
 	defer handler.Close()
 	defer handler.RegisterJob("token", JobCredential{Results: gitea.URL})()

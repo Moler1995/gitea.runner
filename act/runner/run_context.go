@@ -68,6 +68,7 @@ type RunContext struct {
 	kubernetes          bool
 	containerSpec       model.ContainerSpec // container:, resolved once with platformImage
 	containerEnv        yaml.Node           // container.env of the kept containerSpec, decoded once the job env resolves
+	caEnv               map[string]string   // NODE_EXTRA_CA_CERTS for the runner CA, beneath any env the job and its image set
 	JobName             string
 	ActionPath          string
 	Parent              *RunContext
@@ -284,32 +285,29 @@ func (rc *RunContext) validVolumes() []string {
 		getDockerDaemonSocketMountPath(rc.containerDaemonSocket()))
 }
 
-// containerVolumeSources allows the sources of container.volumes, read-only ones only read-only,
-// so a workflow cannot mount them with more access than every container already gets.
+// containerVolumeSources lets workflows mount the container.volumes sources with no more access than they give.
 func (c *Config) containerVolumeSources() []string {
 	var sources []string
 	for _, spec := range c.ContainerVolumes {
-		parsed, err := container.ParseVolume(spec)
-		switch {
-		case err != nil || parsed.Source == "":
-		case parsed.ReadOnly:
-			sources = append(sources, parsed.Source+":ro")
-		default:
-			sources = append(sources, parsed.Source)
+		parsed, _ := container.ParseVolume(spec) // validated on config load
+		if parsed.ReadOnly {
+			parsed.Source += ":ro"
 		}
+		sources = append(sources, parsed.Source)
 	}
 	return sources
 }
 
-// appendContainerVolumes adds the container.volumes on targets left unclaimed, and claims them.
-func (rc *RunContext) appendContainerVolumes(binds []string, claimed map[string]bool) []string {
+// mountVolumes sanitizes volumes and adds the container.volumes on the targets they leave unclaimed.
+func (rc *RunContext) mountVolumes(ctx context.Context, validVolumes, volumes []string) ([]string, map[string]string, map[string]bool) {
+	binds, mounts, claimed := splitVolumes(container.SanitizeBinds(ctx, validVolumes, volumes))
 	for _, spec := range rc.Config.ContainerVolumes {
-		if parsed, err := container.ParseVolume(spec); err == nil && !claimed[parsed.Target] {
+		if parsed, _ := container.ParseVolume(spec); !claimed[parsed.Target] { // validated on config load
 			claimed[parsed.Target] = true
 			binds = append(binds, spec)
 		}
 	}
-	return binds
+	return binds, mounts, claimed
 }
 
 func (rc *RunContext) workdirMountRoot() string {
@@ -386,8 +384,7 @@ func (rc *RunContext) GetBindsAndMounts(ctx context.Context) ([]string, map[stri
 	ext := container.LinuxContainerEnvironmentExtensions{}
 
 	// the runner's own mounts below yield to the targets the job claims
-	binds, mounts, claimed := splitVolumes(container.SanitizeBinds(ctx, rc.validVolumes(), rc.containerSpec.Volumes))
-	binds = rc.appendContainerVolumes(binds, claimed)
+	binds, mounts, claimed := rc.mountVolumes(ctx, rc.validVolumes(), rc.containerSpec.Volumes)
 
 	if rc.containerDaemonSocket() != "-" && !claimed["/var/run/docker.sock"] {
 		binds = append(binds, rc.jobDockerSocket()+":/var/run/docker.sock")
@@ -735,11 +732,11 @@ func (rc *RunContext) jobServices(ctx context.Context, networkName string) (map[
 			entrypoint = []string{spec.Entrypoint}
 		}
 
-		serviceBinds, serviceMounts, claimed := splitVolumes(spec.Volumes)
-		validVolumes := rc.Config.ValidVolumes // not validVolumes(), a service gets no docker socket
+		serviceBinds, serviceMounts, _ := splitVolumes(spec.Volumes) // as given on Kubernetes, which rejects them
+		validVolumes := rc.Config.ValidVolumes                       // not validVolumes(), a service gets no docker socket
 		if !rc.kubernetes {
-			serviceBinds = rc.appendContainerVolumes(serviceBinds, claimed)
 			validVolumes = append(slices.Clone(validVolumes), rc.Config.containerVolumeSources()...)
+			serviceBinds, serviceMounts, _ = rc.mountVolumes(ctx, validVolumes, spec.Volumes)
 		}
 
 		exposedPorts, portBindings, err := nat.ParsePortSpecs(spec.Ports)
@@ -1165,12 +1162,24 @@ func (rc *RunContext) copyWorkflowFiles() common.Executor {
 				return fmt.Errorf("read runner CA file: %w", err)
 			}
 			files = append(files, &container.FileEntry{Name: "ca.crt", Mode: 0o644, Body: string(ca)})
-			if _, ok := rc.Env["NODE_EXTRA_CA_CERTS"]; !ok { // adds to Node's own CA list, which ignores the image's bundle
-				rc.Env["NODE_EXTRA_CA_CERTS"] = rc.JobContainer.GetActPath() + "/ca.crt"
+			imageEnv := map[string]string{}
+			if err = rc.JobContainer.UpdateFromImageEnv(&imageEnv)(ctx); err != nil {
+				return err
+			}
+			if _, set := imageEnv["NODE_EXTRA_CA_CERTS"]; !set {
+				rc.caEnv = map[string]string{"NODE_EXTRA_CA_CERTS": rc.jobCAFile()}
 			}
 		}
 		return rc.JobContainer.Copy(rc.JobContainer.GetActPath()+"/", files...)(ctx)
 	}
+}
+
+// jobCAFile is where copyWorkflowFiles puts the runner CA in the job, empty without one.
+func (rc *RunContext) jobCAFile() string {
+	if rc.Config.CAFile == "" {
+		return ""
+	}
+	return rc.JobContainer.GetActPath() + "/ca.crt"
 }
 
 // captureJobContainerInfo is a convenience: failing to describe the container must not

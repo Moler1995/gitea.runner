@@ -19,6 +19,7 @@ import (
 	"gitea.com/gitea/runner/act/common/logging"
 	"gitea.com/gitea/runner/act/container"
 
+	"github.com/docker/go-connections/tlsconfig"
 	"github.com/docker/go-units"
 	"github.com/joho/godotenv"
 	"go.yaml.in/yaml/v4"
@@ -488,24 +489,12 @@ func (r *Runner) loadCAFile() error {
 		return err
 	}
 	r.CAFile = abs
-	content, err := os.ReadFile(r.CAFile)
+	tlsConfig, err := tlsconfig.Client(tlsconfig.Options{CAFile: r.CAFile})
 	if err != nil {
 		return fmt.Errorf("load runner CA file: %w", err)
 	}
-	pool, err := x509.SystemCertPool()
-	if err != nil {
-		pool = x509.NewCertPool()
-	}
-	if !pool.AppendCertsFromPEM(content) {
-		return fmt.Errorf("load runner CA file: no PEM certificate in %s", r.CAFile)
-	}
-	r.rootCAs = pool
+	r.rootCAs = tlsConfig.RootCAs
 	return nil
-}
-
-// RootCAs are the CAs the Gitea instance is verified against, nil for the system's.
-func (r *Runner) RootCAs() *x509.CertPool {
-	return r.rootCAs
 }
 
 func (r *Runner) TLSConfig() *tls.Config {

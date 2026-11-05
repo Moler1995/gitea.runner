@@ -10,8 +10,6 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json/v2"
@@ -106,9 +104,8 @@ type Handler struct {
 	stopSync context.CancelFunc
 	syncing  sync.WaitGroup
 
-	outboundIP string
-
-	instanceTransport http.RoundTripper // nil is http.DefaultTransport
+	outboundIP        string
+	instanceTransport http.RoundTripper
 
 	// internalSecret guards /_internal/{register,revoke}. When set, a remote
 	// runner can use these endpoints to pre-register per-job
@@ -147,20 +144,21 @@ type Options struct {
 	// in-process RegisterJob method directly.
 	InternalSecret string
 
-	Policy  Policy
-	Logger  *logging.Logger
-	RootCAs *x509.CertPool // verify the instance artifact requests are forwarded to, nil for the system's
+	Policy            Policy
+	Logger            *logging.Logger
+	InstanceTransport http.RoundTripper // reaches the instance artifact requests are forwarded to, nil for http.DefaultTransport
 }
 
 // StartHandler starts an embedded cache or forwards cache requests to Upstream.
 func StartHandler(opts Options) (*Handler, error) {
 	dir, logger := opts.Dir, opts.Logger
 	h := &Handler{
-		creds:          make(map[string]*credEntry),
-		internalSecret: opts.InternalSecret,
-		policy:         opts.Policy.withDefaults(),
-		freeDisk:       disk.FreeBytes,
-		dbLock:         make(chan struct{}, 1),
+		creds:             make(map[string]*credEntry),
+		internalSecret:    opts.InternalSecret,
+		policy:            opts.Policy.withDefaults(),
+		freeDisk:          disk.FreeBytes,
+		dbLock:            make(chan struct{}, 1),
+		instanceTransport: opts.InstanceTransport,
 	}
 
 	if logger == nil {
@@ -168,10 +166,6 @@ func StartHandler(opts Options) (*Handler, error) {
 	}
 	logger = logger.With("module", "artifactcache")
 	h.logger = logger
-
-	if opts.RootCAs != nil {
-		h.instanceTransport = &http.Transport{Proxy: http.ProxyFromEnvironment, TLSClientConfig: &tls.Config{RootCAs: opts.RootCAs}}
-	}
 
 	if opts.OutboundIP != "" {
 		h.outboundIP = opts.OutboundIP

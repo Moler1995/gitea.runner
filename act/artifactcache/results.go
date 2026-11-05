@@ -67,8 +67,7 @@ func (h *Handler) forwardOrNotFound(w http.ResponseWriter, r *http.Request) {
 			h.twirpError(w, r, twirpInternal, fmt.Errorf("cache server cannot reach the artifact service at %s: %w", target, err))
 		},
 	}
-	proxy.Transport = h.instanceTransport
-	if cred.InsecureTLS {
+	if proxy.Transport = h.instanceTransport; proxy.Transport == nil && cred.InsecureTLS { // the instance transport carries runner.insecure and the client cert
 		proxy.Transport = insecureTransport
 	}
 	proxy.ServeHTTP(w, r)

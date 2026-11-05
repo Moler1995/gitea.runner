@@ -277,28 +277,7 @@ jobs:
 	require.Equal(t, [2]string{"", ""}, credentials["redis:latest"])
 }
 
-func TestStartJobContainerGivesServicesTheirVolumes(t *testing.T) {
-	redis := startJobContainerInputs(t, `
-jobs:
-  job:
-    services:
-      redis:
-        image: redis:latest
-        volumes:
-          - data:/data
-          - data:/backup
-`, &Config{ValidVolumes: []string{"data"}})[0]
-
-	require.Equal(t, "redis:latest", redis.Image)
-	require.Equal(t, []string{"data"}, redis.ValidVolumes)
-	require.Equal(t, map[string]string{"data": "/data"}, redis.Mounts)
-	require.Equal(t, []string{"data:/backup"}, redis.Binds)
-	require.Empty(t, redis.WorkingDir)
-	require.Nil(t, redis.Entrypoint)
-	require.Nil(t, redis.Cmd)
-}
-
-func TestStartJobContainerMountsContainerVolumesOnUnclaimedTargets(t *testing.T) {
+func TestStartJobContainerMountsWorkflowVolumesAndContainerVolumesOnUnclaimedTargets(t *testing.T) {
 	const ca, certs = "/host/ca.crt:/etc/ssl/certs/ca-certificates.crt:ro", "/host/certs:/certs"
 	inputs := startJobContainerInputs(t, `
 jobs:
@@ -310,12 +289,22 @@ jobs:
     services:
       redis:
         image: redis:latest
-`, &Config{ValidVolumes: []string{"/job/certs"}, ContainerVolumes: []string{ca, certs}})
+        volumes:
+          - data:/data
+          - data:/backup
+          - /blocked/ca.crt:/etc/ssl/certs/ca-certificates.crt:ro
+          - blocked:/certs
+`, &Config{ValidVolumes: []string{"data", "/job/certs"}, ContainerVolumes: []string{ca, certs}})
 	require.Len(t, inputs, 2)
 	redis, job := inputs[0], inputs[1]
 
-	assert.Equal(t, []string{ca, certs}, redis.Binds)
-	assert.Equal(t, []string{"/job/certs", "/host/ca.crt:ro", "/host/certs"}, redis.ValidVolumes)
+	require.Equal(t, "redis:latest", redis.Image)
+	require.Equal(t, []string{"data", "/job/certs", "/host/ca.crt:ro", "/host/certs"}, redis.ValidVolumes)
+	require.Equal(t, map[string]string{"data": "/data"}, redis.Mounts)
+	require.Equal(t, []string{"data:/backup", ca, certs}, redis.Binds)
+	require.Empty(t, redis.WorkingDir)
+	require.Nil(t, redis.Entrypoint)
+	require.Nil(t, redis.Cmd)
 	assert.Subset(t, job.Binds, []string{"/job/certs:/certs", ca})
 	assert.NotContains(t, job.Binds, certs)
 	assert.Subset(t, job.ValidVolumes, []string{"/job/certs", "/host/ca.crt:ro", "/host/certs"})
@@ -328,7 +317,7 @@ jobs:
   job:
     container: ${{ fromJSON('{"image":"docker://node:20","options":"--label ${{ github.job }}","credentials":{"username":"user","password":"${{ vars.TITLE }}"}}') }}
     services: ${{ fromJSON('{"redis":{"image":"docker://redis:latest","volumes":["data:/data"],"env":{"TITLE":"${{ github.job }}"},"credentials":{"username":"user","password":"${{ github.job }}"},"entrypoint":"/entry.sh","command":"redis-server --port 6380"}}') }}
-`, &Config{})
+`, &Config{ValidVolumes: []string{"data"}})
 	redis, job := inputs[0], inputs[1]
 
 	require.Equal(t, "redis:latest", redis.Image)
@@ -1474,24 +1463,41 @@ func TestGetJobContextReportsContainers(t *testing.T) {
 	}, jobContext.Services)
 }
 
-func TestCopyWorkflowFilesHandsJobsTheRunnerCA(t *testing.T) {
-	caFile := filepath.Join(t.TempDir(), "ca.crt")
+type imageEnvContainer struct {
+	*container.HostEnvironment
+	imageEnv map[string]string
+}
+
+func (c imageEnvContainer) UpdateFromImageEnv(env *map[string]string) common.Executor {
+	return func(_ctx context.Context) error { maps.Copy(*env, c.imageEnv); return nil }
+}
+
+func TestCopyWorkflowFilesHandsNodeTheRunnerCAUnlessTheJobOrImageSetsIt(t *testing.T) {
+	caFile, actPath := filepath.Join(t.TempDir(), "ca.crt"), t.TempDir()
 	require.NoError(t, os.WriteFile(caFile, []byte("PEM\n"), 0o600))
-	copyFiles := func(caFile string, env map[string]string) *RunContext {
-		rc := &RunContext{Config: &Config{CAFile: caFile}, Env: env, JobContainer: &container.HostEnvironment{Path: t.TempDir(), ActPath: t.TempDir(), StdOut: io.Discard}}
+	own := map[string]string{"NODE_EXTRA_CA_CERTS": "/own.pem"}
+	stepEnv := func(caFile string, jobEnv, containerEnv, imageEnv map[string]string) map[string]string {
+		rc := &RunContext{
+			Config:       &Config{CAFile: caFile},
+			Run:          &model.Run{JobID: "job", Workflow: &model.Workflow{Jobs: map[string]*model.Job{"job": {}}}},
+			Env:          maps.Clone(jobEnv),
+			JobContainer: imageEnvContainer{&container.HostEnvironment{Path: t.TempDir(), ActPath: actPath, StdOut: io.Discard}, imageEnv},
+		}
+		rc.containerSpec.Env = containerEnv
 		require.NoError(t, rc.copyWorkflowFiles()(t.Context()))
-		return rc
+		env := map[string]string{}
+		require.NoError(t, setupEnv(t.Context(), &stepRun{RunContext: rc, Step: &model.Step{}, env: env}))
+		return env
 	}
 
-	rc := copyFiles(caFile, map[string]string{})
-	caPath := rc.JobContainer.GetActPath() + "/ca.crt"
-	assert.Equal(t, caPath, rc.Env["NODE_EXTRA_CA_CERTS"])
-	ca, err := os.ReadFile(caPath)
+	assert.Equal(t, actPath+"/ca.crt", stepEnv(caFile, nil, nil, nil)["NODE_EXTRA_CA_CERTS"])
+	ca, err := os.ReadFile(filepath.Join(actPath, "ca.crt"))
 	require.NoError(t, err)
 	assert.Equal(t, "PEM\n", string(ca))
-
-	assert.Equal(t, "/own.pem", copyFiles(caFile, map[string]string{"NODE_EXTRA_CA_CERTS": "/own.pem"}).Env["NODE_EXTRA_CA_CERTS"])
-	assert.NotContains(t, copyFiles("", map[string]string{}).Env, "NODE_EXTRA_CA_CERTS")
+	assert.Equal(t, "/own.pem", stepEnv(caFile, own, nil, nil)["NODE_EXTRA_CA_CERTS"])
+	assert.Equal(t, "/own.pem", stepEnv(caFile, nil, own, nil)["NODE_EXTRA_CA_CERTS"])
+	assert.NotContains(t, stepEnv(caFile, nil, nil, own), "NODE_EXTRA_CA_CERTS")
+	assert.NotContains(t, stepEnv("", nil, nil, nil), "NODE_EXTRA_CA_CERTS")
 }
 
 func TestCaptureJobContainerInfoExportsDockerWorkspace(t *testing.T) {

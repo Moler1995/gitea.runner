@@ -71,8 +71,8 @@ func TestClientCertIsValidatedAndAbsoluteOnLoadReadOnUseAndOfferedOnlyWhenAccept
 }
 
 func TestCAFileIsValidatedAndAbsoluteOnLoadAndTrustedBesidesTheSystem(t *testing.T) {
-	server := httptest.NewUnstartedServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
-	server.Config.ErrorLog = log.New(io.Discard, "", 0) // the handshake the system pool fails
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(_writer http.ResponseWriter, _request *http.Request) {}))
+	server.Config.ErrorLog = log.New(io.Discard, "", 0)
 	server.StartTLS()
 	defer server.Close()
 	dir := t.TempDir()
@@ -82,9 +82,9 @@ func TestCAFileIsValidatedAndAbsoluteOnLoadAndTrustedBesidesTheSystem(t *testing
 
 	t.Chdir(dir)
 	_, err := load("empty.crt")
-	require.ErrorContains(t, err, "no PEM certificate")
+	require.ErrorContains(t, err, "failed to append certificates")
 	_, err = load("missing.crt")
-	require.ErrorContains(t, err, "load runner CA file")
+	require.ErrorContains(t, err, "could not read CA certificate")
 	cfg, err := load("ca.crt")
 	require.NoError(t, err)
 	require.Equal(t, filepath.Join(dir, "ca.crt"), cfg.Runner.CAFile)
