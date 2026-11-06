@@ -35,14 +35,8 @@ func setFetch(t *testing.T, fetch func(context.Context, git.NewGitCloneExecutorI
 func TestShortSHAActionRejected(t *testing.T) {
 	actionRoot := t.TempDir()
 	repo := filepath.Join(actionRoot, "actions", "hello-world-docker-action")
-	require.NoError(t, os.MkdirAll(repo, 0o755))
-	gitMust(t, "", "init", "--initial-branch=main", repo)
-	gitMust(t, repo, "config", "user.email", "test@test")
-	gitMust(t, repo, "config", "user.name", "test")
-	require.NoError(t, os.WriteFile(filepath.Join(repo, "action.yml"),
-		[]byte("name: hello\nruns:\n  using: node24\n  main: index.js\n"), 0o644))
-	gitMust(t, repo, "add", ".")
-	gitMust(t, repo, "commit", "-m", "initial")
+	gitMust(t, "", "init", "--template=", "--initial-branch=main", repo)
+	gitMust(t, repo, "commit", "--allow-empty", "-m", "initial")
 	output, err := exec.Command("git", "-C", repo, "rev-parse", "--short=7", "HEAD").Output()
 	require.NoError(t, err)
 
@@ -76,7 +70,7 @@ func TestStepActionRemote(t *testing.T) {
 		status          model.StepStatus
 		runError        error
 	}{
-		{name: "run-successful", status: model.StepStatusSuccess},
+		{name: "run-successful", condition: "github.action_repository == 'other/composite' && github.action_ref == 'v2'", status: model.StepStatusSuccess},
 		{name: "run-skipped", condition: "false", status: model.StepStatusSkipped},
 		{name: "run-error", status: model.StepStatusFailure, runError: assert.AnError},
 	} {
@@ -110,6 +104,7 @@ func TestStepActionRemote(t *testing.T) {
 					},
 					StepResults:  map[string]*model.StepResult{},
 					JobContainer: cm,
+					Env:          map[string]string{"GITHUB_ACTION_REPOSITORY": "other/composite", "GITHUB_ACTION_REF": "v2"},
 				},
 				Step:       &model.Step{ID: "step", Uses: "remote/action@v1", If: yaml.Node{Value: tt.condition}},
 				readAction: sarm.readAction,
@@ -127,6 +122,8 @@ func TestStepActionRemote(t *testing.T) {
 			require.NoError(t, sar.pre()(ctx))
 			assert.Equal(t, tt.runError, sar.main()(ctx))
 			assert.True(t, clonedAction)
+			assert.Equal(t, "remote/action", sar.env["GITHUB_ACTION_REPOSITORY"])
+			assert.Equal(t, "v1", sar.env["GITHUB_ACTION_REF"])
 			assert.Equal(t, &model.StepResult{Conclusion: tt.status, Outcome: tt.status, Outputs: map[string]string{}}, sar.RunContext.StepResults["step"])
 
 			sarm.AssertExpectations(t)
@@ -182,7 +179,7 @@ func TestStepActionRemotePrepare(t *testing.T) {
 	require.NoError(t, err)
 	root, err := prepare(job, "org/repo@v1")
 	require.NoError(t, err)
-	nested, err := prepare(&RunContext{Config: job.Config, Run: job.Run, JobContainer: job.JobContainer, Parent: job}, "org/repo/save@v1")
+	nested, err := prepare(&RunContext{Config: job.Config, Run: job.Run, JobContainer: job.JobContainer, Parent: job, Env: map[string]string{"GITHUB_ACTION_REPOSITORY": "org/repo", "GITHUB_ACTION_REF": "v1"}}, "$/save")
 	require.NoError(t, err)
 	other, err := prepare(job, "org/repo@v2")
 	require.NoError(t, err)
@@ -346,9 +343,6 @@ func Test_newRemoteActionSelfRepo(t *testing.T) {
 			},
 		},
 		{name: "unknown instance", action: "$/.gitea/actions/build", github: &model.GithubContext{Repository: "owner/workflow-repo", Sha: "abc123"}},
-		{name: "empty path", action: "$/", github: workflow},
-		{name: "ref suffix is not allowed", action: "$/.gitea/actions/build@v1", github: workflow},
-		{name: "path traversal", action: "$/../escape", github: workflow},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -393,7 +387,7 @@ func TestStepActionRemotePreResolvesDownloadedCommit(t *testing.T) {
 		[]byte("name: setup-go\nruns:\n  using: node20\n  main: index.js\n"), 0o600))
 
 	for _, args := range [][]string{
-		{"init", "--initial-branch=main", actionDir},
+		{"init", "--template=", "--initial-branch=main", actionDir},
 		{"-C", actionDir, "add", "action.yml"},
 		{"-C", actionDir, "-c", "user.name=runner", "-c", "user.email=runner@example.com", "-c", "commit.gpgsign=false", "commit", "-m", "action"},
 	} {

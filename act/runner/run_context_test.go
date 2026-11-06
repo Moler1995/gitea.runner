@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -276,25 +277,38 @@ jobs:
 	require.Equal(t, [2]string{"", ""}, credentials["redis:latest"])
 }
 
-func TestStartJobContainerGivesServicesTheirVolumes(t *testing.T) {
-	redis := startJobContainerInputs(t, `
+func TestStartJobContainerMountsWorkflowVolumesAndContainerVolumesOnUnclaimedTargets(t *testing.T) {
+	const ca, certs = "/host/ca.crt:/etc/ssl/certs/ca-certificates.crt:ro", "/host/certs:/certs"
+	inputs := startJobContainerInputs(t, `
 jobs:
   job:
+    container:
+      image: node:24
+      volumes:
+        - /job/certs:/certs
     services:
       redis:
         image: redis:latest
         volumes:
           - data:/data
           - data:/backup
-`, &Config{ValidVolumes: []string{"data"}})[0]
+          - /blocked/ca.crt:/etc/ssl/certs/ca-certificates.crt:ro
+          - blocked:/certs
+`, &Config{ValidVolumes: []string{"data", "/job/certs"}, ContainerVolumes: []string{ca, certs}})
+	require.Len(t, inputs, 2)
+	redis, job := inputs[0], inputs[1]
 
 	require.Equal(t, "redis:latest", redis.Image)
-	require.Equal(t, []string{"data"}, redis.ValidVolumes)
+	require.Equal(t, []string{"data", "/job/certs", "/host/ca.crt:ro", "/host/certs"}, redis.ValidVolumes)
 	require.Equal(t, map[string]string{"data": "/data"}, redis.Mounts)
-	require.Equal(t, []string{"data:/backup"}, redis.Binds)
+	require.Equal(t, []string{"data:/backup", ca, certs}, redis.Binds)
 	require.Empty(t, redis.WorkingDir)
 	require.Nil(t, redis.Entrypoint)
 	require.Nil(t, redis.Cmd)
+	assert.Subset(t, job.Binds, []string{"/job/certs:/certs", ca})
+	assert.NotContains(t, job.Binds, certs)
+	assert.Subset(t, job.ValidVolumes, []string{"/job/certs", "/host/ca.crt:ro", "/host/certs"})
+	assert.NotContains(t, job.ValidVolumes, "/host/ca.crt", "a workflow must not mount a read-only source writable")
 }
 
 func TestStartJobContainerBuildsEvaluatedJobAndServiceInputs(t *testing.T) {
@@ -303,7 +317,7 @@ jobs:
   job:
     container: ${{ fromJSON('{"image":"docker://node:20","options":"--label ${{ github.job }}","credentials":{"username":"user","password":"${{ vars.TITLE }}"}}') }}
     services: ${{ fromJSON('{"redis":{"image":"docker://redis:latest","volumes":["data:/data"],"env":{"TITLE":"${{ github.job }}"},"credentials":{"username":"user","password":"${{ github.job }}"},"entrypoint":"/entry.sh","command":"redis-server --port 6380"}}') }}
-`, &Config{})
+`, &Config{ValidVolumes: []string{"data"}})
 	redis, job := inputs[0], inputs[1]
 
 	require.Equal(t, "redis:latest", redis.Image)
@@ -711,7 +725,7 @@ func TestCleanupJobResources(t *testing.T) {
 			service.On("Remove").Return(removeAlongside(serviceRemoving, jobRemoving, removeError)).Once()
 			service.On("Close").Return(func(context.Context) error { return closeError }).Once()
 			rc := &RunContext{
-				Config:            &Config{CacheContainer: "cache-container", NoSweep: name == "kept proxy"},
+				Config:            &Config{CacheContainer: "cache-container", Sweep: name != "kept proxy"},
 				Run:               &model.Run{Workflow: &model.Workflow{Name: "wf"}, JobID: "job"},
 				JobContainer:      job,
 				serviceContainers: []*serviceContainer{{name: "svc", container: service}},
@@ -877,25 +891,25 @@ func TestGetGitHubContext(t *testing.T) {
 		RepositoryID:      "34",
 		RepositoryOwnerID: "56",
 		WorkflowRef:       "owner/repo/.gitea/workflows/test.yml@refs/heads/main",
-		WorkflowSha:       "workflow-sha",
 		RefProtected:      true,
 	}
 	ghc = rc.getGithubContext(t.Context())
 	assert.Equal(t, "preset-actor", ghc.Actor)
 	assert.Equal(t, "triggerer", ghc.TriggeringActor)
 	assert.Equal(t, "job1", ghc.Job)
-	env := map[string]string{}
+	env := map[string]string{"GITHUB_WORKFLOW_SHA": "workflow-sha"}
 	rc.withGithubEnv(t.Context(), ghc, env)
-	for name, value := range map[string]string{
-		"GITHUB_ACTOR_ID":            "12",
-		"GITHUB_TRIGGERING_ACTOR":    "triggerer",
-		"GITHUB_REPOSITORY_ID":       "34",
-		"GITHUB_REPOSITORY_OWNER_ID": "56",
-		"GITHUB_WORKFLOW_REF":        "owner/repo/.gitea/workflows/test.yml@refs/heads/main",
-		"GITHUB_WORKFLOW_SHA":        "workflow-sha",
-		"GITHUB_REF_PROTECTED":       "true",
+	for suffix, value := range map[string]string{
+		"ACTOR_ID":            "12",
+		"TRIGGERING_ACTOR":    "triggerer",
+		"REPOSITORY_ID":       "34",
+		"REPOSITORY_OWNER_ID": "56",
+		"WORKFLOW_REF":        "owner/repo/.gitea/workflows/test.yml@refs/heads/main",
+		"WORKFLOW_SHA":        "workflow-sha",
+		"REF_PROTECTED":       "true",
 	} {
-		assert.Equal(t, value, env[name], name)
+		assert.Equal(t, value, env["GITHUB_"+suffix], suffix)
+		assert.Equal(t, value, env["GITEA_"+suffix], suffix)
 	}
 	ghc.RefProtected = false
 	rc.withGithubEnv(t.Context(), ghc, env)
@@ -922,12 +936,12 @@ func TestGetGitHubContext(t *testing.T) {
 			github := rc.getGithubContext(t.Context())
 			assert.Equal(t, testcase.serverURL, github.ServerURL)
 			assert.Equal(t, testcase.apiURL, github.APIURL)
-			env := map[string]string{}
+			env := map[string]string{"GITEA_SERVER_URL": "stale", "GITEA_API_URL": "stale"}
 			rc.withGithubEnv(t.Context(), github, env)
 			_, exported := env["GITHUB_SERVER_URL"]
 			assert.Equal(t, testcase.serverURL != "", exported)
-			assert.Equal(t, testcase.serverURL, env["GITHUB_SERVER_URL"])
-			assert.Equal(t, testcase.apiURL, env["GITHUB_API_URL"])
+			assert.Equal(t, testcase.serverURL, env["GITEA_SERVER_URL"])
+			assert.Equal(t, testcase.apiURL, env["GITEA_API_URL"])
 		})
 	}
 }
@@ -1078,6 +1092,51 @@ func TestRunContextGetEnv(t *testing.T) {
 				},
 			}
 			assert.Equal(t, testcase.want, rc.GetEnv()["OVERWRITTEN"])
+		})
+	}
+}
+
+func TestRunContextEnvCaseSensitivity(t *testing.T) {
+	for _, caseInsensitive := range []bool{false, true} {
+		t.Run(strconv.FormatBool(caseInsensitive), func(t *testing.T) {
+			rc := createIfTestRunContext(map[string]*model.Job{
+				"job1": createJob(t, "runs-on: self-hosted\nenv:\n  build_mode: job\n  config_value: job", ""),
+			})
+			rc.Run.Workflow.Env = map[string]string{"BUILD_MODE": "workflow", "CONFIG_VALUE": "workflow", "PATH": "workflow-path", "runner_tool_cache": "workflow-cache"}
+			rc.Config.Env = map[string]string{"CONFIG_VALUE": "config", "RUNNER_TOOL_CACHE": "configured-cache"}
+			rc.Config.DisableActEnv, rc.Config.NoSkipCheckout = true, true
+			rc.Env = nil
+			rc.GetEnv()
+			rc.JobContainer = fakeContainer{ExecutionsEnvironment: &container.HostEnvironment{}, caseInsensitive: caseInsensitive}
+			require.NoError(t, rc.resolvePlatformImage(t.Context()))
+			if caseInsensitive {
+				assert.Equal(t, map[string]string{"build_mode": "job", "CONFIG_VALUE": "config", "PATH": "workflow-path", "RUNNER_TOOL_CACHE": "configured-cache"}, rc.GetEnv())
+			} else {
+				assert.Equal(t, map[string]string{
+					"BUILD_MODE": "workflow", "build_mode": "job", "CONFIG_VALUE": "config",
+					"config_value": "job", "PATH": "workflow-path", "runner_tool_cache": "workflow-cache", "RUNNER_TOOL_CACHE": "configured-cache",
+				}, rc.GetEnv())
+			}
+			want := maps.Clone(rc.GetEnv())
+			rc.Run.Workflow.Env = nil
+			require.NoError(t, rc.Run.Workflow.RawEnv.Encode(`${{ fromJSON('{"BUILD_MODE":"workflow","CONFIG_VALUE":"workflow","PATH":"workflow-path","runner_tool_cache":"workflow-cache"}') }}`))
+			rc.Env = nil
+			evaluated, err := evaluateJobEnv(t.Context(), rc)
+			require.NoError(t, err)
+			assert.Equal(t, want, evaluated)
+			rc.Env = evaluated
+
+			rc.importHostEnv([]string{"Path=host-path", "HOST_ONLY=value", "RUNNER_TRACKING_ID=parent", "runner_tracking_id=parent-lower"})
+			assert.NotContains(t, rc.Env, "RUNNER_TRACKING_ID")
+			assert.Equal(t, "workflow-path", rc.Env["PATH"])
+			assert.Equal(t, "value", rc.Env["HOST_ONLY"])
+			if caseInsensitive {
+				assert.NotContains(t, rc.Env, "Path")
+				assert.NotContains(t, rc.Env, "runner_tracking_id")
+			} else {
+				assert.Equal(t, "host-path", rc.Env["Path"])
+				assert.Equal(t, "parent-lower", rc.Env["runner_tracking_id"])
+			}
 		})
 	}
 }
@@ -1404,14 +1463,52 @@ func TestGetJobContextReportsContainers(t *testing.T) {
 	}, jobContext.Services)
 }
 
+type imageEnvContainer struct {
+	*container.HostEnvironment
+	imageEnv map[string]string
+}
+
+func (c imageEnvContainer) UpdateFromImageEnv(env *map[string]string) common.Executor {
+	return func(_ctx context.Context) error { maps.Copy(*env, c.imageEnv); return nil }
+}
+
+func TestCopyWorkflowFilesHandsNodeTheRunnerCAUnlessTheJobOrImageSetsIt(t *testing.T) {
+	caFile, actPath := filepath.Join(t.TempDir(), "ca.crt"), t.TempDir()
+	require.NoError(t, os.WriteFile(caFile, []byte("PEM\n"), 0o600))
+	own := map[string]string{"NODE_EXTRA_CA_CERTS": "/own.pem"}
+	stepEnv := func(caFile string, jobEnv, containerEnv, imageEnv map[string]string) map[string]string {
+		rc := &RunContext{
+			Config:       &Config{CAFile: caFile},
+			Run:          &model.Run{JobID: "job", Workflow: &model.Workflow{Jobs: map[string]*model.Job{"job": {}}}},
+			Env:          maps.Clone(jobEnv),
+			JobContainer: imageEnvContainer{&container.HostEnvironment{Path: t.TempDir(), ActPath: actPath, StdOut: io.Discard}, imageEnv},
+		}
+		rc.containerSpec.Env = containerEnv
+		require.NoError(t, rc.copyWorkflowFiles()(t.Context()))
+		env := map[string]string{}
+		require.NoError(t, setupEnv(t.Context(), &stepRun{RunContext: rc, Step: &model.Step{}, env: env}))
+		return env
+	}
+
+	assert.Equal(t, filepath.ToSlash(actPath)+"/ca.crt", stepEnv(caFile, nil, nil, nil)["NODE_EXTRA_CA_CERTS"])
+	ca, err := os.ReadFile(filepath.Join(actPath, "ca.crt"))
+	require.NoError(t, err)
+	assert.Equal(t, "PEM\n", string(ca))
+	assert.Equal(t, "/own.pem", stepEnv(caFile, own, nil, nil)["NODE_EXTRA_CA_CERTS"])
+	assert.Equal(t, "/own.pem", stepEnv(caFile, nil, own, nil)["NODE_EXTRA_CA_CERTS"])
+	assert.NotContains(t, stepEnv(caFile, nil, nil, own), "NODE_EXTRA_CA_CERTS")
+	assert.NotContains(t, stepEnv("", nil, nil, nil), "NODE_EXTRA_CA_CERTS")
+}
+
 func TestCaptureJobContainerInfoExportsDockerWorkspace(t *testing.T) {
+	workdir := t.TempDir()
 	job := &containerMock{}
 	job.On("Inspect", mock.Anything).Return(&container.Info{
 		ID:     "job-container-id",
-		Mounts: map[string]string{"/workspace": "/var/lib/docker/volumes/job/_data"},
+		Mounts: map[string]string{job.ToContainerPath(workdir): "/var/lib/docker/volumes/job/_data"},
 	}, nil)
 	rc := &RunContext{
-		Config:       &Config{Workdir: "/workspace/owner/repo/"},
+		Config:       &Config{Workdir: filepath.Join(workdir, "owner", "repo") + string(filepath.Separator)},
 		Env:          map[string]string{},
 		JobContainer: job,
 	}
@@ -1421,7 +1518,7 @@ func TestCaptureJobContainerInfoExportsDockerWorkspace(t *testing.T) {
 	assert.Equal(t, "job-container-id", rc.jobContainerID)
 	assert.Equal(t, "/var/lib/docker/volumes/job/_data/owner/repo", rc.Env["GITEA_DOCKER_WORKSPACE"])
 
-	rc.Config.Workdir = "/elsewhere"
+	rc.Config.Workdir = filepath.Dir(workdir)
 	rc.Env = map[string]string{}
 	require.NoError(t, rc.captureJobContainerInfo()(t.Context()))
 	assert.NotContains(t, rc.Env, "GITEA_DOCKER_WORKSPACE")
@@ -1569,21 +1666,21 @@ func TestRunContextUpdateExtraPath(t *testing.T) {
 	longPath := strings.Repeat("x", 64*1024+1)
 	for _, testcase := range []struct {
 		name    string
-		content []byte
+		content string
 		want    string
 		wantErr bool
 	}{
-		{name: "UTF-8 BOM", content: []byte("\xef\xbb\xbf/utf8/tools\n"), want: "/utf8/tools"},
-		{name: "UTF-16 BOM", content: []byte{0xff, 0xfe, 'C', 0, ':', 0, '\\', 0, 't', 0, 'o', 0, 'o', 0, 'l', 0, 's', 0, '\n', 0}, want: `C:\tools`},
-		{name: "over 64 KiB", content: []byte(longPath + "\n"), want: longPath},
-		{name: "over 16 MiB", content: []byte(strings.Repeat("x", 16*1024*1024+1)), wantErr: true},
+		{name: "UTF-8 BOM", content: "\xef\xbb\xbf/utf8/tools\n", want: "/utf8/tools"},
+		{name: "UTF-16 BOM", content: "\xff\xfeC\x00:\x00\\\x00t\x00o\x00o\x00l\x00s\x00\n\x00", want: `C:\tools`},
+		{name: "over 64 KiB", content: longPath + "\n", want: longPath},
+		{name: "over 16 MiB", content: strings.Repeat("x", 16*1024*1024+1), wantErr: true},
 	} {
 		t.Run(testcase.name, func(t *testing.T) {
 			logger := logging.New(logging.DiscardHandler)
 			ctx := common.WithLogger(t.Context(), logger)
 			jobContainer := &containerMock{}
 			jobContainer.On("GetContainerArchive", mock.Anything, "/github/path").
-				Return(io.NopCloser(bytes.NewReader(tarArchive(t, tarEntry{name: "path", body: string(testcase.content)}))), nil).Once()
+				Return(io.NopCloser(bytes.NewReader(tarArchive(t, tarEntry{name: "path", body: testcase.content}))), nil).Once()
 			defer jobContainer.AssertExpectations(t)
 			rc := &RunContext{JobContainer: jobContainer}
 
@@ -1631,4 +1728,8 @@ func TestRunContextWithGithubEnvRunnerValues(t *testing.T) {
 		rc.withGithubEnv(ctx, &model.GithubContext{}, env)
 		assert.Equal(t, ci, env["CI"])
 	}
+
+	rc.runtimeToken = "run-token"
+	newTestCompositeRunContext(t, rc).withGithubEnv(ctx, &model.GithubContext{}, env)
+	assert.Equal(t, "run-token", env["ACTIONS_RUNTIME_TOKEN"])
 }

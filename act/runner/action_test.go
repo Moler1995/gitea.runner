@@ -115,7 +115,7 @@ runs:
 					"cwd": {
 						Description: "(Actual working directory)",
 						Required:    false,
-						Default:     "actionDir/actionPath",
+						Default:     filepath.Join("actionDir", "actionPath"),
 					},
 					"command": {
 						Description: "(Actual program)",
@@ -144,7 +144,7 @@ runs:
 			}
 
 			writeFile := func(filename string, _data []byte, perm fs.FileMode) error {
-				assert.Equal(t, "actionDir/actionPath/trampoline.js", filename)
+				assert.Equal(t, filepath.Join("actionDir", "actionPath", "trampoline.js"), filename)
 				assert.Equal(t, fs.FileMode(0o644), perm)
 				return nil
 			}
@@ -242,6 +242,40 @@ func TestActionRunner(t *testing.T) {
 				rawOutput, ok := hook.LastRecord().Attr(rawOutputField)
 				require.True(t, ok)
 				assert.Equal(t, true, rawOutput)
+			}
+			cm.AssertExpectations(t)
+		})
+	}
+}
+
+func TestGoActionUsesLinuxExecutablePaths(t *testing.T) {
+	actionRoot := t.TempDir()
+	for _, stage := range []string{"main", "pre", "post"} {
+		t.Run(stage, func(t *testing.T) {
+			cm := &containerMock{}
+			containerActionDir := "/var/run/act/actions/" + model.UsesHash("/org/repo@ref")
+			cm.On("CopyDir", containerActionDir+"/", mock.Anything, false, true).Return(noopExecutor).Maybe()
+			cm.On("Exec", []string{"go", "build", "-o", stage + ".go.out", stage + ".go"}, mock.Anything, "", containerActionDir).Return(noopExecutor).Once()
+			cm.On("Exec", []string{containerActionDir + "/" + stage + ".go.out"}, mock.Anything, "", "").Return(noopExecutor).Once()
+			step := &stepActionRemote{
+				Step: &model.Step{ID: "step", Uses: "org/repo@ref"},
+				RunContext: &RunContext{
+					Config:       &Config{NoActionPatch: true, PresetGitHubContext: &model.GithubContext{}},
+					Run:          &model.Run{JobID: "job", Workflow: &model.Workflow{Jobs: map[string]*model.Job{"job": {}}}},
+					JobContainer: cm,
+				},
+				action:       &model.Action{Runs: model.ActionRuns{Using: model.ActionRunsUsingGo, Main: "main.go", Pre: "pre.go", Post: "post.go"}},
+				actionDir:    filepath.Join(actionRoot, stage),
+				env:          map[string]string{},
+				remoteAction: mustNewRemoteAction(t, "org/repo@ref"),
+			}
+			switch stage {
+			case "main":
+				require.NoError(t, runActionImpl(step, step.actionDir, step.remoteAction)(t.Context()))
+			case "pre":
+				require.NoError(t, runPreStep(step)(t.Context()))
+			case "post":
+				require.NoError(t, runPostStep(step)(t.Context()))
 			}
 			cm.AssertExpectations(t)
 		})
@@ -471,11 +505,21 @@ func TestExecAsDockerHoldsCloneLockForRemoteUncached(t *testing.T) {
 }
 
 func TestExecAsDockerImageChecks(t *testing.T) {
+	actionRoot := t.TempDir()
 	originalExists, originalBuild, originalContainer := ContainerImageExistsLocally, ContainerNewDockerBuildExecutor, ContainerNewContainer
 	t.Cleanup(func() {
 		ContainerImageExistsLocally, ContainerNewDockerBuildExecutor, ContainerNewContainer = originalExists, originalBuild, originalContainer
 	})
 	ContainerNewContainer = func(*container.NewContainerInput) container.ExecutionsEnvironment { return fakeContainer{} }
+	var removed bool
+	fakeDockerDaemon(t, func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method == http.MethodDelete {
+			removed = true
+			_, _ = io.WriteString(writer, `[]`)
+		} else {
+			_, _ = io.WriteString(writer, `{"Architecture":"aarch64"}`)
+		}
+	})
 
 	for _, testcase := range []struct {
 		name, platform           string
@@ -496,18 +540,11 @@ func TestExecAsDockerImageChecks(t *testing.T) {
 				checks = append(checks, platform)
 				return testcase.exists && (platform == "any" || testcase.matches), nil
 			}
-			var built, removed bool
+			var built bool
+			removed = false
 			ContainerNewDockerBuildExecutor = func(container.NewDockerBuildExecutorInput) common.Executor {
 				return func(context.Context) error { built = true; return nil }
 			}
-			fakeDockerDaemon(t, func(writer http.ResponseWriter, request *http.Request) {
-				if request.Method == http.MethodDelete {
-					removed = true
-					_, _ = io.WriteString(writer, `[]`)
-				} else {
-					_, _ = io.WriteString(writer, `{"Architecture":"aarch64"}`)
-				}
-			})
 			step := &stepActionRemote{
 				Step: &model.Step{ID: "action"},
 				RunContext: &RunContext{
@@ -522,7 +559,7 @@ func TestExecAsDockerImageChecks(t *testing.T) {
 				action: &model.Action{Runs: model.ActionRuns{Using: "docker", Image: "Dockerfile"}},
 				env:    map[string]string{},
 			}
-			dir := t.TempDir()
+			dir := filepath.Join(actionRoot, testcase.name)
 			require.NoError(t, execAsDocker(t.Context(), step, "action", dir, dir, false, stepStageMain))
 			assert.Equal(t, testcase.wantChecks, checks)
 			assert.Equal(t, testcase.wantBuild, built)
@@ -694,9 +731,9 @@ func TestExecAsDockerStageEntrypoint(t *testing.T) {
 			cm.On("Close").Return(func(context.Context) error { return nil })
 
 			if tc.stage == stepStageMain {
-				require.NoError(t, runActionImpl(step, t.TempDir(), step.remoteAction)(ctx))
+				require.NoError(t, runActionImpl(step, "", step.remoteAction)(ctx))
 			} else {
-				require.NoError(t, execAsDocker(ctx, step, "action", t.TempDir(), t.TempDir(), false, tc.stage))
+				require.NoError(t, execAsDocker(ctx, step, "action", "", "", false, tc.stage))
 			}
 			if tc.warning == "" {
 				assert.Empty(t, hook.AllRecords())

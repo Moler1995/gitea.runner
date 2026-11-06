@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"maps"
-	"path"
 	"reflect"
 	"regexp"
 	"strings"
@@ -90,18 +89,18 @@ var hashfiles string
 
 // NewStepExpressionEvaluator creates a new evaluator with the `inputs` of the enclosing workflow or composite action
 func (rc *RunContext) NewStepExpressionEvaluator(ctx context.Context, step step) *ExpressionEvaluator {
-	return rc.newStepExpressionEvaluator(ctx, step, rc.actionInputs, rc.getJobContext())
+	return rc.newStepExpressionEvaluator(ctx, step, rc.actionInputs, rc.getJobContext(), getStepGithubContext(ctx, step))
 }
 
 // NewActionInputsExpressionEvaluator creates a new evaluator with the step's own with: values as `inputs`
 func (rc *RunContext) NewActionInputsExpressionEvaluator(ctx context.Context, step step) *ExpressionEvaluator {
-	return rc.newStepExpressionEvaluator(ctx, step, inputsFromEnv(*step.getEnv()), rc.getJobContext())
+	return rc.newStepExpressionEvaluator(ctx, step, inputsFromEnv(*step.getEnv()), rc.getJobContext(), getStepGithubContext(ctx, step))
 }
 
-func (rc *RunContext) newStepExpressionEvaluator(ctx context.Context, step step, stepInputs map[string]any, jobContext *model.JobContext) *ExpressionEvaluator {
+func (rc *RunContext) newStepExpressionEvaluator(ctx context.Context, step step, stepInputs map[string]any, jobContext *model.JobContext, github *model.GithubContext) *ExpressionEvaluator {
 	// todo: cleanup EvaluationEnvironment creation
 	ee := &exprparser.EvaluationEnvironment{
-		Github:   step.getGithubContext(ctx),
+		Github:   github,
 		Env:      *step.getEnv(),
 		Job:      jobContext,
 		Steps:    rc.StepResults,
@@ -112,7 +111,7 @@ func (rc *RunContext) newStepExpressionEvaluator(ctx context.Context, step step,
 		Needs:    exprparser.NeedsContext(rc.Run),
 		// todo: should be unavailable
 		// but required to interpolate/evaluate the inputs in actions/composite
-		Inputs:    getEvaluatorInputs(rc, stepInputs, rc.getGithubContext(ctx)),
+		Inputs:    getEvaluatorInputs(rc, stepInputs, github),
 		HashFiles: getHashFilesFunction(ctx, rc),
 	}
 	ee.Runner = rc.getRunnerContext(ctx)
@@ -160,7 +159,7 @@ func getHashFilesFunction(ctx context.Context, rc *RunContext) func(v []reflect.
 				Name: name,
 				Mode: 0o644,
 				Body: hashfiles,
-			}).Then(rc.JobContainer.Exec([]string{"node", path.Join(rc.JobContainer.GetActPath(), name)}, env, "", ""))(timeoutCtx)
+			}).Then(rc.JobContainer.Exec([]string{"node", container.JoinPath(rc.JobContainer.GetActPath(), name)}, env, "", ""))(timeoutCtx)
 			quotedPatterns := expressionStringEscape(strings.Join(patterns, ", "))
 			switch {
 			case err == nil:
@@ -332,5 +331,10 @@ func getWorkflowSecrets(rc *RunContext) map[string]string {
 	if rc.caller != nil {
 		return rc.workflowCallSecrets
 	}
-	return rc.Config.Secrets
+	if rc.runtimeToken == "" {
+		return rc.Config.Secrets
+	}
+	secrets := map[string]string{"ACTIONS_RUNTIME_TOKEN": rc.runtimeToken} // as the daemon exposes its token
+	maps.Copy(secrets, rc.Config.Secrets)
+	return secrets
 }

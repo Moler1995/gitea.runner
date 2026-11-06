@@ -10,7 +10,11 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	"io"
+	"log"
 	"math/big"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -66,6 +70,46 @@ func TestClientCertIsValidatedAndAbsoluteOnLoadReadOnUseAndOfferedOnlyWhenAccept
 	require.Empty(t, pair.Certificate)
 }
 
+func TestCAFileIsValidatedAndAbsoluteOnLoadAndTrustedBesidesTheSystem(t *testing.T) {
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(_writer http.ResponseWriter, _request *http.Request) {}))
+	server.Config.ErrorLog = log.New(io.Discard, "", 0)
+	server.StartTLS()
+	defer server.Close()
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "ca.crt"), pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "empty.crt"), nil, 0o600))
+	load := func(file string) (*Config, error) { return LoadDefault(write(t, "runner:\n  ca_file: '"+file+"'\n")) }
+
+	t.Chdir(dir)
+	_, err := load("empty.crt")
+	require.ErrorContains(t, err, "failed to append certificates")
+	_, err = load("missing.crt")
+	require.ErrorContains(t, err, "could not read CA certificate")
+	cfg, err := load("ca.crt")
+	require.NoError(t, err)
+	require.Equal(t, filepath.Join(dir, "ca.crt"), cfg.Runner.CAFile)
+
+	get := func(runner *Runner) error {
+		resp, err := (&http.Client{Transport: &http.Transport{TLSClientConfig: runner.TLSConfig()}}).Get(server.URL)
+		if err == nil {
+			resp.Body.Close()
+		}
+		return err
+	}
+	require.Error(t, get(&Runner{}))
+	require.NoError(t, get(&cfg.Runner))
+}
+
+func TestLoadDefault_RejectsContainerVolumesWithoutSource(t *testing.T) {
+	cfg, err := LoadDefault(write(t, "container:\n  volumes: ['/etc/ssl/certs:/etc/ssl/certs:ro', 'data:/data']\n"))
+	require.NoError(t, err)
+	require.Equal(t, []string{"/etc/ssl/certs:/etc/ssl/certs:ro", "data:/data"}, cfg.Container.Volumes)
+	for _, spec := range []string{"/etc/ssl/certs", "/a:/b:ro:/c"} {
+		_, err = LoadDefault(write(t, "container:\n  volumes: ['"+spec+"']\n"))
+		require.ErrorContains(t, err, "is not source:target", spec)
+	}
+}
+
 func TestLoadDefault_ExpandsEnvironmentValues(t *testing.T) {
 	t.Setenv("RUNNER_CAPACITY", "4")
 	t.Setenv("RUNNER_LABEL", "linux:host")
@@ -109,7 +153,7 @@ cache:
     endpoint: "http://minio:9000"
     bucket: "caches"
     prefix: "/runners/"
-    access_key_file: "` + accessPath + `"
+    access_key_file: '` + accessPath + `'
     secret_key: "secret"
 `
 	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
@@ -138,6 +182,19 @@ func TestLoadDefault_ToolCacheMode(t *testing.T) {
 	_, err = LoadDefault(path)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "tool_cache_mode")
+}
+
+func TestLoadDefault_KubernetesTransferMode(t *testing.T) {
+	cfg, err := LoadDefault(write(t, "kubernetes:\n  transfer:\n    host: 10.0.0.5\n"))
+	require.NoError(t, err)
+	assert.Equal(t, KubernetesTransferModeAPI, cfg.Kubernetes.Transfer.Mode, "copies stay on the API server unless asked")
+
+	cfg, err = LoadDefault(write(t, "kubernetes:\n  transfer:\n    mode: direct\n"))
+	require.NoError(t, err)
+	assert.Equal(t, KubernetesTransferModeDirect, cfg.Kubernetes.Transfer.Mode)
+
+	_, err = LoadDefault(write(t, "kubernetes:\n  transfer:\n    mode: fast\n"))
+	require.ErrorContains(t, err, "kubernetes.transfer.mode")
 }
 
 func TestLoadDefault_RejectsInvalidLogReportLevel(t *testing.T) {
@@ -294,11 +351,11 @@ func TestLoadDefault_MalformedYAMLReturnsParseError(t *testing.T) {
 func TestLoadDefault_WarnsOnUnknownKeysButStillLoads(t *testing.T) {
 	hook := logtest.SetDefault(t)
 
-	cfg, err := LoadDefault(write(t, "container:\n  volumes:\n    - /host:/ctr\n  privileged: true\n"))
+	cfg, err := LoadDefault(write(t, "container:\n  mounts:\n    - /host:/ctr\n  privileged: true\n"))
 	require.NoError(t, err)
 	assert.True(t, cfg.Container.Privileged)
 	require.Len(t, hook.AllRecords(), 1)
-	assert.Contains(t, hook.LastRecord().Message, "field volumes not found")
+	assert.Contains(t, hook.LastRecord().Message, "field mounts not found")
 }
 
 func TestContainerNetworkCreateOptions(t *testing.T) {
@@ -328,20 +385,20 @@ func TestLoadDefault_ExternalCacheSecret(t *testing.T) {
 		{name: "without secret", yaml: externalCache, wantErr: "external_secret"},
 		{name: "inline secret", yaml: externalCache + "  external_secret: \"shh\"\n"},
 		{
-			name: "from file", yaml: externalCache + "  external_secret_file: \"$DIR/cache.secret\"\n",
+			name: "from file", yaml: externalCache + "  external_secret_file: '$DIR/cache.secret'\n",
 			fileContent: "  s3cr3t\n", wantSecret: "s3cr3t",
 		},
 		{
-			name: "from file when disabled", yaml: "\ncache:\n  enabled: false\n  external_secret_file: \"$DIR/cache.secret\"\n",
+			name: "from file when disabled", yaml: "\ncache:\n  enabled: false\n  external_secret_file: '$DIR/cache.secret'\n",
 			fileContent: "s3cr3t", wantSecret: "s3cr3t",
 		},
 		{
-			name: "inline and file conflict", yaml: externalCache + "  external_secret: \"inline\"\n  external_secret_file: \"$DIR/cache.secret\"\n",
+			name: "inline and file conflict", yaml: externalCache + "  external_secret: \"inline\"\n  external_secret_file: '$DIR/cache.secret'\n",
 			fileContent: "s3cr3t", wantErr: "both set",
 		},
-		{name: "missing file", yaml: externalCache + "  external_secret_file: \"$DIR/absent.secret\"\n", wantErr: "read cache.external_secret_file"},
+		{name: "missing file", yaml: externalCache + "  external_secret_file: '$DIR/absent.secret'\n", wantErr: "read cache.external_secret_file"},
 		{
-			name: "empty file", yaml: externalCache + "  external_secret_file: \"$DIR/cache.secret\"\n",
+			name: "empty file", yaml: externalCache + "  external_secret_file: '$DIR/cache.secret'\n",
 			fileContent: "\n  \n", wantErr: "contains no secret",
 		},
 	} {

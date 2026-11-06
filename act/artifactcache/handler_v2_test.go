@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -84,6 +85,8 @@ func TestCacheServiceV2RoundTrip(t *testing.T) {
 
 	unsigned := fmt.Sprintf("%s%s/1", handler.ExternalURL(), blobPath)
 	assert.Equal(t, http.StatusUnauthorized, putBlob(t, unsigned, content))
+	unreserved := handler.signedURL(JobCredential{Repo: testRepo}, blobPath, blobUploadPurpose, 1, time.Now().Add(time.Minute))
+	assert.Equal(t, http.StatusBadRequest, putBlob(t, unreserved, content))
 
 	finalized, uploadURL := saveV2(t, handler, "deps-v1", "abc123", content)
 	require.Equal(t, true, finalized["ok"])
@@ -230,6 +233,24 @@ func TestCacheServiceV2Lookups(t *testing.T) {
 
 		got := v2Call(t, handler, otherClient, "GetCacheEntryDownloadURL", map[string]any{"key": "deps-abc", "version": "v1"})
 		assert.Equal(t, false, got["ok"])
+	})
+
+	t.Run("each ref saves and restores its own entry for the same key", func(t *testing.T) {
+		clients := map[string]*http.Client{"x": testClient}
+		for _, ref := range []string{"y", "z"} {
+			handler.RegisterJob(ref, JobCredential{Repo: testRepo, Ref: "refs/pull/" + ref + "/head"})
+			clients[ref] = &http.Client{Transport: &bearerTransport{token: ref}}
+			created := v2Call(t, handler, clients[ref], "CreateCacheEntry", map[string]any{"key": "deps-abc", "version": "v1"})
+			require.Equal(t, true, created["ok"])
+			require.Equal(t, http.StatusCreated, putBlob(t, created["signed_upload_url"].(string), []byte(ref)))
+		}
+		for _, ref := range []string{"y", "z"} {
+			require.Equal(t, true, v2Call(t, handler, clients[ref], "FinalizeCacheEntryUpload", map[string]any{"key": "deps-abc", "version": "v1", "size_bytes": 1})["ok"])
+		}
+		for content, client := range clients {
+			got := v2Call(t, handler, client, "GetCacheEntryDownloadURL", map[string]any{"key": "deps-abc", "version": "v1"})
+			assert.Equal(t, content, string(getURL(t, got["signed_download_url"].(string))))
+		}
 	})
 }
 

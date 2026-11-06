@@ -41,6 +41,7 @@ type Config struct {
 	Env                           map[string]string                             // env for containers
 	Secrets                       map[string]string                             // list of secrets
 	ExtraMasks                    []string                                      // values to hide that are not in Secrets, such as the proxy password
+	RuntimeTokens                 map[*model.Workflow]string                    // ACTIONS_RUNTIME_TOKEN per workflow run, as each is its own artifact run
 	Vars                          map[string]string                             // list of vars
 	Token                         string                                        // GitHub token
 	InsecureSecrets               bool                                          // switch hiding output when printing to terminal
@@ -82,13 +83,15 @@ type Config struct {
 	InstanceTransport                 http.RoundTripper
 	JobLoggerLevel                    *logging.Level // the level of job logger
 	ValidVolumes                      []string       // only volumes (and bind mounts) in this slice can be mounted on the job container or service containers
+	ContainerVolumes                  []string       // mounted into every job, service and docker action container
 	SharedToolCache                   bool           // one tool cache for all jobs instead of one per job
 	InsecureSkipTLS                   bool           // whether to skip verifying TLS certificate of the Gitea instance
 	ClientCertFile, ClientKeyFile     string         // PEM client certificate for the Gitea instance
+	CAFile                            string         // PEM CA certificates the Gitea instance's certificate chains to
 	MaxParallel                       int            // max parallel jobs to run across all workflows (0 = no limit, uses CPU count)
 	AllocatePTY                       bool           // allocate a pseudo-TTY for each step's process
 	ServiceReadyTimeout               time.Duration  // how long a job waits for its service containers to report healthy (0 uses the default)
-	NoSweep                           bool           // keep the containers, networks and volumes a job creates through its docker proxy
+	Sweep                             bool           // remove the containers, networks and volumes a job creates through its docker proxy
 	RunnerName                        string         // name this runner registered with, reported as `runner.name`, defaults to the hostname
 	JobStartedHook                    string         // script run inside the job environment before the job's first step; ACTIONS_RUNNER_HOOK_JOB_STARTED is read from Env when empty
 	JobCompletedHook                  string         // script run inside the job environment after the job's last step; ACTIONS_RUNNER_HOOK_JOB_COMPLETED is read from Env when empty
@@ -355,6 +358,11 @@ func (runner *runnerImpl) newCombinationRunContext(ctx context.Context, run *mod
 		caller:      runner.caller,
 		jobIndex:    index,
 		jobTotal:    total,
+
+		runtimeToken: runner.config.RuntimeTokens[run.Workflow],
+	}
+	if runner.caller != nil {
+		rc.runtimeToken = runner.caller.runContext.runtimeToken
 	}
 	if err := rc.resolveWorkflowCall(ctx); err != nil {
 		return nil, err
