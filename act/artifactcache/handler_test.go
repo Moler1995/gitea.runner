@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"testing/iotest"
 	"testing/synctest"
 	"time"
 
@@ -673,7 +674,7 @@ func TestHandler_evictPolicy(t *testing.T) {
 	}
 }
 
-func TestHandler_evictForFreeSpace(t *testing.T) {
+func TestHandler_makeRoom(t *testing.T) {
 	t.Parallel()
 	free := func(n int64) func(string) (uint64, error) {
 		return func(string) (uint64, error) { return uint64(n), nil }
@@ -682,14 +683,16 @@ func TestHandler_evictForFreeSpace(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		freeDisk func(string) (uint64, error)
+		upload   int64
 		kept     []string
 	}{
-		{"ample free space evicts nothing", free(defaultMinFreeDisk), []string{"oldest", "middle", "newest"}},
-		{"a small shortfall sheds one entry", free(defaultMinFreeDisk - 4*miB), []string{"middle", "newest"}},
-		{"a shortfall the cache cannot cover sheds all of it", free(0), nil},
+		{"ample free space evicts nothing", free(defaultMinFreeDisk), 0, []string{"oldest", "middle", "newest"}},
+		{"room for an upload sheds the oldest entry", free(defaultMinFreeDisk), 4 * miB, []string{"middle", "newest"}},
+		{"a shortfall the cache cannot cover sheds all of it", free(0), 0, nil},
 		{
 			"an unreadable volume is treated as unavailable, not as full",
 			func(string) (uint64, error) { return 0, errors.New("unsupported") },
+			0,
 			[]string{"oldest", "middle", "newest"},
 		},
 	} {
@@ -702,11 +705,7 @@ func TestHandler_evictForFreeSpace(t *testing.T) {
 			}
 			handler := newTestHandler(t, Policy{}, entries...)
 			handler.freeDisk = tc.freeDisk
-
-			db, err := handler.openDB()
-			require.NoError(t, err)
-			handler.evictForFreeSpace(db)
-			require.NoError(t, db.Close())
+			handler.makeRoom(tc.upload)
 
 			assert.ElementsMatch(t, tc.kept, keptKeys(t, handler, entries))
 		})
@@ -759,9 +758,53 @@ func TestHandler_PrefixUsesNewestReservationWithinSecond(t *testing.T) {
 	db, err := handler.openDB()
 	require.NoError(t, err)
 	defer db.Close()
-	cache, err := findCache(db, testRepo, []string{"deps-"}, "v")
+	cache, err := findCache(db, JobCredential{Repo: testRepo}, []string{"deps-"}, "v")
 	require.NoError(t, err)
 	require.Equal(t, newer, cache)
+}
+
+func TestHandler_RestoreRefs(t *testing.T) {
+	t.Parallel()
+	const main, release, pull = "refs/heads/main", "refs/heads/release", "refs/pull/1/head"
+	now := time.Now().Unix()
+	entry := func(ref, key string, age int64) *Cache {
+		return &Cache{Repo: testRepo, Ref: ref, Key: key, Version: "v", Complete: true, CreatedAt: now - 3600 + age, UsedAt: now}
+	}
+	exactOnMain := entry(main, "deps-exact", -1)
+	onRelease := entry(release, "deps-release", 0)
+	onMain := entry(main, "deps-main", 1)
+	onPull := entry(pull, "deps-pull", 2)
+	unscoped := entry("", "deps-unscoped", 3)
+	handler := newTestHandler(t, Policy{}, exactOnMain, onRelease, onMain, onPull, unscoped, entry("refs/pull/2/head", "deps-lost", 4))
+	for _, cache := range []*Cache{exactOnMain, onRelease, onMain, onPull, unscoped} {
+		writeBlob(t, handler, cache.ID)
+	}
+
+	db, err := handler.openDB()
+	require.NoError(t, err)
+	defer db.Close()
+
+	for _, tc := range []struct {
+		name string
+		cred JobCredential
+		keys []string
+		want *Cache
+	}{
+		{"the default branch never restores what a pull request wrote", JobCredential{Ref: main, DefaultRef: main}, []string{"deps-"}, onMain},
+		{"a pull request restores its own entry first", JobCredential{Ref: pull, BaseRef: release, DefaultRef: main}, []string{"deps-"}, onPull},
+		{"a pull request falls back past a lost blob to its base branch before the default branch", JobCredential{Ref: "refs/pull/2/head", BaseRef: release, DefaultRef: main}, []string{"deps-"}, onRelease},
+		{"a branch does not restore a sibling branch", JobCredential{Ref: "refs/heads/other", DefaultRef: main}, []string{"deps-"}, onMain},
+		{"a prefix in the own ref wins over an exact key in the default branch", JobCredential{Ref: release, DefaultRef: main}, []string{"deps-exact", "deps-"}, onRelease},
+		{"a job with a ref never restores entries saved without one", JobCredential{Ref: "refs/heads/other"}, []string{"deps-"}, nil},
+		{"a job without a ref only restores entries saved without one", JobCredential{}, []string{"deps-"}, unscoped},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.cred.Repo = testRepo
+			cache, err := handler.lookupCache(db, tc.cred, tc.keys, "v")
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, cache)
+		})
+	}
 }
 
 func TestHandler_evictOnCommit(t *testing.T) {
@@ -808,6 +851,9 @@ func TestHandler_touchCacheSkipsFreshCompletedEntries(t *testing.T) {
 func newTestHandler(t *testing.T, policy Policy, entries ...*Cache) *Handler {
 	t.Helper()
 	handler := startTestHandler(t, Options{Policy: policy})
+	if len(entries) == 0 {
+		return handler
+	}
 
 	db, err := handler.openDB()
 	require.NoError(t, err)
@@ -842,6 +888,13 @@ func keptKeys(t *testing.T, handler *Handler, entries []*Cache) []string {
 		}
 	}
 	return kept
+}
+
+func TestStorageDropsFailedWrites(t *testing.T) {
+	storage, err := NewStorage(t.TempDir())
+	require.NoError(t, err)
+	require.Error(t, storage.Write(1, 0, io.MultiReader(strings.NewReader("partial"), iotest.ErrReader(io.ErrUnexpectedEOF))))
+	assert.NoFileExists(t, storage.tempName(1, 0))
 }
 
 func writeBlob(t *testing.T, handler *Handler, id uint64) {
@@ -890,6 +943,10 @@ func TestHandler_RejectsBearer(t *testing.T) {
 
 func TestHandler_UnregisterRevokes(t *testing.T) {
 	t.Parallel()
+	handler, err := StartHandler(Options{Dir: filepath.Join(t.TempDir(), "artifactcache")})
+	require.NoError(t, err)
+	defer handler.Close()
+
 	for _, tc := range []struct {
 		name          string
 		token         string
@@ -900,9 +957,6 @@ func TestHandler_UnregisterRevokes(t *testing.T) {
 		{"reference counted", "shared", "v", 2},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			handler, err := StartHandler(Options{Dir: filepath.Join(t.TempDir(), "artifactcache")})
-			require.NoError(t, err)
-			defer handler.Close()
 			revokers := make([]func(), tc.registrations)
 			for i := range revokers {
 				revokers[i] = handler.RegisterJob(tc.token, JobCredential{Repo: testRepo})
@@ -938,6 +992,7 @@ func TestHandler_CrossRepoIsolation(t *testing.T) {
 	defer handler.Close()
 	handler.RegisterJob("token-a", JobCredential{Repo: "owner/repoA"})
 	handler.RegisterJob("token-b", JobCredential{Repo: "owner/repoB"})
+	handler.RegisterJob("token-a-pull", JobCredential{Repo: "owner/repoA", Ref: "refs/pull/1/head"})
 
 	base := handler.ExternalURL() + apiPath
 	key := "shared-key"
@@ -972,13 +1027,20 @@ func TestHandler_CrossRepoIsolation(t *testing.T) {
 	resp.Body.Close()
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
 
-	req, err = http.NewRequest(http.MethodPatch, fmt.Sprintf("%s/caches/%d", base, id), bytes.NewReader([]byte("poison")))
-	require.NoError(t, err)
-	req.Header.Set("Content-Range", "bytes 0-5/*")
-	resp, err = clientB.Do(req)
-	require.NoError(t, err)
-	resp.Body.Close()
-	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+	for _, client := range []*http.Client{clientB, {Transport: &bearerTransport{token: "token-a-pull"}}} {
+		req, err = http.NewRequest(http.MethodPatch, fmt.Sprintf("%s/caches/%d", base, id), bytes.NewReader([]byte("poison")))
+		require.NoError(t, err)
+		req.Header.Set("Content-Range", "bytes 0-5/*")
+		resp, err = client.Do(req)
+		require.NoError(t, err)
+		resp.Body.Close()
+		assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+
+		resp, err = client.Post(fmt.Sprintf("%s/caches/%d", base, id), "", nil)
+		require.NoError(t, err)
+		resp.Body.Close()
+		assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+	}
 }
 
 func TestHandler_ArtifactSignature(t *testing.T) {
@@ -991,9 +1053,8 @@ func TestHandler_ArtifactSignature(t *testing.T) {
 
 	base := handler.ExternalURL() + apiPath
 	good := signArtifactURL(handler, 1)
-	other, err := StartHandler(Options{Dir: filepath.Join(t.TempDir(), "artifactcache2")})
-	require.NoError(t, err)
-	defer other.Close()
+	secret := bytes.Clone(handler.secret)
+	secret[0] ^= 1
 
 	for _, tc := range []struct {
 		name string
@@ -1002,7 +1063,7 @@ func TestHandler_ArtifactSignature(t *testing.T) {
 		{"missing signature", fmt.Sprintf("%s/artifacts/%d", base, 1)},
 		{"tampered signature", good[:len(good)-4] + "dead"},
 		{"expired signature", handler.signedArtifactURL(JobCredential{}, 1, time.Now().Add(-time.Second))},
-		{"signature from a different server", base + strings.SplitN(signArtifactURL(other, 1), apiPath, 2)[1]},
+		{"signature from a different server", base + strings.SplitN(signArtifactURL(&Handler{secret: secret}, 1), apiPath, 2)[1]},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			resp, err := testClient.Get(tc.url)
@@ -1083,49 +1144,20 @@ func TestHandler_ArtifactSignatureDownload(t *testing.T) {
 	assert.Equal(t, content, body)
 }
 
-func TestHandler_GC_PerRepoDedup(t *testing.T) {
+func TestHandler_GC_DedupPerRepoAndRef(t *testing.T) {
 	t.Parallel()
-	dir := filepath.Join(t.TempDir(), "artifactcache")
-	handler, err := StartHandler(Options{Dir: dir})
-	require.NoError(t, err)
-	defer handler.Close()
-	handler.RegisterJob("tok-a", JobCredential{Repo: "owner/repoA"})
-	handler.RegisterJob("tok-b", JobCredential{Repo: "owner/repoB"})
-
-	key := "shared-dedup-key"
-	version := "c19da02a2bd7e77277f1ac29ab45c09b7d46a4ee758284e26bb3045ad11d9d20"
-
-	db, err := handler.openDB()
-	require.NoError(t, err)
 	now := time.Now().Unix()
 	stale := time.Now().Add(-inUseGrace - time.Minute).Unix()
-	a := &Cache{Repo: "owner/repoA", Key: key, Version: version, Complete: true, CreatedAt: stale, UsedAt: stale, Size: 1}
-	b := &Cache{Repo: "owner/repoB", Key: key, Version: version, Complete: true, CreatedAt: now, UsedAt: now, Size: 1}
-	require.NoError(t, handler.insertCache(db, a))
-	require.NoError(t, handler.insertCache(db, b))
-	require.NoError(t, handler.storage.Write(a.ID, 0, strings.NewReader("a")))
-	_, err = handler.storage.Commit(a.ID, 1)
-	require.NoError(t, err)
-	require.NoError(t, handler.storage.Write(b.ID, 0, strings.NewReader("b")))
-	_, err = handler.storage.Commit(b.ID, 1)
-	require.NoError(t, err)
-	require.NoError(t, db.Close())
-
+	entries := []*Cache{
+		{Repo: "owner/repoA", Key: "shared", Version: "v", Complete: true, CreatedAt: stale, UsedAt: stale, Size: 1},
+		{Repo: "owner/repoB", Key: "shared", Version: "v", Complete: true, CreatedAt: now, UsedAt: now, Size: 1},
+		{Repo: "owner/repoA", Ref: "refs/pull/1/head", Key: "shared", Version: "v", Complete: true, CreatedAt: now, UsedAt: now, Size: 1},
+	}
+	handler := newTestHandler(t, Policy{}, entries...)
 	handler.gcAt = time.Time{}
 	handler.gcCache()
 
-	db, err = handler.openDB()
-	require.NoError(t, err)
-	defer db.Close()
-	after, err := db.find(func(cache *Cache) bool { return cache.Key == key && cache.Version == version })
-	require.NoError(t, err)
-
-	repos := make(map[string]bool)
-	for _, c := range after {
-		repos[c.Repo] = true
-	}
-	assert.True(t, repos["owner/repoA"], "repoA's cache must survive dedup against repoB")
-	assert.True(t, repos["owner/repoB"], "repoB's cache must survive dedup against repoA")
+	assert.Len(t, keptKeys(t, handler, entries), len(entries))
 }
 
 func TestHandler_InternalAPI_Disabled(t *testing.T) {
@@ -1190,10 +1222,10 @@ func TestHandler_InternalAPI_AuthAndUsage(t *testing.T) {
 		}
 
 		assert.Equal(t, http.StatusUnauthorized, probe("via-internal-api"))
-		assert.Equal(t, http.StatusOK, post("/_internal/register", secret, `{"token":"via-internal-api","repo":"owner/repo","public_url":"http://runner.example","results":"https://gitea.example","insecure_tls":true}`))
+		assert.Equal(t, http.StatusOK, post("/_internal/register", secret, `{"token":"via-internal-api","repo":"owner/repo","ref":"refs/pull/1/head","base_ref":"refs/heads/release","default_ref":"refs/heads/main","public_url":"http://runner.example","results":"https://gitea.example","insecure_tls":true}`))
 		cred, ok := handler.lookupCredential("via-internal-api")
 		require.True(t, ok)
-		assert.Equal(t, JobCredential{Repo: testRepo, PublicURL: "http://runner.example"}, cred)
+		assert.Equal(t, JobCredential{Repo: testRepo, Ref: "refs/pull/1/head", BaseRef: "refs/heads/release", DefaultRef: "refs/heads/main", PublicURL: "http://runner.example"}, cred)
 		assert.NotEqual(t, http.StatusUnauthorized, probe("via-internal-api"))
 		assert.Equal(t, http.StatusOK, post("/_internal/revoke", secret, `{"token":"via-internal-api"}`))
 		assert.Equal(t, http.StatusUnauthorized, probe("via-internal-api"))

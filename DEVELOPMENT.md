@@ -23,11 +23,14 @@ depending on the prefix:
   covers both forms: it escapes `%` first, so a literal `%3B` becomes `%253B` that the extra
   `##[…]` rules cannot match, and a raw `;` or `]` is never decoded. It is also what makes
   multi-line work, `\n` becomes `%0A` and the UI turns it back into a line break.
-- **Forwarding a command from step output?** Leave the payload alone, it arrived escaped and is
-  decoded once. Decoding here double-decodes and destroys multi-line.
+- **Forwarding a command from step output?** Preserve its escaping unless masking changes it.
+  Decoding for display happens in the UI.
 - **No prefix?** Do not escape, and split multi-line values into one row each.
-- **Interpolating a secret?** Masking runs after escaping, so `AppendSecretMasker` registers the
-  encoded forms too.
+- **Interpolating a secret?** Masking runs after escaping. Recognised command payloads are
+  normalised before masking to cover partially escaped values. Their original escaping is
+  preserved when no replacement occurs. `AppendSecretMasker` also registers encoded forms for
+  other output. Complete nonblank one-character values are masked, while one-byte fragments
+  of multiline values are skipped.
 - Command *properties* also escape `%3A` and `%2C`, which the UI never decodes, so the command
   handler folds an annotation's location into its decoded message and escapes the result again.
 
@@ -57,7 +60,25 @@ Each lives in `internal/pkg/action/<name>` and is registered in `builtinActions`
 
 `make test-e2e` runs the runner against `E2E_GITEA_IMAGE`. It defaults to the nightly image.
 It requires Docker and is excluded from `make test`. CI runs stable and nightly variants in
-parallel.
+parallel. Outside a container it runs `go test` in a Linux container on its own network, as CI does,
+so both take the same paths. `E2E_ARGS` passes extra flags, e.g. `make test-e2e E2E_ARGS='-run TestCompatibility/dispatch'`.
 
-The suite shares one Gitea and regular runner. Cache and ephemeral scenarios use isolated
+The `cli_*` scenarios build the binary and drive `register` and `daemon` as a user would, including `--once`,
+`--labels` and shutdown with a running job. `failure_paths` covers failed, skipped and tolerated jobs, `job_timeout`
+a job killed at the runner's deadline. `label_routing` and `capacity` cover scheduling, `reconnect` drops the
+connection to Gitea through a proxy, and `host_mode` and `reusable_workflow` cover host labels and `workflow_call`.
+`dispatch`, `failure_paths` and `reusable_workflow` run in every mode: through the daemon and `exec`, each on
+Docker and Kubernetes.
+
+The suite shares one Gitea, regular runner and k3s cluster. Cache and ephemeral scenarios use isolated
 repository runners. A run path is `<workflow>@<ref>` and a log row is `<timestamp>Z <payload>`.
+
+## Windows tests
+
+`make test-windows` cross-compiles the test binaries, installs Windows Server 2025 Core in a
+[dockur/windows](https://github.com/dockur/windows) QEMU VM on the docker host and runs them there.
+The host must be amd64 and allow privileged containers. `WINDOWS_TEST_TIMEOUT` sets the minutes
+allowed for installing Windows and running the tests, 165 by default. The VM uses KVM when the host
+has `/dev/kvm`, otherwise Windows is emulated and much slower. Docker-backed tests skip in the VM
+and the race detector is off, it needs cgo. `WINDOWS_TEST_CACHE` names a directory to keep the
+installed Windows in, so later runs skip the install. CI runs this on every pull request.

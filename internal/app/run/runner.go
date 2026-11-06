@@ -98,18 +98,20 @@ func NewRunner(cfg *config.Config, reg *config.Registration, cli client.Client) 
 	}
 	envs := make(map[string]string, len(cfg.Runner.Envs))
 	maps.Copy(envs, cfg.Runner.Envs)
+	instanceTransport := client.NewTransport(cli.Address(), cfg.Runner.TLSConfig())
 	var cacheHandler *artifactcache.Handler
 	if cfg.Cache.Enabled == nil || *cfg.Cache.Enabled {
 		warnIgnoredCachePolicy(cfg)
 		warnIgnoredCacheSecret(cfg)
 		handler, err := artifactcache.StartHandler(artifactcache.Options{
-			Dir:        cfg.Cache.Dir,
-			OutboundIP: cfg.Cache.Host,
-			Port:       cfg.Cache.Port,
-			Upstream:   cfg.Cache.ExternalServer,
-			S3:         cacheS3(cfg),
-			Policy:     CachePolicy(cfg),
-			Logger:     logging.Default().With("module", "cache_request"),
+			Dir:               cfg.Cache.Dir,
+			OutboundIP:        cfg.Cache.Host,
+			Port:              cfg.Cache.Port,
+			Upstream:          cfg.Cache.ExternalServer,
+			S3:                cacheS3(cfg),
+			Policy:            CachePolicy(cfg),
+			Logger:            logging.Default().With("module", "cache_request"),
+			InstanceTransport: instanceTransport,
 		})
 		if err != nil {
 			logging.Errorf("cannot init cache server, it will be disabled: %v", err)
@@ -140,7 +142,7 @@ func NewRunner(cfg *config.Config, reg *config.Registration, cli client.Client) 
 		runHealthCheck: executeHealthCheck,
 	}
 	runner.isolatedCacheContainer = sync.OnceValue(runner.detectIsolatedCacheContainer)
-	runner.instanceTransport = client.NewTransport(cli.Address(), cfg.Runner.TLSConfig())
+	runner.instanceTransport = instanceTransport
 	return runner
 }
 
@@ -168,7 +170,7 @@ func (r *Runner) OnIdle(ctx context.Context) {
 	}
 	// Bind-workdir mode: reclaim stale per-task workspace dirs (numeric task IDs).
 	if r.cfg.Container.BindWorkdir {
-		r.cleanupStaleDirs(ctx, filepath.FromSlash("/"+strings.TrimLeft(r.cfg.Container.WorkdirParent, "/")), isTaskIDDir)
+		r.cleanupStaleDirs(ctx, containerWorkdirRoot(r.cfg.Container.WorkdirParent), isTaskIDDir)
 	}
 	// Host mode: reclaim per-job scratch dirs left behind when HostEnvironment
 	// cleanup timed out (e.g. a delete stalled by an AV/EDR filter driver). They
@@ -415,6 +417,11 @@ func (r *Runner) kubernetesOptions(runsOn []string) container.KubernetesOptions 
 		PodTemplates: []map[string]any{r.cfg.Kubernetes.PodTemplate},
 		RunnerUUID:   r.uuid,
 	}
+	if transfer := r.cfg.Kubernetes.Transfer; transfer.Mode == config.KubernetesTransferModeAuto || transfer.Mode == config.KubernetesTransferModeDirect {
+		options.Transfer = &container.KubernetesTransfer{
+			Host: transfer.Host, Port: transfer.Port, Image: transfer.Image, Fallback: transfer.Mode == config.KubernetesTransferModeAuto,
+		}
+	}
 	names := r.labels.Names()
 	for index, name := range runsOn {
 		if template, ok := r.cfg.Kubernetes.PodTemplates[name]; ok && slices.Contains(names, name) && !slices.Contains(runsOn[:index], name) {
@@ -533,7 +540,7 @@ func (r *Runner) run(ctx context.Context, task *runnerv1.Task, reporter *report.
 	// is removed when the task finishes, so a leaked token stops working as
 	// soon as the job ends rather than remaining valid for the runner's
 	// lifetime.
-	revokeCache, resultsURL := r.registerCacheForTask(giteaRuntimeToken, preset.Repository, cacheURL, reporter)
+	revokeCache, resultsURL := r.registerCacheForTask(giteaRuntimeToken, cacheCredential(preset, cacheURL), reporter)
 	defer revokeCache()
 
 	eventJSON, err := json.Marshal(preset.Event)
@@ -552,12 +559,12 @@ func (r *Runner) run(ctx context.Context, task *runnerv1.Task, reporter *report.
 		actionCloneDepth = 0
 	}
 
-	workdirParent := strings.TrimLeft(r.cfg.Container.WorkdirParent, "/")
+	workdirParent := containerWorkdirRoot(r.cfg.Container.WorkdirParent)
 	if r.cfg.Container.BindWorkdir {
 		// Append the task ID to isolate concurrent jobs from the same repo.
-		workdirParent = fmt.Sprintf("%s/%d", workdirParent, task.Id)
+		workdirParent = filepath.Join(workdirParent, strconv.FormatInt(task.Id, 10))
 	}
-	workdir := filepath.FromSlash(fmt.Sprintf("/%s/%s", workdirParent, preset.Repository))
+	workdir := filepath.Join(workdirParent, filepath.FromSlash(preset.Repository))
 	if runtime.GOOS == "windows" {
 		if abs, err := filepath.Abs(workdir); err == nil {
 			workdir = abs
@@ -605,7 +612,7 @@ func (r *Runner) run(ctx context.Context, task *runnerv1.Task, reporter *report.
 		},
 		ContainerOptions:                  r.cfg.Container.Options,
 		ServiceReadyTimeout:               r.cfg.Container.ServiceReadyTimeout,
-		NoSweep:                           r.cfg.Container.Sweep != nil && !*r.cfg.Container.Sweep,
+		Sweep:                             r.cfg.Container.Sweep,
 		ContainerDaemonSocket:             r.cfg.Container.DockerHost,
 		Privileged:                        r.cfg.Container.Privileged,
 		DefaultActionInstance:             r.getDefaultActionsURL(task),
@@ -615,10 +622,12 @@ func (r *Runner) run(ctx context.Context, task *runnerv1.Task, reporter *report.
 		JobCompletedHook:                  r.cfg.Runner.Hooks.JobCompleted,
 		Vars:                              task.Vars,
 		ValidVolumes:                      r.cfg.Container.ValidVolumes,
+		ContainerVolumes:                  r.cfg.Container.Volumes,
 		SharedToolCache:                   r.cfg.Runner.ToolCacheMode == config.ToolCacheModeShared,
 		InsecureSkipTLS:                   r.cfg.Runner.Insecure,
 		ClientCertFile:                    r.cfg.Runner.ClientCertFile,
 		ClientKeyFile:                     r.cfg.Runner.ClientKeyFile,
+		CAFile:                            r.cfg.Runner.CAFile,
 		InstanceTransport:                 r.instanceTransport,
 		RunnerName:                        r.name,
 		KubernetesPicker:                  r.kubernetesOptions,
@@ -643,10 +652,8 @@ func (r *Runner) run(ctx context.Context, task *runnerv1.Task, reporter *report.
 	reporter.SetOutputs(job.Outputs)
 
 	if r.cfg.Container.BindWorkdir {
-		// Remove the entire task-specific directory (e.g. /workspace/<task_id>).
-		taskDir := filepath.FromSlash("/" + workdirParent)
-		if err := os.RemoveAll(taskDir); err != nil {
-			logging.Warnf("failed to clean up workspace %s: %v", taskDir, err)
+		if err := os.RemoveAll(workdirParent); err != nil {
+			logging.Warnf("failed to clean up workspace %s: %v", workdirParent, err)
 		}
 	}
 
@@ -690,22 +697,41 @@ func (r *Runner) instanceOutOfReach(instance string) bool {
 //
 // Safe with an empty token (older Gitea did not issue one).
 // It also returns the URL to advertise as ACTIONS_RESULTS_URL.
-func (r *Runner) registerCacheForTask(token, repo, publicURL string, reporter *report.Reporter) (func(), string) {
+func (r *Runner) registerCacheForTask(token string, cred artifactcache.JobCredential, reporter *report.Reporter) (func(), string) {
 	if token == "" || r.cacheHandler == nil {
 		return func() {}, ""
 	}
-	cred := artifactcache.JobCredential{
-		Repo:        repo,
-		PublicURL:   publicURL,
-		Results:     r.envs["ACTIONS_RESULTS_URL"], // the instance as the job would reach it
-		InsecureTLS: r.cfg.Runner.Insecure,
-	}
+	cred.Results = r.envs["ACTIONS_RESULTS_URL"] // the instance as the job would reach it
+	cred.InsecureTLS = r.cfg.Runner.Insecure
 	revoke := r.cacheHandler.RegisterJob(token, cred)
 	if r.cfg.Cache.ExternalServer != "" {
-		revokeLocal, revokeExternal := revoke, r.registerExternalCacheJob(token, repo, publicURL, reporter)
+		revokeLocal, revokeExternal := revoke, r.registerExternalCacheJob(token, cred, reporter)
 		revoke = func() { revokeLocal(); revokeExternal() }
 	}
 	return revoke, r.cacheHandler.ResultsURL(cred)
+}
+
+// cacheCredential scopes the job's cache entries by ref, as GitHub does.
+func cacheCredential(preset *model.GithubContext, publicURL string) artifactcache.JobCredential {
+	ref := preset.Ref
+	if strings.HasPrefix(preset.EventName, "pull_request") && preset.EventName != "pull_request_target" {
+		number, _ := preset.Event["number"].(float64)
+		ref = fmt.Sprintf("refs/pull/%d/head", int64(number)) // review events take github.ref from the reviewer's commit_id
+	}
+	return artifactcache.JobCredential{
+		Repo:       preset.Repository,
+		Ref:        ref,
+		BaseRef:    branchRef(preset.BaseRef),
+		DefaultRef: branchRef(model.AsString(model.NestedMapLookup(preset.Event, "repository", "default_branch"))),
+		PublicURL:  publicURL,
+	}
+}
+
+func branchRef(branch string) string {
+	if branch == "" {
+		return ""
+	}
+	return "refs/heads/" + branch
 }
 
 // registerExternalCacheJob POSTs to the remote cache-server's control-plane.
@@ -713,11 +739,12 @@ func (r *Runner) registerCacheForTask(token, repo, publicURL string, reporter *r
 // 401 the job's requests — better than failing the whole task for a cache
 // outage. The warning is mirrored to the job log so users can see why their
 // cache calls 401, instead of having to read the runner daemon's stderr.
-func (r *Runner) registerExternalCacheJob(token, repo, publicURL string, reporter *report.Reporter) func() {
+func (r *Runner) registerExternalCacheJob(token string, cred artifactcache.JobCredential, reporter *report.Reporter) func() {
 	base := strings.TrimRight(r.cfg.Cache.ExternalServer, "/")
-	if err := postInternalCache(base+"/_internal/register", r.cfg.Cache.ExternalSecret, map[string]any{
-		"token": token, "repo": repo, "public_url": publicURL,
-	}); err != nil {
+	if err := postInternalCache(base+"/_internal/register", r.cfg.Cache.ExternalSecret, struct {
+		Token string `json:"token"`
+		artifactcache.JobCredential
+	}{token, cred}); err != nil {
 		logging.Warnf("cache external_server register failed (%s): %v", base, err)
 		if reporter != nil {
 			reporter.Logf("::warning::%s", runner.EscapeCommandData(fmt.Sprintf(
@@ -736,7 +763,7 @@ func (r *Runner) registerExternalCacheJob(token, repo, publicURL string, reporte
 	}
 }
 
-func postInternalCache(url, secret string, body map[string]any) error {
+func postInternalCache(url, secret string, body any) error {
 	buf, err := json.Marshal(body)
 	if err != nil {
 		return err
@@ -796,7 +823,7 @@ func (r *Runner) setHealthStatus(ready bool, reason string) {
 func checkFreeDisk(cfg *config.Config) (bool, string) {
 	root := cfg.Host.WorkdirParent
 	if cfg.Container.BindWorkdir {
-		root = filepath.FromSlash("/" + strings.TrimLeft(cfg.Container.WorkdirParent, "/"))
+		root = containerWorkdirRoot(cfg.Container.WorkdirParent)
 	}
 	root = nearestExistingPath(root)
 	available, err := disk.FreeBytes(root)
@@ -808,6 +835,13 @@ func checkFreeDisk(cfg *config.Config) (bool, string) {
 		return false, fmt.Sprintf("low disk space on %s: %d MiB available, %d MiB required", root, availableMB, cfg.HealthCheck.MinFreeDiskSpaceMB)
 	}
 	return true, "ok"
+}
+
+func containerWorkdirRoot(parent string) string {
+	if filepath.IsAbs(parent) {
+		return filepath.Clean(parent)
+	}
+	return filepath.Join(string(filepath.Separator), parent)
 }
 
 func nearestExistingPath(path string) string {

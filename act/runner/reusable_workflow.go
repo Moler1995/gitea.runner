@@ -23,13 +23,14 @@ func newLocalReusableWorkflowExecutor(rc *RunContext) common.Executor {
 		return common.NewErrorExecutor(err)
 	}
 
-	if !rc.Config.NoSkipCheckout {
+	preset := rc.Config.PresetGitHubContext
+	if preset == nil {
 		// resolve the local workflow against the workspace root, not the process
 		// working directory, so it is found regardless of where the runner is invoked
 		return newReusableWorkflowExecutor(rc, rc.Config.Workdir, localWorkflow.Path, false)
 	}
 
-	uses := fmt.Sprintf("%s/%s@%s", rc.Config.PresetGitHubContext.Repository, localWorkflow.Path, rc.Config.PresetGitHubContext.Sha)
+	uses := fmt.Sprintf("%s/%s@%s", preset.Repository, localWorkflow.Path, preset.Sha)
 
 	remoteReusableWorkflow, err := newRemoteReusableWorkflow(rc.Config.GitHubInstance, uses)
 	if err != nil {
@@ -196,7 +197,7 @@ func (c Config) withInstanceAuth(input git.NewGitCloneExecutorInput, token strin
 	}
 	input.ClientCertFile, input.ClientKeyFile = c.ClientCertFile, c.ClientKeyFile
 	if onInstanceHost(u.Host, c.GitHubInstance) {
-		input.InsecureSkipTLS, input.Transport = c.InsecureSkipTLS, c.InstanceTransport
+		input.InsecureSkipTLS, input.CAFile, input.Transport = c.InsecureSkipTLS, c.CAFile, c.InstanceTransport
 	}
 	if u.User == nil {
 		input.Token = token

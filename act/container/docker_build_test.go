@@ -1,7 +1,7 @@
 // Copyright 2026 The Gitea Authors. All rights reserved.
 // SPDX-License-Identifier: MIT
 
-//go:build !(WITHOUT_DOCKER || !(linux || darwin || windows || netbsd))
+//go:build !(WITHOUT_DOCKER || !(linux || darwin || windows || netbsd || freebsd))
 
 package container
 
@@ -18,10 +18,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestDockerBuildReportsDaemonError(t *testing.T) {
+func TestDockerBuildLabelsImageWithItsTagAndReportsDaemonError(t *testing.T) {
+	var labels string
 	daemon := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("API-Version", "1.47")
 		if strings.HasSuffix(request.URL.Path, "/build") {
+			labels = request.URL.Query().Get("labels")
 			writer.Header().Set("Content-Type", "application/json")
 			writer.WriteHeader(http.StatusInternalServerError)
 			_, _ = io.WriteString(writer, `{"message":"build rejected"}`)
@@ -35,22 +37,23 @@ func TestDockerBuildReportsDaemonError(t *testing.T) {
 	require.ErrorContains(t, NewDockerBuildExecutor(NewDockerBuildExecutorInput{
 		ImageTag: "action:test", Dockerfile: "Dockerfile", BuildContext: strings.NewReader(""),
 	})(t.Context()), "build rejected")
+	require.JSONEq(t, `{"com.gitea.runner.image":"action:test"}`, labels)
 }
 
 func TestCreateBuildContextFollowsDockerignoreAndSymlinkedRootButKeepsDockerfile(t *testing.T) {
 	dir := t.TempDir()
+	require.NoError(t, os.Mkdir(filepath.Join(dir, "build"), 0o755))
 	for name, content := range map[string]string{
 		".dockerignore": "*.log\nbuild\n!build/keep.txt\nDockerfile", "Dockerfile": "FROM scratch", "a.txt": "a",
 		"a.log": "log", "build/drop.txt": "drop", "build/keep.txt": "keep",
 	} {
-		require.NoError(t, os.MkdirAll(filepath.Join(dir, filepath.Dir(name)), 0o755))
 		require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644))
 	}
 	require.NoError(t, os.Mkdir(filepath.Join(dir, "empty"), 0o755))
 
 	contexts := []string{dir}
 	if link := filepath.Join(t.TempDir(), "link"); os.Symlink(dir, link) == nil {
-		contexts = append(contexts, link+string(filepath.Separator))
+		contexts = append(contexts, link, link+string(filepath.Separator))
 	}
 
 	for _, contextDir := range contexts {

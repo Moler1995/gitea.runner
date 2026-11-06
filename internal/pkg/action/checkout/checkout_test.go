@@ -13,9 +13,11 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -50,13 +52,14 @@ func gitLog(dir string) []string {
 
 func TestCheckout(t *testing.T) {
 	server := t.TempDir()
+	serverURL := (&url.URL{Scheme: "file", Path: "/" + strings.TrimPrefix(filepath.ToSlash(server), "/")}).String()
 	var sha string
-	_, lfsErr := exec.LookPath("git-lfs")
+	lfsPath, lfsErr := exec.LookPath("git-lfs")
 	require.True(t, t.Run("fixtures", func(t *testing.T) {
 		t.Run("history", func(t *testing.T) {
 			t.Parallel()
 			work := t.TempDir()
-			runGit(t, "init", "--initial-branch=main", work)
+			runGit(t, "init", "--template=", "--initial-branch=main", work)
 			runGit(t, "-C", work, "commit", "--allow-empty", "-m", "c1")
 			sha = runGit(t, "-C", work, "rev-parse", "HEAD")
 			runGit(t, "-C", work, "tag", "v1")
@@ -74,7 +77,7 @@ func TestCheckout(t *testing.T) {
 		t.Run("sha256", func(t *testing.T) {
 			t.Parallel()
 			sha256Repo := filepath.Join(server, "org", "sha256")
-			runGit(t, "init", "--object-format=sha256", "--initial-branch=main", sha256Repo)
+			runGit(t, "init", "--template=", "--object-format=sha256", "--initial-branch=main", sha256Repo)
 			runGit(t, "-C", sha256Repo, "commit", "--allow-empty", "-m", "s1")
 			runGit(t, "-C", sha256Repo, "checkout", "--detach")
 		})
@@ -103,6 +106,10 @@ test -s "$2" || exit 1
 printf '%s\n' "$@" > "$SSH_ARGS"
 for last; do :; done
 exec sh -c "$(printf '%s' "$last" | sed "s#git-upload-pack '/\(.*\)\.git'#git upload-pack '$SSH_SERVER/\1'#")"
+`), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(tools, "git-lfs"), []byte(`#!/bin/sh
+git config --get-regexp extraheader > "$LFS_HEADERS"
+exec "$LFS" "$@"
 `), 0o755))
 	globalConfig := filepath.Join(t.TempDir(), "gitconfig")
 	require.NoError(t, os.WriteFile(globalConfig, []byte("[protocol \"file\"]\n\tallow = always\n"), 0o644))
@@ -192,22 +199,27 @@ exec sh -c "$(printf '%s' "$last" | sed "s#git-upload-pack '/\(.*\)\.git'#git up
 			if tc.inputs["lfs"] == "true" && lfsErr != nil {
 				t.Skip("needs git-lfs")
 			}
+			if tc.inputs["ssh-key"] != "" && runtime.GOOS == "windows" {
+				t.Skip("Git for Windows puts its own ssh ahead of the fake one on PATH")
+			}
 			workspace, runnerTemp := t.TempDir(), t.TempDir()
 			output := filepath.Join(runnerTemp, "output")
 			checkout := func(inputs map[string]string) error {
 				return Main(t.Context(), &action.Context{
 					Container: &container.HostEnvironment{Path: workspace, TmpDir: runnerTemp, StdOut: io.Discard},
 					Github: &model.GithubContext{
-						Repository: "org/repo", Ref: cmp.Or(tc.eventRef, "refs/heads/main"), Sha: sha, ServerURL: "file://" + server, Token: "tok", Event: tc.event,
+						Repository: "org/repo", Ref: cmp.Or(tc.eventRef, "refs/heads/main"), Sha: sha, ServerURL: serverURL, Token: "tok", Event: tc.event,
 					},
 					Inputs:         inputs,
 					HostWorkdir:    host,
 					Workspace:      workspace,
 					BindWorkdir:    tc.bind,
 					NoSkipCheckout: tc.noSkip,
+					CAFile:         "ca.crt",
 					Env: map[string]string{
 						"PATH": tools + string(os.PathListSeparator) + os.Getenv("PATH"), "GIT_CONFIG_GLOBAL": globalConfig, "GIT_CONFIG_NOSYSTEM": "1",
-						"GIT_DIR": host, "GITHUB_OUTPUT": output, "SSH_SERVER": server, "SSH_ARGS": filepath.Join(runnerTemp, "ssh-args"),
+						"GIT_DIR": host, "GITHUB_OUTPUT": output, "SSH_SERVER": filepath.ToSlash(server), "SSH_ARGS": filepath.Join(runnerTemp, "ssh-args"),
+						"LFS": lfsPath, "LFS_HEADERS": filepath.Join(runnerTemp, "lfs-headers"),
 					},
 				})
 			}
@@ -255,23 +267,48 @@ exec sh -c "$(printf '%s' "$last" | sed "s#git-upload-pack '/\(.*\)\.git'#git up
 				assert.Contains(t, string(outputs), "ref="+cmp.Or(tc.eventRef, "refs/heads/main")+"\n")
 				return
 			}
-			if tc.head == "" {
-				assert.Empty(t, gitOutput(dst, "symbolic-ref", "-q", "HEAD"))
-			} else {
-				assert.Equal(t, "refs/heads/"+tc.head, gitOutput(dst, "symbolic-ref", "-q", "HEAD"))
-				assert.Equal(t, "origin/"+tc.head, gitOutput(dst, "rev-parse", "--abbrev-ref", "@{u}"))
+			headArgs := []string{"-C", dst, "rev-parse", "HEAD", "--symbolic-full-name", "HEAD"}
+			if tc.head != "" {
+				headArgs = append(headArgs, "--abbrev-ref", "@{u}")
 			}
-			assert.Contains(t, string(outputs), "commit="+gitOutput(dst, "rev-parse", "HEAD")+"\n")
+			head := strings.Fields(runGit(t, headArgs...))
+			if tc.head == "" {
+				require.Len(t, head, 2)
+				assert.Equal(t, "HEAD", head[1])
+			} else {
+				require.Len(t, head, 3)
+				assert.Equal(t, "refs/heads/"+tc.head, head[1])
+				assert.Equal(t, "origin/"+tc.head, head[2])
+			}
+			assert.Contains(t, string(outputs), "commit="+head[0]+"\n")
 			if inputRef := tc.inputs["ref"]; inputRef != "" && inputRef != sha {
 				assert.Contains(t, string(outputs), "ref="+inputRef+"\n")
 			}
-			assert.Equal(t, tc.inputs["sparse-checkout"] != "", gitOutput(dst, "config", "--local", "extensions.worktreeConfig") == "true")
 			persisted := tc.inputs["persist-credentials"] != "false"
 			for _, repo := range repos {
+				var credentialIncludes []string
+				var worktreeConfig string
+				for entry := range strings.SplitSeq(runGit(t, "-C", repo, "config", "--local", "--no-includes", "--null", "--list"), "\x00") {
+					key, value, _ := strings.Cut(entry, "\n")
+					switch key {
+					case "extensions.worktreeconfig":
+						worktreeConfig = value
+					case strings.ToLower(credentialsInclude):
+						credentialIncludes = append(credentialIncludes, value)
+					}
+				}
+				if repo == dst {
+					assert.Equal(t, tc.inputs["sparse-checkout"] != "", strings.TrimSpace(worktreeConfig) == "true")
+				}
 				assert.Equal(t, tc.inputs["clean"] == "false", fileExists(filepath.Join(repo, "untracked")), repo)
-				assert.Len(t, strings.Fields(gitOutput(repo, "config", "--local", "--get-all", credentialsInclude)), 1, repo)
-				headers, _ := exec.Command("git", "-C", repo, "config", "--get-all", "http.file://"+server+"/.extraheader").Output()
+				assert.Len(t, strings.Fields(strings.Join(credentialIncludes, "\n")), 1, repo)
+				headers, _ := exec.Command("git", "-C", repo, "config", "--get-all", "http."+serverURL+"/.extraheader").Output()
 				assert.Equal(t, persisted, string(headers) == "\nAuthorization: Basic dG9rZW46dG9r\n", repo)
+				assert.Equal(t, persisted, gitOutput(repo, "config", "http."+serverURL+"/.sslcainfo") != "", repo)
+			}
+			if tc.inputs["lfs"] == "true" && runtime.GOOS != "windows" {
+				headers, _ := os.ReadFile(filepath.Join(runnerTemp, "lfs-headers"))
+				assert.Equal(t, 1, strings.Count(string(headers), "Authorization"), string(headers))
 			}
 			if tc.inputs["ssh-key"] != "" {
 				keys, _ := filepath.Glob(filepath.Join(runnerTemp, "git-ssh-key-*"))
@@ -291,7 +328,7 @@ exec sh -c "$(printf '%s' "$last" | sed "s#git-upload-pack '/\(.*\)\.git'#git up
 	}
 }
 
-func TestCheckoutOffersClientCertOnlyDuringTheStep(t *testing.T) {
+func TestCheckoutTrustsTheRunnerCAAndOffersClientCertOnlyDuringTheStep(t *testing.T) {
 	var gotCert bool
 	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotCert = len(r.TLS.PeerCertificates) > 0
@@ -309,14 +346,14 @@ func TestCheckoutOffersClientCertOnlyDuringTheStep(t *testing.T) {
 	require.NoError(t, os.WriteFile(keyFile, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}), 0o600))
 
 	require.ErrorContains(t, Main(t.Context(), &action.Context{
-		Container:       &container.HostEnvironment{Path: workspace, TmpDir: runnerTemp, StdOut: io.Discard},
-		Github:          &model.GithubContext{Repository: "org/repo", Ref: "refs/heads/main", ServerURL: server.URL},
-		Inputs:          map[string]string{"repository": "other/repo"},
-		Workspace:       workspace,
-		InsecureSkipTLS: true,
-		ClientCertFile:  certFile,
-		ClientKeyFile:   keyFile,
-		Env:             map[string]string{"PATH": os.Getenv("PATH"), "GIT_CONFIG_GLOBAL": os.DevNull, "GIT_CONFIG_NOSYSTEM": "1"},
+		Container:      &container.HostEnvironment{Path: workspace, TmpDir: runnerTemp, StdOut: io.Discard},
+		Github:         &model.GithubContext{Repository: "org/repo", Ref: "refs/heads/main", ServerURL: server.URL},
+		Inputs:         map[string]string{"repository": "other/repo"},
+		Workspace:      workspace,
+		ClientCertFile: certFile,
+		ClientKeyFile:  keyFile,
+		CAFile:         certFile,
+		Env:            map[string]string{"PATH": os.Getenv("PATH"), "GIT_CONFIG_GLOBAL": os.DevNull, "GIT_CONFIG_NOSYSTEM": "1"},
 	}), "checkout: other/repo@")
 	require.True(t, gotCert)
 	keys, _ := filepath.Glob(filepath.Join(runnerTemp, "git-client-key-*"))
@@ -328,15 +365,16 @@ func TestCheckoutOffersClientCertOnlyDuringTheStep(t *testing.T) {
 
 func publish(t *testing.T, server, name string, files, submodules map[string]string) {
 	work := t.TempDir()
-	runGit(t, "init", "--initial-branch=main", work)
+	runGit(t, "init", "--template=", "--initial-branch=main", work)
 	for file, content := range files {
 		require.NoError(t, os.MkdirAll(filepath.Dir(filepath.Join(work, file)), 0o755))
 		require.NoError(t, os.WriteFile(filepath.Join(work, file), []byte(content), 0o644))
 	}
 	runGit(t, "-C", work, "add", ".")
+	var moduleConfig []byte
 	for path, url := range submodules {
-		runGit(t, "-C", work, "config", "-f", ".gitmodules", "submodule."+path+".path", path)
-		runGit(t, "-C", work, "config", "-f", ".gitmodules", "submodule."+path+".url", url)
+		moduleConfig = fmt.Appendf(moduleConfig, "[submodule %q]\n\tpath = %q\n\turl = %q\n", path, path, url)
+		require.NoError(t, os.WriteFile(filepath.Join(work, ".gitmodules"), moduleConfig, 0o644))
 		commit := runGit(t, "--git-dir", filepath.Join(server, name, url), "rev-parse", "main")
 		runGit(t, "-C", work, "update-index", "--add", "--cacheinfo", "160000,"+commit+","+path)
 		runGit(t, "-C", work, "add", ".gitmodules")
@@ -353,4 +391,26 @@ func gitOutput(dir string, args ...string) string {
 func fileExists(name string) bool {
 	_, err := os.Stat(name)
 	return err == nil
+}
+
+func TestWorkspaceDestination(t *testing.T) {
+	for _, tc := range []struct {
+		path    string
+		windows bool
+		want    string
+	}{
+		{`..\x`, true, ""},
+		{`C:x`, true, ""},
+		{`a\b`, true, "/w/a/b"},
+		{`..\x`, false, `/w/..\x`},
+		{`a:b`, false, "/w/a:b"},
+	} {
+		got, err := workspaceDestination("/w", tc.path, tc.windows)
+		if tc.want == "" {
+			assert.ErrorContains(t, err, "must be relative", tc.path)
+		} else {
+			require.NoError(t, err, tc.path)
+			assert.Equal(t, tc.want, got, tc.path)
+		}
+	}
 }
