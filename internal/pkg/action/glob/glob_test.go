@@ -11,13 +11,27 @@ import (
 )
 
 var (
-	posix   = Options{Workdir: "/work/cwd-with-[and]", Home: "/home/home-with-[and]"}
-	windows = Options{Workdir: `C:\work\cwd-with-[and]`, Home: `C:\Users\home-with-[and]`, Windows: true}
+	posix   = Options{Workdir: "/work/cwd-with-[and]", Home: home("/home/home-with-[and]")}
+	windows = Options{Workdir: `C:\work\cwd-with-[and]`, Home: home(`C:\Users\home-with-[and]`), Windows: true}
 )
+
+func home(dir string) func() (string, error) {
+	return func() (string, error) { return dir, nil }
+}
 
 func implicit(o Options) Options {
 	o.ImplicitDescendants = true
 	return o
+}
+
+func TestHomeResolvedLazilyOnce(t *testing.T) {
+	calls := 0
+	o := Options{Workdir: "/w", Home: func() (string, error) { calls++; return "/h", nil }}
+	_, err := Parse("~/a\n! ~/b", o)
+	require.NoError(t, err)
+	_, err = Parse("/a", o)
+	require.NoError(t, err)
+	assert.Equal(t, 1, calls)
 }
 
 func TestMatch(t *testing.T) {
