@@ -664,13 +664,6 @@ func (r *Runner) run(ctx context.Context, task *runnerv1.Task, reporter *report.
 	return execErr
 }
 
-func (r *Runner) builtInCacheURL() string {
-	if r.cacheHandler == nil {
-		return ""
-	}
-	return r.cacheHandler.ExternalURL() + "/"
-}
-
 func (r *Runner) cacheAddress() string {
 	if r.cacheHandler == nil {
 		return ""
@@ -679,7 +672,7 @@ func (r *Runner) cacheAddress() string {
 }
 
 // onChange returns compute's result, computing again only once key changes.
-func onChange(key, compute func() string) func() string {
+func onChange(key func() string, compute func(key string) string) func() string {
 	var (
 		mu       sync.Mutex
 		computed bool
@@ -691,7 +684,7 @@ func onChange(key, compute func() string) func() string {
 		mu.Lock()
 		defer mu.Unlock()
 		if !computed || current != lastKey {
-			computed, lastKey, result = true, current, compute()
+			computed, lastKey, result = true, current, compute(current)
 		}
 		return result
 	}
@@ -957,25 +950,24 @@ func warnIgnoredCacheSecret(cfg *config.Config) {
 
 // cacheForJob returns the cache address for the job, and the container to attach to its network to reach it there.
 func (r *Runner) cacheForJob(job *model.Job, platform string) (string, string) {
-	r.cacheHandler.RefreshOutboundIP()
+	if r.cacheHandler != nil {
+		r.cacheHandler.RefreshOutboundIP()
+	}
 	jobContainer := job.Container()
 	cacheContainer := ""
 	if !strings.HasPrefix(platform, labels.SchemeKubernetes+"://") && (jobContainer != nil && jobContainer.Image != "" || platform != labels.SelfHostedPlatform) {
 		cacheContainer = r.isolatedCacheContainer()
 	}
 	if cacheContainer == "" {
-		return strings.TrimSuffix(r.builtInCacheURL(), "/"), ""
+		return r.cacheAddress(), ""
 	}
 	cacheURL, _ := url.Parse(r.cacheHandler.ExternalURL())
 	cacheURL.Host = net.JoinHostPort(cacheContainer, cacheURL.Port())
 	return cacheURL.String(), cacheContainer
 }
 
-func (r *Runner) detectIsolatedCacheContainer() string {
-	if r.cacheHandler == nil {
-		return ""
-	}
-	addr, err := netip.ParseAddr(hostOf(r.cacheHandler.ExternalURL()))
+func (r *Runner) detectIsolatedCacheContainer(cacheAddress string) string {
+	addr, err := netip.ParseAddr(hostOf(cacheAddress))
 	if err != nil {
 		return ""
 	}

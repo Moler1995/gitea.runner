@@ -307,7 +307,7 @@ func TestNewRunnerLeavesProxyToTheTask(t *testing.T) {
 
 	require.NotContains(t, r.envs, "http_proxy")
 	require.NotContains(t, r.envs, "no_proxy")
-	proxyEnv := JobProxyEnv(r.envs, r.builtInCacheURL(), nil)
+	proxyEnv := JobProxyEnv(r.envs, r.cacheAddress(), nil)
 	assert.Contains(t, proxyEnv["no_proxy"], "runner.local")
 	assert.NotContains(t, proxyEnv["no_proxy"], "cache.local")
 }
@@ -356,7 +356,7 @@ func TestNewRunnerCacheServiceV2(t *testing.T) {
 	defer resp.Body.Close()
 
 	assert.Equal(t, http.StatusOK, resp.StatusCode, "the advertised results service serves no cache service")
-	assert.Equal(t, r.envs["ACTIONS_CACHE_URL"], r.builtInCacheURL(), "the address only the runner knows is bypassed for the operator")
+	assert.Equal(t, r.envs["ACTIONS_CACHE_URL"], r.cacheAddress()+"/", "the address only the runner knows is bypassed for the operator")
 
 	envs := r.cloneEnvs()
 	r.setResultsService(envs, resultsURL)
@@ -410,9 +410,9 @@ func TestCacheAddressFollowsDetection(t *testing.T) {
 	handler, err := artifactcache.StartHandler(artifactcache.Options{Dir: t.TempDir(), DetectOutboundIP: func() net.IP { return ip }})
 	require.NoError(t, err)
 	defer handler.Close()
-	r := &Runner{cacheHandler: handler, envs: map[string]string{"ACTIONS_CACHE_URL": handler.ExternalURL() + "/"}}
-	detections := 0
-	isolated := onChange(r.cacheAddress, func() string { detections++; return "" })
+	r := &Runner{cacheHandler: handler}
+	detections, detected := 0, ""
+	isolated := onChange(r.cacheAddress, func(address string) string { detections++; detected = address; return "" })
 	isolated()
 	isolated()
 	assert.Equal(t, 1, detections)
@@ -424,6 +424,7 @@ func TestCacheAddressFollowsDetection(t *testing.T) {
 	assert.Contains(t, cacheURL, "192.0.2.1")
 	isolated()
 	assert.Equal(t, 2, detections)
+	assert.Equal(t, r.cacheAddress(), detected)
 }
 
 func TestRestoreCalledWorkflowContext(t *testing.T) {

@@ -322,7 +322,7 @@ func (h *Handler) ExternalURL() string {
 
 // RefreshOutboundIP detects the address again, as the network may have changed since startup.
 func (h *Handler) RefreshOutboundIP() {
-	if h == nil || h.detectOutboundIP == nil {
+	if h.detectOutboundIP == nil {
 		return
 	}
 	if ip := h.detectOutboundIP(); ip != nil {
