@@ -75,6 +75,7 @@ type RunContext struct {
 	actionInputs        map[string]any // inputs of the composite action this runs, nil for a job
 	Masks               []string
 	cleanUpJobContainer common.Executor
+	taskWorkspace       string // the task's workspace in the job container, set when the runner bind-mounted it
 	deferVolumeCleanup  func(common.Executor)
 	caller              *caller           // job calling this RunContext (reusable workflows)
 	workflowCallInputs  map[string]any    // the caller's with:, resolved once by resolveWorkflowCall
@@ -414,6 +415,9 @@ func (rc *RunContext) GetBindsAndMounts(ctx context.Context) ([]string, map[stri
 				bindModifiers = ":z"
 			}
 			binds = append(binds, fmt.Sprintf("%s:%s%s", source, target, bindModifiers))
+			if rc.Config.PresetGitHubContext != nil && source == rc.workdirMountRoot() {
+				rc.taskWorkspace = target
+			}
 		} else {
 			mounts[name] = target
 		}
@@ -798,6 +802,9 @@ func (rc *RunContext) cleanupJobResources(networkName string, createAndDeleteNet
 	return func(ctx context.Context) error {
 		logger := common.Logger(ctx)
 		rc.printServiceLogs(ctx)
+		if !preclean {
+			rc.removeTaskWorkspace(ctx)
+		}
 		errs := []error{rc.closeDockerProxy(ctx)}
 		var containers []common.Executor
 		if rc.JobContainer != nil {
@@ -828,6 +835,28 @@ func (rc *RunContext) cleanupJobResources(networkName string, createAndDeleteNet
 			})
 		}
 		return errors.Join(append(errs, runAll(ctx, rest))...)
+	}
+}
+
+// $1 is the workspace, $2 the mountinfo file. rm would reach into a mount below the workspace, and
+// mountinfo escapes unusual paths so grep could miss one: refuse both.
+const removeTaskWorkspaceScript = `case "$1" in *[!A-Za-z0-9/_.-]*) exit 3 ;; esac
+grep -qF " $1/" "$2"
+[ $? -eq 1 ] || exit 3
+rm -rf "$1"/* "$1"/.[!.]* "$1"/..?*`
+
+// removeTaskWorkspace empties the workspace as root while the job container is up, since the runner
+// may not own what the job wrote. Best effort, the runner removes the rest and warns if it cannot.
+// Jobs of a called workflow share the workspace, so they leave it alone.
+func (rc *RunContext) removeTaskWorkspace(ctx context.Context) {
+	if rc.taskWorkspace == "" || rc.caller != nil || rc.JobContainer == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, workspaceCleanupTimeout)
+	defer cancel()
+	command := []string{"sh", "-c", removeTaskWorkspaceScript, "sh", rc.taskWorkspace, "/proc/self/mountinfo"}
+	if err := rc.JobContainer.Exec(command, nil, "0", "/")(ctx); err != nil {
+		common.Logger(ctx).Debugf("could not empty workspace %s in the job container: %v", rc.taskWorkspace, err)
 	}
 }
 

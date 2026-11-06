@@ -36,8 +36,9 @@ import (
 )
 
 const (
-	jobCleanupTimeout  = time.Minute
-	maxJobSummaryBytes = 1024 * 1024
+	jobCleanupTimeout       = time.Minute
+	workspaceCleanupTimeout = 30 * time.Second // of jobCleanupTimeout, leaving the rest to remove the containers
+	maxJobSummaryBytes      = 1024 * 1024
 )
 
 // jobSummaryTruncationMarker is appended to a summary that exceeded the size limit

@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -681,6 +682,137 @@ func TestCleanupJobVolumesReapsAbandonedDeferredCleanup(t *testing.T) {
 	require.ErrorContains(t, err, "became-active")
 	require.ErrorContains(t, err, "remove-failed")
 	assert.ElementsMatch(t, []string{"became-active", "remove-failed", "foreign", "fresh", "unknown-age"}, slices.Collect(maps.Keys(volumes)))
+}
+
+type workspaceCleanupContainer struct {
+	fakeContainer
+	calls   *[]string
+	command []string
+	user    string
+	err     error
+}
+
+func (c *workspaceCleanupContainer) Exec(command []string, _ map[string]string, user, _ string) common.Executor {
+	return func(context.Context) error {
+		*c.calls = append(*c.calls, "exec")
+		c.command, c.user = command, user
+		return c.err
+	}
+}
+
+func (c *workspaceCleanupContainer) Remove() common.Executor {
+	return func(context.Context) error {
+		*c.calls = append(*c.calls, "remove")
+		return nil
+	}
+}
+
+func TestCleanupJobResourcesEmptiesTaskWorkspace(t *testing.T) {
+	tests := []struct {
+		name      string
+		workspace string
+		caller    *caller
+		preclean  bool
+		execErr   error
+		want      []string
+	}{
+		{name: "runs before removal", workspace: "/workspace/1", want: []string{"exec", "remove"}},
+		{name: "failure does not fail the job", workspace: "/workspace/1", execErr: errors.New("no rm"), want: []string{"exec", "remove"}},
+		{name: "no runner bind", want: []string{"remove"}},
+		{name: "called workflow shares it", workspace: "/workspace/1", caller: &caller{}, want: []string{"remove"}},
+		{name: "preclean", workspace: "/workspace/1", preclean: true, want: []string{"remove"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var calls []string
+			job := &workspaceCleanupContainer{calls: &calls, err: tt.execErr}
+			rc := &RunContext{
+				Config:             &Config{},
+				Run:                &model.Run{Workflow: &model.Workflow{Name: "workflow"}, JobID: "job"},
+				JobContainer:       job,
+				taskWorkspace:      tt.workspace,
+				caller:             tt.caller,
+				deferVolumeCleanup: func(common.Executor) {},
+			}
+			require.NoError(t, rc.cleanupJobResources("", false, tt.preclean)(common.WithDryrun(t.Context(), tt.preclean)))
+			assert.Equal(t, tt.want, calls)
+			if len(tt.want) == 2 {
+				assert.Equal(t, "0", job.user)
+				assert.Equal(t, tt.workspace, job.command[4])
+			}
+		})
+	}
+}
+
+func TestRemoveTaskWorkspaceScript(t *testing.T) {
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("needs sh")
+	}
+	run := func(t *testing.T, workspace, mountinfo string) error {
+		t.Helper()
+		info := filepath.Join(t.TempDir(), "mountinfo")
+		require.NoError(t, os.WriteFile(info, []byte(mountinfo), 0o600))
+		return exec.Command(sh, "-c", removeTaskWorkspaceScript, "sh", workspace, info).Run()
+	}
+	newWorkspace := func(t *testing.T, name string) string {
+		t.Helper()
+		workspace := filepath.Join(t.TempDir(), name)
+		for _, file := range []string{"owner/repo/file", ".hidden", "..odd"} {
+			require.NoError(t, os.MkdirAll(filepath.Dir(filepath.Join(workspace, file)), 0o755))
+			require.NoError(t, os.WriteFile(filepath.Join(workspace, file), nil, 0o600))
+		}
+		return workspace
+	}
+	const mount = "36 35 98:0 /src %s rw - ext4 /dev/sda1 rw\n"
+
+	workspace := newWorkspace(t, "workspace")
+	require.NoError(t, run(t, workspace, fmt.Sprintf(mount, workspace)))
+	entries, err := os.ReadDir(workspace)
+	require.NoError(t, err)
+	assert.Empty(t, entries)
+
+	refused := func(name, workspace string, err error) {
+		t.Helper()
+		require.Error(t, err, name)
+		assert.FileExists(t, filepath.Join(workspace, "owner/repo/file"), name)
+	}
+	workspace = newWorkspace(t, "workspace")
+	refused("a mount below the workspace", workspace, run(t, workspace, fmt.Sprintf(mount, workspace+"/owner/repo/cache")))
+	workspace = newWorkspace(t, "workspace")
+	refused("no readable mountinfo", workspace, exec.Command(sh, "-c", removeTaskWorkspaceScript, "sh", workspace, filepath.Join(workspace, "missing")).Run())
+	workspace = newWorkspace(t, "with space")
+	refused("a path mountinfo escapes", workspace, run(t, workspace, ""))
+}
+
+func TestGetBindsAndMountsRecordsTaskWorkspace(t *testing.T) {
+	newRunContext := func(volumes []string) *RunContext {
+		return &RunContext{
+			Config: &Config{
+				BindWorkdir:         true,
+				Workdir:             "/workspace/1/owner/repo",
+				PresetGitHubContext: &model.GithubContext{},
+				ValidVolumes:        []string{"**"},
+			},
+			Run:           &model.Run{Workflow: &model.Workflow{Name: "workflow"}, JobID: "job"},
+			JobContainer:  fakeContainer{},
+			containerSpec: model.ContainerSpec{Volumes: volumes},
+		}
+	}
+
+	rc := newRunContext(nil)
+	binds, _ := rc.GetBindsAndMounts(t.Context())
+	assert.Contains(t, strings.Join(binds, "\n"), "/workspace/1:/workspace/1")
+	assert.Equal(t, "/workspace/1", rc.taskWorkspace)
+
+	rc = newRunContext([]string{"/data:/workspace/1"})
+	rc.GetBindsAndMounts(t.Context())
+	assert.Empty(t, rc.taskWorkspace, "the workflow's mount holds the workspace root")
+
+	rc = newRunContext(nil)
+	rc.Config.PresetGitHubContext = nil
+	rc.GetBindsAndMounts(t.Context())
+	assert.Empty(t, rc.taskWorkspace, "outside the daemon the workdir is the user's checkout")
 }
 
 func TestRemoveDockerActionImagesByTag(t *testing.T) {
