@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -402,6 +403,27 @@ func TestNewRunnerCacheServiceV2(t *testing.T) {
 			assert.Equal(t, r.cacheHandler.ExternalURL(), cacheURL, job)
 		}
 	}
+}
+
+func TestCacheAddressFollowsDetection(t *testing.T) {
+	ip := net.ParseIP("2001:db8::1")
+	handler, err := artifactcache.StartHandler(artifactcache.Options{Dir: t.TempDir(), DetectOutboundIP: func() net.IP { return ip }})
+	require.NoError(t, err)
+	defer handler.Close()
+	r := &Runner{cacheHandler: handler, envs: map[string]string{"ACTIONS_CACHE_URL": handler.ExternalURL() + "/"}}
+	detections := 0
+	isolated := onChange(r.cacheAddress, func() string { detections++; return "" })
+	isolated()
+	isolated()
+	assert.Equal(t, 1, detections)
+
+	workflow, err := model.ReadWorkflow(strings.NewReader(`jobs: {native: {runs-on: native}}`))
+	require.NoError(t, err)
+	ip = net.ParseIP("192.0.2.1")
+	cacheURL, _ := r.cacheForJob(workflow.GetJob("native"), labels.SelfHostedPlatform)
+	assert.Contains(t, cacheURL, "192.0.2.1")
+	isolated()
+	assert.Equal(t, 2, detections)
 }
 
 func TestRestoreCalledWorkflowContext(t *testing.T) {

@@ -13,7 +13,7 @@ import (
 func TestPreferredIP(t *testing.T) {
 	assert.Nil(t, preferredIP(nil))
 	assert.Equal(t, net.ParseIP("2001:db8::1"), preferredIP([]interfaceIP{{IP: net.ParseIP("2001:db8::1")}}))
-	assert.Equal(t, net.ParseIP("2001:db8::1"), preferredIP([]interfaceIP{
+	assert.Equal(t, net.ParseIP("192.0.2.1"), preferredIP([]interfaceIP{
 		{IP: net.ParseIP("192.0.2.1"), Name: "wlan0"},
 		{IP: net.ParseIP("2001:db8::1"), Name: "eth0"},
 	}))

@@ -61,13 +61,13 @@ func preferredIP(ips []interfaceIP) net.IP {
 	sort.Slice(ips, func(i, j int) bool {
 		first, second := ips[i], ips[j]
 
-		// ethernet is preferred
-		if vi, vj := strings.HasPrefix(first.Name, "e"), strings.HasPrefix(second.Name, "e"); vi != vj {
+		// IPv4 is preferred, as job networks are IPv4-only by default
+		if vi, vj := first.To4() != nil, second.To4() != nil; vi != vj {
 			return vi
 		}
 
-		// IPv4 is preferred
-		if vi, vj := first.To4() != nil, second.To4() != nil; vi != vj {
+		// ethernet is preferred
+		if vi, vj := strings.HasPrefix(first.Name, "e"), strings.HasPrefix(second.Name, "e"); vi != vj {
 			return vi
 		}
 

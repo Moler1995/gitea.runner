@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -21,6 +22,8 @@ import (
 	"testing/iotest"
 	"testing/synctest"
 	"time"
+
+	"gitea.com/gitea/runner/act/common/logging/logtest"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -51,6 +54,43 @@ func signArtifactURL(h *Handler, id int64) string {
 func TestHandler_ExternalURL(t *testing.T) {
 	t.Parallel()
 	assert.Equal(t, "http://[2001:db8::1]:8080", (&Handler{outboundIP: "2001:db8::1", port: 8080}).ExternalURL())
+}
+
+func TestHandler_RefreshOutboundIP(t *testing.T) {
+	t.Parallel()
+	logger, logs := logtest.NewLogger()
+	ip := net.ParseIP("2001:db8::1")
+	handler, err := StartHandler(Options{
+		Dir:              t.TempDir(),
+		Logger:           logger,
+		DetectOutboundIP: func() net.IP { return ip },
+	})
+	require.NoError(t, err)
+	defer handler.Close()
+	_, port, err := net.SplitHostPort(strings.TrimPrefix(handler.ExternalURL(), "http://"))
+	require.NoError(t, err)
+	assert.Equal(t, "http://"+net.JoinHostPort("2001:db8::1", port), handler.ExternalURL())
+	require.Len(t, logs.AllRecords(), 1)
+	assert.Contains(t, logs.LastRecord().Message, "IPv6")
+
+	ip = net.ParseIP("192.0.2.1")
+	handler.RefreshOutboundIP()
+	assert.Equal(t, "http://"+net.JoinHostPort("192.0.2.1", port), handler.ExternalURL())
+	assert.Len(t, logs.AllRecords(), 1, "only an IPv6 address warns")
+
+	ip = nil // a failed detection keeps the last address
+	handler.RefreshOutboundIP()
+	assert.Equal(t, "http://"+net.JoinHostPort("192.0.2.1", port), handler.ExternalURL())
+
+	configured, err := StartHandler(Options{
+		Dir:              t.TempDir(),
+		OutboundIP:       "cache.example",
+		DetectOutboundIP: func() net.IP { return net.ParseIP("192.0.2.1") },
+	})
+	require.NoError(t, err)
+	defer configured.Close()
+	configured.RefreshOutboundIP()
+	assert.Contains(t, configured.ExternalURL(), "cache.example")
 }
 
 func TestHandler_Upstream(t *testing.T) {

@@ -141,7 +141,7 @@ func NewRunner(cfg *config.Config, reg *config.Registration, cli client.Client) 
 		now:            time.Now,
 		runHealthCheck: executeHealthCheck,
 	}
-	runner.isolatedCacheContainer = sync.OnceValue(runner.detectIsolatedCacheContainer)
+	runner.isolatedCacheContainer = onChange(runner.cacheAddress, runner.detectIsolatedCacheContainer)
 	runner.instanceTransport = instanceTransport
 	return runner
 }
@@ -668,7 +668,33 @@ func (r *Runner) builtInCacheURL() string {
 	if r.cacheHandler == nil {
 		return ""
 	}
-	return r.envs["ACTIONS_CACHE_URL"]
+	return r.cacheHandler.ExternalURL() + "/"
+}
+
+func (r *Runner) cacheAddress() string {
+	if r.cacheHandler == nil {
+		return ""
+	}
+	return r.cacheHandler.ExternalURL()
+}
+
+// onChange returns compute's result, computing again only once key changes.
+func onChange(key, compute func() string) func() string {
+	var (
+		mu       sync.Mutex
+		computed bool
+		lastKey  string
+		result   string
+	)
+	return func() string {
+		current := key()
+		mu.Lock()
+		defer mu.Unlock()
+		if !computed || current != lastKey {
+			computed, lastKey, result = true, current, compute()
+		}
+		return result
+	}
 }
 
 func (r *Runner) setResultsService(envs map[string]string, resultsURL string) {
@@ -931,6 +957,7 @@ func warnIgnoredCacheSecret(cfg *config.Config) {
 
 // cacheForJob returns the cache address for the job, and the container to attach to its network to reach it there.
 func (r *Runner) cacheForJob(job *model.Job, platform string) (string, string) {
+	r.cacheHandler.RefreshOutboundIP()
 	jobContainer := job.Container()
 	cacheContainer := ""
 	if !strings.HasPrefix(platform, labels.SchemeKubernetes+"://") && (jobContainer != nil && jobContainer.Image != "" || platform != labels.SelfHostedPlatform) {
