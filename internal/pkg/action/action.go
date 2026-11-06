@@ -34,6 +34,7 @@ type Context struct {
 	InsecureSkipTLS bool
 	ClientCertFile  string
 	ClientKeyFile   string
+	CAFile          string // the runner CA as seen inside Container
 	Env             map[string]string
 	ResultsURL      string // the results service as the runner reaches it
 	RuntimeToken    string

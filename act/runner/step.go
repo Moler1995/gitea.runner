@@ -27,10 +27,22 @@ type step interface {
 	post() common.Executor
 
 	getRunContext() *RunContext
-	getGithubContext(ctx context.Context) *model.GithubContext
 	getStepModel() *model.Step
 	getEnv() *map[string]string
 	getIfExpression(context context.Context, stage stepStage) string
+}
+
+func stepActionIdentity(step step) (repository, ref string) {
+	if action, ok := step.(interface{ actionIdentity() (string, string) }); ok {
+		return action.actionIdentity()
+	}
+	return "", ""
+}
+
+func getStepGithubContext(ctx context.Context, step step) *model.GithubContext {
+	github := step.getRunContext().getGithubContext(ctx)
+	github.ActionRepository, github.ActionRef = stepActionIdentity(step)
+	return github
 }
 
 type stepStage int
@@ -57,10 +69,15 @@ func (s stepStage) String() string {
 }
 
 func processRunnerEnvFileCommand(ctx context.Context, fileName string, rc *RunContext, setter func(context.Context, map[string]string, string)) error {
+	if rc.JobContainer.IsEnvironmentCaseInsensitive() {
+		return container.ParseEnvFile(rc.JobContainer, container.JoinPath(rc.JobContainer.GetActPath(), fileName), func(name, value string) {
+			setter(ctx, map[string]string{"name": name}, value)
+		}, true)(ctx)
+	}
 	env := map[string]string{}
-	err := rc.JobContainer.UpdateFromEnv(path.Join(rc.JobContainer.GetActPath(), fileName), &env)(ctx)
-	for k, v := range env {
-		setter(ctx, map[string]string{"name": k}, v)
+	err := rc.JobContainer.UpdateFromEnv(container.JoinPath(rc.JobContainer.GetActPath(), fileName), &env)(ctx)
+	for key, value := range env {
+		setter(ctx, map[string]string{"name": key}, value)
 	}
 	return err
 }
@@ -92,6 +109,8 @@ func runStepExecutor(step step, stage stepStage, executor common.Executor) commo
 			runStep, err = isStepEnabled(ctx, ifExpression, step, stage)
 		}
 		if err == nil && runStep {
+			env := *step.getEnv()
+			env["GITHUB_ACTION_REPOSITORY"], env["GITHUB_ACTION_REF"] = stepActionIdentity(step)
 			err = setupInputs(ctx, step)
 		}
 		if err != nil {
@@ -125,16 +144,16 @@ func runStepExecutor(step step, stage stepStage, executor common.Executor) commo
 		actPath := rc.JobContainer.GetActPath()
 
 		outputFileCommand := path.Join("workflow", "outputcmd.txt")
-		(*step.getEnv())["GITHUB_OUTPUT"] = path.Join(actPath, outputFileCommand)
+		(*step.getEnv())["GITHUB_OUTPUT"] = container.JoinPath(actPath, outputFileCommand)
 
 		stateFileCommand := path.Join("workflow", "statecmd.txt")
-		(*step.getEnv())["GITHUB_STATE"] = path.Join(actPath, stateFileCommand)
+		(*step.getEnv())["GITHUB_STATE"] = container.JoinPath(actPath, stateFileCommand)
 
 		pathFileCommand := path.Join("workflow", "pathcmd.txt")
-		(*step.getEnv())["GITHUB_PATH"] = path.Join(actPath, pathFileCommand)
+		(*step.getEnv())["GITHUB_PATH"] = container.JoinPath(actPath, pathFileCommand)
 
 		envFileCommand := path.Join("workflow", "envs.txt")
-		(*step.getEnv())["GITHUB_ENV"] = path.Join(actPath, envFileCommand)
+		(*step.getEnv())["GITHUB_ENV"] = container.JoinPath(actPath, envFileCommand)
 
 		// Per-step summary file. Composite sub-steps share the outer job step's index
 		// via the Parent chain so all writes from within a composite action accumulate
@@ -142,16 +161,8 @@ func runStepExecutor(step step, stage stepStage, executor common.Executor) commo
 		topRC := rc.topLevelRunContext()
 		stepSummaryIndex := topRC.CurrentStepIndex
 		summaryFileCommand := path.Join("workflow", "step-summary-"+strconv.Itoa(stepSummaryIndex)+".md")
-		(*step.getEnv())["GITHUB_STEP_SUMMARY"] = path.Join(actPath, summaryFileCommand)
-
-		{
-			// For Gitea
-			(*step.getEnv())["GITEA_OUTPUT"] = (*step.getEnv())["GITHUB_OUTPUT"]
-			(*step.getEnv())["GITEA_STATE"] = (*step.getEnv())["GITHUB_STATE"]
-			(*step.getEnv())["GITEA_PATH"] = (*step.getEnv())["GITHUB_PATH"]
-			(*step.getEnv())["GITEA_ENV"] = (*step.getEnv())["GITHUB_ENV"]
-			(*step.getEnv())["GITEA_STEP_SUMMARY"] = (*step.getEnv())["GITHUB_STEP_SUMMARY"]
-		}
+		(*step.getEnv())["GITHUB_STEP_SUMMARY"] = container.JoinPath(actPath, summaryFileCommand)
+		aliasGiteaEnv(*step.getEnv())
 
 		// Reset the per-phase file-command files. GITHUB_STEP_SUMMARY is intentionally
 		// excluded here and initialized below at most once per step so writes from later
@@ -197,7 +208,7 @@ func runStepExecutor(step step, stage stepStage, executor common.Executor) commo
 			if fileErr := processRunnerEnvFileCommand(fileCommandCtx, outputFileCommand, rc, rc.setOutput); fileErr != nil && err == nil {
 				err = fileErr
 			}
-			if fileErr := rc.UpdateExtraPath(fileCommandCtx, path.Join(actPath, pathFileCommand)); fileErr != nil && err == nil {
+			if fileErr := rc.UpdateExtraPath(fileCommandCtx, container.JoinPath(actPath, pathFileCommand)); fileErr != nil && err == nil {
 				err = fileErr
 			}
 		}
@@ -252,8 +263,8 @@ func setupEnv(ctx context.Context, step step) error {
 
 	env := step.getEnv()
 	// container env is the image's baseline, which job env and $GITHUB_ENV override
-	mergeIntoMap(step, env, rc.containerSpec.Env, rc.GetEnv())
-	rc.withGithubEnv(ctx, step.getGithubContext(ctx), *env)
+	mergeIntoMap(step, env, rc.caEnv, rc.containerSpec.Env, rc.GetEnv())
+	rc.withGithubEnv(ctx, getStepGithubContext(ctx, step), *env)
 
 	var err error
 	exprEval := rc.NewExpressionEvaluator(ctx)
@@ -302,7 +313,7 @@ func isStepEnabled(ctx context.Context, expr string, step step, stage stepStage)
 	if rc.Parent != nil && stage == stepStageMain && jobContext.Status != "cancelled" {
 		jobContext.Status = rc.ownStatus()
 	}
-	runStep, err := EvalBool(ctx, rc.newStepExpressionEvaluator(ctx, step, rc.actionInputs, jobContext), expr, defaultStatusCheck)
+	runStep, err := EvalBool(ctx, rc.newStepExpressionEvaluator(ctx, step, rc.actionInputs, jobContext, rc.getGithubContext(ctx)), expr, defaultStatusCheck)
 	if err != nil {
 		return false, fmt.Errorf("if-expression %q evaluation failed: %s", expr, err)
 	}
@@ -345,17 +356,14 @@ func mergeIntoMapCaseInsensitive(target map[string]string, maps ...map[string]st
 	for k := range target {
 		foldKeys[strings.ToLower(k)] = k
 	}
-	toKey := func(s string) string {
-		foldKey := strings.ToLower(s)
-		if k, ok := foldKeys[foldKey]; ok {
-			return k
-		}
-		foldKeys[foldKey] = s
-		return s
-	}
 	for _, m := range maps {
-		for k, v := range m {
-			target[toKey(k)] = v
+		for key, value := range m {
+			foldKey := strings.ToLower(key)
+			if previous, ok := foldKeys[foldKey]; ok {
+				delete(target, previous)
+			}
+			foldKeys[foldKey] = key
+			target[key] = value
 		}
 	}
 }

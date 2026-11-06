@@ -4,11 +4,7 @@
 package process
 
 import (
-	"fmt"
-	"os/exec"
-	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/windows"
@@ -28,25 +24,38 @@ func processAlive(pid int) bool {
 	return code == stillActive
 }
 
-func TestKillerKillsTree(t *testing.T) {
-	pidFile := filepath.Join(t.TempDir(), "child.pid")
+func newProcessExitWaiter(t *testing.T, pids ...int) func() {
+	t.Helper()
+	handles := make([]windows.Handle, 0, len(pids))
+	for _, pid := range pids {
+		handle, err := windows.OpenProcess(windows.SYNCHRONIZE, false, uint32(pid))
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, windows.CloseHandle(handle)) })
+		handles = append(handles, handle)
+	}
+	return func() {
+		t.Helper()
+		result, err := windows.WaitForMultipleObjects(handles, true, 20000)
+		require.NoError(t, err)
+		require.EqualValues(t, windows.WAIT_OBJECT_0, result, "processes should exit: %v", pids)
+	}
+}
 
-	script := fmt.Sprintf(
-		`$c = Start-Process powershell -PassThru -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 600'; `+
-			`Set-Content -LiteralPath %q -Value $c.Id; Start-Sleep -Seconds 600`, pidFile)
-	cmd := exec.Command("powershell.exe", "-NoProfile", "-Command", script)
+func TestKillerKillsTree(t *testing.T) {
+	cmd, ready := newTestProcess(t, "parent", false)
 	require.NoError(t, cmd.Start())
-	t.Cleanup(func() { _ = cmd.Process.Kill() })
 
 	killer, err := NewKiller(cmd.Process)
 	require.NoError(t, err)
-	defer killer.Close()
+	t.Cleanup(func() {
+		_ = killer.Kill()
+		_ = killer.Close()
+	})
 
-	childPID := awaitChildPID(t, pidFile)
+	childPID := ready()
+	require.True(t, processAlive(childPID), "child process should start")
 
+	waitForExit := newProcessExitWaiter(t, cmd.Process.Pid, childPID)
 	require.NoError(t, killer.Kill())
-
-	require.Eventually(t, func() bool {
-		return !processAlive(cmd.Process.Pid) && !processAlive(childPID)
-	}, 20*time.Second, 200*time.Millisecond, "parent and child should both be terminated")
+	waitForExit()
 }

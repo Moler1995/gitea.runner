@@ -1,0 +1,18 @@
+name: reconnect
+on:
+  push:
+    paths:
+      - .gitea/workflows/reconnect.yml
+jobs:
+  slow:
+    runs-on: e2e-reconnect
+    steps:
+      - run: |
+          echo e2e-before-outage
+          i=0
+          until curl -fs "${{ vars.E2E_GATE }}" > /dev/null; do
+            i=$((i + 1))
+            echo "tick-$i"
+            sleep 0.2
+          done
+          echo "ticks=$i"

@@ -33,24 +33,17 @@ func TestReusableWorkflowCachedBranchRefRefreshes(t *testing.T) {
 	}
 
 	remoteDir := t.TempDir()
-	gitMust(t, "", "init", "--bare", "--initial-branch=master", remoteDir)
-
-	workDir := t.TempDir()
-	gitMust(t, "", "clone", remoteDir, workDir)
-	gitMust(t, workDir, "config", "user.email", "test@test")
-	gitMust(t, workDir, "config", "user.name", "test")
-	gitMust(t, workDir, "checkout", "-b", "master")
+	gitMust(t, "", "init", "--template=", "--initial-branch=master", remoteDir)
 
 	const workflowPath = ".gitea/workflows/reusable.yml"
 	tmpl := func(tag string) string {
 		return "name: reusable\non:\n  workflow_call:\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo " + tag + "\n"
 	}
 
-	require.NoError(t, os.MkdirAll(filepath.Join(workDir, ".gitea/workflows"), 0o755))
-	require.NoError(t, os.WriteFile(filepath.Join(workDir, workflowPath), []byte(tmpl("v1")), 0o644))
-	gitMust(t, workDir, "add", workflowPath)
-	gitMust(t, workDir, "commit", "-m", "v1")
-	gitMust(t, workDir, "push", "-u", "origin", "master")
+	require.NoError(t, os.MkdirAll(filepath.Join(remoteDir, ".gitea/workflows"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(remoteDir, workflowPath), []byte(tmpl("v1")), 0o644))
+	gitMust(t, remoteDir, "add", workflowPath)
+	gitMust(t, remoteDir, "commit", "-m", "v1")
 
 	rc := &RunContext{
 		Config: &Config{Env: testCheckoutEnv()},
@@ -70,9 +63,8 @@ func TestReusableWorkflowCachedBranchRefRefreshes(t *testing.T) {
 	require.Equal(t, tmpl("v1"), string(got))
 
 	// Branch tip moves; cache key (cacheDir) does not.
-	require.NoError(t, os.WriteFile(filepath.Join(workDir, workflowPath), []byte(tmpl("v2")), 0o644))
-	gitMust(t, workDir, "commit", "-am", "v2")
-	gitMust(t, workDir, "push", "origin", "master")
+	require.NoError(t, os.WriteFile(filepath.Join(remoteDir, workflowPath), []byte(tmpl("v2")), 0o644))
+	gitMust(t, remoteDir, "commit", "-am", "v2")
 
 	require.NoError(t, cloneRemoteReusableWorkflow(rc, remoteDir, "master", cacheDir)(t.Context()))
 	got, err = os.ReadFile(filepath.Join(cacheDir, workflowPath))
@@ -82,7 +74,7 @@ func TestReusableWorkflowCachedBranchRefRefreshes(t *testing.T) {
 
 func TestNewReusableWorkflowExecutorHoldsCloneLock(t *testing.T) {
 	workflowDir := t.TempDir()
-	require.NoError(t, os.WriteFile(filepath.Join(workflowDir, "reusable.yml"), []byte(":"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(workflowDir, "reusable.yml"), []byte("["), 0o644))
 
 	unlock, err := git.AcquireCloneLock(t.Context(), workflowDir)
 	require.NoError(t, err)
@@ -118,11 +110,11 @@ func TestNewLocalReusableWorkflowExecutorFindsSameRepositoryPaths(t *testing.T) 
 	workdir := filepath.Join(t.TempDir(), "workspace")
 	require.NoError(t, os.MkdirAll(filepath.Join(workdir, ".gitea", "workflows"), 0o755))
 	require.NoError(t, os.Mkdir(workdir+".lock", 0o755))
-	require.NoError(t, os.WriteFile(filepath.Join(workdir, ".gitea", "workflows", "reusable.yml"), []byte(":"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(workdir, ".gitea", "workflows", "reusable.yml"), []byte("["), 0o644))
 
 	for _, uses := range []string{"./.gitea/workflows/reusable.yml", "$/.gitea/workflows/reusable.yml"} {
 		rc := &RunContext{
-			Config: &Config{Workdir: workdir},
+			Config: &Config{Workdir: workdir, NoSkipCheckout: true},
 			Run:    &model.Run{JobID: "job", Workflow: &model.Workflow{Jobs: map[string]*model.Job{"job": {Uses: uses}}}},
 		}
 		err := newLocalReusableWorkflowExecutor(rc)(t.Context())
@@ -130,7 +122,7 @@ func TestNewLocalReusableWorkflowExecutorFindsSameRepositoryPaths(t *testing.T) 
 	}
 }
 
-func TestCloneRemoteReusableWorkflowSendsInstanceTokenAndClientCert(t *testing.T) {
+func TestCloneRemoteReusableWorkflowSendsInstanceTokenAndClientCertTrustingCA(t *testing.T) {
 	var gotCert bool
 	var gotToken string
 	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -150,18 +142,19 @@ func TestCloneRemoteReusableWorkflowSendsInstanceTokenAndClientCert(t *testing.T
 	require.NoError(t, os.WriteFile(keyFile, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}), 0o600))
 	rc := &RunContext{
 		Config: &Config{
-			Env:             testCheckoutEnv(),
-			GitHubInstance:  server.URL,
-			Secrets:         map[string]string{"GITEA_TOKEN": "token"},
-			InsecureSkipTLS: true,
-			ClientCertFile:  certFile,
-			ClientKeyFile:   keyFile,
+			Env:            testCheckoutEnv(),
+			GitHubInstance: server.URL,
+			Secrets:        map[string]string{"GITEA_TOKEN": "token"},
+			ClientCertFile: certFile,
+			ClientKeyFile:  keyFile,
+			CAFile:         certFile,
 		},
 		Run: &model.Run{JobID: "j1", Workflow: &model.Workflow{Jobs: map[string]*model.Job{"j1": {}}}},
 	}
 
-	require.Error(t, cloneRemoteReusableWorkflow(rc, server.URL+"/owner/repo", "main", t.TempDir())(t.Context()))
-	require.True(t, gotCert)
+	err = cloneRemoteReusableWorkflow(rc, server.URL+"/owner/repo", "main", t.TempDir())(t.Context())
+	require.Error(t, err)
+	require.True(t, gotCert, "clone failed before receiving a client certificate: %v", err)
 	require.Equal(t, "token", gotToken)
 }
 
@@ -187,11 +180,12 @@ func TestInstanceAuthAndTransportOnlyApplyToTheInstance(t *testing.T) {
 				InsecureSkipTLS:                   true,
 				ClientCertFile:                    "/cert",
 				ClientKeyFile:                     "/key",
+				CAFile:                            "/ca",
 				InstanceTransport:                 &http.Transport{},
 			}
 			want := git.NewGitCloneExecutorInput{URL: tt.cloneURL, InsecureSkipTLS: tt.insecure}
 			if tt.insecure {
-				want.Transport = conf.InstanceTransport
+				want.CAFile, want.Transport = conf.CAFile, conf.InstanceTransport
 			}
 			if tt.token {
 				want.Token = "token"
@@ -212,7 +206,7 @@ func TestInstanceAuthAndTransportOnlyApplyToTheInstance(t *testing.T) {
 
 func gitMust(t *testing.T, dir string, args ...string) {
 	t.Helper()
-	cmd := exec.Command("git", args...)
+	cmd := exec.Command("git", append([]string{"-c", "user.name=test", "-c", "user.email=test@test"}, args...)...)
 	if dir != "" {
 		cmd.Dir = dir
 	}

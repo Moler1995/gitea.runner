@@ -173,11 +173,9 @@ func TestReporter_RunDaemonClose_Race(t *testing.T) {
 	)
 
 	ctx, cancel := context.WithCancel(t.Context())
-	taskCtx, err := structpb.NewStruct(map[string]any{})
-	require.NoError(t, err)
 	cfg, _ := config.LoadDefault("")
 	reporter := NewReporter(ctx, cancel, client, &runnerv1.Task{
-		Context: taskCtx,
+		Context: &structpb.Struct{},
 	}, cfg)
 	reporter.ResetSteps(newTestSteps(1))
 
@@ -474,10 +472,8 @@ func TestReporter_ServerCancelStillFlushesFinal(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	taskCtx, err := structpb.NewStruct(map[string]any{})
-	require.NoError(t, err)
 	cfg, _ := config.LoadDefault("")
-	reporter := NewReporter(ctx, cancel, client, &runnerv1.Task{Context: taskCtx}, cfg)
+	reporter := NewReporter(ctx, cancel, client, &runnerv1.Task{Context: &structpb.Struct{}}, cfg)
 	reporter.ResetSteps(newTestSteps(1))
 
 	reporter.stateMu.Lock()
@@ -527,10 +523,8 @@ func TestReporter_CloseReportsCancelledOnCanceledCtx(t *testing.T) {
 	)
 
 	ctx, cancel := context.WithCancel(t.Context())
-	taskCtx, err := structpb.NewStruct(map[string]any{})
-	require.NoError(t, err)
 	cfg, _ := config.LoadDefault("")
-	reporter := NewReporter(ctx, cancel, client, &runnerv1.Task{Context: taskCtx}, cfg)
+	reporter := NewReporter(ctx, cancel, client, &runnerv1.Task{Context: &structpb.Struct{}}, cfg)
 	reporter.ResetSteps(newTestSteps(1))
 
 	cancel()
@@ -671,19 +665,15 @@ func TestReporter_SetOutputs(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, "caf\xff", got.value)
 
-	maxValue := strings.Repeat("v", maxOutputValueLen)
-	r.SetOutputs(map[string]string{"atlimit": maxValue})
+	r.SetOutputs(map[string]string{"atlimit": longValue[:maxOutputValueLen]})
 	got, ok = r.outputs["atlimit"]
 	require.True(t, ok)
 	assert.Len(t, got.value, maxOutputValueLen)
 }
 
 func TestReporter_DebugSettingsAreNotMasked(t *testing.T) {
-	taskCtx, err := structpb.NewStruct(map[string]any{})
-	require.NoError(t, err)
-
 	reporter := NewReporter(t.Context(), nil, nil, &runnerv1.Task{
-		Context: taskCtx,
+		Context: &structpb.Struct{},
 		Secrets: map[string]string{"ACTIONS_STEP_DEBUG": "true", "ACTIONS_RUNNER_DEBUG": "true", "TOKEN": "s3cr3t"},
 	}, &config.Config{})
 	defer deregisterGlobalMasks(reporter)
@@ -760,8 +750,7 @@ func TestReporter_ParseResult(t *testing.T) {
 func TestReporter_masksEncodedSecrets(t *testing.T) {
 	secret := `p@ss w"rd/1`
 	r := &Reporter{logReplacer: strings.NewReplacer()}
-	r.oldnew = runner.AppendSecretMasker(r.oldnew, secret)
-	r.logReplacer = strings.NewReplacer(r.oldnew...)
+	r.AddMask(secret)
 
 	for _, line := range []string{
 		"token: " + secret,
@@ -772,6 +761,17 @@ func TestReporter_masksEncodedSecrets(t *testing.T) {
 		assert.Contains(t, masked, "***")
 		assert.NotContains(t, masked, secret)
 		assert.NotContains(t, masked, base64.StdEncoding.EncodeToString([]byte(secret)))
+	}
+
+	r.AddMask("alpha beta;gamma]delta")
+	r.AddMask("%")
+	for _, test := range []struct{ line, want string }{
+		{"##[group]alpha beta%3Bgamma%5Ddelta", "##[group]***"},
+		{"##[group]alpha beta%3Bgamma]delta", "##[group]***"},
+		{"%", "***"},
+	} {
+		r.appendLogRow(logRow(logging.Record{Message: test.line}))
+		assert.Equal(t, test.want, r.logRows[len(r.logRows)-1].Content)
 	}
 }
 
@@ -861,10 +861,8 @@ func TestReporter_ServerFailureResultIsReportedAsFailure(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	taskCtx, err := structpb.NewStruct(map[string]any{})
-	require.NoError(t, err)
 	cfg, _ := config.LoadDefault("")
-	reporter := NewReporter(ctx, cancel, client, &runnerv1.Task{Context: taskCtx}, cfg)
+	reporter := NewReporter(ctx, cancel, client, &runnerv1.Task{Context: &structpb.Struct{}}, cfg)
 	close(reporter.daemon)
 
 	require.NoError(t, reporter.ReportState(false))
@@ -1031,9 +1029,7 @@ func newTestReporter(t *testing.T, client *mocks.Client, cfg *config.Config) *Re
 	t.Helper()
 	ctx, cancel := context.WithCancel(t.Context())
 	t.Cleanup(cancel)
-	taskCtx, err := structpb.NewStruct(map[string]any{})
-	require.NoError(t, err)
-	return NewReporter(ctx, cancel, client, &runnerv1.Task{Context: taskCtx}, cfg)
+	return NewReporter(ctx, cancel, client, &runnerv1.Task{Context: &structpb.Struct{}}, cfg)
 }
 
 func newTestSteps(n int) []*model.Step {
@@ -1051,11 +1047,9 @@ func TestReporter_ReportedSteps(t *testing.T) {
 			return &runnerv1.UpdateLogResponse{AckIndex: req.Index + int64(len(req.Rows))}, nil
 		})
 		client.On("UpdateTask", mock.Anything, mock.Anything).Maybe().Return(&runnerv1.UpdateTaskResponse{}, nil)
-		taskCtx, err := structpb.NewStruct(map[string]any{})
-		require.NoError(t, err)
 		cfg, _ := config.LoadDefault("")
 		ctx, cancel := context.WithCancel(t.Context())
-		reporter := NewReporter(ctx, cancel, client, &runnerv1.Task{Context: taskCtx, Secrets: map[string]string{"TOKEN": "s3cr3t"}}, cfg)
+		reporter := NewReporter(ctx, cancel, client, &runnerv1.Task{Context: &structpb.Struct{}, Secrets: map[string]string{"TOKEN": "s3cr3t"}}, cfg)
 		reporter.RunDaemon()
 		reporter.Logf("runner version")
 		reporter.ResetSteps(steps)

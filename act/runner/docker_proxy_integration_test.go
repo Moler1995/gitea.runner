@@ -1,7 +1,7 @@
 // Copyright 2026 The Gitea Authors. All rights reserved.
 // SPDX-License-Identifier: MIT
 
-//go:build !(WITHOUT_DOCKER || !(linux || darwin || windows || netbsd))
+//go:build !(WITHOUT_DOCKER || !(linux || darwin || windows || netbsd || freebsd))
 
 package runner
 
@@ -49,6 +49,7 @@ func TestDockerProxyMountedJob(t *testing.T) {
 		ContainerNamePrefix:   resourceName,
 		ContainerDaemonSocket: dockerClient.DaemonHost(),
 		ContainerMaxLifetime:  2 * time.Minute,
+		Sweep:                 true,
 		ContainerOptions:      "-v /usr/local/bin/docker:/usr/local/bin/docker:ro -v /usr/local/libexec/docker/cli-plugins:/usr/local/libexec/docker/cli-plugins:ro",
 		ValidVolumes:          []string{"/usr/local/bin/docker", "/usr/local/libexec/docker/cli-plugins"},
 		Env:                   map[string]string{"PROXY_TEST_RESOURCE": resourceName, "PROXY_TEST_MODE": mode, "PROXY_TEST_IMAGE": baseImage, "COMPOSE_PROJECT_NAME": resourceName},

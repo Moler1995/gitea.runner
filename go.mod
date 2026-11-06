@@ -5,9 +5,9 @@ go 1.27
 toolchain go1.27.3
 
 require (
-	connectrpc.com/connect/v2 v2.0.1
-	gitea.dev/actionslib v1.5.0
-	github.com/bmatcuk/doublestar/v4 v4.10.3
+	connectrpc.com/connect/v2 v2.0.2
+	gitea.dev/actionslib v1.5.2
+	github.com/bmatcuk/doublestar/v4 v4.10.4
 	github.com/coder/websocket v1.8.15
 	github.com/containerd/errdefs v1.0.0
 	github.com/creack/pty v1.1.24
@@ -32,8 +32,8 @@ require (
 	go.opentelemetry.io/otel/sdk v1.47.0
 	go.opentelemetry.io/otel/trace v1.47.0
 	go.opentelemetry.io/proto/otlp v1.11.1
-	go.yaml.in/yaml/v4 v4.0.0-rc.6.0.20261013184558-04dd63131525
-	golang.org/x/net v0.61.0
+	go.yaml.in/yaml/v4 v4.0.0
+	golang.org/x/net v0.62.0
 	golang.org/x/sync v0.24.0
 	golang.org/x/sys v0.49.0
 	golang.org/x/term v0.47.0

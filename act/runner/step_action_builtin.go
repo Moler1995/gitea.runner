@@ -49,7 +49,7 @@ func (sab *stepActionBuiltin) main() common.Executor {
 		}
 		return sab.run(ctx, &action.Context{
 			Container:       rc.JobContainer,
-			Github:          rc.getGithubContext(ctx),
+			Github:          getStepGithubContext(ctx, sab),
 			Inputs:          inputs,
 			HostWorkdir:     rc.Config.Workdir,
 			Workspace:       rc.JobContainer.ToContainerPath(rc.Config.Workdir),
@@ -59,6 +59,7 @@ func (sab *stepActionBuiltin) main() common.Executor {
 			InsecureSkipTLS: rc.Config.InsecureSkipTLS,
 			ClientCertFile:  rc.Config.ClientCertFile,
 			ClientKeyFile:   rc.Config.ClientKeyFile,
+			CAFile:          rc.jobCAFile(),
 			Env:             sab.env,
 			ResultsURL:      rc.Config.ResultsURL,
 			RuntimeToken:    cmp.Or(rc.runtimeToken, rc.topLevelRunContext().Config.Secrets["ACTIONS_RUNTIME_TOKEN"]), // composite contexts have no secrets
@@ -74,10 +75,6 @@ func (sab *stepActionBuiltin) main() common.Executor {
 func (sab *stepActionBuiltin) post() common.Executor { return common.NewPipelineExecutor() }
 
 func (sab *stepActionBuiltin) getRunContext() *RunContext { return sab.RunContext }
-
-func (sab *stepActionBuiltin) getGithubContext(ctx context.Context) *model.GithubContext {
-	return sab.RunContext.getGithubContext(ctx)
-}
 
 func (sab *stepActionBuiltin) getStepModel() *model.Step { return sab.Step }
 

@@ -8,17 +8,25 @@ package e2e
 import (
 	"cmp"
 	"context"
+	"errors"
+	"flag"
 	"fmt"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"gitea.com/gitea/runner/internal/app/poll"
+
+	mobyclient "github.com/moby/moby/client"
 )
 
 const runTimeout = 3 * time.Minute
@@ -30,6 +38,8 @@ var fixture *GiteaFixture
 var skipReason string
 
 var binDir string
+
+var dockerCLI mobyclient.APIClient
 
 var runnerBinary = sync.OnceValues(func() (string, error) {
 	bin := filepath.Join(binDir, "gitea-runner")
@@ -52,6 +62,17 @@ func runSuite(m *testing.M) int {
 		skipReason = fmt.Sprintf("docker unavailable: %v", err)
 		return m.Run()
 	}
+	dockerCLI = cli
+
+	if binDir, err = os.MkdirTemp("", "gitea-runner-e2e-"); err != nil {
+		fmt.Fprintf(os.Stderr, "create binary dir: %v\n", err)
+		return 1
+	}
+	defer os.RemoveAll(binDir)
+	defer stopCluster()
+	if flag.Parse(); flag.Lookup("test.run").Value.String() == "" { // a filtered run starts the cluster only if it needs it
+		go func() { _, _ = k3s() }()
+	}
 
 	f, err := StartGitea(ctx, cli)
 	if err != nil {
@@ -61,15 +82,14 @@ func runSuite(m *testing.M) int {
 	fixture = f
 	defer func() { _ = fixture.Close(context.Background()) }()
 
-	if binDir, err = os.MkdirTemp("", "gitea-runner-e2e-"); err != nil {
-		fmt.Fprintf(os.Stderr, "create binary dir: %v\n", err)
-		return 1
-	}
-	defer os.RemoveAll(binDir)
-
 	fmt.Fprintf(os.Stderr, "gitea fixture: image=%s version=%s\n", fixture.image, fixture.version)
 
-	return m.Run()
+	code := m.Run()
+	if err := checkClusterLeaks(); err != nil && code == 0 {
+		fmt.Fprintln(os.Stderr, err)
+		code = 1
+	}
+	return code
 }
 
 func newScenario(t *testing.T) (*GiteaAPI, string) {
@@ -129,6 +149,10 @@ func runLogs(t *testing.T, api *GiteaAPI, repo string, runID int64) string {
 	var all strings.Builder
 	for _, job := range jobs {
 		logs, err := api.JobLogs(ctx, repo, job.ID)
+		var response statusError
+		if errors.As(err, &response) && response.code == http.StatusNotFound {
+			continue // skipped jobs and reusable workflow callers never ran a task, so have no log
+		}
 		if err != nil {
 			t.Fatalf("job logs for %s: %v", job.Name, err)
 		}
@@ -154,6 +178,24 @@ func dumpRunLogs(t *testing.T, api *GiteaAPI, repo string, runID int64) {
 		}
 		t.Logf("job %q concluded %q:\n%s", job.Name, job.Conclusion, logs)
 	}
+}
+
+// newGate serves a URL that answers 503 until release, for jobs to poll instead of sleeping.
+func newGate(t *testing.T) (string, func()) {
+	t.Helper()
+	var released atomic.Bool
+	listener, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatalf("listen for the gate: %v", err)
+	}
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if !released.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+	}), ReadHeaderTimeout: time.Second}
+	go func() { _ = server.Serve(listener) }()
+	t.Cleanup(func() { _ = server.Close() })
+	return fmt.Sprintf("http://%s/", net.JoinHostPort(fixture.selfIP, strconv.Itoa(listener.Addr().(*net.TCPAddr).Port))), func() { released.Store(true) }
 }
 
 func waitForRun(t *testing.T, api *GiteaAPI, repo string) *ActionRun {

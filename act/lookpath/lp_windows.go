@@ -53,6 +53,10 @@ func findExecutable(file string, exts []string) (string, error) {
 // a suitable candidate.
 // The result may be an absolute path or a path relative to the current directory.
 func LookPath2(file string, env map[string]string) (string, error) {
+	return lookPathWindows(file, env, lookPath)
+}
+
+func lookPath(file string, env map[string]string) (string, error) {
 	var exts []string
 	x := getenv(env, `PATHEXT`)
 	if x != "" {
@@ -75,9 +79,6 @@ func LookPath2(file string, env map[string]string) (string, error) {
 		} else {
 			return "", &Error{file, err}
 		}
-	}
-	if f, err := findExecutable(filepath.Join(".", file), exts); err == nil {
-		return f, nil
 	}
 	path := getenv(env, "path")
 	for _, dir := range filepath.SplitList(path) {

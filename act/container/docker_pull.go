@@ -2,7 +2,7 @@
 // Copyright 2020 The nektos/act Authors. All rights reserved.
 // SPDX-License-Identifier: MIT
 
-//go:build !(WITHOUT_DOCKER || !(linux || darwin || windows || netbsd))
+//go:build !(WITHOUT_DOCKER || !(linux || darwin || windows || netbsd || freebsd))
 
 package container
 
@@ -22,7 +22,7 @@ import (
 
 // NewDockerPullExecutor function to create a run executor for the container
 func NewDockerPullExecutor(input NewDockerPullExecutorInput) common.Executor {
-	return func(ctx context.Context) error {
+	return common.Executor(func(ctx context.Context) error {
 		logger := common.Logger(ctx)
 		logger.Debugf("docker pull %v", input.Image)
 
@@ -83,7 +83,7 @@ func NewDockerPullExecutor(input NewDockerPullExecutorInput) common.Executor {
 			return nil
 		}
 		return fmt.Errorf("failed to pull image '%s' (%s): %w", imageRef, input.Platform, err)
-	}
+	}).Retry(3)
 }
 
 func getImagePullOptions(ctx context.Context, input NewDockerPullExecutorInput) (client.ImagePullOptions, error) {

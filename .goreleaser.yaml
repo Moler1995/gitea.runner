@@ -34,8 +34,6 @@ builds:
       goarch: s390x
     - goos: windows
       goarch: arm
-    - goos: windows
-      goarch: arm64
     - goos: freebsd
       goarch: s390x
     - goos: freebsd
@@ -82,6 +80,7 @@ builds:
 publishers:
   - name: cloudflare-r2
     checksum: true
+    signature: true
     extra_files:
       - glob: ./**.xz
       - glob: ./**.sha256
@@ -101,6 +100,10 @@ checksum:
   name_template: 'checksums.txt'
   extra_files:
       - glob: ./**.xz
+
+signs:
+  - artifacts: checksum
+    args: ["--batch", "-u", "{{ .Env.GPG_FINGERPRINT }}", "--output", "${signature}", "--detach-sign", "${artifact}"]
 
 snapshot:
   version_template: "{{ .Branch }}-devel"
