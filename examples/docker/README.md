@@ -12,3 +12,13 @@ docker run --privileged \
 ```
 
 The volumes keep the runner's registration and the job image cache. See [image flavours](../../README.md#image-flavours) for alternatives.
+
+#### Pull job images from a registry with a private CA
+
+The bundled Docker daemon pulls job images, so it needs to trust the registry's CA itself. `runner.ca_file` doesn't cover this. Mount the CA where the daemon looks for it, naming the directory after the registry's host and port:
+
+```sh
+-v "$PWD/ca.crt:/etc/docker/certs.d/registry.example.com:5000/ca.crt:ro"
+```
+
+On `latest-dind-rootless`, use `/home/rootless/.config/docker/certs.d/registry.example.com:5000/ca.crt` as the target.
