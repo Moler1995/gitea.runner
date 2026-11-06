@@ -319,6 +319,7 @@ func TestKubernetesPodRunsJobThroughAPI(t *testing.T) {
 	downloaded, err := os.ReadFile(workdir + "/download/new/dir/data.txt")
 	require.NoError(t, err)
 	assert.Equal(t, "payload", string(downloaded))
+	assert.Contains(t, lastExec(), url.QueryEscape("gzip -dc |"))
 
 	pathEnv := map[string]string{}
 	require.NoError(t, job.UpdateFromImageEnv(&pathEnv)(ctx))
