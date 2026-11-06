@@ -274,6 +274,15 @@ func (rc *RunContext) nodeBinary() string {
 	return jobNodeDir + "/bin/node"
 }
 
+// nodeDirMount returns the job container's bind of the Node install and the valid volume allowing it, empty when unset.
+func (rc *RunContext) nodeDirMount() (bind, valid string) {
+	dir := rc.Config.ContainerNodeDir
+	if dir == "" {
+		return "", ""
+	}
+	return dir + ":" + jobNodeDir + ":ro", dir + ":ro"
+}
+
 // validVolumes returns what the job and action containers may mount, the configured base plus
 // the runner's own volumes. Fresh slice per call, the shared Config is never mutated.
 func (rc *RunContext) validVolumes() []string {
@@ -292,8 +301,8 @@ func (rc *RunContext) validVolumes() []string {
 		volumes = append(volumes, rc.dockerProxy.Socket)
 	}
 	volumes = append(volumes, rc.Config.containerVolumeSources()...)
-	if rc.Config.ContainerNodeDir != "" {
-		volumes = append(volumes, rc.Config.ContainerNodeDir+":ro")
+	if _, valid := rc.nodeDirMount(); valid != "" {
+		volumes = append(volumes, valid)
 	}
 	// TODO: add a new configuration to control whether the docker daemon can be mounted
 	return append(volumes, name, name+"-env",
@@ -688,8 +697,8 @@ func (rc *RunContext) startJobContainer() common.Executor {
 		}
 		rc.startDockerProxy(ctx)
 		containerInput.Binds, containerInput.Mounts = rc.GetBindsAndMounts(ctx)
-		if rc.Config.ContainerNodeDir != "" {
-			containerInput.Binds = append(containerInput.Binds, rc.Config.ContainerNodeDir+":"+jobNodeDir+":ro")
+		if bind, _ := rc.nodeDirMount(); bind != "" {
+			containerInput.Binds = append(containerInput.Binds, bind)
 		}
 		containerInput.ValidVolumes = rc.validVolumes()
 

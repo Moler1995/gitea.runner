@@ -6,6 +6,7 @@ package runner
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -189,6 +190,7 @@ func TestGetHashFilesFunction(t *testing.T) {
 		warning bool
 		expired bool
 		nodeDir string
+		node    string
 	}{
 		{name: "success", output: "patterns __OUTPUT__wrong__OUTPUT__ echoed\n__OUTPUT__digest__OUTPUT__", hash: "digest"},
 		{name: "no matches", output: "__OUTPUT____OUTPUT__"},
@@ -199,18 +201,14 @@ func TestGetHashFilesFunction(t *testing.T) {
 		{name: "node not executable", execErr: container.ExitCodeError(126), warning: true},
 		{name: "host node missing", execErr: errors.New("Cannot find: node in PATH"), warning: true},
 		{name: "copy failure", copyErr: errors.New("open /runner/cache: permission denied"), err: failureMessage},
-		{name: "node_dir", nodeDir: "/opt/node", execErr: container.ExitCodeError(127), warning: true},
+		{name: "node_dir", nodeDir: "/opt/node", node: "/__e/node/bin/node", execErr: container.ExitCodeError(127), warning: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			logger, hook := logtest.NewLogger()
 			stdout, stderr := &bytes.Buffer{}, &bytes.Buffer{}
 			jobContainer := &hashFilesContainer{stdout: stdout, stderr: stderr, copyErr: test.copyErr}
 			jobContainer.execute = func(command []string, env map[string]string, user, workdir string) common.Executor {
-				node := "node"
-				if test.nodeDir != "" {
-					node = "/__e/node/bin/node"
-				}
-				assert.Equal(t, []string{node, "/var/run/act/workflow/hashfiles/index.js"}, command)
+				assert.Equal(t, []string{cmp.Or(test.node, "node"), "/var/run/act/workflow/hashfiles/index.js"}, command)
 				assert.Equal(t, map[string]string{"patterns": "dir'file\n*.sum\n123\ntrue\n", "followSymbolicLinks": "true"}, env)
 				assert.Empty(t, user)
 				assert.Empty(t, workdir)

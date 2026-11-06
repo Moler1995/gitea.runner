@@ -5,6 +5,7 @@
 package runner
 
 import (
+	"cmp"
 	"context"
 	"io"
 	"io/fs"
@@ -169,6 +170,7 @@ func TestActionRunner(t *testing.T) {
 		expectedEnv map[string]string
 		warning     string
 		nodeDir     string
+		node        string
 	}{
 		{
 			name:        "with-input",
@@ -197,13 +199,10 @@ func TestActionRunner(t *testing.T) {
 			state:       map[string]string{"name": "state value"},
 			expectedEnv: map[string]string{"STATE_name": "state value"},
 		},
-		{name: "node_dir", nodeDir: "/opt/node"},
+		{name: "node_dir", nodeDir: "/opt/node", node: "/__e/node/bin/node"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			node := "node"
-			if tt.nodeDir != "" {
-				node = "/__e/node/bin/node"
-			}
+			node := cmp.Or(tt.node, "node")
 			hook := logtest.NewWithLevel(logging.LevelWarn)
 			ctx := common.WithLogger(t.Context(), logging.New(hook))
 			cm := &containerMock{}

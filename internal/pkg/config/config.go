@@ -332,8 +332,8 @@ func LoadDefault(file string) (*Config, error) {
 			return nil, fmt.Errorf("container.volumes entry %q is not source:target[:options]", spec)
 		}
 	}
-	if dir := cfg.Container.NodeDir; dir != "" && (!path.IsAbs(dir) || strings.Contains(dir, ":")) {
-		return nil, fmt.Errorf("container.node_dir %q is not an absolute path on the Docker daemon's host", dir)
+	if dir := cfg.Container.NodeDir; dir != "" && (!path.IsAbs(dir) || strings.ContainsAny(dir, `:*?[]{}\`)) { // it is also matched as a valid_volumes glob
+		return nil, fmt.Errorf("container.node_dir %q is not an absolute path on the Docker daemon's host, without any of : * ? [ ] { } \\", dir)
 	}
 
 	if cfg.Log.Level == "" {
