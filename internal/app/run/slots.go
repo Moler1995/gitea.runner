@@ -4,11 +4,16 @@
 package run
 
 import (
+	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 
 	"gitea.com/gitea/runner/internal/pkg/config"
+
+	runnerv1 "gitea.dev/actionslib/runner/v1"
 )
 
 // slotAllocator numbers running tasks with the lowest free slot, so at most capacity tasks stay within 0..capacity-1.
@@ -33,6 +38,27 @@ func (a *slotAllocator) release(slot int) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.used[slot] = false
+}
+
+const stableWorkdirDir = "workspaces"
+
+var safePathName = regexp.MustCompile(`^[A-Za-z0-9._-]*[A-Za-z0-9_-]$`) // no trailing dot, which Windows drops
+
+// stableHostRoot returns the task's stable host directory, empty when disabled or the repository is unsafe in a path.
+func (r *Runner) stableHostRoot(task *runnerv1.Task, slot int) string {
+	if !r.cfg.Host.StableWorkdir {
+		return ""
+	}
+	return stableHostRoot(r.cfg.Host.WorkdirParent, task.GetContext().GetFields()["repository"].GetStringValue(), slot)
+}
+
+func stableHostRoot(parent, repository string, slot int) string {
+	owner, repo, ok := strings.Cut(repository, "/")
+	if !ok || !safePathName.MatchString(owner) || !safePathName.MatchString(repo) ||
+		!filepath.IsLocal(owner) || !filepath.IsLocal(repo) { // rejects Windows device names
+		return ""
+	}
+	return filepath.Join(filepath.FromSlash(parent), stableWorkdirDir, owner, repo, strconv.Itoa(slot))
 }
 
 func toolCacheSuffix(mode string, slot int) string {

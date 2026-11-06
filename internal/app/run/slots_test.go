@@ -4,9 +4,12 @@
 package run
 
 import (
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"gitea.com/gitea/runner/internal/pkg/config"
 
@@ -44,6 +47,39 @@ func TestSlotAllocatorConcurrent(t *testing.T) {
 		})
 	}
 	wg.Wait()
+}
+
+func TestStableHostRoot(t *testing.T) {
+	assert.Equal(t, filepath.Join("/p", "workspaces", "owner", "my.repo-1", "2"), stableHostRoot("/p", "owner/my.repo-1", 2))
+	for _, repository := range []string{"", "owner", "../repo", "owner/..", "owner/.", "owner/a/b", "owner/", "/repo", "owner/a\\b", "owner/repo."} {
+		assert.Empty(t, stableHostRoot("/p", repository, 0), repository)
+	}
+}
+
+func TestCleanupStaleStableDirs(t *testing.T) {
+	now := time.Date(2026, time.April, 29, 20, 0, 0, 0, time.UTC)
+	root := t.TempDir()
+	old := now.Add(-48 * time.Hour)
+	stale := filepath.Join(root, "gone", "repo", "0")
+	fresh := filepath.Join(root, "owner", "repo", "0")
+	staleSibling := filepath.Join(root, "owner", "repo", "1")
+	operatorData := filepath.Join(root, "other", "repo", "keep-me")
+	for _, path := range []string{stale, fresh, staleSibling, operatorData} {
+		require.NoError(t, os.MkdirAll(path, 0o700))
+	}
+	for _, path := range []string{stale, staleSibling, operatorData} {
+		require.NoError(t, os.Chtimes(path, old, old))
+	}
+	require.NoError(t, os.Chtimes(fresh, now, now))
+
+	r := &Runner{cfg: &config.Config{Runner: config.Runner{WorkdirCleanupAge: 24 * time.Hour}}, now: func() time.Time { return now }}
+	r.cleanupStaleStableDirs(t.Context(), root)
+
+	assert.NoDirExists(t, filepath.Join(root, "gone"))
+	assert.DirExists(t, fresh)
+	assert.NoDirExists(t, staleSibling)
+	assert.DirExists(t, operatorData)
+	r.cleanupStaleStableDirs(t.Context(), filepath.Join(root, "missing"))
 }
 
 func TestToolCacheSuffix(t *testing.T) {

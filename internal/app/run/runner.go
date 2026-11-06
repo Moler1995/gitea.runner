@@ -179,6 +179,7 @@ func (r *Runner) OnIdle(ctx context.Context) {
 	// match leaves untouched. No-op when no host-mode job ever ran.
 	if hostRoot := filepath.FromSlash(r.cfg.Host.WorkdirParent); hostRoot != "" {
 		r.cleanupStaleDirs(ctx, hostRoot, isHostScratchDir)
+		r.cleanupStaleStableDirs(ctx, filepath.Join(hostRoot, stableWorkdirDir))
 	}
 	r.cleanupOrphanDockerResources(ctx)
 	if r.uuid != "" && r.usesKubernetes() {
@@ -287,6 +288,31 @@ func (r *Runner) cleanupStaleDirs(ctx context.Context, root string, match func(n
 			continue
 		}
 		logging.Infof("cleaned stale directory %s", dir)
+	}
+}
+
+// cleanupStaleStableDirs removes stale <owner>/<repo>/<slot> dirs under root, and the owner and repo dirs that leaves empty.
+func (r *Runner) cleanupStaleStableDirs(ctx context.Context, root string) {
+	owners, _ := os.ReadDir(root) // no root means no stable job ever ran
+	for _, owner := range owners {
+		if !owner.IsDir() {
+			continue
+		}
+		ownerDir := filepath.Join(root, owner.Name())
+		repos, err := os.ReadDir(ownerDir)
+		if err != nil {
+			logging.Warnf("failed to list directory %s for stale cleanup: %v", ownerDir, err)
+			continue
+		}
+		for _, repo := range repos {
+			if !repo.IsDir() {
+				continue
+			}
+			repoDir := filepath.Join(ownerDir, repo.Name())
+			r.cleanupStaleDirs(ctx, repoDir, isTaskIDDir)
+			_ = os.Remove(repoDir) // fails unless empty, a job starting now falls back to a random dir
+		}
+		_ = os.Remove(ownerDir)
 	}
 }
 
@@ -629,6 +655,7 @@ func (r *Runner) run(ctx context.Context, task *runnerv1.Task, reporter *report.
 		ContainerVolumes:                  r.cfg.Container.Volumes,
 		SharedToolCache:                   r.cfg.Runner.ToolCacheMode != config.ToolCacheModeNone,
 		ToolCacheSuffix:                   toolCacheSuffix(r.cfg.Runner.ToolCacheMode, slot),
+		StableHostRoot:                    r.stableHostRoot(task, slot),
 		InsecureSkipTLS:                   r.cfg.Runner.Insecure,
 		ClientCertFile:                    r.cfg.Runner.ClientCertFile,
 		ClientKeyFile:                     r.cfg.Runner.ClientKeyFile,

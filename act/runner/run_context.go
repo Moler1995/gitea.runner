@@ -422,13 +422,34 @@ func (rc *RunContext) GetBindsAndMounts(ctx context.Context) ([]string, map[stri
 	return binds, mounts
 }
 
+// claimStableHostRoot creates the stable directory exclusively, since parallel jobs of a called
+// workflow, another runner, or a failed removal can hold it. It returns empty when it can't.
+func (rc *RunContext) claimStableHostRoot(ctx context.Context) string {
+	root := rc.Config.StableHostRoot
+	if root == "" {
+		return ""
+	}
+	err := os.MkdirAll(filepath.Dir(root), 0o777)
+	if err == nil {
+		err = os.Mkdir(root, 0o777)
+	}
+	if err != nil {
+		common.Logger(ctx).Warnf("using a random job directory, cannot claim %s: %v", root, err)
+		return ""
+	}
+	return root
+}
+
 func (rc *RunContext) startHostEnvironment() common.Executor {
 	return func(ctx context.Context) error {
 		logWriter := rc.commandLogWriter(ctx)
 		cacheDir := rc.ActionCacheDir()
-		randBytes := make([]byte, 8)
-		_, _ = rand.Read(randBytes)
-		miscpath := filepath.Join(cacheDir, hex.EncodeToString(randBytes))
+		miscpath := rc.claimStableHostRoot(ctx)
+		if miscpath == "" {
+			randBytes := make([]byte, 8)
+			_, _ = rand.Read(randBytes)
+			miscpath = filepath.Join(cacheDir, hex.EncodeToString(randBytes))
+		}
 		rc.cleanUpJobContainer = func(_ctx context.Context) error { return os.RemoveAll(miscpath) }
 		actPath := filepath.Join(miscpath, "act")
 		if err := os.MkdirAll(actPath, 0o777); err != nil {

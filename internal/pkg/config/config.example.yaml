@@ -315,6 +315,9 @@ host:
   # The parent directory of a job's working directory.
   # If it's empty, $HOME/.cache/act/ will be used.
   #workdir_parent:
+  # Run host jobs in workdir_parent/workspaces/<owner>/<repo>/<slot>/hostexecutor instead of a random
+  # directory. The contents are still removed after each job, see docs/host-mode.md.
+  #stable_workdir: false
 
 # Jobs that run as Kubernetes pods, see docs/kubernetes.md.
 kubernetes:

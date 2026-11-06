@@ -1203,6 +1203,36 @@ func TestStartHostEnvironmentToolCacheSuffix(t *testing.T) {
 	assert.Equal(t, filepath.Join(cacheDir, "tool_cache-1"), rc.JobContainer.(*container.HostEnvironment).ToolCache)
 }
 
+func TestStartHostEnvironmentStableRoot(t *testing.T) {
+	cacheDir := t.TempDir()
+	root := filepath.Join(cacheDir, "workspaces", "owner", "repo", "0")
+	start := func() *RunContext {
+		rc := &RunContext{
+			Config: &Config{ActionCacheDir: cacheDir, StableHostRoot: root},
+			Env:    map[string]string{},
+			Run:    &model.Run{Workflow: &model.Workflow{Name: "wf"}},
+		}
+		require.NoError(t, rc.startHostEnvironment()(t.Context()))
+		return rc
+	}
+	path := func(rc *RunContext) string { return rc.JobContainer.(*container.HostEnvironment).Path }
+
+	first := start()
+	assert.Equal(t, filepath.Join(root, "hostexecutor"), path(first))
+
+	second := start()
+	assert.NotContains(t, path(second), root)
+	require.NoError(t, second.cleanUpJobContainer(context.Background()))
+	assert.DirExists(t, root)
+
+	require.NoError(t, first.cleanUpJobContainer(context.Background()))
+	assert.NoDirExists(t, root)
+
+	third := start()
+	assert.Equal(t, filepath.Join(root, "hostexecutor"), path(third))
+	require.NoError(t, third.cleanUpJobContainer(context.Background()))
+}
+
 func TestRunContext_cleanupFailedStart(t *testing.T) {
 	type ctxKey string
 	const sentinel = ctxKey("sentinel")
