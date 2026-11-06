@@ -11,6 +11,7 @@ import (
 	"encoding/json/v2"
 	"errors"
 	"fmt"
+	"io/fs"
 	"maps"
 	"net"
 	"net/http"
@@ -179,7 +180,9 @@ func (r *Runner) OnIdle(ctx context.Context) {
 	// match leaves untouched. No-op when no host-mode job ever ran.
 	if hostRoot := filepath.FromSlash(r.cfg.Host.WorkdirParent); hostRoot != "" {
 		r.cleanupStaleDirs(ctx, hostRoot, isHostScratchDir)
-		r.cleanupStaleStableDirs(ctx, filepath.Join(hostRoot, stableWorkdirDir))
+		if r.cfg.Host.StableWorkdir {
+			r.cleanupStaleStableDirs(ctx, filepath.Join(hostRoot, stableWorkdirDir))
+		}
 	}
 	r.cleanupOrphanDockerResources(ctx)
 	if r.uuid != "" && r.usesKubernetes() {
@@ -293,25 +296,25 @@ func (r *Runner) cleanupStaleDirs(ctx context.Context, root string, match func(n
 
 // cleanupStaleStableDirs removes stale <owner>/<repo>/<slot> dirs under root, and the owner and repo dirs that leaves empty.
 func (r *Runner) cleanupStaleStableDirs(ctx context.Context, root string) {
-	owners, _ := os.ReadDir(root) // no root means no stable job ever ran
-	for _, owner := range owners {
-		if !owner.IsDir() {
-			continue
-		}
-		ownerDir := filepath.Join(root, owner.Name())
-		repos, err := os.ReadDir(ownerDir)
-		if err != nil {
-			logging.Warnf("failed to list directory %s for stale cleanup: %v", ownerDir, err)
-			continue
-		}
-		for _, repo := range repos {
-			if !repo.IsDir() {
-				continue
+	dirs := func(pattern string) []string {
+		matches, _ := fs.Glob(os.DirFS(root), pattern) // fs.Glob, as root is no pattern; no root means no stable job ever ran
+		var found []string
+		for _, match := range matches {
+			dir := filepath.Join(root, filepath.FromSlash(match))
+			if info, err := os.Lstat(dir); err == nil && info.IsDir() {
+				found = append(found, dir)
 			}
-			repoDir := filepath.Join(ownerDir, repo.Name())
-			r.cleanupStaleDirs(ctx, repoDir, isTaskIDDir)
-			_ = os.Remove(repoDir) // fails unless empty, a job starting now falls back to a random dir
 		}
+		return found
+	}
+	for _, repoDir := range dirs("*/*") {
+		if ctx.Err() != nil {
+			return
+		}
+		r.cleanupStaleDirs(ctx, repoDir, isTaskIDDir)
+		_ = os.Remove(repoDir) // fails unless empty, a job starting now falls back to a random dir
+	}
+	for _, ownerDir := range dirs("*") {
 		_ = os.Remove(ownerDir)
 	}
 }
@@ -589,6 +592,11 @@ func (r *Runner) run(ctx context.Context, task *runnerv1.Task, reporter *report.
 		actionCloneDepth = 0
 	}
 
+	stableRoot := ""
+	if r.cfg.Host.StableWorkdir {
+		stableRoot = stableHostPath(r.cfg.Host.WorkdirParent, preset.Repository, slot)
+	}
+
 	workdirParent := containerWorkdirRoot(r.cfg.Container.WorkdirParent)
 	if r.cfg.Container.BindWorkdir {
 		// Append the task ID to isolate concurrent jobs from the same repo.
@@ -655,7 +663,7 @@ func (r *Runner) run(ctx context.Context, task *runnerv1.Task, reporter *report.
 		ContainerVolumes:                  r.cfg.Container.Volumes,
 		SharedToolCache:                   r.cfg.Runner.ToolCacheMode != config.ToolCacheModeNone,
 		ToolCacheSuffix:                   toolCacheSuffix(r.cfg.Runner.ToolCacheMode, slot),
-		StableHostRoot:                    r.stableHostRoot(task, slot),
+		StableHostRoot:                    stableRoot,
 		InsecureSkipTLS:                   r.cfg.Runner.Insecure,
 		ClientCertFile:                    r.cfg.Runner.ClientCertFile,
 		ClientKeyFile:                     r.cfg.Runner.ClientKeyFile,

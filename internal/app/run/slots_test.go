@@ -52,10 +52,10 @@ func TestSlotAllocatorConcurrent(t *testing.T) {
 	wg.Wait()
 }
 
-func TestStableHostRoot(t *testing.T) {
-	assert.Equal(t, filepath.Join("/p", "workspaces", "owner", "my.repo-1", "2"), stableHostRoot("/p", "owner/my.repo-1", 2))
+func TestStableHostPath(t *testing.T) {
+	assert.Equal(t, filepath.Join("/p", "workspaces", "owner", "my.repo-1", "2"), stableHostPath("/p", "owner/my.repo-1", 2))
 	for _, repository := range []string{"", "owner", "../repo", "owner/..", "owner/.", "owner/a/b", "owner/", "/repo", "owner/a\\b", "owner/repo."} {
-		assert.Empty(t, stableHostRoot("/p", repository, 0), repository)
+		assert.Empty(t, stableHostPath("/p", repository, 0), repository)
 	}
 }
 

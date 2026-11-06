@@ -64,9 +64,11 @@ func TestRunnerOnIdleCleansStaleHostScratchDirs(t *testing.T) {
 	freshScratch := filepath.Join(hostRoot, "fedcba9876543210")
 	toolCache := filepath.Join(hostRoot, "tool_cache")
 	operatorData := filepath.Join(hostRoot, "keep-me")
-	for _, path := range []string{staleScratch, freshScratch, toolCache, operatorData} {
+	stableLookalike := filepath.Join(hostRoot, stableWorkdirDir, "owner", "repo", "0")
+	for _, path := range []string{staleScratch, freshScratch, toolCache, operatorData, stableLookalike} {
 		require.NoError(t, os.MkdirAll(path, 0o700))
 	}
+	require.NoError(t, os.Chtimes(stableLookalike, now.Add(-72*time.Hour), now.Add(-72*time.Hour)))
 	require.NoError(t, os.Chtimes(staleScratch, now.Add(-48*time.Hour), now.Add(-48*time.Hour)))
 	require.NoError(t, os.Chtimes(freshScratch, now.Add(-10*time.Minute), now.Add(-10*time.Minute)))
 	require.NoError(t, os.Chtimes(toolCache, now.Add(-72*time.Hour), now.Add(-72*time.Hour)))
@@ -85,10 +87,11 @@ func TestRunnerOnIdleCleansStaleHostScratchDirs(t *testing.T) {
 
 	r.OnIdle(t.Context())
 
-	assert.NoDirExists(t, staleScratch) // stale scratch reclaimed
-	assert.DirExists(t, freshScratch)   // within cleanup age, kept
-	assert.DirExists(t, toolCache)      // shared cache, never a scratch match
-	assert.DirExists(t, operatorData)   // non-hex name, untouched
+	assert.NoDirExists(t, staleScratch)  // stale scratch reclaimed
+	assert.DirExists(t, freshScratch)    // within cleanup age, kept
+	assert.DirExists(t, toolCache)       // shared cache, never a scratch match
+	assert.DirExists(t, operatorData)    // non-hex name, untouched
+	assert.DirExists(t, stableLookalike) // host.stable_workdir is off
 }
 
 func TestIsHostScratchDir(t *testing.T) {
