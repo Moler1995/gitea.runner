@@ -25,6 +25,9 @@ func TestSlotAllocatorReusesLowestFree(t *testing.T) {
 	slots.release(1)
 	assert.Equal(t, 1, slots.acquire())
 	assert.Equal(t, 3, slots.acquire())
+
+	assert.Equal(t, "-3", toolCacheSuffix(config.ToolCacheModePerSlot, 3))
+	assert.Empty(t, toolCacheSuffix(config.ToolCacheModeShared, 3))
 }
 
 func TestSlotAllocatorConcurrent(t *testing.T) {
@@ -71,6 +74,10 @@ func TestCleanupStaleStableDirs(t *testing.T) {
 		require.NoError(t, os.Chtimes(path, old, old))
 	}
 	require.NoError(t, os.Chtimes(fresh, now, now))
+	strayFiles := []string{filepath.Join(root, "file"), filepath.Join(root, "other", "file")}
+	for _, path := range strayFiles {
+		require.NoError(t, os.WriteFile(path, nil, 0o600))
+	}
 
 	r := &Runner{cfg: &config.Config{Runner: config.Runner{WorkdirCleanupAge: 24 * time.Hour}}, now: func() time.Time { return now }}
 	r.cleanupStaleStableDirs(t.Context(), root)
@@ -79,11 +86,8 @@ func TestCleanupStaleStableDirs(t *testing.T) {
 	assert.DirExists(t, fresh)
 	assert.NoDirExists(t, staleSibling)
 	assert.DirExists(t, operatorData)
+	for _, path := range strayFiles {
+		assert.FileExists(t, path)
+	}
 	r.cleanupStaleStableDirs(t.Context(), filepath.Join(root, "missing"))
-}
-
-func TestToolCacheSuffix(t *testing.T) {
-	assert.Equal(t, "-2", toolCacheSuffix(config.ToolCacheModePerSlot, 2))
-	assert.Empty(t, toolCacheSuffix(config.ToolCacheModeShared, 2))
-	assert.Empty(t, toolCacheSuffix(config.ToolCacheModeNone, 2))
 }
