@@ -39,7 +39,6 @@ type tok struct {
 type mmSegment struct {
 	globstar bool
 	magic    bool
-	never    bool // the regexp minimatch would build is invalid and matches nothing
 	nocase   bool
 	literal  string
 	toks     []tok
@@ -78,11 +77,11 @@ func compileSegment(s string, nocase bool) mmSegment {
 		return mmSegment{}
 	}
 	p := utf16.Encode([]rune(s))
-	toks, magic, never := parseSegment(p, nocase)
+	toks, magic := parseSegment(p, nocase)
 	if !magic {
 		return mmSegment{literal: globUnescape(s)}
 	}
-	return mmSegment{magic: true, never: never, nocase: nocase, toks: toks}
+	return mmSegment{magic: true, nocase: nocase, toks: toks}
 }
 
 // globUnescape replaces \x with x like s.replace(/\\(.)/g, '$1'); JS . excludes line terminators.
@@ -99,7 +98,7 @@ func globUnescape(s string) string {
 }
 
 // parseSegment ports minimatch's parse(), emitting tokens instead of a regexp source.
-func parseSegment(p []uint16, nocase bool) (toks []tok, hasMagic, never bool) {
+func parseSegment(p []uint16, nocase bool) (toks []tok, hasMagic bool) {
 	hasMagic = nocase
 	escaping := false
 	var stateChar uint16
@@ -135,13 +134,12 @@ func parseSegment(p []uint16, nocase bool) (toks []tok, hasMagic, never bool) {
 			inClass = false
 			return
 		}
-		subToks, subMagic, subNever := parseSegment(cs, nocase)
+		subToks, subMagic := parseSegment(cs, nocase)
 		toks = append(toks, subToks...)
 		if closing {
 			lit(']')
 		}
 		hasMagic = hasMagic || subMagic
-		never = never || subNever
 		inClass = false
 	}
 
@@ -209,12 +207,11 @@ func parseSegment(p []uint16, nocase bool) (toks []tok, hasMagic, never bool) {
 				escaping = false
 				continue
 			}
-			if !jsClassValid(p[classStart+1 : i]) {
+			t, ok := buildClass(class)
+			if !ok {
 				fallback(p[classStart+1:i], true)
 				continue
 			}
-			t, ok := buildClass(class)
-			never = never || !ok
 			toks = append(toks, t)
 			hasMagic = true
 			inClass = false
@@ -244,24 +241,22 @@ func parseSegment(p []uint16, nocase bool) (toks []tok, hasMagic, never bool) {
 	if addPatternStart && p[0] != '.' {
 		toks = append([]tok{{kind: tokNotDot}}, toks...)
 	}
-	return toks, hasMagic, never
+	return toks, hasMagic
 }
 
-// buildClass turns the class body minimatch emits into ranges; ok is false for an out of order
-// range, which makes the regexp constructor throw and minimatch fall back to matching nothing.
+// buildClass turns the class body minimatch emits into ranges, ok is false for an out of order range like [z-a], which matches literally.
 func buildClass(items []classItem) (tok, bool) {
 	t := tok{kind: tokClass}
 	if len(items) > 0 && items[0].ch == '^' && !items[0].escaped {
 		t.neg = true
 		items = items[1:]
 	}
-	ok := true
 	for i := 0; i < len(items); {
 		lo := items[i].ch
 		if i+2 < len(items) && items[i+1].ch == '-' && !items[i+1].escaped {
 			hi := items[i+2].ch
 			if lo > hi {
-				ok = false
+				return t, false
 			}
 			t.ranges = append(t.ranges, unitRange{lo, hi})
 			i += 3
@@ -270,99 +265,7 @@ func buildClass(items []classItem) (tok, bool) {
 		t.ranges = append(t.ranges, unitRange{lo, lo})
 		i++
 	}
-	return t, ok
-}
-
-// jsClassValid reports whether RegExp('[' + cs + ']') compiles, which minimatch uses to decide
-// whether a bracket expression is a class or literal text.
-func jsClassValid(cs []uint16) bool {
-	i := 0
-	if i < len(cs) && cs[i] == '^' {
-		i++
-	}
-	for i < len(cs) {
-		lo, loClass, next := jsClassAtom(cs, i)
-		i = next
-		if i+1 < len(cs) && cs[i] == '-' {
-			hi, hiClass, next := jsClassAtom(cs, i+1)
-			if !loClass && !hiClass && lo > hi {
-				return false
-			}
-			i = next
-		}
-	}
-	return true
-}
-
-func isHex(c uint16) bool {
-	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
-}
-
-func hexValue(u []uint16) uint16 {
-	var v uint16
-	for _, c := range u {
-		switch {
-		case c >= '0' && c <= '9':
-			v = v<<4 | (c - '0')
-		case c >= 'a' && c <= 'f':
-			v = v<<4 | (c - 'a' + 10)
-		default:
-			v = v<<4 | (c - 'A' + 10)
-		}
-	}
-	return v
-}
-
-// jsClassAtom reads one Annex B class atom, reporting class escapes such as \d that cannot bound a range.
-func jsClassAtom(cs []uint16, i int) (value uint16, isClass bool, next int) {
-	if cs[i] != '\\' || i+1 >= len(cs) {
-		return cs[i], false, i + 1
-	}
-	c := cs[i+1]
-	switch c {
-	case 'd', 'D', 'w', 'W', 's', 'S':
-		return 0, true, i + 2
-	case 'b':
-		return '\b', false, i + 2
-	case 'f':
-		return '\f', false, i + 2
-	case 'n':
-		return '\n', false, i + 2
-	case 'r':
-		return '\r', false, i + 2
-	case 't':
-		return '\t', false, i + 2
-	case 'v':
-		return '\v', false, i + 2
-	case 'c':
-		if i+2 < len(cs) {
-			if l := cs[i+2]; (l >= 'a' && l <= 'z') || (l >= 'A' && l <= 'Z') || (l >= '0' && l <= '9') || l == '_' {
-				return l % 32, false, i + 3
-			}
-		}
-		return '\\', false, i + 1
-	case 'x':
-		if i+3 < len(cs) && isHex(cs[i+2]) && isHex(cs[i+3]) {
-			return hexValue(cs[i+2 : i+4]), false, i + 4
-		}
-	case 'u':
-		if i+5 < len(cs) && isHex(cs[i+2]) && isHex(cs[i+3]) && isHex(cs[i+4]) && isHex(cs[i+5]) {
-			return hexValue(cs[i+2 : i+6]), false, i + 6
-		}
-	}
-	if c >= '0' && c <= '7' {
-		v, j := uint16(0), i+1
-		maxDigits := 2
-		if c <= '3' {
-			maxDigits = 3
-		}
-		for n := 0; n < maxDigits && j < len(cs) && cs[j] >= '0' && cs[j] <= '7'; n++ {
-			v = v*8 + cs[j] - '0'
-			j++
-		}
-		return v, false, j
-	}
-	return c, false, i + 2
+	return t, true
 }
 
 func isLineTerminator(c uint16) bool {
@@ -406,9 +309,6 @@ func (t *tok) classMatch(c uint16, nocase bool) bool {
 func (s *mmSegment) match(f string) bool {
 	if !s.magic {
 		return f == s.literal
-	}
-	if s.never {
-		return false
 	}
 	u := utf16.Encode([]rune(f))
 	n := len(u) + 1

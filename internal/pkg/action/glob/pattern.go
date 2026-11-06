@@ -25,7 +25,7 @@ type pattern struct {
 type parseEnv struct {
 	w    flavour
 	cwd  string
-	home string
+	home func() (string, error)
 }
 
 func newPattern(s string, implicit bool, env parseEnv) (*pattern, error) {
@@ -89,13 +89,19 @@ func fixupPattern(s string, env parseEnv) (string, error) {
 	case s == "." || strings.HasPrefix(s, "."+sep):
 		s = globEscape(env.cwd, w) + s[1:]
 	case s == "~" || strings.HasPrefix(s, "~"+sep):
-		if env.home == "" {
+		var home string
+		if env.home != nil {
+			if home, err = env.home(); err != nil {
+				return "", err
+			}
+		}
+		if home == "" {
 			return "", errors.New("unable to determine HOME directory")
 		}
-		if !w.hasAbsoluteRoot(env.home) {
-			return "", fmt.Errorf("expected HOME directory to be a rooted path, actual '%s'", env.home)
+		if home = w.normalizeSeparators(home); !w.hasAbsoluteRoot(home) {
+			return "", fmt.Errorf("expected HOME directory to be a rooted path, actual '%s'", home)
 		}
-		s = globEscape(env.home, w) + s[1:]
+		s = globEscape(home, w) + s[1:]
 	case w.windows && (reDriveOnly.MatchString(s) || reDriveNoSep.MatchString(s)):
 		if root, err = w.ensureAbsoluteRoot(`C:\dummy-root`, s[:2], env.cwd); err != nil {
 			return "", err
