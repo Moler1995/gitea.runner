@@ -544,7 +544,7 @@ func TestRejectsMissingContainer(t *testing.T) {
 	check("Inspect after removal", err)
 }
 
-func TestCopyTarStreamOwnsMissingParents(t *testing.T) {
+func TestCopyTarStreamOwnsMissingParentsAndRejectsEscapes(t *testing.T) {
 	ctx := t.Context()
 	client := &mockDockerClient{}
 	client.On("ContainerInspect", ctx, "job", mobyclient.ContainerInspectOptions{}).
@@ -567,20 +567,21 @@ func TestCopyTarStreamOwnsMissingParents(t *testing.T) {
 				return
 			}
 			require.NoError(t, err)
-			assert.Equal(t, []int{1001, 1002}, []int{header.Uid, header.Gid}, header.Name)
+			assert.Equal(t, []any{1001, 1002, ""}, []any{header.Uid, header.Gid, header.Uname}, header.Name)
 			entries = append(entries, header.Name)
 		}
 	}).Return(mobyclient.CopyToContainerResult{}, nil).Once()
 
 	cr := &containerReference{id: "job", cli: client, input: &NewContainerInput{Name: "job"}, UID: 1001, GID: 1002}
 	require.NoError(t, cr.CopyTarStream(ctx, "/w/out/a/", func(tw *TarWriter) error {
-		if err := tw.WriteHeader(&tar.Header{Typeflag: tar.TypeDir, Name: "dir/", Mode: 0o755}); err != nil {
-			return err
-		}
-		return tw.WriteHeader(&tar.Header{Typeflag: tar.TypeReg, Name: "dir/f.txt", Mode: 0o644})
+		return tw.WriteHeader(&tar.Header{Typeflag: tar.TypeReg, Name: "dir/f.txt", Mode: 0o644, Uname: "nobody"})
 	}))
 	assert.Equal(t, []string{"w/out/", "w/out/a/", "w/out/a/dir/", "w/out/a/dir/f.txt"}, entries)
 	client.AssertExpectations(t)
+
+	require.ErrorContains(t, writeTarStream(io.Discard, 0, 0, "w/out/a", nil, func(tw *TarWriter) error {
+		return tw.WriteHeader(&tar.Header{Typeflag: tar.TypeReg, Name: "../../../etc/passwd"})
+	}), "escapes")
 }
 
 func TestPublicCopyPipelineHandlesStaleID(t *testing.T) {

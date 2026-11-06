@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -115,7 +116,6 @@ func (e *HostEnvironment) Inspect(_ context.Context) (*Info, error) {
 	return &Info{Health: HealthNone, Ports: map[string]string{}}, nil
 }
 
-// GetContainerArchive streams, so a large tree is never held in memory.
 func (e *HostEnvironment) GetContainerArchive(ctx context.Context, srcPath string) (io.ReadCloser, error) {
 	srcPath = filepath.Clean(srcPath)
 	fi, err := os.Lstat(srcPath)
@@ -131,7 +131,7 @@ func (e *HostEnvironment) GetContainerArchive(ctx context.Context, srcPath strin
 		}
 		writer.CloseWithError(err)
 	}()
-	return reader, nil
+	return startedArchive(reader)
 }
 
 func writeHostArchive(ctx context.Context, tc *filecollector.TarCollector, srcPath string, fi fs.FileInfo) error {
@@ -163,50 +163,56 @@ func writeHostArchive(ctx context.Context, tc *filecollector.TarCollector, srcPa
 	return tc.WriteFile(fi.Name(), fi, linkname, f)
 }
 
-func (e *HostEnvironment) CopyTarStream(_ context.Context, destPath string, write func(*TarWriter) error) error {
+func (e *HostEnvironment) CopyTarStream(ctx context.Context, destPath string, write func(*TarWriter) error) error {
 	if err := os.MkdirAll(destPath, 0o777); err != nil {
 		return err
 	}
-	content := pipeTar(0, 0, "", nil, write)
-	defer content.Close()
-	tr := tar.NewReader(content)
-	for {
-		hdr, err := tr.Next()
-		if errors.Is(err, io.EOF) {
-			return nil
-		} else if err != nil {
-			return err
-		}
-		name := filepath.FromSlash(strings.TrimSuffix(hdr.Name, "/"))
-		if !filepath.IsLocal(name) {
-			return fmt.Errorf("tar entry %q escapes %s", hdr.Name, destPath)
-		}
-		target := filepath.Join(destPath, name)
-		switch hdr.Typeflag {
-		case tar.TypeDir:
-			if err := os.MkdirAll(target, hdr.FileInfo().Mode().Perm()); err != nil {
-				return err
-			}
-		case tar.TypeReg:
-			if err := writeHostFile(target, hdr.FileInfo().Mode().Perm(), tr); err != nil {
-				return err
-			}
-		default:
-			return fmt.Errorf("tar entry %q: unsupported type %q", hdr.Name, hdr.Typeflag)
-		}
-	}
-}
-
-func writeHostFile(target string, mode fs.FileMode, body io.Reader) error {
-	if err := os.MkdirAll(filepath.Dir(target), 0o777); err != nil {
-		return err
-	}
-	f, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
+	root, err := os.OpenRoot(destPath)
 	if err != nil {
 		return err
 	}
-	_, err = io.Copy(f, body)
-	return errors.Join(err, f.Close())
+	defer root.Close()
+	content := pipeTar(0, 0, "", nil, write)
+	defer content.Close()
+	tr := tar.NewReader(content)
+	var dirs []*tar.Header
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		hdr, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		} else if err != nil {
+			return err
+		}
+		hdr.Name = filepath.FromSlash(strings.TrimSuffix(hdr.Name, "/"))
+		if hdr.Typeflag == tar.TypeDir {
+			err = root.MkdirAll(hdr.Name, 0o777) // modes apply after the contents, so read-only directories can be filled
+			dirs = append(dirs, hdr)
+		} else {
+			err = writeRootFile(root, hdr.Name, hdr.FileInfo().Mode().Perm(), tr)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	for _, dir := range slices.Backward(dirs) {
+		if err := root.Chmod(dir.Name, dir.FileInfo().Mode().Perm()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func writeRootFile(root *os.Root, name string, mode fs.FileMode, body io.Reader) error {
+	_ = root.Remove(name) // replaces read-only files and applies mode, as the daemon and tar do
+	file, err := root.OpenFile(name, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
+	if err != nil {
+		return err
+	}
+	_, err = io.Copy(file, body)
+	return errors.Join(err, file.Close())
 }
 
 func (e *HostEnvironment) Pull(_ bool) common.Executor {

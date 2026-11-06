@@ -8,6 +8,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -100,13 +101,30 @@ func TestHostCopyTarStream(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "#!/bin/sh\n", string(content))
 	if runtime.GOOS != "windows" {
-		info, err := os.Stat(filepath.Join(dest, "dir", "run.sh"))
-		require.NoError(t, err)
-		assert.Equal(t, os.FileMode(0o755), info.Mode().Perm())
+		require.NoError(t, os.Chmod(filepath.Join(dest, "dir", "run.sh"), 0o444))
+		require.NoError(t, e.CopyTarStream(t.Context(), dest, func(tw *TarWriter) error {
+			if err := tw.WriteHeader(&tar.Header{Typeflag: tar.TypeDir, Name: "dir/", Mode: 0o555}); err != nil {
+				return err
+			}
+			return write("dir/run.sh", 0o755, "")(tw)
+		}))
+		t.Cleanup(func() { require.NoError(t, os.Chmod(filepath.Join(dest, "dir"), 0o755)) })
+		for name, mode := range map[string]os.FileMode{"dir": 0o555, filepath.Join("dir", "run.sh"): 0o755} {
+			info, err := os.Stat(filepath.Join(dest, name))
+			require.NoError(t, err)
+			assert.Equal(t, mode, info.Mode().Perm(), name)
+		}
+		require.NoError(t, os.Symlink(t.TempDir(), filepath.Join(dest, "link")))
+		require.ErrorContains(t, e.CopyTarStream(t.Context(), dest, write("link/x", 0o644, "x")), "escapes")
 	}
 
 	require.ErrorContains(t, e.CopyTarStream(t.Context(), dest, write("../escape", 0o644, "x")), "escapes")
 	assert.NoFileExists(t, filepath.Join(filepath.Dir(dest), "escape"))
+	require.Error(t, e.CopyTarStream(t.Context(), dest, func(_tw *TarWriter) error { return fmt.Errorf("read body: %w", io.EOF) }))
+	canceled, cancel := context.WithCancel(t.Context())
+	cancel()
+	require.ErrorIs(t, e.CopyTarStream(canceled, dest, write("late", 0o644, "x")), context.Canceled)
+	assert.NoFileExists(t, filepath.Join(dest, "late"))
 }
 
 func TestHostEnvironmentExecExitCode(t *testing.T) {

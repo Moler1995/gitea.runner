@@ -131,7 +131,6 @@ type Container interface {
 	Copy(destPath string, files ...*FileEntry) common.Executor
 	CopyDir(destPath, srcPath string, useGitIgnore, skipGitDir bool) common.Executor
 	GetContainerArchive(ctx context.Context, srcPath string) (io.ReadCloser, error)
-	// CopyTarStream extracts the entries write produces under destPath as they are written.
 	CopyTarStream(ctx context.Context, destPath string, write func(*TarWriter) error) error
 	Inspect(ctx context.Context) (*Info, error)
 	DumpLogs(ctx context.Context) error

@@ -4,7 +4,6 @@
 package container
 
 import (
-	"bufio"
 	"bytes"
 	"cmp"
 	"compress/gzip"
@@ -577,15 +576,7 @@ func (c *kubernetesContainer) GetContainerArchive(ctx context.Context, srcPath s
 		}
 		writer.CloseWithError(err)
 	}()
-	buffered := bufio.NewReader(reader)
-	if _, err := buffered.Peek(1); err != nil {
-		reader.Close()
-		return nil, err
-	}
-	return struct {
-		io.Reader
-		io.Closer
-	}{buffered, reader}, nil
+	return startedArchive(reader)
 }
 
 func (c *kubernetesContainer) UpdateFromEnv(srcPath string, env *map[string]string) common.Executor {

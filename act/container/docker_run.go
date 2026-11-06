@@ -973,17 +973,17 @@ func (cr *containerReference) CopyTarStream(ctx context.Context, destPath string
 	}
 	destPath = path.Clean(destPath)
 	root := cr.extractionRoot(destPath)
-	rel := func(p string) string { return strings.TrimPrefix(strings.TrimPrefix(p, root), "/") }
-	// the daemon would create missing parents as root, which a non-root job user cannot write to
-	var parents []string
+	rel := func(fullPath string) string { return strings.TrimPrefix(strings.TrimPrefix(fullPath, root), "/") }
+	var parents []string // sent as entries so they belong to the job user, the daemon creates missing ones as root
 	for dir := destPath; dir != root && dir != "/" && dir != "."; dir = path.Dir(dir) {
 		if _, err := cr.cli.ContainerStatPath(ctx, cr.id, client.ContainerStatPathOptions{Path: dir}); err == nil {
 			break
 		} else if !cerrdefs.IsNotFound(err) {
 			return fmt.Errorf("stat %s: %w", dir, err)
 		}
-		parents = append([]string{rel(dir)}, parents...)
+		parents = append(parents, rel(dir))
 	}
+	slices.Reverse(parents)
 	content := pipeTar(cr.UID, cr.GID, rel(destPath), parents, write)
 	defer content.Close()
 	return cr.upload(ctx, root, content)
