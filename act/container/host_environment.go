@@ -39,7 +39,8 @@ type HostEnvironment struct {
 	// when Workdir points at a caller-owned checkout (e.g. `act` local mode).
 	CleanWorkdir bool
 	ActPath      string
-	CleanUp      func()
+	Root         string
+	TrackingID   string // RUNNER_TRACKING_ID of the job, a step with another value keeps its leftovers
 	StdOut       io.Writer
 	AllocatePTY  bool // allocate a pseudo-TTY for each step's process
 
@@ -55,7 +56,7 @@ func (e *HostEnvironment) processGroup(ctx context.Context) *process.Group {
 	e.procGroupOnce.Do(func() {
 		group, err := process.NewGroup()
 		if err != nil {
-			common.Logger(ctx).Warnf("could not create the job's process group; processes a step leaves behind can only be reclaimed by the workspace scan: %v", err)
+			common.Logger(ctx).Warnf("could not create the job's process group, processes a step leaves behind may outlive the job: %v", err)
 			return
 		}
 		e.procGroup.Store(group)
@@ -305,6 +306,7 @@ func (e *HostEnvironment) exec(ctx context.Context, command []string, cmdline st
 	// Flush any buffered, not-yet-newline-terminated trailing line, as the docker backend
 	// does in waitForCommand, so the final line of a command's output is not lost.
 	defer common.FlushWriter(e.StdOut)
+	process.UTF8Console()
 
 	f, err := lookupPathHost(command[0], env, e.StdOut)
 	if err != nil {
@@ -314,7 +316,12 @@ func (e *HostEnvironment) exec(ctx context.Context, command []string, cmdline st
 	cmd.Path = f
 	cmd.Args = command
 	cmd.Stdout = e.StdOut
-	cmd.Env = getEnvListFromMap(env)
+	trackingID := e.TrackingID
+	if value, ok := common.LookupFold(env, "RUNNER_TRACKING_ID", e.IsEnvironmentCaseInsensitive()); ok {
+		trackingID = value
+	}
+	tracked := trackingID == e.TrackingID
+	cmd.Env = append(getEnvListFromMap(env), "RUNNER_TRACKING_ID="+trackingID)
 	cmd.Stderr = e.StdOut
 	cmd.Dir = wd
 	cmd.SysProcAttr = process.SysProcAttr(cmdline, false)
@@ -322,6 +329,7 @@ func (e *HostEnvironment) exec(ctx context.Context, command []string, cmdline st
 	// Kills the step's whole tree on cancellation and bounds the post-exit I/O
 	// wait, so an orphan holding cmd's stdout pipe cannot hang cmd.Wait().
 	treeKill := process.NewTreeKill(cmd)
+	treeKill.KeepLeftovers = !tracked
 
 	var ppty *os.File
 	var tty *os.File
@@ -355,10 +363,10 @@ func (e *HostEnvironment) exec(ctx context.Context, command []string, cmdline st
 	if err := cmd.Start(); err != nil {
 		return err
 	}
-	// Assign before the step's Killer so the step's job nests inside the group's;
-	// cancellation still scopes to this step's tree.
-	if err := e.processGroup(ctx).Assign(cmd.Process); err != nil {
-		common.Logger(ctx).Warnf("could not assign the step's process to the job's process group; a process it leaves behind may outlive the job: %v", err)
+	if tracked {
+		if err := e.processGroup(ctx).Assign(cmd.Process); err != nil {
+			common.Logger(ctx).Warnf("could not assign the step's process to the job's process group, a process it leaves behind may outlive the job: %v", err)
+		}
 	}
 	if k, kerr := treeKill.Capture(cmd.Process); kerr != nil {
 		common.Logger(ctx).Warnf("process tree kill setup failed, falling back to single-process kill: %v", kerr)
@@ -409,9 +417,7 @@ func (e *HostEnvironment) UpdateFromEnv(srcPath string, env *map[string]string) 
 // removeAll is a var so tests can substitute a blocking stub.
 var removeAll = os.RemoveAll
 
-// removeAllWithContext returns once the delete finishes or ctx is cancelled. On
-// cancellation the goroutine leaks: a delete inside a syscall cannot be
-// interrupted (see runWithTimeout).
+// Returns on cancel while an uninterruptible delete keeps running, freeing the runner's capacity slot.
 func removeAllWithContext(ctx context.Context, path string) error {
 	done := make(chan error, 1)
 	go func() { done <- removeAll(path) }()
@@ -453,129 +459,22 @@ func removePathWithRetry(ctx context.Context, path string) error {
 	return lastErr
 }
 
-// buildWindowsWorkspaceKillScript builds a PowerShell command that taskkills
-// every process tree whose ExecutablePath or CommandLine references one of the
-// given workspace dirs, releasing file handles for cleanup. Win32_Process
-// exposes both fields (Get-Process doesn't, wmic is deprecated); matching is on
-// the dir+separator prefix via ordinal String methods, so a name-prefix sibling
-// (job1 vs job10) is spared and path metacharacters stay literal.
-func buildWindowsWorkspaceKillScript(dirs []string) string {
-	quoted := make([]string, len(dirs))
-	for i, d := range dirs {
-		// Single-quoted PowerShell literal; escape ' by doubling it.
-		quoted[i] = "'" + strings.ReplaceAll(d, "'", "''") + "'"
-	}
-
-	return `$paths = @(` + strings.Join(quoted, ",") + `)
-$selfPid = $PID
-Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
-    if ($_.ProcessId -eq $selfPid) { return $false }
-    foreach ($p in $paths) {
-        $prefix = $p + '\'
-        if ($_.ExecutablePath -and $_.ExecutablePath.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
-        if ($_.CommandLine -and $_.CommandLine.IndexOf($prefix, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { return $true }
-    }
-    return $false
-} | ForEach-Object {
-    & taskkill.exe /PID $_.ProcessId /T /F 2>$null | Out-Null
-}
-`
-}
-
-func (e *HostEnvironment) terminateRunningProcesses(ctx context.Context) {
-	if runtime.GOOS != "windows" {
-		return
-	}
-
-	// Detached: exec.CommandContext won't start on a cancelled ctx, and a
-	// server cancel has already cancelled the parent ctx.
-	killCtx, killCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer killCancel()
-
-	logger := common.Logger(ctx)
-
-	// Dirs we own; a process referencing one is a leftover. ToolCache is shared
-	// across jobs, and Workdir may be a caller-owned checkout.
-	owned := []string{e.Path, e.TmpDir}
-	if e.CleanWorkdir {
-		owned = append(owned, e.Workdir)
-	}
-	dirs := make([]string, 0, len(owned))
-	for _, d := range owned {
-		if d == "" {
-			continue
-		}
-		abs, err := filepath.Abs(d)
-		if err != nil {
-			continue
-		}
-		dirs = append(dirs, abs)
-	}
-	if len(dirs) == 0 {
-		return
-	}
-
-	script := buildWindowsWorkspaceKillScript(dirs)
-
-	cmd := exec.CommandContext(killCtx, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		logger.Debugf("workspace process-tree kill via PowerShell failed: %v output=%s", err, strings.TrimSpace(string(out)))
-	}
-
-	// Win32_Process exposes no working directory, so the scan above misses a
-	// process that merely runs in a workspace dir while pinning a handle on it.
-	if killed, err := process.KillProcessesWithCWDUnder(killCtx, dirs); err != nil {
-		logger.Debugf("workspace process kill by working directory reported errors: %v", err)
-	} else if killed > 0 {
-		logger.Debugf("terminated %d leftover process(es) by workspace working directory", killed)
-	}
-}
-
 // hostCleanupTimeout bounds each teardown phase so one stalled delete cannot
 // wedge the runner slot. A var so tests can shrink it.
 var hostCleanupTimeout = 30 * time.Second
-
-// runWithTimeout returns context.DeadlineExceeded once timeout elapses, leaking
-// the goroutine: a delete blocked in a syscall (AV filter driver, dead network
-// mount) cannot be interrupted, and leaking scratch state beats losing the
-// runner's capacity slot forever. The idle stale-dir sweep reclaims it later.
-func runWithTimeout(fn func(), timeout time.Duration) error {
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		fn()
-	}()
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-	select {
-	case <-done:
-		return nil
-	case <-timer.C:
-		return context.DeadlineExceeded
-	}
-}
 
 func (e *HostEnvironment) Remove() common.Executor {
 	return func(ctx context.Context) error {
 		logger := common.Logger(ctx)
 
-		// End lingering processes before removing the workspace; on Windows their
-		// file locks block cleanup. Closing the group is deterministic, the scan a net.
+		// End lingering processes before removing the workspace, on Windows their file locks block cleanup.
 		if err := e.procGroup.Load().Close(); err != nil {
 			logger.Debugf("closing the job's process group failed: %v", err)
 		}
-		e.terminateRunningProcesses(ctx)
-
-		// Removes per-job misc state only, never the toolcache root. Bounded because
-		// CleanUp is a caller-supplied, typically unbounded os.RemoveAll.
-		if e.CleanUp != nil {
-			logger.Debugf("running host environment cleanup callback")
-			if err := runWithTimeout(e.CleanUp, hostCleanupTimeout); err != nil {
-				logger.Warnf("host environment cleanup did not finish within %s; continuing job completion, scratch state may be leaked and is reclaimed by the idle stale-dir sweep", hostCleanupTimeout)
-			} else {
-				logger.Debugf("host environment cleanup callback finished")
-			}
+		if killed, err := process.KillTrackedProcesses(e.TrackingID); err != nil {
+			logger.Debugf("killing the job's leftover processes reported errors: %v", err)
+		} else if killed > 0 {
+			logger.Debugf("killed %d leftover process(es) of the job", killed)
 		}
 
 		// Detach: a cancelled ctx would skip removePathWithRetry's retries,
@@ -584,8 +483,8 @@ func (e *HostEnvironment) Remove() common.Executor {
 		defer rmCancel()
 
 		var errs []error
-		if err := removePathWithRetry(rmCtx, e.Path); err != nil {
-			logger.Warnf("failed to remove host misc state %s: %v", e.Path, err)
+		if err := removePathWithRetry(rmCtx, cmp.Or(e.Root, e.Path)); err != nil {
+			logger.Warnf("failed to remove host misc state %s: %v", cmp.Or(e.Root, e.Path), err)
 			errs = append(errs, err)
 		}
 		if e.CleanWorkdir {
@@ -657,6 +556,7 @@ func goOsToActionOs(os string) string {
 		"linux":   "Linux",
 		"darwin":  "macOS",
 		"windows": "Windows",
+		"freebsd": "FreeBSD",
 	}[os], os)
 }
 

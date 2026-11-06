@@ -68,6 +68,7 @@ type RunContext struct {
 	kubernetes          bool
 	containerSpec       model.ContainerSpec // container:, resolved once with platformImage
 	containerEnv        yaml.Node           // container.env of the kept containerSpec, decoded once the job env resolves
+	caEnv               map[string]string   // NODE_EXTRA_CA_CERTS for the runner CA, beneath any env the job and its image set
 	JobName             string
 	ActionPath          string
 	Parent              *RunContext
@@ -81,6 +82,7 @@ type RunContext struct {
 	jobRunDefaults      model.RunDefaults // defaults.run, resolved once at job setup as GitHub does
 	platformImage       string            // container.image or the runs-on pick, resolved once by isEnabled
 	jobIndex, jobTotal  int               // strategy.job-index and job-total, total 0 when unknown
+	trackingID          string            // RUNNER_TRACKING_ID of the job, generated on first use
 	runtimeToken        string            // ACTIONS_RUNTIME_TOKEN of the workflow run, shared with its called workflows and composite actions
 
 	jobEnv             map[string]string          // workflow and job env as evaluated for the container and service specs
@@ -191,7 +193,7 @@ func (rc *RunContext) GetEnv() map[string]string {
 		if rc.Run != nil && rc.Run.Workflow != nil && rc.Config != nil {
 			job := rc.Run.Job()
 			if job != nil {
-				rc.Env = mergeMaps(rc.Run.Workflow.Env, job.Environment(), rc.Config.Env)
+				rc.Env = rc.mergeEnv(rc.Run.Workflow.Env, job.Environment(), rc.Config.Env)
 			}
 		}
 		if rc.runtimeToken != "" {
@@ -277,9 +279,35 @@ func (rc *RunContext) validVolumes() []string {
 	if rc.dockerProxy != nil {
 		volumes = append(volumes, rc.dockerProxy.Socket)
 	}
+	volumes = append(volumes, rc.Config.containerVolumeSources()...)
 	// TODO: add a new configuration to control whether the docker daemon can be mounted
 	return append(volumes, name, name+"-env",
 		getDockerDaemonSocketMountPath(rc.containerDaemonSocket()))
+}
+
+// containerVolumeSources lets workflows mount the container.volumes sources with no more access than they give.
+func (c *Config) containerVolumeSources() []string {
+	var sources []string
+	for _, spec := range c.ContainerVolumes {
+		parsed, _ := container.ParseVolume(spec) // validated on config load
+		if parsed.ReadOnly {
+			parsed.Source += ":ro"
+		}
+		sources = append(sources, parsed.Source)
+	}
+	return sources
+}
+
+// mountVolumes sanitizes volumes and adds the container.volumes on the targets they leave unclaimed.
+func (rc *RunContext) mountVolumes(ctx context.Context, validVolumes, volumes []string) ([]string, map[string]string, map[string]bool) {
+	binds, mounts, claimed := splitVolumes(container.SanitizeBinds(ctx, validVolumes, volumes))
+	for _, spec := range rc.Config.ContainerVolumes {
+		if parsed, _ := container.ParseVolume(spec); !claimed[parsed.Target] { // validated on config load
+			claimed[parsed.Target] = true
+			binds = append(binds, spec)
+		}
+	}
+	return binds, mounts, claimed
 }
 
 func (rc *RunContext) workdirMountRoot() string {
@@ -356,7 +384,7 @@ func (rc *RunContext) GetBindsAndMounts(ctx context.Context) ([]string, map[stri
 	ext := container.LinuxContainerEnvironmentExtensions{}
 
 	// the runner's own mounts below yield to the targets the job claims
-	binds, mounts, claimed := splitVolumes(container.SanitizeBinds(ctx, rc.validVolumes(), rc.containerSpec.Volumes))
+	binds, mounts, claimed := rc.mountVolumes(ctx, rc.validVolumes(), rc.containerSpec.Volumes)
 
 	if rc.containerDaemonSocket() != "-" && !claimed["/var/run/docker.sock"] {
 		binds = append(binds, rc.jobDockerSocket()+":/var/run/docker.sock")
@@ -429,24 +457,55 @@ func (rc *RunContext) startHostEnvironment() common.Executor {
 			Workdir:      rc.Config.Workdir,
 			CleanWorkdir: rc.Config.CleanWorkdir,
 			ActPath:      actPath,
-			CleanUp: func() {
-				os.RemoveAll(miscpath)
-			},
-			StdOut:      logWriter,
-			AllocatePTY: rc.Config.AllocatePTY,
+			Root:         miscpath,
+			TrackingID:   rc.runnerTrackingID(),
+			StdOut:       logWriter,
+			AllocatePTY:  rc.Config.AllocatePTY,
 		}
 		rc.cleanUpJobContainer = rc.JobContainer.Remove()
 		rc.setRunnerContextEnv(ctx)
-		for _, env := range os.Environ() {
-			if k, v, ok := strings.Cut(env, "="); ok {
-				// don't override
-				if _, ok := rc.Env[k]; !ok {
-					rc.Env[k] = v
-				}
-			}
-		}
+		rc.importHostEnv(os.Environ())
 
 		return rc.copyWorkflowFiles()(ctx)
+	}
+}
+
+func (rc *RunContext) runnerTrackingID() string {
+	job := rc.topLevelRunContext()
+	if job.trackingID == "" {
+		job.trackingID = "gitea_" + rand.Text()
+	}
+	return job.trackingID
+}
+
+func (rc *RunContext) isEnvCaseInsensitive() bool {
+	if rc.JobContainer != nil {
+		return rc.JobContainer.IsEnvironmentCaseInsensitive()
+	}
+	return runtime.GOOS == "windows" && rc.IsHostEnv()
+}
+
+func (rc *RunContext) importHostEnv(environ []string) {
+	for _, env := range environ {
+		if key, value, ok := strings.Cut(env, "="); ok {
+			if key == "RUNNER_TRACKING_ID" || rc.isEnvCaseInsensitive() && strings.EqualFold(key, "RUNNER_TRACKING_ID") {
+				continue
+			}
+			_, exists := common.LookupFold(rc.Env, key, rc.isEnvCaseInsensitive())
+			if !exists {
+				rc.Env[key] = value
+			}
+		}
+	}
+}
+
+func (rc *RunContext) mergeEnv(envs ...map[string]string) map[string]string {
+	if rc.isEnvCaseInsensitive() {
+		env := map[string]string{}
+		mergeIntoMapCaseInsensitive(env, envs...)
+		return env
+	} else {
+		return mergeMaps(envs...)
 	}
 }
 
@@ -459,6 +518,15 @@ func (rc *RunContext) setRunnerContextEnv(ctx context.Context) {
 }
 
 var errKubernetesDocker = errors.New("docker actions and docker:// steps are not supported on Kubernetes")
+
+var errWindowsHostContainer = errors.New("container actions and docker:// steps are not supported in Windows host jobs")
+
+var hostOS = runtime.GOOS // replaced in tests
+
+func (rc *RunContext) isWindowsHost() bool {
+	_, host := rc.JobContainer.(*container.HostEnvironment)
+	return host && hostOS == "windows"
+}
 
 func (rc *RunContext) startKubernetesPod() common.Executor {
 	return func(ctx context.Context) error {
@@ -664,7 +732,12 @@ func (rc *RunContext) jobServices(ctx context.Context, networkName string) (map[
 			entrypoint = []string{spec.Entrypoint}
 		}
 
-		serviceBinds, serviceMounts, _ := splitVolumes(spec.Volumes)
+		serviceBinds, serviceMounts, _ := splitVolumes(spec.Volumes) // as given on Kubernetes, which rejects them
+		validVolumes := rc.Config.ValidVolumes                       // not validVolumes(), a service gets no docker socket
+		if !rc.kubernetes {
+			validVolumes = append(slices.Clone(validVolumes), rc.Config.containerVolumeSources()...)
+			serviceBinds, serviceMounts, _ = rc.mountVolumes(ctx, validVolumes, spec.Volumes)
+		}
 
 		exposedPorts, portBindings, err := nat.ParsePortSpecs(spec.Ports)
 		if err != nil {
@@ -693,7 +766,7 @@ func (rc *RunContext) jobServices(ctx context.Context, networkName string) (map[
 			NetworkAliases:  []string{serviceID},
 			ExposedPorts:    exposedPorts,
 			PortBindings:    portBindings,
-			ValidVolumes:    rc.Config.ValidVolumes, // not validVolumes(), a service gets no docker socket
+			ValidVolumes:    validVolumes,
 			AllocatePTY:     rc.Config.AllocatePTY,
 		}
 	}
@@ -737,7 +810,7 @@ func (rc *RunContext) cleanupJobResources(networkName string, createAndDeleteNet
 		errs = append(errs, runAll(ctx, containers))
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), jobCleanupTimeout)
 		defer cancel()
-		if !common.Dryrun(ctx) && !rc.Config.NoSweep && (preclean || rc.hadDockerProxy) {
+		if !common.Dryrun(ctx) && rc.Config.Sweep && (preclean || rc.hadDockerProxy) {
 			errs = append(errs, container.RemoveDockerJobResources(ctx, rc.jobContainerName())) // after the containers, whose endpoints would block removing the job networks
 		}
 		var rest []common.Executor
@@ -1078,10 +1151,35 @@ func (svc *serviceContainer) healthOutputSuffix() string {
 }
 
 func (rc *RunContext) copyWorkflowFiles() common.Executor {
-	return rc.JobContainer.Copy(rc.JobContainer.GetActPath()+"/",
-		&container.FileEntry{Name: "workflow/event.json", Mode: 0o644, Body: rc.EventJSON},
-		&container.FileEntry{Name: "workflow/envs.txt", Mode: 0o666},
-	)
+	return func(ctx context.Context) error {
+		files := []*container.FileEntry{
+			{Name: "workflow/event.json", Mode: 0o644, Body: rc.EventJSON},
+			{Name: "workflow/envs.txt", Mode: 0o666},
+		}
+		if rc.Config.CAFile != "" {
+			ca, err := os.ReadFile(rc.Config.CAFile)
+			if err != nil {
+				return fmt.Errorf("read runner CA file: %w", err)
+			}
+			files = append(files, &container.FileEntry{Name: "ca.crt", Mode: 0o644, Body: string(ca)})
+			imageEnv := map[string]string{}
+			if err = rc.JobContainer.UpdateFromImageEnv(&imageEnv)(ctx); err != nil {
+				return err
+			}
+			if _, set := imageEnv["NODE_EXTRA_CA_CERTS"]; !set {
+				rc.caEnv = map[string]string{"NODE_EXTRA_CA_CERTS": rc.jobCAFile()}
+			}
+		}
+		return rc.JobContainer.Copy(rc.JobContainer.GetActPath()+"/", files...)(ctx)
+	}
+}
+
+// jobCAFile is where copyWorkflowFiles puts the runner CA in the job, empty without one.
+func (rc *RunContext) jobCAFile() string {
+	if rc.Config.CAFile == "" {
+		return ""
+	}
+	return rc.JobContainer.GetActPath() + "/ca.crt"
 }
 
 // captureJobContainerInfo is a convenience: failing to describe the container must not
@@ -1311,6 +1409,10 @@ func (rc *RunContext) resolvePlatformImage(ctx context.Context) error {
 	}
 	image, rc.kubernetes = strings.CutPrefix(image, "kubernetes://")
 	rc.platformImage = cmp.Or(rc.containerSpec.Image, image)
+	if rc.isEnvCaseInsensitive() {
+		rc.Env = nil // Rebuild scopes after the host platform is known.
+		rc.GetEnv()
+	}
 	return nil
 }
 
@@ -1509,7 +1611,6 @@ func (rc *RunContext) getGithubContext(ctx context.Context) *model.GithubContext
 		RepositoryOwner:  rc.Config.Env["GITHUB_REPOSITORY_OWNER"],
 		RetentionDays:    cmp.Or(rc.Config.Env["GITHUB_RETENTION_DAYS"], "0"),
 		RunnerPerflog:    cmp.Or(rc.Config.Env["RUNNER_PERFLOG"], "/dev/null"),
-		RunnerTrackingID: rc.Config.Env["RUNNER_TRACKING_ID"],
 		Repository:       rc.Config.Env["GITHUB_REPOSITORY"],
 		Ref:              rc.Config.Env["GITHUB_REF"],
 		Sha:              rc.Config.Env["SHA_REF"],
@@ -1522,6 +1623,8 @@ func (rc *RunContext) getGithubContext(ctx context.Context) *model.GithubContext
 	if rc.JobContainer != nil {
 		ghc.EventPath = rc.JobContainer.GetActPath() + "/workflow/event.json"
 	}
+
+	ghc.RunnerTrackingID = rc.runnerTrackingID()
 
 	if preset := rc.Config.PresetGitHubContext; preset != nil {
 		merged := *preset
@@ -1602,6 +1705,23 @@ func isLocalCheckout(ghc *model.GithubContext, step *model.Step) bool {
 	return true
 }
 
+// aliasGiteaEnv mirrors the runner's GITHUB_* variables as GITEA_*, call it after the last write to them.
+func aliasGiteaEnv(env map[string]string) {
+	for _, suffix := range []string{
+		"ACTION", "ACTION_PATH", "ACTION_REF", "ACTION_REPOSITORY", "ACTIONS", "ACTOR", "ACTOR_ID", "API_URL", "BASE_REF",
+		"ENV", "EVENT_NAME", "EVENT_PATH", "GRAPHQL_URL", "HEAD_REF", "JOB", "OUTPUT", "PATH", "REF", "REF_NAME",
+		"REF_PROTECTED", "REF_TYPE", "REPOSITORY", "REPOSITORY_ID", "REPOSITORY_OWNER", "REPOSITORY_OWNER_ID",
+		"RETENTION_DAYS", "RUN_ATTEMPT", "RUN_ID", "RUN_NUMBER", "SERVER_URL", "SHA", "STATE", "STEP_SUMMARY",
+		"TRIGGERING_ACTOR", "WORKFLOW", "WORKFLOW_REF", "WORKFLOW_SHA", "WORKSPACE",
+	} {
+		if value, ok := env["GITHUB_"+suffix]; ok {
+			env["GITEA_"+suffix] = value
+		} else {
+			delete(env, "GITEA_"+suffix)
+		}
+	}
+}
+
 func (rc *RunContext) withGithubEnv(ctx context.Context, github *model.GithubContext, env map[string]string) {
 	if _, ok := env["CI"]; !ok {
 		env["CI"] = "true"
@@ -1628,7 +1748,9 @@ func (rc *RunContext) withGithubEnv(ctx context.Context, github *model.GithubCon
 	env["GITHUB_REPOSITORY_OWNER"] = github.RepositoryOwner
 	env["GITHUB_RETENTION_DAYS"] = github.RetentionDays
 	env["RUNNER_PERFLOG"] = github.RunnerPerflog
-	env["RUNNER_TRACKING_ID"] = github.RunnerTrackingID
+	if _, ok := common.LookupFold(env, "RUNNER_TRACKING_ID", rc.isEnvCaseInsensitive()); !ok {
+		env["RUNNER_TRACKING_ID"] = github.RunnerTrackingID
+	}
 	env["GITHUB_BASE_REF"] = github.BaseRef
 	env["GITHUB_HEAD_REF"] = github.HeadRef
 	env["GITHUB_SERVER_URL"] = github.ServerURL
@@ -1654,6 +1776,7 @@ func (rc *RunContext) withGithubEnv(ctx context.Context, github *model.GithubCon
 
 	env["GITHUB_GRAPHQL_URL"] = ""
 	env["GITHUB_RUN_ATTEMPT"] = github.RunAttempt
+	aliasGiteaEnv(env)
 
 	env["RUNNER_NAME"] = rc.Config.RunnerName
 	env["RUNNER_ENVIRONMENT"] = "self-hosted"

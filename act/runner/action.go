@@ -180,9 +180,9 @@ func runActionImpl(step actionStep, actionDir string, remoteAction *remoteAction
 
 		action := step.getActionModel()
 
-		rc.withGithubEnv(ctx, step.getGithubContext(ctx), *step.getEnv())
+		rc.withGithubEnv(ctx, getStepGithubContext(ctx, step), *step.getEnv())
 		populateEnvsFromSavedState(step.getEnv(), step, rc)
-		if err := populateEnvsFromInput(ctx, step.getEnv(), action, rc); err != nil {
+		if err := populateEnvsFromInput(ctx, step, action); err != nil {
 			return err
 		}
 		warnUnexpectedInputs(ctx, action, stepModel.With)
@@ -198,7 +198,7 @@ func runActionImpl(step actionStep, actionDir string, remoteAction *remoteAction
 			if err := maybeCopyToActionDir(ctx, step, actionDir, actionPath, containerActionDir); err != nil {
 				return err
 			}
-			containerArgs := nodeActionCommand(path.Join(containerActionDir, action.Runs.Main))
+			containerArgs := nodeActionCommand(container.JoinPath(containerActionDir, action.Runs.Main))
 			logger.Debugf("executing remote job container: %s", containerArgs)
 
 			rc.ApplyExtraPath(ctx, step.getEnv())
@@ -226,7 +226,7 @@ func runActionImpl(step actionStep, actionDir string, remoteAction *remoteAction
 			execFileName := action.Runs.Main + ".out"
 			return common.NewPipelineExecutor(
 				rc.JobContainer.Exec([]string{"go", "build", "-o", execFileName, action.Runs.Main}, *step.getEnv(), "", containerActionDir),
-				rc.JobContainer.Exec([]string{filepath.Join(containerActionDir, execFileName)}, *step.getEnv(), "", ""),
+				rc.JobContainer.Exec([]string{container.JoinPath(containerActionDir, execFileName)}, *step.getEnv(), "", ""),
 			)(ctx)
 		default:
 			return fmt.Errorf("the runs.using key must be one of: %v, got %s", []string{
@@ -283,7 +283,7 @@ func (rc *RunContext) dockerActionImage(ctx context.Context, step actionStep, ac
 	}
 	image, ok := job.dockerActionImages[step.getStepModel()]
 	if !ok {
-		image = dockerActionImageTag(step.getGithubContext(ctx).Repository, actionName, localAction) + "-" + strings.ToLower(rand.Text())
+		image = dockerActionImageTag(getStepGithubContext(ctx, step).Repository, actionName, localAction) + "-" + strings.ToLower(rand.Text())
 		if !common.Dryrun(ctx) { // a dry run builds nothing to remove
 			job.dockerActionImages[step.getStepModel()] = image
 		}
@@ -295,6 +295,9 @@ func (rc *RunContext) dockerActionImage(ctx context.Context, step actionStep, ac
 func execAsDocker(ctx context.Context, step actionStep, actionName, actionDir, basedir string, localAction bool, stage stepStage) error {
 	logger := common.Logger(ctx)
 	rc := step.getRunContext()
+	if rc.isWindowsHost() {
+		return errWindowsHostContainer
+	}
 	action := step.getActionModel()
 	if rc.kubernetes {
 		return errKubernetesDocker
@@ -336,34 +339,30 @@ func execAsDocker(ctx context.Context, step actionStep, actionName, actionDir, b
 
 		if !correctArchExists || rc.Config.ForceRebuild {
 			logger.Debugf("image '%s' for architecture '%s' will be built from context '%s", image, rc.Config.ContainerArchitecture, contextDir)
-			var buildContext io.ReadCloser
-			if localAction {
-				buildContext, err = rc.JobContainer.GetContainerArchive(ctx, contextDir+"/.")
-				if err != nil {
-					return err
+			prepImage = common.Executor(func(ctx context.Context) error {
+				input := container.NewDockerBuildExecutorInput{
+					ContextDir: contextDir,
+					Dockerfile: fileName,
+					ImageTag:   image,
+					Platform:   rc.Config.ContainerArchitecture,
+					BuildArgs:  rc.proxyBuildArgs(),
 				}
-				defer buildContext.Close()
-			}
-			prepImage = ContainerNewDockerBuildExecutor(container.NewDockerBuildExecutorInput{
-				ContextDir:   contextDir,
-				Dockerfile:   fileName,
-				ImageTag:     image,
-				BuildContext: buildContext,
-				Platform:     rc.Config.ContainerArchitecture,
-				BuildArgs:    rc.proxyBuildArgs(),
-			})
-			if buildContext == nil {
-				// Held across the whole build: the daemon drains contextDir lazily.
-				inner := prepImage
-				prepImage = func(ctx context.Context) error {
-					unlock, err := git.AcquireCloneLock(ctx, actionDir)
+				if localAction {
+					buildContext, err := rc.JobContainer.GetContainerArchive(ctx, contextDir+"/.")
+					if err != nil {
+						return err
+					}
+					defer buildContext.Close()
+					input.BuildContext = buildContext
+				} else {
+					unlock, err := git.AcquireCloneLock(ctx, actionDir) // held across the whole build, the daemon drains contextDir lazily
 					if err != nil {
 						return err
 					}
 					defer unlock()
-					return inner(ctx)
 				}
-			}
+				return ContainerNewDockerBuildExecutor(input)(ctx)
+			}).Retry(3)
 		} else {
 			logger.Debugf("image '%s' for architecture '%s' already exists", image, rc.Config.ContainerArchitecture)
 		}
@@ -437,7 +436,7 @@ func evalDockerEnv(ctx context.Context, step step, action *model.Action) (*expre
 	for key := range step.getStepModel().With {
 		providedInputs[strings.ToLower(key)] = true
 	}
-	eval := rc.NewExpressionEvaluator(ctx)
+	eval := rc.NewStepExpressionEvaluator(ctx, step)
 	for k, input := range action.Inputs {
 		if providedInputs[strings.ToLower(k)] {
 			continue
@@ -456,6 +455,7 @@ func evalDockerEnv(ctx context.Context, step step, action *model.Action) (*expre
 		}
 	}
 	mergeIntoMap(step, step.getEnv(), runsEnv, maps.Clone(*step.getEnv()))
+	aliasGiteaEnv(*step.getEnv())
 	return ee, nil
 }
 
@@ -509,8 +509,9 @@ func inputEnvKey(inputID string) string {
 	return "INPUT_" + inputEnvPattern.ReplaceAllString(strings.ToUpper(inputID), "_")
 }
 
-func populateEnvsFromInput(ctx context.Context, env *map[string]string, action *model.Action, rc *RunContext) error {
-	eval := rc.NewExpressionEvaluator(ctx)
+func populateEnvsFromInput(ctx context.Context, step step, action *model.Action) error {
+	env := step.getEnv()
+	eval := step.getRunContext().NewStepExpressionEvaluator(ctx, step)
 	for inputID, input := range action.Inputs {
 		envKey := inputEnvKey(inputID)
 		if _, ok := (*env)[envKey]; !ok {
@@ -523,22 +524,8 @@ func populateEnvsFromInput(ctx context.Context, env *map[string]string, action *
 	return nil
 }
 
-// lookupFold finds name in values, ignoring case where the environment does, as GitHub's inputs always do.
-func lookupFold[V any](values map[string]V, name string, caseInsensitive bool) (V, bool) {
-	if value, ok := values[name]; ok || !caseInsensitive {
-		return value, ok
-	}
-	for key, value := range values {
-		if strings.EqualFold(key, name) {
-			return value, true
-		}
-	}
-	var zero V
-	return zero, false
-}
-
 func stepInput(step *model.Step, name string) string {
-	value, _ := lookupFold(step.With, name, true)
+	value, _ := common.LookupFold(step.With, name, true)
 	return value
 }
 
@@ -546,7 +533,7 @@ func warnUnexpectedInputs(ctx context.Context, action *model.Action, inputs map[
 	docker := action.Runs.Using.IsDocker()
 	var unexpectedInputs []string
 	for input := range inputs {
-		_, declared := lookupFold(action.Inputs, input, true)
+		_, declared := common.LookupFold(action.Inputs, input, true)
 		containerInput := docker && (strings.EqualFold(input, "entryPoint") || strings.EqualFold(input, "args"))
 		if !declared && !containerInput {
 			unexpectedInputs = append(unexpectedInputs, input)
@@ -652,7 +639,7 @@ func runPreStep(step actionStep) common.Executor {
 		x := action.Runs.Using
 		if !x.IsComposite() {
 			// defaults in pre steps were missing, however provided inputs are available
-			if err := populateEnvsFromInput(ctx, step.getEnv(), action, rc); err != nil {
+			if err := populateEnvsFromInput(ctx, step, action); err != nil {
 				return err
 			}
 		}
@@ -663,7 +650,7 @@ func runPreStep(step actionStep) common.Executor {
 				return err
 			}
 
-			containerArgs := nodeActionCommand(path.Join(containerActionDir, action.Runs.Pre))
+			containerArgs := nodeActionCommand(container.JoinPath(containerActionDir, action.Runs.Pre))
 			logger.Debugf("executing remote job container: %s", containerArgs)
 
 			rc.ApplyExtraPath(ctx, step.getEnv())
@@ -695,7 +682,7 @@ func runPreStep(step actionStep) common.Executor {
 			execFileName := action.Runs.Pre + ".out"
 			return common.NewPipelineExecutor(
 				rc.JobContainer.Exec([]string{"go", "build", "-o", execFileName, action.Runs.Pre}, *step.getEnv(), "", containerActionDir),
-				rc.JobContainer.Exec([]string{filepath.Join(containerActionDir, execFileName)}, *step.getEnv(), "", ""),
+				rc.JobContainer.Exec([]string{container.JoinPath(containerActionDir, execFileName)}, *step.getEnv(), "", ""),
 			)(ctx)
 		default:
 			return nil
@@ -763,7 +750,7 @@ func runPostStep(step actionStep) common.Executor {
 
 			populateEnvsFromSavedState(step.getEnv(), step, rc)
 
-			containerArgs := nodeActionCommand(path.Join(containerActionDir, action.Runs.Post))
+			containerArgs := nodeActionCommand(container.JoinPath(containerActionDir, action.Runs.Post))
 			logger.Debugf("executing remote job container: %s", containerArgs)
 
 			rc.ApplyExtraPath(ctx, step.getEnv())
@@ -792,7 +779,7 @@ func runPostStep(step actionStep) common.Executor {
 			execFileName := action.Runs.Post + ".out"
 			return common.NewPipelineExecutor(
 				rc.JobContainer.Exec([]string{"go", "build", "-o", execFileName, action.Runs.Post}, *step.getEnv(), "", containerActionDir),
-				rc.JobContainer.Exec([]string{filepath.Join(containerActionDir, execFileName)}, *step.getEnv(), "", ""),
+				rc.JobContainer.Exec([]string{container.JoinPath(containerActionDir, execFileName)}, *step.getEnv(), "", ""),
 			)(ctx)
 
 		default:

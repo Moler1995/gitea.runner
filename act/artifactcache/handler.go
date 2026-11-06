@@ -59,6 +59,10 @@ type credKey struct{}
 type JobCredential struct {
 	Repo string `json:"repo"`
 
+	Ref        string `json:"ref"`
+	BaseRef    string `json:"base_ref"`
+	DefaultRef string `json:"default_ref"`
+
 	// Results is the instance whose artifact service this server forwards for the job, and
 	// InsecureTLS how the runner reaches it; see results.go.
 	Results     string `json:"-"`
@@ -66,6 +70,10 @@ type JobCredential struct {
 
 	// PublicURL is this server as a reverse proxy makes the job reach it, not the listen address.
 	PublicURL string `json:"public_url"`
+}
+
+func (cred JobCredential) owns(cache *Cache) bool {
+	return cache.Repo == cred.Repo && cache.Ref == cred.Ref
 }
 
 // credEntry holds a registered job's credential along with an active
@@ -96,7 +104,8 @@ type Handler struct {
 	stopSync context.CancelFunc
 	syncing  sync.WaitGroup
 
-	outboundIP string
+	outboundIP        string
+	instanceTransport http.RoundTripper
 
 	// internalSecret guards /_internal/{register,revoke}. When set, a remote
 	// runner can use these endpoints to pre-register per-job
@@ -116,7 +125,7 @@ type Handler struct {
 
 	policy Policy
 
-	// freeDisk is a field so tests can drive evictForFreeSpace without a full volume.
+	// freeDisk is a field so tests can drive makeRoom without a full volume.
 	freeDisk func(string) (uint64, error)
 }
 
@@ -135,19 +144,21 @@ type Options struct {
 	// in-process RegisterJob method directly.
 	InternalSecret string
 
-	Policy Policy
-	Logger *logging.Logger
+	Policy            Policy
+	Logger            *logging.Logger
+	InstanceTransport http.RoundTripper // reaches the instance artifact requests are forwarded to, nil for http.DefaultTransport
 }
 
 // StartHandler starts an embedded cache or forwards cache requests to Upstream.
 func StartHandler(opts Options) (*Handler, error) {
 	dir, logger := opts.Dir, opts.Logger
 	h := &Handler{
-		creds:          make(map[string]*credEntry),
-		internalSecret: opts.InternalSecret,
-		policy:         opts.Policy.withDefaults(),
-		freeDisk:       disk.FreeBytes,
-		dbLock:         make(chan struct{}, 1),
+		creds:             make(map[string]*credEntry),
+		internalSecret:    opts.InternalSecret,
+		policy:            opts.Policy.withDefaults(),
+		freeDisk:          disk.FreeBytes,
+		dbLock:            make(chan struct{}, 1),
+		instanceTransport: opts.InstanceTransport,
 	}
 
 	if logger == nil {
@@ -653,7 +664,7 @@ func (h *Handler) find(w http.ResponseWriter, r *http.Request) {
 	}
 	defer db.Close()
 
-	cache, err := h.lookupCache(db, cred.Repo, keys, version)
+	cache, err := h.lookupCache(db, cred, keys, version)
 	if err != nil {
 		h.responseJSON(w, r, 500, err)
 		return
@@ -669,26 +680,27 @@ func (h *Handler) find(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// lookupCache returns the entry to restore for these keys, or (nil, nil) when there is none:
-// either nothing matched, or the match had lost its blob to a prune, in which case the dangling
-// entry is dropped on the way out.
-func (h *Handler) lookupCache(db *cacheDB, repo string, keys []string, version string) (*Cache, error) {
-	cache, err := findCache(db, repo, keys, version)
-	if err != nil || cache == nil {
-		return nil, err
+// lookupCache returns the entry to restore or (nil, nil), dropping matches whose blob was pruned.
+func (h *Handler) lookupCache(db *cacheDB, cred JobCredential, keys []string, version string) (*Cache, error) {
+	for {
+		cache, err := findCache(db, cred, keys, version)
+		if err != nil || cache == nil {
+			return nil, err
+		}
+		ok, err := h.storage.Exist(cache.ID)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			// Handing out a download URL counts as access, or eviction could drop the entry between
+			// this call and the GET that follows it.
+			h.touch(db, cache)
+			return cache, nil
+		}
+		if !h.deleteCache(db, cache) {
+			return nil, nil //nolint:nilnil // absence is not an error here
+		}
 	}
-	ok, err := h.storage.Exist(cache.ID)
-	if err != nil {
-		return nil, err
-	}
-	if !ok {
-		h.deleteCache(db, cache)
-		return nil, nil //nolint:nilnil // absence is not an error here
-	}
-	// Handing out a download URL counts as access, or eviction could drop the entry between
-	// this call and the GET that follows it.
-	h.touch(db, cache)
-	return cache, nil
 }
 
 // POST /_apis/artifactcache/caches
@@ -700,7 +712,7 @@ func (h *Handler) reserve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cache := &Cache{Repo: cred.Repo, Key: api.Key, Version: api.Version, Size: api.Size}
+	cache := &Cache{Repo: cred.Repo, Ref: cred.Ref, Key: api.Key, Version: api.Version, Size: api.Size}
 	if cache.Size == 0 {
 		cache.Size = -1
 	}
@@ -749,7 +761,7 @@ func (h *Handler) upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if cache.Repo != cred.Repo {
+	if !cred.owns(cache) {
 		h.responseJSON(w, r, 403, fmt.Errorf("cache %d: forbidden", id))
 		return
 	}
@@ -764,6 +776,7 @@ func (h *Handler) upload(w http.ResponseWriter, r *http.Request) {
 		h.responseJSON(w, r, 400, err)
 		return
 	}
+	h.makeRoom(r.ContentLength)
 	if err := h.storage.Write(cache.ID, start, r.Body); err != nil {
 		h.responseJSON(w, r, 500, err)
 		return
@@ -808,7 +821,7 @@ func (h *Handler) commit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if cache.Repo != cred.Repo {
+	if !cred.owns(cache) {
 		h.responseJSON(w, r, 403, fmt.Errorf("cache %d: forbidden", id))
 		return
 	}
@@ -866,11 +879,8 @@ func (h *Handler) commitCache(cache *Cache) error {
 	if h.s3 != nil {
 		return nil // lifecycle rules on the bucket bound its size
 	}
-	// A commit is the only thing that grows the store, so the only thing that can push the
-	// volume under the floor.
 	h.evictRepo(db, cache.Repo)
 	h.evictTotal(db)
-	h.evictForFreeSpace(db)
 	return nil
 }
 
@@ -1071,25 +1081,35 @@ func (h *Handler) signedArtifactURL(cred JobCredential, cacheID uint64, exp time
 	return h.signedURL(cred, apiPath+"/artifacts", "", cacheID, exp)
 }
 
-// if not found, return (nil, nil) instead of an error.
-func findCache(db *cacheDB, repo string, keys []string, version string) (*Cache, error) {
-	for _, prefix := range keys {
-		// if a key in the list matches exactly, don't return partial matches
-		exact, err := findExactCache(db, repo, prefix, version, true)
-		if err != nil {
-			return nil, err
+// findCache tries every key in one ref before the next ref, and returns (nil, nil) on a miss.
+func findCache(db *cacheDB, cred JobCredential, keys []string, version string) (*Cache, error) {
+	refs := []string{cred.Ref}
+	for _, ref := range []string{cred.BaseRef, cred.DefaultRef} {
+		if ref != "" && !slices.Contains(refs, ref) {
+			refs = append(refs, ref)
 		}
-		if exact != nil {
-			return exact, nil
-		}
-		caches, err := db.find(func(cache *Cache) bool {
-			return cache.Repo == repo && strings.HasPrefix(cache.Key, prefix) && cache.Version == version && cache.Complete
-		})
-		if err != nil {
-			return nil, fmt.Errorf("find cache: %w", err)
-		}
-		if cache := latest(caches, (*Cache).createdAtNano); cache != nil {
-			return cache, nil
+	}
+	caches, err := db.find(func(cache *Cache) bool {
+		return cache.Repo == cred.Repo && cache.Version == version && cache.Complete && slices.Contains(refs, cache.Ref) &&
+			slices.ContainsFunc(keys, func(prefix string) bool { return strings.HasPrefix(cache.Key, prefix) })
+	})
+	if err != nil {
+		return nil, fmt.Errorf("find cache: %w", err)
+	}
+	for _, ref := range refs {
+		for _, prefix := range keys {
+			var exact, partial []*Cache
+			for _, cache := range caches {
+				if cache.Ref == ref && cache.Key == prefix {
+					exact = append(exact, cache)
+				} else if cache.Ref == ref && strings.HasPrefix(cache.Key, prefix) {
+					partial = append(partial, cache)
+				}
+			}
+			// if a key in the list matches exactly, don't return partial matches
+			if cache := cmp.Or(latest(exact, (*Cache).createdAtNano), latest(partial, (*Cache).createdAtNano)); cache != nil {
+				return cache, nil
+			}
 		}
 	}
 	return nil, nil //nolint:nilnil // pre-existing issue from nektos/act
@@ -1111,9 +1131,9 @@ func latest(caches []*Cache, stamp func(*Cache) int64) *Cache {
 // A completed entry is the one to restore, sorted by when it was written. An incomplete one is a
 // reservation being uploaded to, sorted by when it was last written to, because the upload route
 // touches UsedAt on every part.
-func findExactCache(db *cacheDB, repo, key, version string, complete bool) (*Cache, error) {
+func findExactCache(db *cacheDB, cred JobCredential, key, version string, complete bool) (*Cache, error) {
 	caches, err := db.find(func(cache *Cache) bool {
-		return cache.Key == key && cache.Repo == repo && cache.Version == version && cache.Complete == complete
+		return cred.owns(cache) && cache.Key == key && cache.Version == version && cache.Complete == complete
 	})
 	if err != nil {
 		return nil, fmt.Errorf("find cache: %w", err)
@@ -1154,9 +1174,6 @@ func (h *Handler) touchCache(id uint64, requireIncomplete bool) error {
 	defer db.Close()
 
 	cache, err := db.get(id)
-	if errors.Is(err, errCacheNotFound) {
-		return nil
-	}
 	if err != nil {
 		return err
 	}
@@ -1241,23 +1258,29 @@ func (h *Handler) gcCache() {
 	h.evictExpired(db)
 	h.evictSuperseded(db)
 	h.evictOversized(db)
-	h.evictForFreeSpace(db)
+	_ = db.Close()
+	h.makeRoom(0)
 }
 
-// evictForFreeSpace bounds the volume itself, so it also covers bytes the cache never
-// accounted for.
-func (h *Handler) evictForFreeSpace(db *cacheDB) {
+// makeRoom evicts the least recently used entries to keep need bytes above the floor, as GitHub saves new over old.
+func (h *Handler) makeRoom(need int64) {
 	free, err := h.freeDisk(h.dir)
 	if err != nil {
 		h.logger.Debugf("free disk check: %v", err) // unsupported platform, treat as unavailable rather than full
 		return
 	}
-	if free >= uint64(h.policy.MinFreeDisk) {
+	shortfall := h.policy.MinFreeDisk + max(need, 0) - int64(free)
+	if h.s3 != nil || shortfall <= 0 {
 		return
 	}
+	db, err := h.openDB()
+	if err != nil {
+		return
+	}
+	defer db.Close()
 
 	caches := h.completedByUse(db)
-	total, shortfall := totalSize(caches), h.policy.MinFreeDisk-int64(free)
+	total := totalSize(caches)
 	if total <= shortfall {
 		// Say so, or shedding everything and still being short reads as the backstop working.
 		h.logger.Warnf("cache volume is %d MiB short of the free space floor with only %d MiB of cache on it; something else is filling it", shortfall/miB, total/miB)
@@ -1280,13 +1303,12 @@ func (h *Handler) evictExpired(db *cacheDB) {
 	h.sweep(db, func(cache *Cache) bool { return cache.UsedAt < expired })
 }
 
-// evictSuperseded removes entries a newer one with the same key and version replaced. The
-// grouping includes Repo so two repos sharing a (key, version) do not evict each other.
+// evictSuperseded removes entries a newer one with the same repo, ref, key and version replaced.
 func (h *Handler) evictSuperseded(db *cacheDB) {
-	type entry struct{ repo, key, version string }
+	type entry struct{ repo, ref, key, version string }
 	groups := make(map[entry][]*Cache)
 	for _, cache := range h.caches(db, func(cache *Cache) bool { return cache.Complete }) {
-		group := entry{cache.Repo, cache.Key, cache.Version}
+		group := entry{cache.Repo, cache.Ref, cache.Key, cache.Version}
 		groups[group] = append(groups[group], cache)
 	}
 	for _, caches := range groups {

@@ -40,7 +40,12 @@ func Main(ctx context.Context, c *action.Context) error {
 	if err != nil {
 		return err
 	}
-	g, err := parse(ctx, c, in.path)
+	g, err := glob.Parse(in.path, glob.Options{
+		Workdir:             c.Workspace,
+		Home:                func() (string, error) { return c.Home(ctx) },
+		Windows:             c.Windows(),
+		ImplicitDescendants: true,
+	})
 	if err != nil {
 		return err
 	}
@@ -111,18 +116,6 @@ func readInputs(c *action.Context) (*inputs, error) {
 		}
 	}
 	return in, nil
-}
-
-func parse(ctx context.Context, c *action.Context, patterns string) (*glob.Globber, error) {
-	opts := glob.Options{Workdir: c.Workspace, Windows: c.Windows(), ImplicitDescendants: true}
-	if slices.ContainsFunc(strings.Split(patterns, "\n"), func(line string) bool { return strings.HasPrefix(strings.TrimLeft(strings.TrimSpace(line), "!"), "~") }) {
-		home, err := c.Home(ctx)
-		if err != nil {
-			return nil, err
-		}
-		opts.Home = home
-	}
-	return glob.Parse(patterns, opts)
 }
 
 type collected struct {

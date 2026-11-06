@@ -1,13 +1,14 @@
 DIST := dist
-EXECUTABLE := gitea-runner
 GO ?= go
+EXECUTABLE := gitea-runner$(shell $(GO) env GOEXE)
 HAS_GO = $(shell hash $(GO) > /dev/null 2>&1 && echo "GO" || echo "NOGO" )
 
 PODMAN_TEST_IMAGE ?= quay.io/containers/podman:v5.8.9-immutable@sha256:87f42f37fa85b421664c30b8f5f9cfc23920057f5e5fcadf0b6f68d9edc6d415 # renovate: datasource=docker
-E2E_JOB_IMAGE ?= docker.gitea.com/runner-images:ubuntu-latest@sha256:8856b200466e9a5af9cc0d4de4ca96f73547833bcdddf9a567189ff772c4d372 # renovate: datasource=docker
+E2E_JOB_IMAGE ?= docker.gitea.com/runner-images:ubuntu-latest@sha256:657378e5cfd898e36f820459c60ef8e69be8fcda9fd354e4381a8b654d091bbc # renovate: datasource=docker
 SERVICE_IMAGE ?= nginx:1.31.7-alpine@sha256:892bb2152464f0c5d8972593a5f5afaf8054552580b699d95f8ff4af08c2d33d # renovate: datasource=docker
 E2E_GITEA_IMAGE ?= gitea/gitea:main-nightly
 E2E_K3S_IMAGE ?= rancher/k3s:v1.37.1-k3s1@sha256:ca7f37d993d82ef0dcdcfecb2e0e2618ea541dbaffc620c8cedebe01a82acd0d # renovate: datasource=docker
+WINDOWS_TEST_IMAGE ?= dockurr/windows:6.06@sha256:16fd7c39a3e48bb946d29c59dc6015942e5b900a1fa5d7e5552053bfc48ee2ea # renovate: datasource=docker
 
 GOFILES := $(shell find . -type f -name "*.go" -o -name "go.mod" ! -name "generated.*")
 
@@ -150,11 +151,15 @@ coverage-report: ## turn coverage.txt from `make test` into .tmp/coverage.md
 test-dind: ## run the daemon-facing tests against the built dind image or podman (TARGET=dind|dind-rootless|podman)
 	@PODMAN_TEST_IMAGE=$(PODMAN_TEST_IMAGE) ./scripts/test-dind.sh $(TARGET)
 
+.PHONY: test-windows
+test-windows: ## run the tests on Windows Server Core in a QEMU VM on the docker host
+	@GO=$(GO) WINDOWS_TEST_IMAGE=$(WINDOWS_TEST_IMAGE) ./scripts/test-windows.sh
+
 E2E_CONCURRENCY ?= 8
 
 .PHONY: test-e2e
 test-e2e: ## run Gitea compatibility tests against E2E_GITEA_IMAGE
-	@E2E_CONCURRENCY=$(E2E_CONCURRENCY) E2E_GITEA_IMAGE=$(E2E_GITEA_IMAGE) E2E_K3S_IMAGE=$(E2E_K3S_IMAGE) E2E_JOB_IMAGE=$(E2E_JOB_IMAGE) GO=$(GO) SERVICE_IMAGE=$(SERVICE_IMAGE) ./tools/test-e2e.sh
+	@E2E_CONCURRENCY=$(E2E_CONCURRENCY) E2E_GITEA_IMAGE=$(E2E_GITEA_IMAGE) E2E_K3S_IMAGE=$(E2E_K3S_IMAGE) E2E_JOB_IMAGE=$(E2E_JOB_IMAGE) GO=$(GO) SERVICE_IMAGE=$(SERVICE_IMAGE) ./tools/test-e2e.sh $(E2E_ARGS)
 
 .PHONY: install
 install: $(GOFILES) ## install the runner binary via `go install`

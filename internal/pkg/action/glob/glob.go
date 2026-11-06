@@ -2,19 +2,21 @@
 // SPDX-License-Identifier: MIT
 
 // Package glob ports the pattern semantics of the JavaScript @actions/glob 0.6.1 package, as
-// bundled in actions/upload-artifact, without walking a filesystem.
+// bundled in actions/upload-artifact, without walking a filesystem. Malformed bracket expressions
+// and some non-ASCII case folding on Windows can match differently.
 package glob
 
 import (
 	"fmt"
 	"path"
 	"strings"
+	"sync"
 )
 
 type Options struct {
-	Workdir             string // absolute; relative patterns resolve against it
-	Home                string // replaces ~
-	Windows             bool   // Windows path flavour
+	Workdir             string                 // absolute; relative patterns resolve against it
+	Home                func() (string, error) // replaces ~, called once and only when a pattern uses it
+	Windows             bool                   // Windows path flavour
 	ImplicitDescendants bool
 }
 
@@ -30,13 +32,15 @@ const (
 type Globber struct {
 	patterns    []*pattern
 	searchPaths []string
-	w           flavour
 }
 
 // Parse parses newline separated patterns like DefaultGlobber.create.
 func Parse(patterns string, o Options) (*Globber, error) {
 	w := flavour{o.Windows}
-	env := parseEnv{w: w, cwd: w.normalizeSeparators(o.Workdir), home: w.normalizeSeparators(o.Home)}
+	env := parseEnv{w: w, cwd: w.normalizeSeparators(o.Workdir)}
+	if o.Home != nil {
+		env.home = sync.OnceValues(o.Home)
+	}
 	if env.cwd == "" || !w.hasAbsoluteRoot(env.cwd) {
 		return nil, fmt.Errorf("workdir '%s' is not an absolute path", o.Workdir)
 	}
@@ -58,7 +62,7 @@ func Parse(patterns string, o Options) (*Globber, error) {
 		parsed = append(parsed, p)
 	}
 
-	g := &Globber{searchPaths: searchPaths(parsed, w), w: w}
+	g := &Globber{searchPaths: searchPaths(parsed, w)}
 	for _, p := range parsed {
 		g.patterns = append(g.patterns, p)
 		if o.ImplicitDescendants && (p.trailingSeparator || p.segments[len(p.segments)-1] != "**") {

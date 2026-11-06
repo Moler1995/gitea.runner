@@ -35,10 +35,6 @@ func (sd *stepDocker) getRunContext() *RunContext {
 	return sd.RunContext
 }
 
-func (sd *stepDocker) getGithubContext(ctx context.Context) *model.GithubContext {
-	return sd.getRunContext().getGithubContext(ctx)
-}
-
 func (sd *stepDocker) getStepModel() *model.Step {
 	return sd.Step
 }
@@ -56,6 +52,9 @@ func (sd *stepDocker) runUsesContainer() common.Executor {
 	step := sd.Step
 
 	return func(ctx context.Context) error {
+		if rc.isWindowsHost() {
+			return errWindowsHostContainer
+		}
 		if rc.kubernetes {
 			return errKubernetesDocker
 		}
