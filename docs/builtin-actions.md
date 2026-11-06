@@ -42,7 +42,7 @@ With `gitea-runner exec`, checking out the workflow's own repository copies your
 
 ## upload-artifact
 
-Works like `actions/upload-artifact` v7 with these inputs. Any other input logs a warning, as on GitHub. It needs Gitea 1.22.4 or later, and 1.26 for `archive: false`.
+Works like `actions/upload-artifact` v7 with these inputs. Any other input logs a warning, as on GitHub.
 
 | Input | Default |
 | --- | --- |
@@ -55,7 +55,7 @@ Works like `actions/upload-artifact` v7 with these inputs. Any other input logs 
 | `include-hidden-files` | `false`, `true` uploads files and directories whose name starts with `.` |
 | `archive` | `true`, `false` uploads a single file as is |
 
-Patterns, symlinks and the artifact's root directory follow `actions/upload-artifact`. `ACTIONS_ARTIFACT_UPLOAD_CONCURRENCY` sets upload concurrency (default `5`), and `ACTIONS_ARTIFACT_UPLOAD_TIMEOUT_MS` sets the upload stall timeout (default `300000`). The step outputs `artifact-id`, `artifact-digest` and `artifact-url`. On Gitea 1.26 and later, the `artifact-url` is the artifact's link on the run page for this attempt, where `actions/upload-artifact` gives a link only GitHub serves.
+Patterns, symlinks and the artifact's root directory follow `actions/upload-artifact`. `ACTIONS_ARTIFACT_UPLOAD_CONCURRENCY` sets upload concurrency (default `5`), and `ACTIONS_ARTIFACT_UPLOAD_TIMEOUT_MS` sets the upload stall timeout (default `300000`). The step outputs `artifact-id`, `artifact-digest` and `artifact-url`. The `artifact-url` is the artifact's link on the run page for this attempt, where `actions/upload-artifact` gives a link only GitHub serves.
 
 Container jobs list the search paths in the job container and transfer only the selected files, gzipped when the image has gzip, requiring `sh`, `find` and `tar` in the image. On Kubernetes these files still pass through the API server, unlike `actions/upload-artifact`, which uploads from the pod.
 
@@ -80,6 +80,6 @@ ZIP entries become regular files with current modification times, so files lose 
 
 The runner downloads each artifact to a temporary file on the runner because the zip is read out of order, then streams the files into the job container. On Kubernetes, the stream goes through the API server, gzipped when the image has gzip, or over the pod network with `kubernetes.transfer.mode` set to `auto` or `direct`, while `actions/download-artifact` downloads from the pod directly.
 
-`github-token` needs Gitea 1.24 or later and is only sent to the instance the runner is registered with. Downloads from another run paginate through its artifacts and skip expired ones, where `actions/download-artifact` sees only Gitea's first 30 and fails on an expired newest copy. `run-id` must be positive, since Gitea treats nonpositive IDs as a request for artifacts from every run. Artifact names and ZIP entries that would leave the destination are rejected.
+`github-token` is only sent to the instance the runner is registered with. Downloads from another run paginate through its artifacts and skip expired ones, where `actions/download-artifact` sees only Gitea's first 30 and fails on an expired newest copy. `run-id` must be positive, since Gitea treats nonpositive IDs as a request for artifacts from every run. Artifact names and ZIP entries that would leave the destination are rejected.
 
 With `gitea-runner exec`, both actions use the local artifact server of `--artifact-server-path`, which serves no other runs for `github-token`.
