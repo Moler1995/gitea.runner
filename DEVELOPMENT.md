@@ -24,7 +24,6 @@ depending on the prefix:
   `##[…]` rules cannot match, and a raw `;` or `]` is never decoded. It is also what makes
   multi-line work, `\n` becomes `%0A` and the UI turns it back into a line break.
 - **Forwarding a command from step output?** Preserve its escaping unless masking changes it.
-  Group commands with prefixes the UI cannot recognise are normalised to lowercase v2 commands.
   Decoding for display happens in the UI.
 - **No prefix?** Do not escape, and split multi-line values into one row each.
 - **Interpolating a secret?** Masking runs after escaping. Recognised command payloads are
