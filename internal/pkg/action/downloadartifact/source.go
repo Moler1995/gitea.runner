@@ -5,20 +5,34 @@ package downloadartifact
 
 import (
 	"context"
+	"net/http"
 	"strings"
+	"time"
 
 	"gitea.com/gitea/runner/internal/pkg/action"
 	"gitea.com/gitea/runner/internal/pkg/action/artifact"
 )
 
-func newSource(c *action.Context, token string) (source, error) {
+type source struct {
+	list      func(context.Context, string) ([]artifact.Artifact, error)
+	signedURL func(context.Context, artifact.Artifact) (string, error)
+	download  func(context.Context, string, time.Duration) (*http.Response, error)
+}
+
+func newSource(c *action.Context, token string) (*source, error) {
 	if token == "" {
 		client, err := artifact.New(c.ResultsURL, c.RuntimeToken, c.Transport)
 		if err != nil {
 			return nil, err
 		}
 		client.Logf = c.Infof
-		return runSource{client}, nil
+		return &source{
+			list: client.List,
+			signedURL: func(ctx context.Context, art artifact.Artifact) (string, error) {
+				return client.SignedURL(ctx, art.Name)
+			},
+			download: client.Download,
+		}, nil
 	}
 	parts := append(strings.Split(c.Input("repository"), "/"), "")
 	owner, repo := parts[0], parts[1]
@@ -34,33 +48,13 @@ func newSource(c *action.Context, token string) (source, error) {
 		return nil, err
 	}
 	rest.Logf = c.Infof
-	return otherRunSource{rest, owner, repo, int64(runID)}, nil
-}
-
-type runSource struct{ *artifact.Client }
-
-func (s runSource) list(ctx context.Context, name string) ([]artifact.Artifact, error) {
-	list, err := s.List(ctx, name)
-	if err == nil {
-		s.Logf("Found %d artifact(s)", len(list))
-	}
-	return list, err
-}
-
-func (s runSource) signedURL(ctx context.Context, art artifact.Artifact) (string, error) {
-	return s.SignedURL(ctx, art.Name)
-}
-
-type otherRunSource struct {
-	*artifact.REST
-	owner, repo string
-	runID       int64
-}
-
-func (s otherRunSource) list(ctx context.Context, name string) ([]artifact.Artifact, error) {
-	return s.List(ctx, s.owner, s.repo, s.runID, name)
-}
-
-func (s otherRunSource) signedURL(ctx context.Context, art artifact.Artifact) (string, error) {
-	return s.DownloadURL(ctx, s.owner, s.repo, art.ID)
+	return &source{
+		list: func(ctx context.Context, name string) ([]artifact.Artifact, error) {
+			return rest.List(ctx, owner, repo, int64(runID), name)
+		},
+		signedURL: func(ctx context.Context, art artifact.Artifact) (string, error) {
+			return rest.DownloadURL(ctx, owner, repo, art.ID)
+		},
+		download: rest.Download,
+	}, nil
 }

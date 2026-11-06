@@ -14,10 +14,6 @@ import (
 	"time"
 )
 
-// restPageSize goes in `limit`, as Gitea ignores the toolkit's `per_page` and pages by 30 then.
-const restPageSize = 50
-
-// REST reaches artifacts of other runs through Gitea's API, with a token of the workflow's choice.
 type REST struct {
 	base  *url.URL
 	token string
@@ -57,14 +53,15 @@ func (r *REST) get(ctx context.Context, what string, endpoint *url.URL) (*http.R
 	})
 }
 
-// List returns the run's artifacts that have not expired, all of them or those named name.
 func (r *REST) List(ctx context.Context, owner, repo string, runID int64, name string) ([]Artifact, error) {
-	r.Logf("Fetching artifact list for workflow run %d in repository %s/%s", runID, owner, repo)
+	if name == "" {
+		r.Logf("Fetching artifact list for workflow run %d in repository %s/%s", runID, owner, repo)
+	}
 	var list []Artifact
 	seen := 0
 	for page := 1; ; page++ {
 		endpoint := r.base.JoinPath("repos", owner, repo, "actions", "runs", strconv.FormatInt(runID, 10), "artifacts")
-		query := url.Values{"page": {strconv.Itoa(page)}, "limit": {strconv.Itoa(restPageSize)}}
+		query := url.Values{"page": {strconv.Itoa(page)}, "limit": {"50"}}
 		if name != "" {
 			query.Set("name", name)
 		}
@@ -94,15 +91,12 @@ func (r *REST) List(ctx context.Context, owner, repo string, runID int64, name s
 			}
 		}
 		if seen += len(body.Artifacts); len(body.Artifacts) == 0 || seen >= body.TotalCount {
-			r.Logf("Found %d artifact(s)", len(list))
 			return list, nil
 		}
 	}
 }
 
-// DownloadURL returns the signed URL the artifact's zip redirects to.
 func (r *REST) DownloadURL(ctx context.Context, owner, repo string, id int64) (string, error) {
-	r.Logf("Downloading artifact '%d' from '%s/%s'", id, owner, repo)
 	resp, err := r.get(ctx, "download artifact", r.base.JoinPath("repos", owner, repo, "actions", "artifacts", strconv.FormatInt(id, 10), "zip"))
 	if err != nil {
 		return "", fmt.Errorf("unable to download artifact: %w", err)
@@ -118,7 +112,6 @@ func (r *REST) DownloadURL(ctx context.Context, owner, repo string, id int64) (s
 	return location.String(), nil
 }
 
-// Download GETs the URL DownloadURL returned. A body that sends nothing for stall fails the read.
 func (r *REST) Download(ctx context.Context, signedURL string, stall time.Duration) (*http.Response, error) {
-	return download(ctx, r.blob, signedURL, stall)
+	return (&Client{blob: r.blob}).Download(ctx, signedURL, stall)
 }

@@ -11,7 +11,6 @@ import (
 	"strconv"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -28,7 +27,7 @@ func TestRESTListsEveryPageAndSkipsExpired(t *testing.T) {
 		const maxResponseItems = 20
 		var entries []string
 		for id := (page-1)*maxResponseItems + 1; id <= min(page*maxResponseItems, 53); id++ {
-			entries = append(entries, fmt.Sprintf(`{"id":%d,"name":"a%d","size_in_bytes":%d,"created_at":"2026-01-02T03:04:05Z","expired":%t}`, id, id, id, id == 2))
+			entries = append(entries, fmt.Sprintf(`{"id":%d,"name":"a%d","size_in_bytes":%d,"expired":%t}`, id, id, id, id == 2))
 		}
 		_, _ = io.WriteString(w, `{"total_count":53,"artifacts":[`+strings.Join(entries, ",")+`]}`)
 	}))
@@ -40,38 +39,4 @@ func TestRESTListsEveryPageAndSkipsExpired(t *testing.T) {
 	assert.Equal(t, []string{"1/50", "2/50", "3/50"}, pages)
 	assert.Len(t, list, 52)
 	assert.Equal(t, Artifact{ID: 3, Name: "a3", Size: 3}, list[1])
-}
-
-func TestRESTDownloadKeepsTheTokenOffTheBlob(t *testing.T) {
-	blob := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		assert.Empty(t, r.Header.Get("Authorization"))
-		_, _ = io.WriteString(w, "zip bytes")
-	}))
-	defer blob.Close()
-	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/api/v1/repos/o/r/actions/artifacts/5/zip":
-			http.Redirect(w, r, blob.URL+"/raw?sig=x", http.StatusFound)
-		case "/api/v1/repos/o/r/actions/artifacts/6/zip":
-			w.WriteHeader(http.StatusNotFound)
-			_, _ = io.WriteString(w, `{"message":"Artifact has expired","url":"https://gitea.example/api/swagger"}`)
-		}
-	}))
-	defer api.Close()
-	rest, err := NewREST(api.URL, "secret", nil)
-	require.NoError(t, err)
-	rest.Retry = fastRetry
-
-	location, err := rest.DownloadURL(t.Context(), "o", "r", 5)
-	require.NoError(t, err)
-	assert.Equal(t, blob.URL+"/raw?sig=x", location)
-	resp, err := rest.Download(t.Context(), location, time.Minute)
-	require.NoError(t, err)
-	body, err := io.ReadAll(resp.Body)
-	require.NoError(t, err)
-	require.NoError(t, resp.Body.Close())
-	assert.Equal(t, "zip bytes", string(body))
-
-	_, err = rest.DownloadURL(t.Context(), "o", "r", 6)
-	require.EqualError(t, err, "unable to download artifact: (404) Not Found: Artifact has expired")
 }

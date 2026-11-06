@@ -127,16 +127,8 @@ func (c *Context) Base(p string) string {
 	return path.Base(p)
 }
 
-func (c *Context) IsAbs(p string) bool {
-	if c.Windows() {
-		return filepath.IsAbs(p)
-	}
-	return path.IsAbs(p)
-}
-
-// Resolve resolves p against the workspace, as path.resolve does in the step's working directory.
 func (c *Context) Resolve(p string) string {
-	if c.IsAbs(p) {
+	if c.Windows() && filepath.IsAbs(p) || !c.Windows() && path.IsAbs(p) {
 		return c.Join(p)
 	}
 	return c.Join(c.Workspace, p)

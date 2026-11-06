@@ -66,7 +66,7 @@ Works like `actions/download-artifact` v8 with these inputs. Any other input log
 | `name` | empty, every artifact of the run |
 | `artifact-ids` | empty, comma-separated IDs instead of `name` |
 | `path` | workspace root, `~` is the job user's home |
-| `pattern` | empty, a glob the artifact names must match, without the extglobs and brace ranges of minimatch |
+| `pattern` | empty, a glob the artifact names must match, without the extglobs and brace ranges of minimatch, ignored with `name` or `artifact-ids` |
 | `merge-multiple` | `false`, several artifacts go to `path/<name>`, `true` puts them all in `path` |
 | `github-token` | empty, a token to download from another run or repository |
 | `repository` | `github.repository`, with `github-token` |
@@ -74,8 +74,10 @@ Works like `actions/download-artifact` v8 with these inputs. Any other input log
 | `skip-decompress` | `false`, `true` keeps a zipped artifact as `<name>.zip` |
 | `digest-mismatch` | `error`, also `ignore`, `info` or `warn` |
 
-Files are written as `actions/download-artifact` writes them, without their mode, so executables lose their executable bit. `digest-mismatch` only applies when the server reports a digest, which Gitea does not. The step outputs `download-path`.
+ZIP entries become regular files with current modification times, so new files lose their executable bit and symlinks become files containing their targets. On the host, overwriting preserves existing file modes and follows destination symlinks. Container extraction uses tar, which can replace destination links and existing modes. New files and directories in containers use modes `0644` and `0755`. `digest-mismatch` only applies when the server reports a digest, which Gitea does not. The step outputs `download-path`.
 
-`github-token` needs Gitea 1.24 or later and is only sent to the instance the runner is registered with. Downloads from another run read every page of its artifacts and skip expired ones, where `actions/download-artifact` sees only Gitea's first 30 and fails on an expired newest copy.
+The runner downloads each artifact to a temporary file on the runner because the zip is read out of order, then streams the files into the job container. On Kubernetes, the stream goes through the API server, gzipped when the image has gzip, or over the pod network with `kubernetes.transfer.mode` set to `auto` or `direct`, while `actions/download-artifact` downloads from the pod directly.
+
+`github-token` needs Gitea 1.24 or later and is only sent to the instance the runner is registered with. Downloads from another run paginate through its artifacts and skip expired ones, where `actions/download-artifact` sees only Gitea's first 30 and fails on an expired newest copy. `run-id` must be positive, since Gitea treats nonpositive IDs as a request for artifacts from every run. Artifact names containing path separators or escaping the destination are rejected. ZIP entry paths escaping the destination are rejected.
 
 With `gitea-runner exec`, both actions use the local artifact server of `--artifact-server-path`, which serves no other runs for `github-token`.
