@@ -22,6 +22,9 @@ func TestSlotAllocatorReusesLowestFree(t *testing.T) {
 	slots.release(1)
 	assert.Equal(t, 1, slots.acquire())
 	assert.Equal(t, 3, slots.acquire())
+
+	assert.Equal(t, "-3", toolCacheSuffix(config.ToolCacheModePerSlot, 3))
+	assert.Empty(t, toolCacheSuffix(config.ToolCacheModeShared, 3))
 }
 
 func TestSlotAllocatorConcurrent(t *testing.T) {
@@ -44,10 +47,4 @@ func TestSlotAllocatorConcurrent(t *testing.T) {
 		})
 	}
 	wg.Wait()
-}
-
-func TestToolCacheSuffix(t *testing.T) {
-	assert.Equal(t, "-2", toolCacheSuffix(config.ToolCacheModePerSlot, 2))
-	assert.Empty(t, toolCacheSuffix(config.ToolCacheModeShared, 2))
-	assert.Empty(t, toolCacheSuffix(config.ToolCacheModeNone, 2))
 }

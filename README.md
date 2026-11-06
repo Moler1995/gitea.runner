@@ -184,7 +184,7 @@ Setup actions like `setup-go` install tools into `RUNNER_TOOL_CACHE`. `runner.to
 | --- | --- |
 | `none` (default) | Provided by the job image. Versions it lacks are downloaded in every job. |
 | `shared` | One volume for all jobs. Only safe with `runner.capacity: 1`. |
-| `per_slot` | One volume per `runner.capacity` slot, each used by one job at a time. Takes more disk, as each slot downloads its own tools. |
+| `per_slot` | One volume per `runner.capacity` slot. Parallel jobs of a called workflow share their slot's volume. Takes more disk, as each slot downloads its own tools. |
 
 To ship tools in a job image, install them to `/opt/hostedtoolcache/<tool>/<version>/<arch>` with an empty `<arch>.complete` file next to it, as the `-full` [runner images](https://gitea.com/gitea/runner-images) do:
 

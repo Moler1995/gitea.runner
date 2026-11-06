@@ -1201,6 +1201,17 @@ func TestStartHostEnvironmentToolCacheSuffix(t *testing.T) {
 	require.NoError(t, rc.startHostEnvironment()(t.Context()))
 	t.Cleanup(func() { require.NoError(t, rc.cleanUpJobContainer(context.Background())) })
 	assert.Equal(t, filepath.Join(cacheDir, "tool_cache-1"), rc.JobContainer.(*container.HostEnvironment).ToolCache)
+
+	override := filepath.Join(cacheDir, "override")
+	rc = &RunContext{
+		Config: &Config{ActionCacheDir: cacheDir, SharedToolCache: true, ToolCacheSuffix: "-1"},
+		Env:    map[string]string{"RUNNER_TOOL_CACHE": override},
+		Run:    &model.Run{Workflow: &model.Workflow{Name: "wf"}},
+	}
+	require.NoError(t, rc.startHostEnvironment()(t.Context()))
+	t.Cleanup(func() { require.NoError(t, rc.cleanUpJobContainer(context.Background())) })
+	assert.Equal(t, override+"-1", rc.JobContainer.(*container.HostEnvironment).ToolCache)
+	assert.Equal(t, override+"-1", rc.Env["RUNNER_TOOL_CACHE"])
 }
 
 func TestRunContext_cleanupFailedStart(t *testing.T) {
