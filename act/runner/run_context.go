@@ -260,7 +260,19 @@ func (rc *RunContext) containerDaemonSocket() string {
 	return cmp.Or(rc.Config.ContainerDaemonSocket, "/var/run/docker.sock")
 }
 
-const sharedToolCacheVolume = "act-toolcache" // mounted only when the tool cache is shared
+const (
+	sharedToolCacheVolume = "act-toolcache" // mounted only when the tool cache is shared
+	jobNodeDir            = "/__e/node"     // off PATH, so setup-node and `run: node` see only what the job installs
+)
+
+// nodeBinary is what runs JavaScript actions and hashFiles in the job.
+func (rc *RunContext) nodeBinary() string {
+	_, host := rc.JobContainer.(*container.HostEnvironment)
+	if rc.Config.ContainerNodeDir == "" || host || rc.kubernetes {
+		return "node"
+	}
+	return jobNodeDir + "/bin/node"
+}
 
 // validVolumes returns what the job and action containers may mount, the configured base plus
 // the runner's own volumes. Fresh slice per call, the shared Config is never mutated.
@@ -280,6 +292,9 @@ func (rc *RunContext) validVolumes() []string {
 		volumes = append(volumes, rc.dockerProxy.Socket)
 	}
 	volumes = append(volumes, rc.Config.containerVolumeSources()...)
+	if rc.Config.ContainerNodeDir != "" {
+		volumes = append(volumes, rc.Config.ContainerNodeDir+":ro")
+	}
 	// TODO: add a new configuration to control whether the docker daemon can be mounted
 	return append(volumes, name, name+"-env",
 		getDockerDaemonSocketMountPath(rc.containerDaemonSocket()))
@@ -673,6 +688,9 @@ func (rc *RunContext) startJobContainer() common.Executor {
 		}
 		rc.startDockerProxy(ctx)
 		containerInput.Binds, containerInput.Mounts = rc.GetBindsAndMounts(ctx)
+		if rc.Config.ContainerNodeDir != "" {
+			containerInput.Binds = append(containerInput.Binds, rc.Config.ContainerNodeDir+":"+jobNodeDir+":ro")
+		}
 		containerInput.ValidVolumes = rc.validVolumes()
 
 		rc.jobNetworkName = networkName

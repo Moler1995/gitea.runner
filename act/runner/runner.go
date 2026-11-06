@@ -85,6 +85,7 @@ type Config struct {
 	JobLoggerLevel                    *logging.Level // the level of job logger
 	ValidVolumes                      []string       // only volumes (and bind mounts) in this slice can be mounted on the job container or service containers
 	ContainerVolumes                  []string       // mounted into every job, service and docker action container
+	ContainerNodeDir                  string         // Node install on the docker host that Docker jobs run JavaScript actions and hashFiles with
 	SharedToolCache                   bool           // one tool cache for all jobs instead of one per job
 	InsecureSkipTLS                   bool           // whether to skip verifying TLS certificate of the Gitea instance
 	ClientCertFile, ClientKeyFile     string         // PEM client certificate for the Gitea instance

@@ -617,6 +617,30 @@ func TestRunContextValidVolumes(t *testing.T) {
 	assert.Equal(t, binds, container.SanitizeBinds(t.Context(), rc.validVolumes(), binds))
 }
 
+func TestContainerNodeDir(t *testing.T) {
+	const bind = "/opt/node:/__e/node:ro"
+	inputs := startJobContainerInputs(t, `
+jobs:
+  job:
+    container:
+      image: alpine:3
+    services:
+      redis:
+        image: redis:latest
+`, &Config{ContainerNodeDir: "/opt/node"})
+	require.Len(t, inputs, 2)
+	redis, job := inputs[0], inputs[1]
+	assert.Contains(t, job.Binds, bind)
+	assert.Contains(t, container.SanitizeBinds(t.Context(), job.ValidVolumes, job.Binds), bind)
+	assert.NotContains(t, redis.Binds, bind)
+
+	config := &Config{ContainerNodeDir: "/opt/node"}
+	assert.Equal(t, "/__e/node/bin/node", (&RunContext{Config: config, JobContainer: fakeContainer{}}).nodeBinary())
+	assert.Equal(t, "node", (&RunContext{Config: config, JobContainer: &container.HostEnvironment{}}).nodeBinary())
+	assert.Equal(t, "node", (&RunContext{Config: config, JobContainer: fakeContainer{}, kubernetes: true}).nodeBinary())
+	assert.Equal(t, "node", (&RunContext{Config: &Config{}, JobContainer: fakeContainer{}}).nodeBinary())
+}
+
 func TestCleanupJobResourcesCleansServicesWithoutJobContainer(t *testing.T) {
 	service := &containerMock{}
 	service.On("Remove").Return(func(context.Context) error { return nil }).Once()

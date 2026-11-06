@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"maps"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -183,6 +184,7 @@ type Container struct {
 	WorkdirParent        string                        `yaml:"workdir_parent"`         // WorkdirParent specifies the parent directory for the container's working directory.
 	ValidVolumes         []string                      `yaml:"valid_volumes"`          // ValidVolumes specifies the volumes (including bind mounts) can be mounted to containers.
 	Volumes              []string                      `yaml:"volumes"`                // Volumes are mounted into every job, service and docker action container.
+	NodeDir              string                        `yaml:"node_dir"`               // NodeDir is a Node install on the Docker daemon's host that Docker jobs run JavaScript actions and hashFiles with, instead of the image's node.
 	DockerHost           string                        `yaml:"docker_host"`            // DockerHost specifies the Docker host. It overrides the value specified in environment variable DOCKER_HOST.
 	ForcePull            bool                          `yaml:"force_pull"`             // Pull docker image(s) even if already present, except digest-pinned ones. A pull that fails while a local copy exists is a warning, not a job failure.
 	ForceRebuild         bool                          `yaml:"force_rebuild"`          // Rebuild docker image(s) even if already present
@@ -329,6 +331,9 @@ func LoadDefault(file string) (*Config, error) {
 		if parsed, err := container.ParseVolume(spec); err != nil || parsed.Source == "" {
 			return nil, fmt.Errorf("container.volumes entry %q is not source:target[:options]", spec)
 		}
+	}
+	if dir := cfg.Container.NodeDir; dir != "" && (!path.IsAbs(dir) || strings.Contains(dir, ":")) {
+		return nil, fmt.Errorf("container.node_dir %q is not an absolute path on the Docker daemon's host", dir)
 	}
 
 	if cfg.Log.Level == "" {

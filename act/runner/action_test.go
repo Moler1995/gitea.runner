@@ -168,6 +168,7 @@ func TestActionRunner(t *testing.T) {
 		state       map[string]string
 		expectedEnv map[string]string
 		warning     string
+		nodeDir     string
 	}{
 		{
 			name:        "with-input",
@@ -196,8 +197,13 @@ func TestActionRunner(t *testing.T) {
 			state:       map[string]string{"name": "state value"},
 			expectedEnv: map[string]string{"STATE_name": "state value"},
 		},
+		{name: "node_dir", nodeDir: "/opt/node"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
+			node := "node"
+			if tt.nodeDir != "" {
+				node = "/__e/node/bin/node"
+			}
 			hook := logtest.NewWithLevel(logging.LevelWarn)
 			ctx := common.WithLogger(t.Context(), logging.New(hook))
 			cm := &containerMock{}
@@ -212,15 +218,15 @@ func TestActionRunner(t *testing.T) {
 				}
 				return true
 			})
-			cm.On("Exec", []string{"node", "--preserve-symlinks-main", containerActionDir + "path"}, envMatcher, "", "").Return(func(_ctx context.Context) error { return nil })
-			cm.On("Exec", nodeActionCommand(containerActionDir+"path/pre.js"), mock.Anything, "", "").Return(func(_ctx context.Context) error { return nil })
-			cm.On("Exec", nodeActionCommand(containerActionDir+"path/post.js"), envMatcher, "", "").Return(func(_ctx context.Context) error { return nil })
+			cm.On("Exec", []string{node, "--preserve-symlinks-main", containerActionDir + "path"}, envMatcher, "", "").Return(func(_ctx context.Context) error { return nil })
+			cm.On("Exec", nodeActionCommand(node, containerActionDir+"path/pre.js"), mock.Anything, "", "").Return(func(_ctx context.Context) error { return nil })
+			cm.On("Exec", nodeActionCommand(node, containerActionDir+"path/post.js"), envMatcher, "", "").Return(func(_ctx context.Context) error { return nil })
 
 			remoteAction := mustNewRemoteAction(t, "org/repo/path@ref")
 			step := &stepActionRemote{
 				Step: &model.Step{ID: "step", Uses: "org/repo/path@ref", With: tt.with},
 				RunContext: &RunContext{
-					Config:           &Config{PresetGitHubContext: &model.GithubContext{}},
+					Config:           &Config{PresetGitHubContext: &model.GithubContext{}, ContainerNodeDir: tt.nodeDir},
 					Run:              &model.Run{JobID: "job", Workflow: &model.Workflow{Jobs: map[string]*model.Job{"job": {}}}},
 					IntraActionState: map[string]map[string]string{"step": tt.state},
 					JobContainer:     cm,
@@ -303,7 +309,7 @@ if (process.argv[1] !== self) {
 	require.NoError(t, os.Symlink(actionDir, symlinkedActionDir))
 	symlinkedEntrypoint := filepath.Join(symlinkedActionDir, "index.mjs")
 
-	args := nodeActionCommand(symlinkedEntrypoint)
+	args := nodeActionCommand("node", symlinkedEntrypoint)
 	output, err := exec.CommandContext(t.Context(), args[0], args[1:]...).CombinedOutput()
 	require.NoError(t, err, "%s", output)
 }

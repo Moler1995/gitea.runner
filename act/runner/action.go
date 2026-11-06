@@ -198,7 +198,7 @@ func runActionImpl(step actionStep, actionDir string, remoteAction *remoteAction
 			if err := maybeCopyToActionDir(ctx, step, actionDir, actionPath, containerActionDir); err != nil {
 				return err
 			}
-			containerArgs := nodeActionCommand(container.JoinPath(containerActionDir, action.Runs.Main))
+			containerArgs := nodeActionCommand(rc.nodeBinary(), container.JoinPath(containerActionDir, action.Runs.Main))
 			logger.Debugf("executing remote job container: %s", containerArgs)
 
 			rc.ApplyExtraPath(ctx, step.getEnv())
@@ -243,8 +243,8 @@ func runActionImpl(step actionStep, actionDir string, remoteAction *remoteAction
 }
 
 // /var/run is a symlink, so without the flag node's import.meta.url differs from argv[1], which ESM actions compare.
-func nodeActionCommand(script string) []string {
-	return []string{"node", "--preserve-symlinks-main", script}
+func nodeActionCommand(node, script string) []string {
+	return []string{node, "--preserve-symlinks-main", script}
 }
 
 // dockerActionImageTag derives the local docker image tag used when an action
@@ -650,7 +650,7 @@ func runPreStep(step actionStep) common.Executor {
 				return err
 			}
 
-			containerArgs := nodeActionCommand(container.JoinPath(containerActionDir, action.Runs.Pre))
+			containerArgs := nodeActionCommand(rc.nodeBinary(), container.JoinPath(containerActionDir, action.Runs.Pre))
 			logger.Debugf("executing remote job container: %s", containerArgs)
 
 			rc.ApplyExtraPath(ctx, step.getEnv())
@@ -750,7 +750,7 @@ func runPostStep(step actionStep) common.Executor {
 
 			populateEnvsFromSavedState(step.getEnv(), step, rc)
 
-			containerArgs := nodeActionCommand(container.JoinPath(containerActionDir, action.Runs.Post))
+			containerArgs := nodeActionCommand(rc.nodeBinary(), container.JoinPath(containerActionDir, action.Runs.Post))
 			logger.Debugf("executing remote job container: %s", containerArgs)
 
 			rc.ApplyExtraPath(ctx, step.getEnv())

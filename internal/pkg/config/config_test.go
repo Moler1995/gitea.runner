@@ -110,6 +110,16 @@ func TestLoadDefault_RejectsContainerVolumesWithoutSource(t *testing.T) {
 	}
 }
 
+func TestLoadDefault_ContainerNodeDir(t *testing.T) {
+	cfg, err := LoadDefault(write(t, "container:\n  node_dir: /opt/node24\n"))
+	require.NoError(t, err)
+	require.Equal(t, "/opt/node24", cfg.Container.NodeDir)
+	for _, dir := range []string{"node24", "/opt/node:/x"} {
+		_, err = LoadDefault(write(t, "container:\n  node_dir: "+dir+"\n"))
+		require.ErrorContains(t, err, "container.node_dir", dir)
+	}
+}
+
 func TestLoadDefault_ExpandsEnvironmentValues(t *testing.T) {
 	t.Setenv("RUNNER_CAPACITY", "4")
 	t.Setenv("RUNNER_LABEL", "linux:host")

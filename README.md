@@ -13,7 +13,7 @@ Gitea Runner runs the jobs of Gitea Actions workflows. Register it with a Gitea 
 In the job image, or on the host for host jobs:
 
 - `bash` or `sh`, or `pwsh` or `powershell` on Windows.
-- `node` for JavaScript actions and `hashFiles()`.
+- `node` for JavaScript actions and `hashFiles()`. On Docker, `container.node_dir` can supply it from the Docker daemon's host instead, see [Node for JavaScript actions](#node-for-javascript-actions).
 - `git` 2.34.1 or newer for [`builtin:checkout`](docs/builtin-actions.md).
 - `git-lfs` for `builtin:checkout` with `lfs: true`.
 - `ssh` for `builtin:checkout` with `ssh-key`.
@@ -244,6 +244,19 @@ volumes:
 ```
 
 Set `container.sweep: true` to remove the containers, networks and volumes most Linux container jobs create when they end, `docker compose` services included. Leave it off if jobs deploy services to the runner's Docker daemon.
+
+### Node for JavaScript actions
+
+Set `container.node_dir` to a Node install on the Docker daemon's host to run JavaScript actions and `hashFiles()` in Docker jobs whose image has no Node, as on GitHub:
+
+```yaml
+container:
+  node_dir: /opt/node24
+```
+
+The directory must hold `bin/node`. It is mounted read-only at `/__e/node` in job containers and replaces the image's `node` for these actions, whatever the job installs. It stays off `PATH`, so `run: node -v` and `actions/setup-node` are unaffected.
+
+The build must match the job images' architecture and libc. A glibc build fails on musl images such as Alpine, and on images with an older glibc than it needs. Host and Kubernetes jobs ignore the setting.
 
 ### Built-in actions (`uses: builtin:<name>`)
 

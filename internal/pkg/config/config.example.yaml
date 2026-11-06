@@ -279,6 +279,12 @@ container:
   # volumes:
   #   - /etc/ssl/certs/ca-certificates.crt:/etc/ssl/certs/ca-certificates.crt:ro
   #volumes: []
+  # A Node install on the Docker daemon's host, holding bin/node, that JavaScript actions and hashFiles
+  # run with in Docker jobs, so job images need no Node. It is mounted read-only at /__e/node, stays off
+  # PATH and overrides the image's node for them. Its build must match the job images' architecture and
+  # libc: a glibc build fails on musl images such as Alpine, and on images with an older glibc than it needs.
+  # Docker only, ignored on the host and on Kubernetes.
+  #node_dir: /opt/node24
   # Overrides the docker client host with the specified one.
   # If it's empty, runner will find an available docker host automatically.
   # If it's "-", runner will find an available docker host automatically, but won't mount it into the job and action containers.
