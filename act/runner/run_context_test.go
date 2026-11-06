@@ -684,29 +684,6 @@ func TestCleanupJobVolumesReapsAbandonedDeferredCleanup(t *testing.T) {
 	assert.ElementsMatch(t, []string{"became-active", "remove-failed", "foreign", "fresh", "unknown-age"}, slices.Collect(maps.Keys(volumes)))
 }
 
-type workspaceCleanupContainer struct {
-	fakeContainer
-	calls   *[]string
-	command []string
-	user    string
-	err     error
-}
-
-func (c *workspaceCleanupContainer) Exec(command []string, _ map[string]string, user, _ string) common.Executor {
-	return func(context.Context) error {
-		*c.calls = append(*c.calls, "exec")
-		c.command, c.user = command, user
-		return c.err
-	}
-}
-
-func (c *workspaceCleanupContainer) Remove() common.Executor {
-	return func(context.Context) error {
-		*c.calls = append(*c.calls, "remove")
-		return nil
-	}
-}
-
 func TestCleanupJobResourcesEmptiesTaskWorkspace(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -714,10 +691,12 @@ func TestCleanupJobResourcesEmptiesTaskWorkspace(t *testing.T) {
 		caller    *caller
 		preclean  bool
 		execErr   error
+		log       string
 		want      []string
 	}{
 		{name: "runs before removal", workspace: "/workspace/1", want: []string{"exec", "remove"}},
-		{name: "failure does not fail the job", workspace: "/workspace/1", execErr: errors.New("no rm"), want: []string{"exec", "remove"}},
+		{name: "refusal is logged", workspace: "/workspace/1", execErr: container.ExitCodeError(3), log: "not emptying workspace /workspace/1", want: []string{"exec", "remove"}},
+		{name: "failure does not fail the job", workspace: "/workspace/1", execErr: errors.New("no rm"), log: "could not empty workspace /workspace/1", want: []string{"exec", "remove"}},
 		{name: "no runner bind", want: []string{"remove"}},
 		{name: "called workflow shares it", workspace: "/workspace/1", caller: &caller{}, want: []string{"remove"}},
 		{name: "preclean", workspace: "/workspace/1", preclean: true, want: []string{"remove"}},
@@ -725,7 +704,22 @@ func TestCleanupJobResourcesEmptiesTaskWorkspace(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var calls []string
-			job := &workspaceCleanupContainer{calls: &calls, err: tt.execErr}
+			job := &containerMock{}
+			if len(tt.want) == 2 {
+				isScript := mock.MatchedBy(func(command []string) bool { return command[4] == tt.workspace })
+				job.On("Exec", isScript, mock.Anything, "0", "/").Return(func(ctx context.Context) error {
+					calls = append(calls, "exec")
+					deadline, ok := ctx.Deadline()
+					assert.True(t, ok)
+					assert.LessOrEqual(t, time.Until(deadline), 10*time.Second, "half of what remains")
+					common.Logger(ctx).Infof("script must not reach the job log")
+					return tt.execErr
+				})
+			}
+			job.On("Remove").Return(func(context.Context) error {
+				calls = append(calls, "remove")
+				return nil
+			})
 			rc := &RunContext{
 				Config:             &Config{},
 				Run:                &model.Run{Workflow: &model.Workflow{Name: "workflow"}, JobID: "job"},
@@ -734,11 +728,18 @@ func TestCleanupJobResourcesEmptiesTaskWorkspace(t *testing.T) {
 				caller:             tt.caller,
 				deferVolumeCleanup: func(common.Executor) {},
 			}
-			require.NoError(t, rc.cleanupJobResources("", false, tt.preclean)(common.WithDryrun(t.Context(), tt.preclean)))
+			var log bytes.Buffer
+			ctx, cancel := context.WithTimeout(common.WithDryrun(t.Context(), tt.preclean), 20*time.Second)
+			defer cancel()
+			ctx = common.WithLogger(ctx, logging.New(logging.NewLevelHandler(newJobLogHandler(&log, cyan), logging.LevelInfo)))
+			require.NoError(t, rc.cleanupJobResources("", false, tt.preclean)(ctx))
 			assert.Equal(t, tt.want, calls)
-			if len(tt.want) == 2 {
-				assert.Equal(t, "0", job.user)
-				assert.Equal(t, tt.workspace, job.command[4])
+			job.AssertExpectations(t)
+			assert.NotContains(t, log.String(), "must not reach")
+			if tt.log == "" {
+				assert.NotContains(t, log.String(), "workspace")
+			} else {
+				assert.Contains(t, log.String(), tt.log)
 			}
 		})
 	}
@@ -772,20 +773,32 @@ func TestRemoveTaskWorkspaceScript(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, entries)
 
-	refused := func(name, workspace string, err error) {
-		t.Helper()
-		require.Error(t, err, name)
-		assert.FileExists(t, filepath.Join(workspace, "owner/repo/file"), name)
+	for _, tt := range []struct {
+		name, dir string
+		run       func(t *testing.T, workspace string) error
+	}{
+		{"a mount below the workspace", "workspace", func(t *testing.T, workspace string) error {
+			return run(t, workspace, fmt.Sprintf(mount, workspace+"/owner/repo/cache"))
+		}},
+		{"no readable mountinfo", "workspace", func(_ *testing.T, workspace string) error {
+			return exec.Command(sh, "-c", removeTaskWorkspaceScript, "sh", workspace, filepath.Join(workspace, "missing")).Run()
+		}},
+		{"a path mountinfo escapes", "with space", func(t *testing.T, workspace string) error {
+			return run(t, workspace, "")
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			workspace := newWorkspace(t, tt.dir)
+			require.Error(t, tt.run(t, workspace))
+			assert.FileExists(t, filepath.Join(workspace, "owner/repo/file"))
+		})
 	}
-	workspace = newWorkspace(t, "workspace")
-	refused("a mount below the workspace", workspace, run(t, workspace, fmt.Sprintf(mount, workspace+"/owner/repo/cache")))
-	workspace = newWorkspace(t, "workspace")
-	refused("no readable mountinfo", workspace, exec.Command(sh, "-c", removeTaskWorkspaceScript, "sh", workspace, filepath.Join(workspace, "missing")).Run())
-	workspace = newWorkspace(t, "with space")
-	refused("a path mountinfo escapes", workspace, run(t, workspace, ""))
 }
 
-func TestGetBindsAndMountsRecordsTaskWorkspace(t *testing.T) {
+func TestBindsAndMountsReturnsTaskWorkspace(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("container paths are linux paths")
+	}
 	newRunContext := func(volumes []string) *RunContext {
 		return &RunContext{
 			Config: &Config{
@@ -800,19 +813,17 @@ func TestGetBindsAndMountsRecordsTaskWorkspace(t *testing.T) {
 		}
 	}
 
-	rc := newRunContext(nil)
-	binds, _ := rc.GetBindsAndMounts(t.Context())
+	binds, _, workspace := newRunContext(nil).bindsAndMounts(t.Context())
 	assert.Contains(t, strings.Join(binds, "\n"), "/workspace/1:/workspace/1")
-	assert.Equal(t, "/workspace/1", rc.taskWorkspace)
+	assert.Equal(t, "/workspace/1", workspace)
 
-	rc = newRunContext([]string{"/data:/workspace/1"})
-	rc.GetBindsAndMounts(t.Context())
-	assert.Empty(t, rc.taskWorkspace, "the workflow's mount holds the workspace root")
+	_, _, workspace = newRunContext([]string{"/data:/workspace/1"}).bindsAndMounts(t.Context())
+	assert.Empty(t, workspace, "the workflow's mount holds the workspace root")
 
-	rc = newRunContext(nil)
+	rc := newRunContext(nil)
 	rc.Config.PresetGitHubContext = nil
-	rc.GetBindsAndMounts(t.Context())
-	assert.Empty(t, rc.taskWorkspace, "outside the daemon the workdir is the user's checkout")
+	_, _, workspace = rc.bindsAndMounts(t.Context())
+	assert.Empty(t, workspace, "outside the daemon the workdir is the user's checkout")
 }
 
 func TestRemoveDockerActionImagesByTag(t *testing.T) {

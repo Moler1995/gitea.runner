@@ -37,7 +37,7 @@ import (
 
 const (
 	jobCleanupTimeout       = time.Minute
-	workspaceCleanupTimeout = 30 * time.Second // of jobCleanupTimeout, leaving the rest to remove the containers
+	workspaceCleanupTimeout = 30 * time.Second // at most, removeTaskWorkspace leaves half of what remains to remove the containers
 	maxJobSummaryBytes      = 1024 * 1024
 )
 
