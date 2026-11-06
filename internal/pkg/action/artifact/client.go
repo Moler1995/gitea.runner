@@ -1,7 +1,7 @@
 // Copyright 2026 The Gitea Authors. All rights reserved.
 // SPDX-License-Identifier: MIT
 
-// Package artifact talks to the v4 results service of the job's run and, for other runs, to Gitea's API.
+// Package artifact talks to the v4 results service of the job's run.
 package artifact
 
 import (
@@ -25,10 +25,9 @@ type Artifact struct {
 	ID     int64  `json:"databaseId,string"`
 	Name   string `json:"name"`
 	Size   int64  `json:"size,string"`
-	Digest string `json:"digest"` // empty when the service reports none, Gitea never does
+	Digest string `json:"digest"`
 }
 
-// Retry is how requests retry, the toolkit's schedule by default.
 type Retry struct {
 	Attempts   int
 	Base       time.Duration
@@ -65,7 +64,7 @@ func New(base, token string, transport http.RoundTripper) (*Client, error) {
 	}
 	return &Client{
 		base: parsed, token: token, ids: ids,
-		api:   &http.Client{Transport: transport},
+		api:   &http.Client{Transport: transport, Timeout: 3 * time.Minute},
 		blob:  &http.Client{Transport: blobTransport{instance: parsed.Host, transport: transport}},
 		Retry: DefaultRetry,
 		Logf:  func(string, ...any) {},
@@ -125,15 +124,6 @@ func IsNotFound(err error) bool {
 	return errors.As(err, &status) && status.Status == http.StatusNotFound
 }
 
-func retryable(status int) bool {
-	switch status {
-	case http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
-		return true
-	}
-	return false
-}
-
-// do retries send until it succeeds or fails for good, the caller closing the response.
 func (r Retry) do(ctx context.Context, logf func(string, ...any), what string, send func() (*http.Response, error)) (*http.Response, error) {
 	var waited time.Duration
 	for attempt := 0; ; attempt++ {
@@ -146,10 +136,12 @@ func (r Retry) do(ctx context.Context, logf func(string, ...any), what string, s
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 			resp.Body.Close()
 			err = &StatusError{Status: resp.StatusCode, Msg: twirpMessage(body)}
-			if !retryable(resp.StatusCode) {
+			switch resp.StatusCode {
+			case http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+			default:
 				return nil, err
 			}
-			if seconds, parseErr := strconv.Atoi(resp.Header.Get("Retry-After")); parseErr == nil && resp.StatusCode == http.StatusTooManyRequests {
+			if seconds, parseErr := strconv.Atoi(resp.Header.Get("Retry-After")); parseErr == nil && seconds > 0 && resp.StatusCode == http.StatusTooManyRequests {
 				wait = time.Duration(seconds) * time.Second
 			}
 		}
@@ -212,12 +204,11 @@ type ( // the ArtifactService messages in the protobuf JSON mapping, requests wi
 		NameFilter string `json:"name_filter,omitempty"`
 	}
 	idResponse struct {
-		Ok         bool  `json:"ok"`
 		ArtifactID int64 `json:"artifactId,string"`
 	}
 )
 
-func call[Req, Resp any](ctx context.Context, c *Client, method string, req Req) (Resp, error) {
+func call[Resp any](ctx context.Context, c *Client, method string, req any) (Resp, error) {
 	var resp Resp
 	body, err := json.Marshal(req)
 	if err != nil {
@@ -237,62 +228,37 @@ func call[Req, Resp any](ctx context.Context, c *Client, method string, req Req)
 		return resp, fmt.Errorf("failed to %s: %w", method, err)
 	}
 	defer httpResp.Body.Close()
-	if err := json.UnmarshalRead(httpResp.Body, &resp); err != nil {
-		return resp, fmt.Errorf("failed to %s: %w", method, err)
-	}
-	return resp, nil
+	err = json.UnmarshalRead(httpResp.Body, &resp)
+	return resp, err
 }
 
-func (c *Client) named(name string) namedRequest {
-	return namedRequest{c.ids, name}
-}
-
-// Create starts an upload and returns where the content goes.
 func (c *Client) Create(ctx context.Context, name, mimeType string, expiresAt *time.Time) (string, error) {
-	resp, err := call[createRequest, struct {
-		Ok              bool   `json:"ok"`
+	resp, err := call[struct {
 		SignedUploadURL string `json:"signedUploadUrl"`
-	}](ctx, c, "CreateArtifact", createRequest{c.named(name), expiresAt, 7, mimeType})
-	if err == nil && !resp.Ok {
-		err = errors.New("CreateArtifact: response from backend was not ok")
-	}
+	}](ctx, c, "CreateArtifact", createRequest{namedRequest{c.ids, name}, expiresAt, 7, mimeType})
 	return resp.SignedUploadURL, err
 }
 
 func (c *Client) Finalize(ctx context.Context, name string, size int64, digest string) (int64, error) {
-	resp, err := call[finalizeRequest, idResponse](ctx, c, "FinalizeArtifact", finalizeRequest{c.named(name), size, digest})
-	if err == nil && !resp.Ok {
-		err = errors.New("FinalizeArtifact: response from backend was not ok")
-	}
+	resp, err := call[idResponse](ctx, c, "FinalizeArtifact", finalizeRequest{namedRequest{c.ids, name}, size, digest})
 	return resp.ArtifactID, err
 }
 
-// List returns the run's artifacts, those named name when given.
 func (c *Client) List(ctx context.Context, name string) ([]Artifact, error) {
-	resp, err := call[listRequest, struct {
+	resp, err := call[struct {
 		Artifacts []Artifact `json:"artifacts"`
 	}](ctx, c, "ListArtifacts", listRequest{c.ids, name})
 	return resp.Artifacts, err
 }
 
 func (c *Client) SignedURL(ctx context.Context, name string) (string, error) {
-	resp, err := call[namedRequest, struct {
+	resp, err := call[struct {
 		SignedURL string `json:"signedUrl"`
-	}](ctx, c, "GetSignedArtifactURL", c.named(name))
+	}](ctx, c, "GetSignedArtifactURL", namedRequest{c.ids, name})
 	return resp.SignedURL, err
 }
 
 func (c *Client) Delete(ctx context.Context, name string) (int64, error) {
-	resp, err := call[namedRequest, idResponse](ctx, c, "DeleteArtifact", c.named(name))
+	resp, err := call[idResponse](ctx, c, "DeleteArtifact", namedRequest{c.ids, name})
 	return resp.ArtifactID, err
-}
-
-// ScrubQuery drops the signature from a URL before it is logged.
-func ScrubQuery(rawURL string) string {
-	parsed, err := url.Parse(rawURL)
-	if err != nil {
-		return "<unparsable URL>"
-	}
-	parsed.RawQuery = ""
-	return parsed.String()
 }

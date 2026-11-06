@@ -146,6 +146,47 @@ func (cr *containerReference) CopyDir(destPath, srcPath string, useGitIgnore, sk
 	).IfNot(common.Dryrun)
 }
 
+func (cr *containerReference) ExecOutput(ctx context.Context, command []string) (io.ReadCloser, error) {
+	if common.Dryrun(ctx) {
+		return nil, errors.New("DRYRUN is not supported in ExecOutput")
+	}
+	if err := cr.connect()(ctx); err != nil {
+		return nil, err
+	}
+	if err := cr.find()(ctx); err != nil {
+		return nil, err
+	}
+	if cr.id == "" {
+		return nil, cr.missingContainerError("exec %v", command)
+	}
+	return streamOutput(ctx, func(ctx context.Context, stdout, stderr io.Writer) error {
+		created, err := cr.cli.ExecCreate(ctx, cr.id, client.ExecCreateOptions{
+			Cmd: command, AttachStdout: true, AttachStderr: true,
+		})
+		if err != nil {
+			return err
+		}
+		attached, err := cr.cli.ExecAttach(ctx, created.ID, client.ExecAttachOptions{})
+		if err != nil {
+			return err
+		}
+		defer attached.Close()
+		stop := context.AfterFunc(ctx, func() { attached.Close() })
+		defer stop()
+		if _, err := stdcopy.StdCopy(stdout, stderr, attached.Reader); err != nil {
+			return err
+		}
+		inspected, err := cr.cli.ExecInspect(ctx, created.ID, client.ExecInspectOptions{})
+		if err != nil {
+			return err
+		}
+		if inspected.ExitCode != 0 {
+			return ExitCodeError(inspected.ExitCode)
+		}
+		return nil
+	}), nil
+}
+
 func (cr *containerReference) GetContainerArchive(ctx context.Context, srcPath string) (io.ReadCloser, error) {
 	if common.Dryrun(ctx) {
 		return nil, errors.New("DRYRUN is not supported in GetContainerArchive")
@@ -938,10 +979,7 @@ func (cr *containerReference) copyDir(dstPath, srcPath string, useGitIgnore, ski
 				logger.Error(err)
 			}
 		}()
-		extractionRoot := "/"
-		if actPath := cr.GetActPath(); strings.HasPrefix(dstPath+"/", actPath+"/") {
-			extractionRoot = actPath // keeps tar entries from crossing the image's /var/run symlink
-		}
+		extractionRoot := cr.extractionRoot(dstPath)
 		if err := writeDirTar(ctx, tarFile, path.Join("/", strings.TrimPrefix(dstPath, extractionRoot)), srcPath, useGitIgnore, skipGitDir, cr.UID, cr.GID, cr.markExecutable(ctx)); err != nil {
 			return err
 		}
@@ -952,6 +990,13 @@ func (cr *containerReference) copyDir(dstPath, srcPath string, useGitIgnore, ski
 		}
 		return cr.upload(ctx, extractionRoot, tarFile)
 	}
+}
+
+func (cr *containerReference) extractionRoot(dstPath string) string {
+	if actPath := cr.GetActPath(); strings.HasPrefix(dstPath+"/", actPath+"/") {
+		return actPath // keeps tar entries from crossing the image's /var/run symlink
+	}
+	return "/"
 }
 
 func (cr *containerReference) CopyTarStream(ctx context.Context, destPath string, write func(*TarWriter) error) error {
@@ -968,27 +1013,21 @@ func (cr *containerReference) CopyTarStream(ctx context.Context, destPath string
 		return cr.missingContainerError("copy to %s", destPath)
 	}
 	destPath = path.Clean(destPath)
-	root := destPath // the deepest existing directory, as the daemon refuses a read-only rootfs even for a volume below it
-	for ; root != "/" && root != "."; root = path.Dir(root) {
-		if _, err := cr.cli.ContainerStatPath(ctx, cr.id, client.ContainerStatPathOptions{Path: root}); err == nil {
+	root := cr.extractionRoot(destPath)
+	rel := func(fullPath string) string { return strings.TrimPrefix(strings.TrimPrefix(fullPath, root), "/") }
+	var parents []string // sent as entries so they belong to the job user, the daemon creates missing ones as root
+	for dir := destPath; dir != root && dir != "/" && dir != "."; dir = path.Dir(dir) {
+		if _, err := cr.cli.ContainerStatPath(ctx, cr.id, client.ContainerStatPathOptions{Path: dir}); err == nil {
 			break
 		} else if !cerrdefs.IsNotFound(err) {
-			return fmt.Errorf("stat %s: %w", root, err)
+			return fmt.Errorf("stat %s: %w", dir, err)
 		}
+		parents = append(parents, rel(dir))
 	}
-	reader, writer := io.Pipe()
-	written := make(chan error, 1)
-	go func() {
-		err := writeTarStream(writer, cr.UID, cr.GID, strings.TrimPrefix(strings.TrimPrefix(destPath, root), "/"), write)
-		writer.CloseWithError(err)
-		written <- err
-	}()
-	err := cr.upload(ctx, root, reader)
-	reader.Close()
-	if writeErr := <-written; writeErr != nil && !errors.Is(writeErr, io.ErrClosedPipe) {
-		return writeErr // the client reports it as a failure to connect
-	}
-	return err
+	slices.Reverse(parents)
+	content := pipeTar(cr.UID, cr.GID, rel(destPath), parents, write)
+	defer content.Close()
+	return cr.upload(ctx, root, content)
 }
 
 func (cr *containerReference) copyContent(dstPath string, files ...*FileEntry) common.Executor {
