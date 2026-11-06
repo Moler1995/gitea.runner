@@ -165,6 +165,7 @@ type Container interface {
 	CopyDir(destPath, srcPath string, useGitIgnore, skipGitDir bool) common.Executor
 	ExecOutput(ctx context.Context, command []string) (io.ReadCloser, error)
 	GetContainerArchive(ctx context.Context, srcPath string) (io.ReadCloser, error)
+	CopyTarStream(ctx context.Context, destPath string, write func(*TarWriter) error) error
 	Inspect(ctx context.Context) (*Info, error)
 	DumpLogs(ctx context.Context) error
 	Pull(forcePull bool) common.Executor
