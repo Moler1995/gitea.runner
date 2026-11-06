@@ -48,12 +48,14 @@ Works like `actions/upload-artifact` v7 with these inputs. Any other input logs 
 | `name` | `artifact`, ignored with `archive: false`, which names the artifact after the file |
 | `path` | required, files, directories or patterns, one per line, `!` excludes |
 | `if-no-files-found` | `warn`, also `error` or `ignore` |
-| `retention-days` | the server's default, at most `GITHUB_RETENTION_DAYS` when set |
+| `retention-days` | the server's default, at most the repository's retention limit |
 | `compression-level` | `6`, from `0` for none to `9` |
 | `overwrite` | `false`, `true` deletes an artifact of the same name first |
 | `include-hidden-files` | `false`, `true` uploads files and directories whose name starts with `.` |
 | `archive` | `true`, `false` uploads a single file as is |
 
-Patterns, symlinks and the artifact's root directory follow `actions/upload-artifact`, as do `ACTIONS_ARTIFACT_UPLOAD_CONCURRENCY` and `ACTIONS_ARTIFACT_UPLOAD_TIMEOUT_MS`. The step outputs `artifact-id`, `artifact-digest` and `artifact-url`. On Gitea 1.26 and later, the `artifact-url` is the artifact's link on the run page for this attempt, where `actions/upload-artifact` gives a link only GitHub serves.
+Patterns, symlinks and the artifact's root directory follow `actions/upload-artifact`. `ACTIONS_ARTIFACT_UPLOAD_CONCURRENCY` sets upload concurrency (default `5`), and `ACTIONS_ARTIFACT_UPLOAD_TIMEOUT_MS` sets the upload stall timeout (default `300000`). The step outputs `artifact-id`, `artifact-digest` and `artifact-url`. On Gitea 1.26 and later, the `artifact-url` is the artifact's link on the run page for this attempt, where `actions/upload-artifact` gives a link only GitHub serves.
+
+Container jobs list the search paths in the job container and transfer only the selected files, gzipped when the image has gzip, requiring `sh`, `find` and `tar` in the image. On Kubernetes these files still pass through the API server, unlike `actions/upload-artifact`, which uploads from the pod.
 
 With `gitea-runner exec`, it uses the local artifact server of `--artifact-server-path`.

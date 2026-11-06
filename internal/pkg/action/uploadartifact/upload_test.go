@@ -4,20 +4,18 @@
 package uploadartifact
 
 import (
-	"archive/tar"
 	"archive/zip"
 	"bytes"
 	"context"
 	"fmt"
 	"io"
-	"io/fs"
 	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
-	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -32,60 +30,16 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-type dockerArchives struct {
+type localContainer struct {
 	*container.HostEnvironment
+	bin string
 }
 
-func (d dockerArchives) GetContainerArchive(_ context.Context, srcPath string) (io.ReadCloser, error) {
-	if _, err := os.Lstat(srcPath); err != nil {
-		return nil, err
+func (c localContainer) ExecOutput(ctx context.Context, command []string) (io.ReadCloser, error) {
+	if c.bin != "" {
+		command = append([]string{"env", "PATH=" + c.bin}, command...)
 	}
-	var buf bytes.Buffer
-	tw := tar.NewWriter(&buf)
-	type file struct {
-		info fs.FileInfo
-		name string
-	}
-	var files []file
-	err := filepath.WalkDir(srcPath, func(p string, entry fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		info, err := entry.Info()
-		if err != nil {
-			return err
-		}
-		link := ""
-		if info.Mode()&fs.ModeSymlink != 0 {
-			if link, err = os.Readlink(p); err != nil {
-				return err
-			}
-		}
-		hdr, err := tar.FileInfoHeader(info, link)
-		if err != nil {
-			return err
-		}
-		rel, _ := filepath.Rel(srcPath, p)
-		hdr.Name = filepath.ToSlash(filepath.Join(filepath.Base(srcPath), rel))
-		if i := slices.IndexFunc(files, func(f file) bool { return os.SameFile(f.info, info) }); i >= 0 {
-			hdr.Typeflag, hdr.Linkname, hdr.Size = tar.TypeLink, files[i].name, 0
-		} else if info.Mode().IsRegular() {
-			files = append(files, file{info, hdr.Name})
-		}
-		if err := tw.WriteHeader(hdr); err != nil || hdr.Typeflag != tar.TypeReg {
-			return err
-		}
-		content, err := os.ReadFile(p)
-		if err != nil {
-			return err
-		}
-		_, err = tw.Write(content)
-		return err
-	})
-	if err != nil {
-		return nil, err
-	}
-	return io.NopCloser(&buf), tw.Close()
+	return c.HostEnvironment.ExecOutput(ctx, command)
 }
 
 type harness struct {
@@ -96,6 +50,7 @@ type harness struct {
 	env              container.ExecutionsEnvironment
 	logs, annotation []string
 	retentionDays    string
+	variables        map[string]string
 	output           string
 }
 
@@ -122,12 +77,14 @@ func (h *harness) write(rel, content string, mode os.FileMode) {
 func (h *harness) run(inputs map[string]string) error {
 	h.logs, h.annotation = nil, nil
 	h.output = filepath.Join(h.t.TempDir(), "output")
+	variables := map[string]string{"GITHUB_OUTPUT": h.output}
+	maps.Copy(variables, h.variables)
 	return Main(h.t.Context(), &action.Context{
 		Container:    h.env,
 		Github:       &model.GithubContext{ServerURL: "https://gitea.example", Repository: "owner/repo", RunID: "7", RunAttempt: "2", RetentionDays: h.retentionDays},
 		Inputs:       inputs,
 		Workspace:    h.workspace,
-		Env:          map[string]string{"GITHUB_OUTPUT": h.output},
+		Env:          variables,
 		ResultsURL:   h.server,
 		RuntimeToken: artifacts.LocalRuntimeToken("7", time.Hour),
 		Infof:        func(format string, args ...any) { h.logs = append(h.logs, fmt.Sprintf(format, args...)) },
@@ -156,6 +113,7 @@ func (h *harness) fetch(name string) ([]byte, map[string]string) {
 		require.NoError(h.t, err)
 		data, err := io.ReadAll(body)
 		require.NoError(h.t, err)
+		require.NoError(h.t, body.Close())
 		entries[f.Name] = string(data)
 	}
 	return content, entries
@@ -164,7 +122,14 @@ func (h *harness) fetch(name string) ([]byte, map[string]string) {
 func TestUploadSelectsWhatTheToolkitSelects(t *testing.T) {
 	envs := map[string]container.ExecutionsEnvironment{"host": &container.HostEnvironment{}}
 	if runtime.GOOS != "windows" {
-		envs["container"] = dockerArchives{&container.HostEnvironment{}}
+		envs["container gzip"] = localContainer{HostEnvironment: &container.HostEnvironment{}}
+		bin := t.TempDir()
+		for _, name := range []string{"sh", "find", "readlink", "tar"} {
+			binary, err := exec.LookPath(name)
+			require.NoError(t, err)
+			require.NoError(t, os.Symlink(binary, filepath.Join(bin, name)))
+		}
+		envs["container plain"] = localContainer{HostEnvironment: &container.HostEnvironment{}, bin: bin}
 	}
 	for envName, env := range envs {
 		t.Run(envName, func(t *testing.T) {
@@ -172,12 +137,16 @@ func TestUploadSelectsWhatTheToolkitSelects(t *testing.T) {
 			h.write("dist/a.txt", "a", 0o644)
 			h.write("dist/run.sh", "#!/bin/sh\n", 0o755)
 			h.write("dist/sub/b.txt", "b", 0o644)
+			h.write("dist/empty", "", 0o644)
+			require.NoError(t, os.Mkdir(filepath.Join(h.workspace, "dist", "emptydir"), 0o755))
 			h.write("dist/.hidden", "h", 0o644)
 			h.write("dist/.git/config", "c", 0o644)
 			h.write("logs/x.log", "x", 0o644)
+			h.write(".store/target.txt", "hidden target", 0o644)
 			if runtime.GOOS != "windows" {
 				require.NoError(t, os.Symlink("a.txt", filepath.Join(h.workspace, "dist", "link.txt")))
 				require.NoError(t, os.Symlink("sub", filepath.Join(h.workspace, "dist", "linkdir")))
+				require.NoError(t, os.Symlink("../.store", filepath.Join(h.workspace, "dist", "alias")))
 				require.NoError(t, os.Symlink("missing", filepath.Join(h.workspace, "dist", "broken")))
 				require.NoError(t, os.Symlink("..", filepath.Join(h.workspace, "dist", "loop")))
 				require.NoError(t, os.Link(filepath.Join(h.workspace, "dist", "a.txt"), filepath.Join(h.workspace, "dist", "hard.txt")))
@@ -192,20 +161,30 @@ func TestUploadSelectsWhatTheToolkitSelects(t *testing.T) {
 				{
 					name:     "a directory",
 					inputs:   map[string]string{"path": "dist"},
-					expected: map[string]string{"a.txt": "a", "run.sh": "#!/bin/sh\n", "sub/b.txt": "b"},
-					links:    map[string]string{"link.txt": "a", "hard.txt": "a", "linkdir/b.txt": "b", "loop/logs/x.log": "x"},
+					expected: map[string]string{"a.txt": "a", "run.sh": "#!/bin/sh\n", "sub/b.txt": "b", "empty": ""},
+					links:    map[string]string{"link.txt": "a", "hard.txt": "a", "linkdir/b.txt": "b", "loop/logs/x.log": "x", "alias/target.txt": "hidden target"},
 				},
 				{
 					name:     "hidden files included",
 					inputs:   map[string]string{"path": "dist/", "include-hidden-files": "true"},
-					expected: map[string]string{"a.txt": "a", "run.sh": "#!/bin/sh\n", "sub/b.txt": "b", ".hidden": "h", ".git/config": "c"},
-					links:    map[string]string{"link.txt": "a", "hard.txt": "a", "linkdir/b.txt": "b", "loop/logs/x.log": "x"},
+					expected: map[string]string{"a.txt": "a", "run.sh": "#!/bin/sh\n", "sub/b.txt": "b", ".hidden": "h", ".git/config": "c", "empty": ""},
+					links:    map[string]string{"link.txt": "a", "hard.txt": "a", "linkdir/b.txt": "b", "loop/logs/x.log": "x", "loop/.store/target.txt": "hidden target", "alias/target.txt": "hidden target"},
+				},
+				{
+					name:     "only exclusions and comments",
+					inputs:   map[string]string{"path": "!dist\n# dist"},
+					expected: map[string]string{},
 				},
 				{
 					name:     "several patterns share their common ancestor as root",
 					inputs:   map[string]string{"path": "dist/**/*.txt\n!dist/sub/**\n# a comment\nlogs/x.log"},
 					expected: map[string]string{"dist/a.txt": "a", "logs/x.log": "x"},
-					links:    map[string]string{"dist/link.txt": "a", "dist/hard.txt": "a", "dist/linkdir/b.txt": "b"},
+					links:    map[string]string{"dist/link.txt": "a", "dist/hard.txt": "a", "dist/linkdir/b.txt": "b", "dist/alias/target.txt": "hidden target"},
+				},
+				{
+					name:     "hidden root skipped",
+					inputs:   map[string]string{"path": ".store"},
+					expected: map[string]string{},
 				},
 				{
 					name:     "a single file keeps no directory",
@@ -221,6 +200,10 @@ func TestUploadSelectsWhatTheToolkitSelects(t *testing.T) {
 					if runtime.GOOS != "windows" {
 						maps.Copy(expected, test.links)
 					}
+					if len(expected) == 0 {
+						assert.Contains(t, h.annotation, "warning: No files were found with the provided path: "+test.inputs["path"]+". No artifacts will be uploaded.")
+						return
+					}
 					_, entries := h.fetch("art")
 					assert.Equal(t, expected, entries)
 				})
@@ -229,14 +212,14 @@ func TestUploadSelectsWhatTheToolkitSelects(t *testing.T) {
 	}
 }
 
-func TestUploadZipAndOutputs(t *testing.T) {
+func TestUploadOptions(t *testing.T) {
 	h := newHarness(t, &container.HostEnvironment{})
 	h.write("out/run.sh", "#!/bin/sh\n", 0o755)
 	h.write("out/data.txt", strings.Repeat("data", 1000), 0o644)
-	h.retentionDays = "3"
-	require.NoError(t, h.run(map[string]string{"name": "packed", "path": "out", "compression-level": "0", "retention-days": "10"}))
-	assert.Equal(t, []string{"warning: Retention days cannot be greater than the maximum allowed retention set within the repository. Using 3 instead."}, h.annotation)
-	assert.Contains(t, h.logs, "With the provided path, there will be 2 files uploaded")
+	h.variables = map[string]string{"ACTIONS_ARTIFACT_UPLOAD_CONCURRENCY": " 2 workers", "ACTIONS_ARTIFACT_UPLOAD_TIMEOUT_MS": " 60000ms"}
+	h.retentionDays = "5"
+	require.NoError(t, h.run(map[string]string{"name": "packed", "path": "out", "compression-level": "0", "retention-days": "10 days"}))
+	assert.Equal(t, []string{"warning: Retention days cannot be greater than the maximum allowed retention set within the repository. Using 5 instead."}, h.annotation)
 
 	content, _ := h.fetch("packed")
 	reader, err := zip.NewReader(bytes.NewReader(content), int64(len(content)))
@@ -255,30 +238,18 @@ func TestUploadZipAndOutputs(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, fmt.Sprintf("artifact-id=%d\nartifact-digest=%s\nartifact-url=https://gitea.example/owner/repo/actions/runs/7/artifacts/packed?attempt=2\n", list[0].ID, strings.TrimPrefix(list[0].Digest, "sha256:")), string(outputs))
 
-	require.NoError(t, h.run(map[string]string{"name": "packed", "path": "out/data.txt", "overwrite": "true"}))
-	list, err = h.client.List(t.Context(), "")
-	require.NoError(t, err)
-	require.Len(t, list, 1)
-}
-
-func TestUploadWithoutArchiving(t *testing.T) {
-	h := newHarness(t, &container.HostEnvironment{})
 	h.write("report.html", "<html></html>", 0o644)
-	h.write("two/a.txt", "a", 0o644)
-	h.write("two/b.txt", "b", 0o644)
 
-	require.NoError(t, h.run(map[string]string{"name": "ignored", "path": "report.html", "archive": "false"}))
+	require.NoError(t, h.run(map[string]string{"name": "packed", "path": "report.html", "archive": "false", "overwrite": "true"}))
+	list, err = h.client.List(t.Context(), "packed")
+	require.NoError(t, err)
+	assert.Empty(t, list)
 	content, entries := h.fetch("report.html")
 	assert.Nil(t, entries)
 	assert.Equal(t, "<html></html>", string(content))
 	assert.Contains(t, h.logs, "Uploading artifact: report.html")
-
-	require.ErrorContains(t, h.run(map[string]string{"path": "two", "archive": "false"}), "When 'archive' is set to false, only a single file can be uploaded. Found 2 files to upload.")
-}
-
-func TestUploadFailures(t *testing.T) {
-	h := newHarness(t, &container.HostEnvironment{})
-	h.write("ok.txt", "x", 0o644)
+	assert.Contains(t, strings.Join(h.logs, "\n"), "Artifact packed has been successfully uploaded!")
+	require.ErrorContains(t, h.run(map[string]string{"path": "out", "archive": "false"}), "When 'archive' is set to false, only a single file can be uploaded. Found 2 files to upload.")
 
 	require.NoError(t, h.run(map[string]string{"path": "nothing/here"}))
 	assert.Equal(t, []string{"warning: No files were found with the provided path: nothing/here. No artifacts will be uploaded."}, h.annotation)
@@ -286,16 +257,24 @@ func TestUploadFailures(t *testing.T) {
 	assert.Contains(t, h.logs, "No files were found with the provided path: nothing. No artifacts will be uploaded.")
 	require.ErrorContains(t, h.run(map[string]string{"path": "nothing", "if-no-files-found": "error"}), "No files were found")
 
-	require.ErrorContains(t, h.run(map[string]string{"name": "a/b", "path": "ok.txt"}), "The artifact name is not valid: a/b. Contains the following character:  Forward slash /")
-	require.ErrorContains(t, h.run(map[string]string{}), "Input required and not supplied: path")
-	require.ErrorContains(t, h.run(map[string]string{"name": "", "path": "ok.txt"}), "Provided artifact name input during validation is empty")
-	require.ErrorContains(t, h.run(map[string]string{"path": "ok.txt", "overwrite": ""}), "Core Schema")
-	require.NoError(t, h.run(map[string]string{"path": "ok.txt", "retention": "1", "overwrite": "true"}))
+	for _, test := range []struct {
+		inputs map[string]string
+		want   string
+	}{
+		{map[string]string{"name": "a/b", "path": "out/data.txt"}, "The artifact name is not valid: a/b"},
+		{map[string]string{}, "Input required and not supplied: path"},
+		{map[string]string{"name": "", "path": "out/data.txt"}, "Provided artifact name input during validation is empty"},
+		{map[string]string{"path": "out/data.txt", "overwrite": ""}, "Core Schema"},
+		{map[string]string{"path": "out/data.txt", "compression-level": "10"}, "Invalid compression-level. Valid values are 0-9"},
+		{map[string]string{"path": "out/data.txt", "compression-level": "+-1"}, "Invalid compression-level"},
+		{map[string]string{"path": "out/data.txt", "if-no-files-found": "fail"}, "Unrecognized if-no-files-found input"},
+	} {
+		require.ErrorContains(t, h.run(test.inputs), test.want)
+	}
+	require.NoError(t, h.run(map[string]string{"path": "out/data.txt", "retention": "1", "overwrite": "true"}))
 	assert.Equal(t, []string{"warning: Unexpected input(s) 'retention', valid inputs are ['name', 'path', 'if-no-files-found', 'retention-days', 'compression-level', 'overwrite', 'include-hidden-files', 'archive']"}, h.annotation)
-	require.ErrorContains(t, h.run(map[string]string{"path": "ok.txt", "compression-level": "10"}), "Invalid compression-level. Valid values are 0-9")
-	require.ErrorContains(t, h.run(map[string]string{"path": "ok.txt", "if-no-files-found": "fail"}), "Unrecognized if-no-files-found input. Provided: fail. Available options: warn,error,ignore")
 	if runtime.GOOS != "windows" {
 		h.write("bad/a:b.txt", "x", 0o644)
-		require.ErrorContains(t, h.run(map[string]string{"path": "bad"}), "The path for one of the files in artifact is not valid: /a:b.txt. Contains the following character:  Colon :")
+		require.ErrorContains(t, h.run(map[string]string{"path": "bad"}), "The path for one of the files in artifact is not valid: /a:b.txt")
 	}
 }

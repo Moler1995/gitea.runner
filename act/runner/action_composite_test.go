@@ -193,7 +193,7 @@ func TestBuiltinActionGetsLowercaseInputsAndTheJobTokenInComposites(t *testing.T
 	composite.JobContainer = job.JobContainer
 	for _, rc := range []*RunContext{job, composite} {
 		var got *action.Context
-		sab := &stepActionBuiltin{Step: &model.Step{ID: "x", With: map[string]string{"Name": "x"}}, RunContext: rc, run: func(_ context.Context, c *action.Context) error {
+		sab := &stepActionBuiltin{Step: &model.Step{ID: "x", With: map[string]string{"Name": "x"}}, RunContext: rc, run: func(_ctx context.Context, c *action.Context) error {
 			got = c
 			return nil
 		}}

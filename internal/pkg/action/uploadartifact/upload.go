@@ -13,9 +13,6 @@ import (
 	"io"
 	"io/fs"
 	"net/url"
-	"os"
-	"runtime"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -24,8 +21,6 @@ import (
 	"gitea.com/gitea/runner/internal/pkg/action/artifact"
 	"gitea.com/gitea/runner/internal/pkg/action/glob"
 )
-
-var noFileBehaviors = []string{"warn", "error", "ignore"}
 
 type inputs struct {
 	name, path, ifNoFilesFound          string
@@ -49,19 +44,15 @@ func Main(ctx context.Context, c *action.Context) error {
 	if err != nil {
 		return err
 	}
-	spool, err := os.CreateTemp("", "artifact-*")
+	files, err := selectFiles(ctx, c, g, in.includeHidden)
 	if err != nil {
 		return err
 	}
-	defer func() {
-		spool.Close()
-		os.Remove(spool.Name())
-	}()
-	collected, err := collect(ctx, c, g, in, spool)
-	if err != nil {
-		return err
+	collected := &collected{files: files, root: glob.LeastCommonAncestor(g.SearchPaths(), c.Windows())}
+	if len(files) == 1 && files[0].path == collected.root {
+		collected.root = c.Dir(collected.root)
 	}
-	if collected.files == 0 {
+	if len(collected.files) == 0 {
 		message := fmt.Sprintf("No files were found with the provided path: %s. No artifacts will be uploaded.", in.path)
 		switch in.ifNoFilesFound {
 		case "warn":
@@ -73,15 +64,10 @@ func Main(ctx context.Context, c *action.Context) error {
 		}
 		return nil
 	}
-	plural := "s"
-	if collected.files == 1 {
-		plural = ""
+	if !in.archiveIt && len(collected.files) > 1 {
+		return action.Failf("When 'archive' is set to false, only a single file can be uploaded. Found %d files to upload.", len(collected.files))
 	}
-	c.Infof("With the provided path, there will be %d file%s uploaded", collected.files, plural)
-	if !in.archiveIt && collected.files > 1 {
-		return action.Failf("When 'archive' is set to false, only a single file can be uploaded. Found %d files to upload.", collected.files)
-	}
-	return upload(ctx, c, in, collected, spool)
+	return upload(ctx, c, in, collected)
 }
 
 func readInputs(c *action.Context) (*inputs, error) {
@@ -99,8 +85,8 @@ func readInputs(c *action.Context) (*inputs, error) {
 	if in.archiveIt, err = c.BoolInput("archive"); err != nil {
 		return nil, err
 	}
-	if !slices.Contains(noFileBehaviors, in.ifNoFilesFound) {
-		return nil, action.Failf("Unrecognized if-no-files-found input. Provided: %s. Available options: %s", in.ifNoFilesFound, strings.Join(noFileBehaviors, ","))
+	if in.ifNoFilesFound != "warn" && in.ifNoFilesFound != "error" && in.ifNoFilesFound != "ignore" {
+		return nil, action.Failf("Unrecognized if-no-files-found input. Provided: %s. Available options: warn,error,ignore", in.ifNoFilesFound)
 	}
 	if days := c.Input("retention-days"); days != "" {
 		if in.retentionDays, err = action.ParseInt(days); err != nil {
@@ -119,153 +105,81 @@ func readInputs(c *action.Context) (*inputs, error) {
 }
 
 type collected struct {
-	files    int
-	fileName string // the single file uploaded as is
+	files []found
+	root  string
 }
 
-// collect writes the selected files to spool, zipped or, without archiving, the first one as is.
-func collect(ctx context.Context, c *action.Context, globber *glob.Globber, in *inputs, spool *os.File) (*collected, error) {
-	roots := globber.SearchPaths()
-	root := ""
-	if len(roots) > 1 {
-		c.Infof("Multiple search paths detected. Calculating the least common ancestor of all paths")
-		root = glob.LeastCommonAncestor(roots, c.Windows())
-		c.Infof("The least common ancestor is %s. This will be the root directory of the artifact", root)
+func (got *collected) write(ctx context.Context, c *action.Context, in *inputs, output io.Writer) error {
+	if !in.archiveIt {
+		return readFiles(ctx, c, got.files, func(file found) error {
+			_, err := io.Copy(output, file.body)
+			return err
+		})
 	}
-	result := &collected{}
 	deflater, err := flate.NewWriter(nil, in.compressionLevel)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	zw := zip.NewWriter(spool)
-	zw.RegisterCompressor(zip.Deflate, func(w io.Writer) (io.WriteCloser, error) {
-		deflater.Reset(w)
+	writer := zip.NewWriter(output)
+	writer.RegisterCompressor(zip.Deflate, func(output io.Writer) (io.WriteCloser, error) {
+		deflater.Reset(output)
 		return deflater, nil
 	})
-	seen := map[string]bool{}
-	files := &walker{g: globber, includeHidden: in.includeHidden, visit: func(file found) error {
-		result.files++
-		if lower := strings.ToLower(file.path); seen[lower] {
-			c.Infof("Uploads are case insensitive: %s was detected that it will be overwritten by another file with the same path", file.path)
-		} else {
-			seen[lower] = true
+	if err := readFiles(ctx, c, got.files, func(file found) error {
+		header := &zip.FileHeader{
+			Name:   strings.TrimLeft(strings.ReplaceAll(strings.TrimPrefix(file.path, got.root), `\`, "/"), "/"),
+			Method: zip.Deflate, Modified: file.mtime.UTC(),
 		}
-		if !in.archiveIt {
-			if result.files == 1 {
-				result.fileName = c.Base(file.path)
-				_, err := io.Copy(spool, file.body)
-				return err
-			}
-			return nil
+		if in.compressionLevel == 0 {
+			header.Method = zip.Store
 		}
-		base := root
-		if base == "" {
-			base = roots[0]
-			if file.path == base { // a single file uploaded by its own path keeps no directory
-				base = c.Dir(base)
-			}
+		header.SetMode(file.mode & (fs.ModePerm | fs.ModeSetuid | fs.ModeSetgid | fs.ModeSticky))
+		entry, err := writer.CreateHeader(header)
+		if err != nil {
+			return err
 		}
-		return addToZip(zw, in.compressionLevel, base, file)
-	}}
-	walk := func() error { return files.walkContainer(ctx, c, roots) }
-	if c.Host() {
-		walk = func() error { return files.walkHost(roots) }
-	}
-	if err := walk(); err != nil {
-		return nil, err
-	}
-	if in.archiveIt {
-		if err := zw.Close(); err != nil {
-			return nil, err
-		}
-	}
-	return result, nil
-}
-
-type invalidChar struct{ char, label string }
-
-// The toolkit's characters, with its labels, which NTFS cannot store.
-var (
-	invalidPathChars = []invalidChar{
-		{`"`, ` Double quote "`},
-		{":", " Colon :"},
-		{"<", " Less than <"},
-		{">", " Greater than >"},
-		{"|", " Vertical bar |"},
-		{"*", " Asterisk *"},
-		{"?", " Question mark ?"},
-		{"\r", ` Carriage return \r`},
-		{"\n", ` Line feed \n`},
-	}
-	invalidNameChars = append(slices.Clone(invalidPathChars), invalidChar{`\`, ` Backslash \`}, invalidChar{"/", " Forward slash /"})
-)
-
-func labels(chars []invalidChar) string {
-	var list []string
-	for _, char := range chars {
-		list = append(list, char.label)
-	}
-	return strings.Join(list, ",")
-}
-
-func addToZip(zw *zip.Writer, level int, root string, file found) error {
-	rel := strings.TrimPrefix(file.path, root)
-	for _, invalid := range invalidPathChars {
-		if strings.Contains(rel, invalid.char) {
-			return action.Failf("The path for one of the files in artifact is not valid: %s. Contains the following character: %s\n\nInvalid characters include: %s\n\nThe following characters are not allowed in files that are uploaded due to limitations with certain file systems such as NTFS. To maintain file system agnostic behavior, these characters are intentionally not allowed to prevent potential problems with downloads on different file systems.", rel, invalid.label, labels(invalidPathChars))
-		}
-	}
-	header := &zip.FileHeader{Name: strings.TrimLeft(strings.ReplaceAll(rel, `\`, "/"), "/"), Method: zip.Deflate, Modified: file.mtime.UTC()} // zip-stream writes DOS times in UTC
-	if level == 0 {
-		header.Method = zip.Store
-	}
-	header.SetMode(file.mode & (fs.ModePerm | fs.ModeSetuid | fs.ModeSetgid | fs.ModeSticky))
-	entry, err := zw.CreateHeader(header)
-	if err != nil {
+		_, err = io.Copy(entry, file.body)
+		return err
+	}); err != nil {
 		return err
 	}
-	_, err = io.Copy(entry, file.body)
-	return err
+	return writer.Close()
 }
 
-func validateName(c *action.Context, name string) error {
-	if name == "" {
-		return action.Failf("Provided artifact name input during validation is empty")
-	}
-	for _, invalid := range invalidNameChars {
-		if strings.Contains(name, invalid.char) {
-			return action.Failf("The artifact name is not valid: %s. Contains the following character: %s\n\nInvalid characters include: %s\n\nThese characters are not allowed in the artifact name due to limitations with certain file systems such as NTFS. To maintain file system agnostic behavior, these characters are intentionally not allowed to prevent potential problems with downloads on different file systems.", name, invalid.label, labels(invalidNameChars))
-		}
-	}
-	c.Infof("Artifact name is valid!")
-	return nil
-}
+const invalidPathChars = "\":<>|*?\r\n"
 
-func upload(ctx context.Context, c *action.Context, in *inputs, got *collected, spool *os.File) error {
-	name, fileName, mimeType := in.name, in.name+".zip", ""
-	if !in.archiveIt {
-		name, fileName, mimeType = got.fileName, got.fileName, mimeTypeOf(got.fileName)
-	}
-	if err := validateName(c, name); err != nil {
-		return err
-	}
+func upload(ctx context.Context, c *action.Context, in *inputs, got *collected) error {
 	client, err := artifact.New(c.ResultsURL, c.RuntimeToken, c.Transport)
 	if err != nil {
 		return err
 	}
 	client.Logf = c.Infof
 	if in.overwrite {
-		if id, err := client.Delete(ctx, name); err == nil {
-			c.Infof("Artifact '%s' (ID: %d) deleted", name, id)
+		if id, err := client.Delete(ctx, in.name); err == nil {
+			c.Infof("Artifact '%s' (ID: %d) deleted", in.name, id)
 		} else if !artifact.IsNotFound(err) {
 			c.Infof("Unable to delete artifact: %v", err) // best effort, as the JavaScript action
 		}
 	}
+	name, fileName, mimeType := in.name, in.name+".zip", ""
+	if !in.archiveIt {
+		name, fileName, mimeType = c.Base(got.files[0].path), c.Base(got.files[0].path), mimeTypeOf(got.files[0].path)
+	}
+	if name == "" {
+		return action.Failf("Provided artifact name input during validation is empty")
+	}
+	if strings.ContainsAny(name, invalidPathChars+`\/`) {
+		return action.Failf("The artifact name is not valid: %s", name)
+	}
+	if in.archiveIt {
+		for _, file := range got.files {
+			if rel := strings.TrimPrefix(file.path, got.root); strings.ContainsAny(rel, invalidPathChars) {
+				return action.Failf("The path for one of the files in artifact is not valid: %s", rel)
+			}
+		}
+	}
 	signed, err := client.Create(ctx, name, mimeType, expiresAt(c, in.retentionDays))
 	if err != nil {
-		return err
-	}
-	if _, err := spool.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
 	concurrency, err := uploadConcurrency(c)
@@ -277,34 +191,34 @@ func upload(ctx context.Context, c *action.Context, in *inputs, got *collected, 
 		return err
 	}
 	c.Infof("Uploading artifact: %s", fileName)
-	c.Infof("Beginning upload of artifact content to blob storage")
-	uploaded, err := client.Upload(ctx, signed, cmp.Or(mimeType, "application/zip"), spool, concurrency, stall)
+	reader, writer := io.Pipe()
+	defer reader.Close()
+	streamCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		writer.CloseWithError(got.write(streamCtx, c, in, writer))
+	}()
+	uploaded, err := client.Upload(ctx, signed, cmp.Or(mimeType, "application/zip"), reader, concurrency, stall)
+	reader.CloseWithError(err)
+	cancel()
+	<-done
 	if err != nil {
 		return err
 	}
-	digest := strings.TrimPrefix(uploaded.Digest, "sha256:")
-	c.Infof("Finished uploading artifact content to blob storage!")
-	c.Infof("SHA256 digest of uploaded artifact is %s", digest)
-	c.Infof("Finalizing artifact upload")
 	id, err := client.Finalize(ctx, name, uploaded.Size, uploaded.Digest)
 	if err != nil {
 		return err
 	}
-	c.Infof("Artifact %s successfully finalized. Artifact ID %d", name, id)
-	c.Infof("Artifact %s has been successfully uploaded! Final size is %d bytes. Artifact ID is %d", name, uploaded.Size, id)
-	artifactURL := artifactURL(c, name)
-	c.Infof("Artifact download URL: %s", artifactURL)
-	return c.SetOutputs(ctx, "artifact-id", strconv.FormatInt(id, 10), "artifact-digest", digest, "artifact-url", artifactURL)
-}
-
-// artifactURL links the run page by name and attempt, as the JavaScript action's ID-based link only resolves on GitHub.
-func artifactURL(c *action.Context, name string) string {
+	c.Infof("Artifact %s has been successfully uploaded! Final size is %d bytes. Artifact ID is %d", in.name, uploaded.Size, id)
 	ghc := c.Github
 	link := strings.TrimSuffix(ghc.ServerURL, "/") + "/" + ghc.Repository + "/actions/runs/" + ghc.RunID + "/artifacts/" + url.PathEscape(name)
 	if ghc.RunAttempt != "" {
 		link += "?attempt=" + url.QueryEscape(ghc.RunAttempt)
 	}
-	return link
+	c.Infof("Artifact download URL: %s", link)
+	return c.SetOutputs(ctx, "artifact-id", strconv.FormatInt(id, 10), "artifact-digest", strings.TrimPrefix(uploaded.Digest, "sha256:"), "artifact-url", link)
 }
 
 func expiresAt(c *action.Context, days int) *time.Time {
@@ -320,10 +234,6 @@ func expiresAt(c *action.Context, days int) *time.Time {
 }
 
 func uploadConcurrency(c *action.Context) (int, error) {
-	limit := 32
-	if cpus := runtime.NumCPU(); cpus > 4 {
-		limit = min(16*cpus, 300)
-	}
 	override := c.Env["ACTIONS_ARTIFACT_UPLOAD_CONCURRENCY"]
 	if override == "" {
 		return 5, nil
@@ -332,12 +242,7 @@ func uploadConcurrency(c *action.Context) (int, error) {
 	if err != nil || concurrency < 1 {
 		return 0, action.Failf("Invalid value set for ACTIONS_ARTIFACT_UPLOAD_CONCURRENCY env variable")
 	}
-	if concurrency < limit {
-		c.Infof("Set concurrency based on the value set in ACTIONS_ARTIFACT_UPLOAD_CONCURRENCY.")
-		return concurrency, nil
-	}
-	c.Infof("ACTIONS_ARTIFACT_UPLOAD_CONCURRENCY is higher than the cap of %d based on the number of cpus. Set it to the maximum value allowed.", limit)
-	return limit, nil
+	return concurrency, nil
 }
 
 func uploadTimeout(c *action.Context) (time.Duration, error) {

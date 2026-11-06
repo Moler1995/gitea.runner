@@ -4,9 +4,9 @@
 package uploadartifact
 
 import (
-	"archive/tar"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
@@ -19,181 +19,160 @@ import (
 	"gitea.com/gitea/runner/act/container"
 	"gitea.com/gitea/runner/internal/pkg/action"
 	"gitea.com/gitea/runner/internal/pkg/action/glob"
-
-	cerrdefs "github.com/containerd/errdefs"
 )
 
-// found is a file the patterns select, symlinks resolved to their target's content and mode.
 type found struct {
-	path  string
-	mode  fs.FileMode
-	mtime time.Time
-	body  io.Reader
+	path, source string
+	mode         fs.FileMode
+	mtime        time.Time
+	body         io.Reader
 }
 
-// maxFollow bounds symlinked directory nesting where no realpath tells a cycle.
-const maxFollow = 32
-
-// walker visits what @actions/glob yields with upload-artifact's options: links followed, broken and hidden ones skipped, files only.
-type walker struct {
-	g             *glob.Globber
-	includeHidden bool
-	visit         func(found) error
+type treeEntry struct {
+	name, target string
+	dir          bool
 }
 
-// selected reports how a visited entry matches, and whether it or its descendants may match.
-func (w *walker) selected(p string) (glob.MatchKind, bool) {
-	match := w.g.Match(p)
-	return match, match != glob.MatchNone || w.g.PartialMatch(p)
+type tree struct {
+	real    string
+	entries map[string][]treeEntry
 }
 
-func (w *walker) hidden(base string) bool {
-	return !w.includeHidden && strings.HasPrefix(base, ".")
-}
+const listScript = `test -e "$1" || exit 1
+[ -d "$1" ] || { printf 'f\0'; exit 0; }
+cd "$1" || exit 2
+shift
+pwd -P; printf '\0'
+find . "$@" -type d ! -name . -print0; printf '\0'
+find . "$@" -type l -exec sh -c 'for l; do printf "%s\0" "$l"; readlink "$l"; printf "\0"; done' sh {} +; printf '\0'
+find . "$@" ! -type d ! -type l -print0`
 
-func (w *walker) walkHost(roots []string) error {
-	for _, root := range roots {
-		if err := w.hostItem(root, nil); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (w *walker) hostItem(p string, chain []string) error {
-	match, selected := w.selected(p)
-	if !selected {
-		return nil
-	}
-	info, err := os.Stat(p)
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil // broken symlink
-	} else if err != nil {
-		return err
-	}
-	if w.hidden(filepath.Base(p)) {
-		return nil
-	}
-	if !info.IsDir() {
-		if match&glob.MatchFile == 0 {
-			return nil
-		}
-		f, err := os.Open(p)
+func list(ctx context.Context, c *action.Context, source string, includeHidden bool) (*tree, error) {
+	if c.Host() {
+		info, err := os.Stat(source)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		defer f.Close()
-		return w.visit(found{path: p, mode: info.Mode(), mtime: info.ModTime(), body: f})
+		resolved, err := filepath.EvalSymlinks(source)
+		if err != nil || !info.IsDir() {
+			return &tree{real: resolved}, err
+		}
+		entries, err := os.ReadDir(resolved)
+		result := &tree{real: resolved, entries: map[string][]treeEntry{".": nil}}
+		for _, entry := range entries {
+			result.entries["."] = append(result.entries["."], treeEntry{name: entry.Name(), dir: entry.IsDir()})
+		}
+		return result, err
 	}
-	resolved, err := filepath.EvalSymlinks(p)
+	command := []string{"sh", "-c", listScript, "sh", source}
+	if !includeHidden {
+		command = append(command, "!", "-name", ".", "-name", ".*", "-prune", "-o")
+	}
+	output, err := c.Container.ExecOutput(ctx, command)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if slices.Contains(chain, resolved) {
-		return nil // symlink cycle
-	}
-	entries, err := os.ReadDir(p)
+	defer output.Close()
+	data, err := io.ReadAll(output)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	chain = append(chain, resolved)
-	for _, entry := range entries {
-		if err := w.hostItem(filepath.Join(p, entry.Name()), chain); err != nil {
-			return err
-		}
+	if err := output.Close(); err != nil {
+		return nil, err
 	}
-	return nil
-}
-
-// walkContainer reads each search root as an archive, following the links in it by archiving their targets.
-func (w *walker) walkContainer(ctx context.Context, c *action.Context, roots []string) error {
-	for _, root := range roots {
-		if err := w.containerTree(ctx, c, root, root, nil, 0); err != nil {
-			return err
-		}
+	if string(data) == "f\x00" {
+		return &tree{real: source}, nil
 	}
-	return nil
-}
-
-type link struct {
-	virtual, target string
-	chain           []string
-}
-
-// missing reports a path Docker did not find, or whose `test -e` exited 1 on Kubernetes.
-func missing(err error) bool {
-	var exit container.ExitCodeError
-	return cerrdefs.IsNotFound(err) || errors.Is(err, fs.ErrNotExist) || errors.As(err, &exit) && exit == 1
-}
-
-// containerTree walks the archive of source as found at virtual, chain holding the real directories entered.
-func (w *walker) containerTree(ctx context.Context, c *action.Context, virtual, source string, chain []string, depth int) error {
-	archive, err := c.Container.GetContainerArchive(ctx, source)
-	if missing(err) {
-		return nil // a search path that does not exist, or a broken symlink
-	} else if err != nil {
-		return err
+	fields := strings.Split(string(data), "\x00")
+	if len(fields) < 4 {
+		return nil, fmt.Errorf("invalid directory listing for %s", source)
 	}
-	defer archive.Close()
-	var links []link
-	descended := map[string][]string{} // the chain below each directory the walk enters
-	reader := tar.NewReader(archive)
-	for {
-		hdr, err := reader.Next()
-		if errors.Is(err, io.EOF) {
-			break
-		} else if err != nil {
-			return err
-		}
-		name := strings.TrimSuffix(hdr.Name, "/")
-		entryVirtual := virtual + strings.TrimPrefix(name, path.Base(source))
-		entryChain := chain
-		if entryVirtual != virtual {
-			var entered bool
-			if entryChain, entered = descended[c.Dir(entryVirtual)]; !entered {
-				continue
-			}
-		}
-		match, selected := w.selected(entryVirtual)
-		if !selected || w.hidden(c.Base(entryVirtual)) {
+	result := &tree{real: strings.TrimSuffix(fields[0], "\n"), entries: map[string][]treeEntry{".": nil}}
+	section := 0
+	for index := 1; index < len(fields)-1; index++ {
+		name := fields[index]
+		if name == "" {
+			section++
 			continue
 		}
-		switch hdr.Typeflag {
-		case tar.TypeSymlink:
-			target := hdr.Linkname
-			if !path.IsAbs(target) {
-				target = path.Join(path.Dir(path.Join(path.Dir(source), name)), target)
+		entry := treeEntry{name: path.Base(name), dir: section == 0}
+		switch section {
+		case 0:
+			result.entries[path.Clean(name)] = nil
+		case 1:
+			index++
+			if index >= len(fields)-1 {
+				return nil, fmt.Errorf("invalid symlink listing for %s", source)
 			}
-			links = append(links, link{virtual: entryVirtual, target: target, chain: entryChain})
-		case tar.TypeLink:
+			entry.target = strings.TrimSuffix(fields[index], "\n")
+		}
+		result.entries[path.Dir(name)] = append(result.entries[path.Dir(name)], entry)
+	}
+	for _, entries := range result.entries {
+		slices.SortFunc(entries, func(left, right treeEntry) int { return strings.Compare(left.name, right.name) })
+	}
+	return result, nil
+}
+
+func selectFiles(ctx context.Context, c *action.Context, globber *glob.Globber, includeHidden bool) ([]found, error) {
+	var files []found
+	join := path.Join
+	if c.Windows() {
+		join = filepath.Join
+	}
+	var walk func(string, string, []string, *tree, string) error
+	walk = func(virtual, source string, chain []string, listed *tree, relative string) error {
+		match := globber.Match(virtual)
+		if match == glob.MatchNone && !globber.PartialMatch(virtual) || !includeHidden && strings.HasPrefix(c.Base(virtual), ".") {
+			return nil
+		}
+		if listed == nil {
+			var err error
+			listed, err = list(ctx, c, source, includeHidden)
+			var exit container.ExitCodeError
+			if errors.Is(err, fs.ErrNotExist) || errors.As(err, &exit) && exit == 1 {
+				return nil
+			} else if err != nil {
+				return err
+			}
+			relative = "."
+		}
+		if listed.entries == nil {
 			if match&glob.MatchFile != 0 {
-				links = append(links, link{virtual: entryVirtual, target: path.Join(path.Dir(source), hdr.Linkname), chain: entryChain})
+				files = append(files, found{path: virtual, source: listed.real})
 			}
-		case tar.TypeDir:
-			if dirReal := path.Join(path.Dir(source), name); !slices.Contains(entryChain, dirReal) { // else a symlink cycle
-				descended[entryVirtual] = append(slices.Clip(entryChain), dirReal)
-			}
-		case tar.TypeReg:
-			if match&glob.MatchFile != 0 {
-				if err := w.visit(found{path: entryVirtual, mode: hdr.FileInfo().Mode(), mtime: hdr.ModTime, body: reader}); err != nil {
-					return err
+			return nil
+		}
+		resolved := join(listed.real, relative)
+		if slices.Contains(chain, resolved) {
+			return nil
+		}
+		chain = append(slices.Clip(chain), resolved)
+		for _, entry := range listed.entries[relative] {
+			child := join(virtual, entry.name)
+			source := join(resolved, entry.name)
+			var subtree *tree
+			switch {
+			case entry.target != "":
+				source = entry.target
+				if !path.IsAbs(source) {
+					source = path.Join(resolved, source)
 				}
+			case entry.dir && !c.Host():
+				subtree = listed
+			case !entry.dir && !c.Host():
+				subtree = &tree{real: source}
+			}
+			if err := walk(child, source, chain, subtree, path.Join(relative, entry.name)); err != nil {
+				return err
 			}
 		}
+		return nil
 	}
-	if _, err := io.Copy(io.Discard, archive); err != nil { // the exit status of a Kubernetes tar arrives after its archive
-		return err
-	}
-	if err := archive.Close(); err != nil {
-		return err
-	}
-	for _, followed := range links {
-		if depth >= maxFollow || slices.Contains(followed.chain, followed.target) {
-			continue // a symlink cycle
-		}
-		if err := w.containerTree(ctx, c, followed.virtual, followed.target, followed.chain, depth+1); err != nil {
-			return err
+	for _, root := range globber.SearchPaths() {
+		if err := walk(root, root, nil, nil, "."); err != nil {
+			return nil, err
 		}
 	}
-	return nil
+	return files, nil
 }

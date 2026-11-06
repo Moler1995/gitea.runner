@@ -16,6 +16,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"gitea.com/gitea/runner/act/container"
 
@@ -43,7 +44,6 @@ type Context struct {
 	Warning         func(format string, args ...any)
 }
 
-// ApplyDefaults sets the defaults of inputs not given, names and defaults alternating, and warns about unknown inputs as GitHub does.
 func (c *Context) ApplyDefaults(pairs ...string) {
 	var valid, unexpected []string
 	for i := 0; i+1 < len(pairs); i += 2 {
@@ -79,7 +79,6 @@ func (c *Context) BoolInput(name string) (bool, error) {
 	return false, Failf("Input does not meet YAML 1.2 \"Core Schema\" specification: %s\nSupport boolean input list: `true | True | TRUE | false | False | FALSE`", name)
 }
 
-// SetOutputs writes the step's outputs, name and value alternating.
 func (c *Context) SetOutputs(ctx context.Context, pairs ...string) error {
 	output := c.Env["GITHUB_OUTPUT"]
 	if output == "" {
@@ -95,13 +94,11 @@ func (c *Context) SetOutputs(ctx context.Context, pairs ...string) error {
 	return c.Container.Copy(c.Dir(output), &container.FileEntry{Name: c.Base(output), Mode: 0o666, Body: body.String()})(ctx)
 }
 
-// Host reports whether the job runs on the runner's host, where its paths are the runner's own.
 func (c *Context) Host() bool {
 	_, host := c.Container.(*container.HostEnvironment)
 	return host
 }
 
-// Windows reports whether the job's paths are Windows paths, which only a host job on Windows has.
 func (c *Context) Windows() bool {
 	return c.Host() && runtime.GOOS == "windows"
 }
@@ -125,10 +122,8 @@ func (c *Context) Home(ctx context.Context) (string, error) {
 	if home := c.Env["HOME"]; home != "" {
 		return home, nil
 	}
-	if c.Windows() {
-		if home := c.Env["USERPROFILE"]; home != "" {
-			return home, nil
-		}
+	if home := c.Env["USERPROFILE"]; c.Windows() && home != "" {
+		return home, nil
 	}
 	if c.Host() {
 		return os.UserHomeDir()
@@ -153,6 +148,7 @@ func Failf(format string, args ...any) error {
 
 // ParseInt reads a leading integer the way JavaScript's parseInt does.
 func ParseInt(s string) (int, error) {
+	s = strings.TrimLeftFunc(s, unicode.IsSpace)
 	end := 0
 	if end < len(s) && (s[end] == '-' || s[end] == '+') {
 		end++
