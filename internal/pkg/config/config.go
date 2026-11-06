@@ -90,7 +90,7 @@ type Runner struct {
 	PatchActions          *bool             `yaml:"patch_actions"`            // PatchActions applies compatibility patches to the actions a job runs, so actions written for GitHub work against Gitea, see act/runner/patch_actions.go. It is a pointer to distinguish between false and not set; if not set, it defaults to true. Set it to false to run every action exactly as published, at the price of the artifact actions refusing.
 	AllocatePTY           bool              `yaml:"allocate_pty"`             // AllocatePTY allocates a pseudo-TTY for each step's process. Default is false, matching GitHub's actions/runner. Enable only for jobs that need an interactive terminal; tools like docker build emit redrawing progress frames into the captured log when a TTY is present. Applies to both host and docker backends.
 	DefaultImage          string            `yaml:"default_image"`            // DefaultImage is the image a job runs in when its runs-on matches none of the runner's labels. A runner without docker runs such a job on the host instead.
-	ToolCacheMode         string            `yaml:"tool_cache_mode"`          // ToolCacheMode is what the runner mounts at RUNNER_TOOL_CACHE on both backends: ToolCacheModeNone or ToolCacheModeShared.
+	ToolCacheMode         string            `yaml:"tool_cache_mode"`          // ToolCacheMode is what the runner mounts at RUNNER_TOOL_CACHE on both backends: ToolCacheModeNone, ToolCacheModeShared or ToolCacheModePerSlot.
 	PostTaskScript        string            `yaml:"post_task_script"`         // PostTaskScript is the path to an executable script run on the host after each task's cleanup completes. Empty disables the hook. On Windows use .exe/.bat/.cmd; PowerShell (.ps1) is not supported yet as the configured path.
 	PostTaskScriptTimeout time.Duration     `yaml:"post_task_script_timeout"` // PostTaskScriptTimeout caps how long the post-task script may run. Default is 5m when post_task_script is set.
 	Hooks                 RunnerHooks       `yaml:"hooks"`                    // Hooks are scripts run inside the job environment around the job's steps.
@@ -193,13 +193,14 @@ type Container struct {
 	Sweep                bool                          `yaml:"sweep"`                  // Sweep removes the containers, networks and volumes a job creates through its Docker proxy when the job ends.
 }
 
-// Values of Runner.ToolCacheMode: the runner mounts no tool cache, or one that every job reuses.
+// Values of Runner.ToolCacheMode: the runner mounts no tool cache, one that every job reuses, or one per capacity slot.
 const (
-	ToolCacheModeNone   = "none"
-	ToolCacheModeShared = "shared"
+	ToolCacheModeNone    = "none"
+	ToolCacheModeShared  = "shared"
+	ToolCacheModePerSlot = "per_slot"
 )
 
-var ToolCacheModes = []string{ToolCacheModeNone, ToolCacheModeShared}
+var ToolCacheModes = []string{ToolCacheModeNone, ToolCacheModeShared, ToolCacheModePerSlot}
 
 type ContainerNetworkCreateOptions struct {
 	EnableIPv4 *bool `yaml:"enable_ipv4"` // Enable or disable IPv4 for the network (true for docker by default)

@@ -133,6 +133,8 @@ runner:
   #           either way what it installs is gone when the job ends.
   #   shared: one tool cache every job reuses. Two jobs writing the same tool version at once
   #           corrupt it, so use it only with capacity 1.
+  #   per_slot: one tool cache per capacity slot, each reused by one job at a time. Disk use grows
+  #           with capacity, and a slot downloads a tool again even if another slot has it.
   #tool_cache_mode: none
   # Optional executable on the host, run once after each task's built-in cleanup
   # (post-steps, container teardown, bind-workdir removal). Additive only.

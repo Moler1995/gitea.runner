@@ -79,6 +79,7 @@ type Runner struct {
 	runningTasks            sync.Map
 	runningCount            atomic.Int64
 	lastIdleCleanupUnixNano atomic.Int64
+	slots                   slotAllocator
 	now                     func() time.Time
 	healthCheckLast         time.Time
 	healthCheckReady        bool
@@ -452,6 +453,9 @@ func (r *Runner) run(ctx context.Context, task *runnerv1.Task, reporter *report.
 		}
 	}()
 
+	slot := r.slots.acquire()
+	defer r.slots.release(slot)
+
 	workflowCallInputs := restoreCalledWorkflowContext(task)
 	for _, line := range r.setupLines(task) {
 		reporter.Logf("%s", line)
@@ -623,7 +627,8 @@ func (r *Runner) run(ctx context.Context, task *runnerv1.Task, reporter *report.
 		Vars:                              task.Vars,
 		ValidVolumes:                      r.cfg.Container.ValidVolumes,
 		ContainerVolumes:                  r.cfg.Container.Volumes,
-		SharedToolCache:                   r.cfg.Runner.ToolCacheMode == config.ToolCacheModeShared,
+		SharedToolCache:                   r.cfg.Runner.ToolCacheMode != config.ToolCacheModeNone,
+		ToolCacheSuffix:                   toolCacheSuffix(r.cfg.Runner.ToolCacheMode, slot),
 		InsecureSkipTLS:                   r.cfg.Runner.Insecure,
 		ClientCertFile:                    r.cfg.Runner.ClientCertFile,
 		ClientKeyFile:                     r.cfg.Runner.ClientKeyFile,

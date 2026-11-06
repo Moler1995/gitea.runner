@@ -558,6 +558,11 @@ func TestRunContext_GetBindsAndMounts(t *testing.T) {
 		rc.containerSpec.Volumes = []string{"/unapproved:" + container.DefaultToolCache}
 		_, gotmount = rc.GetBindsAndMounts(t.Context())
 		assert.Equal(t, container.DefaultToolCache, gotmount[sharedToolCacheVolume])
+
+		rc.Config.ToolCacheSuffix = "-1"
+		_, gotmount = rc.GetBindsAndMounts(t.Context())
+		assert.Equal(t, container.DefaultToolCache, gotmount[sharedToolCacheVolume+"-1"])
+		assert.NotContains(t, gotmount, sharedToolCacheVolume)
 	})
 
 	t.Run("DaemonMountsAboveOwnerRepo", func(t *testing.T) {
@@ -596,6 +601,11 @@ func TestRunContextValidVolumes(t *testing.T) {
 
 	assert.Equal(t, []string{"my-vol", "/host/path"}, rc.Config.ValidVolumes)
 	assert.Len(t, rc.validVolumes(), len(got), "repeated calls must be stable, not accumulate")
+
+	rc.Config.ToolCacheSuffix = "-1"
+	assert.Contains(t, rc.validVolumes(), sharedToolCacheVolume+"-1")
+	assert.NotContains(t, rc.validVolumes(), sharedToolCacheVolume)
+	rc.Config.ToolCacheSuffix = ""
 
 	rc.Config.SharedToolCache = false
 	assert.NotContains(t, rc.validVolumes(), sharedToolCacheVolume)
@@ -1179,6 +1189,18 @@ func TestPrintStartJobContainerGroupGolden(t *testing.T) {
 		"",
 	}, "\n")
 	assert.Equal(t, want, buf.String())
+}
+
+func TestStartHostEnvironmentToolCacheSuffix(t *testing.T) {
+	cacheDir := t.TempDir()
+	rc := &RunContext{
+		Config: &Config{ActionCacheDir: cacheDir, SharedToolCache: true, ToolCacheSuffix: "-1"},
+		Env:    map[string]string{},
+		Run:    &model.Run{Workflow: &model.Workflow{Name: "wf"}},
+	}
+	require.NoError(t, rc.startHostEnvironment()(t.Context()))
+	t.Cleanup(func() { require.NoError(t, rc.cleanUpJobContainer(context.Background())) })
+	assert.Equal(t, filepath.Join(cacheDir, "tool_cache-1"), rc.JobContainer.(*container.HostEnvironment).ToolCache)
 }
 
 func TestRunContext_cleanupFailedStart(t *testing.T) {

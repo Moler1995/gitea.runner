@@ -271,7 +271,7 @@ func (rc *RunContext) validVolumes() []string {
 		volumes = append(volumes, hostEnv.Path, hostEnv.GetActPath())
 	}
 	if rc.Config.SharedToolCache {
-		volumes = append(volumes, sharedToolCacheVolume)
+		volumes = append(volumes, sharedToolCacheVolume+rc.Config.ToolCacheSuffix)
 	}
 	if rc.Config.BindWorkdir {
 		volumes = append(volumes, rc.Config.Workdir, rc.workdirMountRoot())
@@ -391,7 +391,7 @@ func (rc *RunContext) GetBindsAndMounts(ctx context.Context) ([]string, map[stri
 	}
 	if rc.Config.SharedToolCache {
 		if toolCache := rc.toolCache(container.DefaultToolCache); !claimed[toolCache] {
-			mounts[sharedToolCacheVolume] = toolCache
+			mounts[sharedToolCacheVolume+rc.Config.ToolCacheSuffix] = toolCache
 		}
 	}
 	if hostEnv, ok := rc.JobContainer.(*container.HostEnvironment); ok {
@@ -446,7 +446,7 @@ func (rc *RunContext) startHostEnvironment() common.Executor {
 		if rc.Config.SharedToolCache {
 			toolCacheParent = cacheDir
 		}
-		toolCache := rc.toolCache(filepath.Join(toolCacheParent, "tool_cache"))
+		toolCache := rc.toolCache(filepath.Join(toolCacheParent, "tool_cache"+rc.Config.ToolCacheSuffix))
 		if err := os.MkdirAll(toolCache, 0o777); err != nil {
 			return err
 		}
