@@ -6,6 +6,7 @@ package common
 
 import (
 	"net"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -55,6 +56,9 @@ func GetOutboundIP() net.IP {
 }
 
 func preferredIP(ips []interfaceIP) net.IP {
+	ips = slices.DeleteFunc(ips, func(ip interfaceIP) bool {
+		return len(ip.Name) == 15 && strings.HasPrefix(ip.Name, "br-") && strings.Trim(ip.Name[3:], "0123456789abcdef") == "" // a Docker network's bridge, removed with the network
+	})
 	if len(ips) == 0 {
 		return nil
 	}

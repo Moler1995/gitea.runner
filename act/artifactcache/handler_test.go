@@ -53,44 +53,23 @@ func signArtifactURL(h *Handler, id int64) string {
 
 func TestHandler_ExternalURL(t *testing.T) {
 	t.Parallel()
-	assert.Equal(t, "http://[2001:db8::1]:8080", (&Handler{outboundIP: "2001:db8::1", port: 8080}).ExternalURL())
-}
+	assert.Empty(t, (*Handler)(nil).RefreshExternalURL())
+	assert.Equal(t, "http://cache.example:8080", (&Handler{outboundIP: "cache.example", port: 8080}).RefreshExternalURL())
 
-func TestHandler_RefreshOutboundIP(t *testing.T) {
-	t.Parallel()
 	logger, logs := logtest.NewLogger()
-	ip := net.ParseIP("2001:db8::1")
-	handler, err := StartHandler(Options{
-		Dir:              t.TempDir(),
-		Logger:           logger,
-		DetectOutboundIP: func() net.IP { return ip },
-	})
-	require.NoError(t, err)
-	defer handler.Close()
-	_, port, err := net.SplitHostPort(strings.TrimPrefix(handler.ExternalURL(), "http://"))
-	require.NoError(t, err)
-	assert.Equal(t, "http://"+net.JoinHostPort("2001:db8::1", port), handler.ExternalURL())
+	var ip net.IP
+	handler := &Handler{port: 8080, logger: logger, detectOutboundIP: func() net.IP { return ip }}
+	assert.Empty(t, handler.RefreshExternalURL())
+	ip = net.ParseIP("2001:db8::1")
+	assert.Equal(t, "http://[2001:db8::1]:8080", handler.RefreshExternalURL())
+	assert.Equal(t, "http://[2001:db8::1]:8080", handler.RefreshExternalURL())
+	ip = net.ParseIP("192.0.2.1")
+	assert.Equal(t, "http://[2001:db8::1]:8080", handler.ExternalURL())
+	assert.Equal(t, "http://192.0.2.1:8080", handler.RefreshExternalURL())
+	ip = nil
+	assert.Equal(t, "http://192.0.2.1:8080", handler.RefreshExternalURL())
 	require.Len(t, logs.AllRecords(), 1)
 	assert.Contains(t, logs.LastRecord().Message, "IPv6")
-
-	ip = net.ParseIP("192.0.2.1")
-	handler.RefreshOutboundIP()
-	assert.Equal(t, "http://"+net.JoinHostPort("192.0.2.1", port), handler.ExternalURL())
-	assert.Len(t, logs.AllRecords(), 1, "only an IPv6 address warns")
-
-	ip = nil // a failed detection keeps the last address
-	handler.RefreshOutboundIP()
-	assert.Equal(t, "http://"+net.JoinHostPort("192.0.2.1", port), handler.ExternalURL())
-
-	configured, err := StartHandler(Options{
-		Dir:              t.TempDir(),
-		OutboundIP:       "cache.example",
-		DetectOutboundIP: func() net.IP { return net.ParseIP("192.0.2.1") },
-	})
-	require.NoError(t, err)
-	defer configured.Close()
-	configured.RefreshOutboundIP()
-	assert.Contains(t, configured.ExternalURL(), "cache.example")
 }
 
 func TestHandler_Upstream(t *testing.T) {
