@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"gitea.com/gitea/runner/act/common"
 
@@ -23,6 +24,9 @@ import (
 )
 
 var hostOS = runtime.GOOS // replaced in tests
+
+// DrainGracePeriod caps the wait for container output to drain so the log tail is not truncated
+const DrainGracePeriod = 2 * time.Second
 
 // ExitCodeError reports a non-zero process exit code from a container command.
 type ExitCodeError int
