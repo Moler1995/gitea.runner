@@ -94,5 +94,6 @@ func (cm *containerMock) CopyTarStream(ctx context.Context, destPath string, wri
 }
 
 func (cm *containerMock) ReplaceLogWriter(stdout, stderr io.Writer) (io.Writer, io.Writer) {
-	return stdout, stderr
+	args := cm.Called(stdout, stderr)
+	return args.Get(0).(io.Writer), args.Get(1).(io.Writer)
 }
