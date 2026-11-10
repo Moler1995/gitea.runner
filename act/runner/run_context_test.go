@@ -561,7 +561,7 @@ func TestRunContext_GetBindsAndMounts(t *testing.T) {
 		assert.Equal(t, container.DefaultToolCache, gotmount[sharedToolCacheVolume])
 
 		rc.Config.ToolCacheSlot = "1"
-		_, gotmount = rc.GetBindsAndMounts(t.Context())
+		_, gotmount, _ = rc.GetBindsAndMounts(t.Context())
 		assert.Equal(t, container.DefaultToolCache, gotmount[sharedToolCacheVolume+"-1"])
 		assert.NotContains(t, gotmount, sharedToolCacheVolume)
 		assert.Contains(t, rc.validVolumes(), sharedToolCacheVolume+"-1")
