@@ -73,7 +73,7 @@ type Runner struct {
 	cacheHandler *artifactcache.Handler
 	capabilities string
 
-	isolatedCacheContainer func() string
+	isolatedCacheContainer func(cacheURL string) string
 	instanceTransport      http.RoundTripper
 
 	runningTasks            sync.Map
@@ -119,7 +119,6 @@ func NewRunner(cfg *config.Config, reg *config.Registration, cli client.Client) 
 			// go on
 		} else {
 			cacheHandler = handler
-			envs["ACTIONS_CACHE_URL"] = handler.ExternalURL() + "/"
 		}
 	}
 
@@ -142,7 +141,7 @@ func NewRunner(cfg *config.Config, reg *config.Registration, cli client.Client) 
 		now:            time.Now,
 		runHealthCheck: executeHealthCheck,
 	}
-	runner.isolatedCacheContainer = sync.OnceValue(runner.detectIsolatedCacheContainer)
+	runner.isolatedCacheContainer = lastResult(runner.detectIsolatedCacheContainer)
 	runner.instanceTransport = instanceTransport
 	return runner
 }
@@ -197,7 +196,7 @@ func (r *Runner) cleanupOrphanDockerResources(ctx context.Context) {
 		return
 	}
 	cutoff := r.now().Add(-orphanDockerResourceAge)
-	if err := removeOrphanNetworks(ctx, r.uuid, r.isolatedCacheContainer(), cutoff); err != nil {
+	if err := removeOrphanNetworks(ctx, r.uuid, r.isolatedCacheContainer(r.cacheHandler.ExternalURL()), cutoff); err != nil {
 		logging.Warnf("failed to clean up networks left behind by earlier jobs: %v", err)
 	}
 	if err := removeOrphanJobVolumes(ctx, r.uuid, cutoff); err != nil {
@@ -489,7 +488,7 @@ func (r *Runner) run(ctx context.Context, task *runnerv1.Task, reporter *report.
 		return fallbackPlatform()
 	}
 	platform := platformPicker(job.RunsOn())
-	cacheURL, cacheContainer := r.cacheForJob(job, platform)
+	cacheURL, cacheContainer := r.cacheForJob(job, platform, reporter.Logf)
 	if cacheURL != "" {
 		envs["ACTIONS_CACHE_URL"] = cacheURL + "/"
 	}
@@ -634,7 +633,6 @@ func (r *Runner) run(ctx context.Context, task *runnerv1.Task, reporter *report.
 		ClientKeyFile:                     r.cfg.Runner.ClientKeyFile,
 		CAFile:                            r.cfg.Runner.CAFile,
 		InstanceTransport:                 r.instanceTransport,
-		ResultsURL:                        strings.TrimSuffix(r.client.Address(), "/"),
 		RunnerName:                        r.name,
 		KubernetesPicker:                  r.kubernetesOptions,
 	}
@@ -669,11 +667,24 @@ func (r *Runner) run(ctx context.Context, task *runnerv1.Task, reporter *report.
 	return execErr
 }
 
-func (r *Runner) builtInCacheURL() string {
-	if r.cacheHandler == nil {
-		return ""
+func lastResult(compute func(key string) (string, bool)) func(key string) string {
+	var (
+		mu      sync.Mutex
+		lastKey string
+		result  string
+	)
+	return func(key string) string {
+		mu.Lock()
+		defer mu.Unlock()
+		if key == lastKey {
+			return result
+		}
+		value, ok := compute(key)
+		if ok {
+			lastKey, result = key, value
+		}
+		return value
 	}
-	return r.envs["ACTIONS_CACHE_URL"]
 }
 
 func (r *Runner) setResultsService(envs map[string]string, resultsURL string) {
@@ -704,7 +715,7 @@ func (r *Runner) instanceOutOfReach(instance string) bool {
 // Safe with an empty token (older Gitea did not issue one).
 // It also returns the URL to advertise as ACTIONS_RESULTS_URL.
 func (r *Runner) registerCacheForTask(token string, cred artifactcache.JobCredential, reporter *report.Reporter) (func(), string) {
-	if token == "" || r.cacheHandler == nil {
+	if token == "" || cred.PublicURL == "" {
 		return func() {}, ""
 	}
 	cred.Results = r.envs["ACTIONS_RESULTS_URL"] // the instance as the job would reach it
@@ -935,35 +946,39 @@ func warnIgnoredCacheSecret(cfg *config.Config) {
 }
 
 // cacheForJob returns the cache address for the job, and the container to attach to its network to reach it there.
-func (r *Runner) cacheForJob(job *model.Job, platform string) (string, string) {
+func (r *Runner) cacheForJob(job *model.Job, platform string, logf func(string, ...any)) (string, string) {
+	cacheURL := r.cacheHandler.RefreshExternalURL()
 	jobContainer := job.Container()
-	cacheContainer := ""
-	if !strings.HasPrefix(platform, labels.SchemeKubernetes+"://") && (jobContainer != nil && jobContainer.Image != "" || platform != labels.SelfHostedPlatform) {
-		cacheContainer = r.isolatedCacheContainer()
+	if cacheURL == "" || strings.HasPrefix(platform, labels.SchemeKubernetes+"://") || (jobContainer == nil || jobContainer.Image == "") && platform == labels.SelfHostedPlatform {
+		return cacheURL, ""
 	}
-	if cacheContainer == "" {
-		return strings.TrimSuffix(r.builtInCacheURL(), "/"), ""
+	if cacheContainer := r.isolatedCacheContainer(cacheURL); cacheContainer != "" {
+		isolatedURL, _ := url.Parse(cacheURL)
+		isolatedURL.Host = net.JoinHostPort(cacheContainer, isolatedURL.Port())
+		return isolatedURL.String(), cacheContainer
 	}
-	cacheURL, _ := url.Parse(r.cacheHandler.ExternalURL())
-	cacheURL.Host = net.JoinHostPort(cacheContainer, cacheURL.Port())
-	return cacheURL.String(), cacheContainer
+	network, enableIPv6 := r.cfg.Container.Network, r.cfg.Container.NetworkCreateOptions.EnableIPv6
+	if addr, err := netip.ParseAddr(hostOf(cacheURL)); err == nil && addr.Is6() && r.cfg.Cache.Host == "" &&
+		network != "host" && (network != "" || enableIPv6 == nil || !*enableIPv6) {
+		logf("::warning::%s", runner.EscapeCommandData("The runner's cache server is at the IPv6 address "+addr.String()+
+			", so cache and artifact steps fail if this job's network has no IPv6. Set cache.host to an address the job reaches, or enable IPv6 on the job network."))
+	}
+	return cacheURL, ""
 }
 
-func (r *Runner) detectIsolatedCacheContainer() string {
-	if r.cacheHandler == nil {
-		return ""
-	}
-	addr, err := netip.ParseAddr(hostOf(r.cacheHandler.ExternalURL()))
+func (r *Runner) detectIsolatedCacheContainer(cacheURL string) (string, bool) {
+	addr, err := netip.ParseAddr(hostOf(cacheURL))
 	if err != nil {
-		return ""
+		return "", true
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	cacheContainer, err := container.IsolatedCacheContainer(ctx, addr, r.cfg.Container.Network)
 	if err != nil {
 		logging.Warnf("cannot check whether jobs reach the cache server: %v", err)
+		return "", false
 	}
-	return cacheContainer
+	return cacheContainer, true
 }
 
 // taskLogFields returns key/value pairs for logging.With.
