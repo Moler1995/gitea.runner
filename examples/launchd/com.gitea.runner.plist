@@ -9,8 +9,6 @@
         <string>/usr/local/bin/gitea-runner</string>
         <string>daemon</string>
     </array>
-    <key>UserName</key>
-    <string>gitea-runner</string>
     <key>WorkingDirectory</key>
     <string>/Users/gitea-runner/gitea-runner</string>
     <key>EnvironmentVariables</key>

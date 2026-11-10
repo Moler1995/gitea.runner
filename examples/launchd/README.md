@@ -1,54 +1,54 @@
-# Running the runner as a launchd service on macOS
+# Running the runner with launchd on macOS
 
-[`com.gitea.runner.plist`](./com.gitea.runner.plist) is an example job for
-running the runner as a background service on macOS.
+[`com.gitea.runner.plist`](./com.gitea.runner.plist) runs the runner in the
+login session of the user that jobs should run as. Jobs then have that user's
+login keychain and the GUI.
 
 ## Setup
 
 1. Install the `gitea-runner` binary (e.g. to `/usr/local/bin/gitea-runner`).
-2. Register as the user that jobs should run as, with a host label so that jobs
-   run on the Mac itself:
+2. Register as that user, with a host label so that jobs run on the Mac itself:
 
    ```bash
    mkdir ~/gitea-runner && cd ~/gitea-runner
    gitea-runner register --instance https://gitea.example.com --token <token> --labels macos-arm64:host
    ```
 
-3. Replace `gitea-runner` in the job with that user, then install and start it:
+3. Replace `/Users/gitea-runner` in the file with the user's home directory,
+   then install it and start the runner. From now on, it also starts whenever
+   the user logs in:
 
    ```bash
-   sudo cp com.gitea.runner.plist /Library/LaunchDaemons/
-   sudo launchctl bootstrap system /Library/LaunchDaemons/com.gitea.runner.plist
+   mkdir -p ~/Library/LaunchAgents
+   cp com.gitea.runner.plist ~/Library/LaunchAgents/
+   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.gitea.runner.plist
    ```
 
-launchd passes no shell environment to the runner. Set what jobs need, such as
-proxy variables, in `EnvironmentVariables`.
+4. Enable automatic login for the user in System Settings, so that the runner
+   starts after a restart too. macOS does not offer automatic login while
+   FileVault is on.
 
-## Jobs that need the login session
+The runner does not get the environment of your shell. Set what jobs need, such
+as proxy variables, in `EnvironmentVariables`.
 
-A daemon starts at boot, and its jobs have no login session. If jobs need the
-login keychain or the GUI, for example for UI tests, run the runner as an agent
-instead. Remove the `UserName` key, enable automatic login for the user and
-install the job as that user:
+## Local network access
+
+macOS blocks a runner that was started this way from other hosts on the Mac's
+own subnet, such as the Gitea instance or a shared cache server. The runner
+then logs `no route to host`. Commands run in Terminal or over SSH are not
+blocked, so registering works even when the running runner cannot connect. See
+[local network privacy](https://developer.apple.com/documentation/technotes/tn3179-understanding-local-network-privacy).
+
+macOS asks on the Mac's screen whether to allow the access. To allow it without
+that prompt, exempt the subnet on macOS 15.5 or later and restart the Mac. On
+Wi-Fi, the key is `AllowedWiFiLocalNetworkAddresses`:
 
 ```bash
-mkdir -p ~/Library/LaunchAgents
-cp com.gitea.runner.plist ~/Library/LaunchAgents/
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.gitea.runner.plist
+sudo defaults write com.apple.network.local-network AllowedEthernetLocalNetworkAddresses -array "192.168.1.0/24"
 ```
 
-Two things to know when running as an agent:
+## Git credentials
 
-- [Local network privacy](https://developer.apple.com/documentation/technotes/tn3179-understanding-local-network-privacy)
-  keeps an agent from reaching other hosts on the Mac's own subnet, such as a
-  shared cache server, with `no route to host`. On macOS 15.5 or later, exempt
-  the subnet and restart the Mac. On Wi-Fi, the key is
-  `AllowedWiFiLocalNetworkAddresses`:
-
-  ```bash
-  sudo defaults write com.apple.network.local-network AllowedEthernetLocalNetworkAddresses -array "192.168.1.0/24"
-  ```
-
-- Git on macOS saves credentials from remote URLs to the keychain, which can
-  stop a job at a dialog that nobody answers. Set `GIT_CONFIG_NOSYSTEM` to `1`
-  in `EnvironmentVariables` to turn that off.
+Git on macOS saves credentials from remote URLs to the keychain, which can stop
+a job at a dialog that nobody answers. To turn that off, set
+`GIT_CONFIG_NOSYSTEM` to `1` in `EnvironmentVariables`.
