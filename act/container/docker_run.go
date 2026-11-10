@@ -41,13 +41,6 @@ import (
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
-// drainGracePeriod bounds how long we wait for an output-copy goroutine to
-// finish draining a container's output before returning, so that neither a
-// cancellation (waitForCommand) nor a normal container exit (wait) truncates
-// the tail of the log. It is a safety bound: in the common case the stream
-// reaches EOF and the goroutine returns well before this elapses.
-const drainGracePeriod = 2 * time.Second
-
 // NewContainer creates a reference to a container
 func NewContainer(input *NewContainerInput) ExecutionsEnvironment {
 	// Resolved up front because the image pull runs before the container is created.
@@ -144,47 +137,6 @@ func (cr *containerReference) CopyDir(destPath, srcPath string, useGitIgnore, sk
 			return nil
 		},
 	).IfNot(common.Dryrun)
-}
-
-func (cr *containerReference) ExecOutput(ctx context.Context, command []string) (io.ReadCloser, error) {
-	if common.Dryrun(ctx) {
-		return nil, errors.New("DRYRUN is not supported in ExecOutput")
-	}
-	if err := cr.connect()(ctx); err != nil {
-		return nil, err
-	}
-	if err := cr.find()(ctx); err != nil {
-		return nil, err
-	}
-	if cr.id == "" {
-		return nil, cr.missingContainerError("exec %v", command)
-	}
-	return streamOutput(ctx, func(ctx context.Context, stdout, stderr io.Writer) error {
-		created, err := cr.cli.ExecCreate(ctx, cr.id, client.ExecCreateOptions{
-			Cmd: command, AttachStdout: true, AttachStderr: true,
-		})
-		if err != nil {
-			return err
-		}
-		attached, err := cr.cli.ExecAttach(ctx, created.ID, client.ExecAttachOptions{})
-		if err != nil {
-			return err
-		}
-		defer attached.Close()
-		stop := context.AfterFunc(ctx, func() { attached.Close() })
-		defer stop()
-		if _, err := stdcopy.StdCopy(stdout, stderr, attached.Reader); err != nil {
-			return err
-		}
-		inspected, err := cr.cli.ExecInspect(ctx, created.ID, client.ExecInspectOptions{})
-		if err != nil {
-			return err
-		}
-		if inspected.ExitCode != 0 {
-			return ExitCodeError(inspected.ExitCode)
-		}
-		return nil
-	}), nil
 }
 
 func (cr *containerReference) GetContainerArchive(ctx context.Context, srcPath string) (io.ReadCloser, error) {
@@ -902,6 +854,7 @@ func (cr *containerReference) tryReadID(opt string, cbk func(id int)) common.Exe
 			return nil
 		}
 		defer resp.Close()
+		defer context.AfterFunc(ctx, resp.Close)()
 
 		sid, err := resp.Reader.ReadString('\n')
 		if err != nil {
@@ -947,7 +900,7 @@ func (cr *containerReference) waitForCommand(ctx context.Context, resp client.Hi
 			if err != nil {
 				logger.Debugf("Failed to drain command output after cancellation: %v", err)
 			}
-		case <-time.After(drainGracePeriod):
+		case <-time.After(DrainGracePeriod):
 			logger.Warn("Timed out draining command output after cancellation")
 		}
 
@@ -997,37 +950,6 @@ func (cr *containerReference) extractionRoot(dstPath string) string {
 		return actPath // keeps tar entries from crossing the image's /var/run symlink
 	}
 	return "/"
-}
-
-func (cr *containerReference) CopyTarStream(ctx context.Context, destPath string, write func(*TarWriter) error) error {
-	if common.Dryrun(ctx) {
-		return nil
-	}
-	if err := cr.connect()(ctx); err != nil {
-		return err
-	}
-	if err := cr.find()(ctx); err != nil {
-		return err
-	}
-	if cr.id == "" {
-		return cr.missingContainerError("copy to %s", destPath)
-	}
-	destPath = path.Clean(destPath)
-	root := cr.extractionRoot(destPath)
-	rel := func(fullPath string) string { return strings.TrimPrefix(strings.TrimPrefix(fullPath, root), "/") }
-	var parents []string // sent as entries so they belong to the job user, the daemon creates missing ones as root
-	for dir := destPath; dir != root && dir != "/" && dir != "."; dir = path.Dir(dir) {
-		if _, err := cr.cli.ContainerStatPath(ctx, cr.id, client.ContainerStatPathOptions{Path: dir}); err == nil {
-			break
-		} else if !cerrdefs.IsNotFound(err) {
-			return fmt.Errorf("stat %s: %w", dir, err)
-		}
-		parents = append(parents, rel(dir))
-	}
-	slices.Reverse(parents)
-	content := pipeTar(cr.UID, cr.GID, rel(destPath), parents, write)
-	defer content.Close()
-	return cr.upload(ctx, root, content)
 }
 
 func (cr *containerReference) copyContent(dstPath string, files ...*FileEntry) common.Executor {
@@ -1122,7 +1044,7 @@ func (cr *containerReference) wait() common.Executor {
 		if cr.attachDone != nil {
 			select {
 			case <-cr.attachDone:
-			case <-time.After(drainGracePeriod):
+			case <-time.After(DrainGracePeriod):
 				logger.Warn("Timed out draining container output")
 			}
 			cr.attachDone = nil

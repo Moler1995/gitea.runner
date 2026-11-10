@@ -188,10 +188,14 @@ func (i *executeArgs) eventJSON() (string, error) {
 func (i *executeArgs) LoadEnvs() map[string]string {
 	envs := parseKVAndFile(i.envs, i.Envfile())
 
-	envs["ACTIONS_CACHE_URL"] = i.cacheHandler.ExternalURL() + "/"
+	cacheURL := i.cacheHandler.ExternalURL()
+	if cacheURL == "" {
+		return envs
+	}
+	envs["ACTIONS_CACHE_URL"] = cacheURL + "/"
 	// The same server answers cache v2, which docker buildx reads from the results origin alone.
 	if envs["ACTIONS_RESULTS_URL"] == "" {
-		envs["ACTIONS_RESULTS_URL"] = cmp.Or(os.Getenv("ACTIONS_RESULTS_URL"), i.cacheHandler.ExternalURL())
+		envs["ACTIONS_RESULTS_URL"] = cmp.Or(os.Getenv("ACTIONS_RESULTS_URL"), cacheURL)
 	}
 	envs[runner.CacheServiceV2Env] = "true"
 
@@ -207,10 +211,6 @@ func parseKVAndFile(rawKVs []string, filePath string) map[string]string {
 		result[key] = value
 	}
 	return result
-}
-
-func (i *executeArgs) artifactServerURL() string {
-	return "http://" + net.JoinHostPort(i.artifactServerAddr, i.artifactServerPort)
 }
 
 // Workdir returns path to workdir
@@ -386,7 +386,6 @@ func (i *executeArgs) runnerConfig(eventName string, env, proxyEnv map[string]st
 		ArtifactServerPath:                i.artifactServerPath,
 		ArtifactServerPort:                i.artifactServerPort,
 		ArtifactServerAddr:                i.artifactServerAddr,
-		ResultsURL:                        i.artifactServerURL(),
 		NoSkipCheckout:                    i.noSkipCheckout,
 		EventName:                         eventName,
 		EventJSON:                         eventJSON,
@@ -518,7 +517,7 @@ func runExec(ctx context.Context, execArgs *executeArgs) func(cmd *cobra.Command
 				token := cmp.Or(inheritedToken, artifacts.LocalRuntimeToken(workflowRun, maxLifetime))
 				config.RuntimeTokens[run.Workflow] = token
 				config.ExtraMasks = append(config.ExtraMasks, token)
-				handler.RegisterJob(token, artifactcache.JobCredential{Repo: "__local/__exec", Results: execArgs.artifactServerURL()})
+				handler.RegisterJob(token, artifactcache.JobCredential{Repo: "__local/__exec", Results: "http://" + net.JoinHostPort(execArgs.artifactServerAddr, execArgs.artifactServerPort)})
 			}
 		}
 
