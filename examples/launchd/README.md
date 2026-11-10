@@ -14,7 +14,7 @@ running the runner as a background service on macOS.
    gitea-runner register --instance https://gitea.example.com --token <token> --labels macos-arm64:host
    ```
 
-3. Replace `runner` in the job with that user, then install and start it:
+3. Replace `gitea-runner` in the job with that user, then install and start it:
 
    ```bash
    sudo cp com.gitea.runner.plist /Library/LaunchDaemons/

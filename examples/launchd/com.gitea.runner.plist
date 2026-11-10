@@ -10,16 +10,16 @@
         <string>daemon</string>
     </array>
     <key>UserName</key>
-    <string>runner</string>
+    <string>gitea-runner</string>
     <key>WorkingDirectory</key>
-    <string>/Users/runner/gitea-runner</string>
+    <string>/Users/gitea-runner/gitea-runner</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>
     <key>StandardErrorPath</key>
-    <string>/Users/runner/gitea-runner/runner.log</string>
+    <string>/Users/gitea-runner/gitea-runner/runner.log</string>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
