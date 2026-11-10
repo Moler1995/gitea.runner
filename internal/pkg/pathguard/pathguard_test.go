@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -30,7 +31,7 @@ func TestCheckParent(t *testing.T) {
 	require.EqualError(t, CheckParent("container.workdir_parent", "", sep, home),
 		"container.workdir_parent is empty; set it to a dedicated directory the runner may fill and delete")
 	require.EqualError(t, CheckParent("host.workdir_parent", sep, sep, home),
-		`host.workdir_parent "`+sep+`" is the filesystem root; set it to a dedicated directory the runner may fill and delete`)
+		"host.workdir_parent "+strconv.Quote(sep)+" is the filesystem root; set it to a dedicated directory the runner may fill and delete")
 	// A relative container parent is resolved under "/", so "." is the root too.
 	require.ErrorContains(t, CheckParent("container.workdir_parent", ".", sep, home), "filesystem root")
 	require.ErrorContains(t, CheckParent("host.workdir_parent", ".", home+sep, home), "is the home directory")
