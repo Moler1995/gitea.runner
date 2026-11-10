@@ -332,7 +332,10 @@ func (rc *RunContext) startDockerProxy(ctx context.Context) {
 }
 
 func (rc *RunContext) toolCacheVolume() string {
-	return sharedToolCacheVolume + rc.Config.ToolCacheSuffix
+	if rc.Config.ToolCacheSlot == "" {
+		return sharedToolCacheVolume
+	}
+	return sharedToolCacheVolume + "-" + rc.Config.ToolCacheSlot
 }
 
 // toolCache returns the tool cache path the job sees, relocatable through RUNNER_TOOL_CACHE.
@@ -450,10 +453,11 @@ func (rc *RunContext) startHostEnvironment() common.Executor {
 		if rc.Config.SharedToolCache {
 			toolCacheParent = cacheDir
 		}
-		if override := rc.GetEnv()["RUNNER_TOOL_CACHE"]; override != "" {
-			rc.Env["RUNNER_TOOL_CACHE"] = override + rc.Config.ToolCacheSuffix // on the host, slots share the path without it
+		toolCache := rc.toolCache(filepath.Join(toolCacheParent, "tool_cache"))
+		if rc.Config.ToolCacheSlot != "" {
+			toolCache = filepath.Join(toolCache, rc.Config.ToolCacheSlot)
+			rc.Env["RUNNER_TOOL_CACHE"] = toolCache // overrides a RUNNER_TOOL_CACHE the slots would otherwise share
 		}
-		toolCache := rc.toolCache(filepath.Join(toolCacheParent, "tool_cache"+rc.Config.ToolCacheSuffix))
 		if err := os.MkdirAll(toolCache, 0o777); err != nil {
 			return err
 		}

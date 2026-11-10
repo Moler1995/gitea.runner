@@ -456,8 +456,8 @@ func LoadDefault(file string) (*Config, error) {
 
 	// Validate and fix invalid config combinations to prevent confusing behavior.
 	if cfg.Runner.ToolCacheMode == ToolCacheModeShared && cfg.Runner.Capacity > 1 {
-		logging.Warnf("runner.tool_cache_mode %q with capacity %d: two jobs writing the same tool version at once corrupt it",
-			ToolCacheModeShared, cfg.Runner.Capacity)
+		logging.Warnf("runner.tool_cache_mode %q with capacity %d: two jobs writing the same tool version at once corrupt it, use %q instead",
+			ToolCacheModeShared, cfg.Runner.Capacity, ToolCacheModePerSlot)
 	}
 	if cfg.Runner.FetchTimeout > RequestTimeout {
 		logging.Warnf("fetch_timeout (%v) exceeds the RPC timeout (%v), capping it", cfg.Runner.FetchTimeout, RequestTimeout)

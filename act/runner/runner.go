@@ -85,8 +85,8 @@ type Config struct {
 	JobLoggerLevel                    *logging.Level // the level of job logger
 	ValidVolumes                      []string       // only volumes (and bind mounts) in this slice can be mounted on the job container or service containers
 	ContainerVolumes                  []string       // mounted into every job, service and docker action container
-	SharedToolCache                   bool           // one tool cache for all jobs instead of one per job
-	ToolCacheSuffix                   string         // distinguishes the reused tool cache, so concurrent jobs each get their own
+	SharedToolCache                   bool           // keeps the tool cache across jobs instead of one per job
+	ToolCacheSlot                     string         // set by per_slot, so concurrent tasks keep separate tool caches
 	InsecureSkipTLS                   bool           // whether to skip verifying TLS certificate of the Gitea instance
 	ClientCertFile, ClientKeyFile     string         // PEM client certificate for the Gitea instance
 	CAFile                            string         // PEM CA certificates the Gitea instance's certificate chains to

@@ -559,10 +559,11 @@ func TestRunContext_GetBindsAndMounts(t *testing.T) {
 		_, gotmount = rc.GetBindsAndMounts(t.Context())
 		assert.Equal(t, container.DefaultToolCache, gotmount[sharedToolCacheVolume])
 
-		rc.Config.ToolCacheSuffix = "-1"
+		rc.Config.ToolCacheSlot = "uuid-1"
 		_, gotmount = rc.GetBindsAndMounts(t.Context())
-		assert.Equal(t, container.DefaultToolCache, gotmount[sharedToolCacheVolume+"-1"])
+		assert.Equal(t, container.DefaultToolCache, gotmount[sharedToolCacheVolume+"-uuid-1"])
 		assert.NotContains(t, gotmount, sharedToolCacheVolume)
+		assert.Contains(t, rc.validVolumes(), sharedToolCacheVolume+"-uuid-1")
 	})
 
 	t.Run("DaemonMountsAboveOwnerRepo", func(t *testing.T) {
@@ -601,11 +602,6 @@ func TestRunContextValidVolumes(t *testing.T) {
 
 	assert.Equal(t, []string{"my-vol", "/host/path"}, rc.Config.ValidVolumes)
 	assert.Len(t, rc.validVolumes(), len(got), "repeated calls must be stable, not accumulate")
-
-	rc.Config.ToolCacheSuffix = "-1"
-	assert.Contains(t, rc.validVolumes(), sharedToolCacheVolume+"-1")
-	assert.NotContains(t, rc.validVolumes(), sharedToolCacheVolume)
-	rc.Config.ToolCacheSuffix = ""
 
 	rc.Config.SharedToolCache = false
 	assert.NotContains(t, rc.validVolumes(), sharedToolCacheVolume)
@@ -1191,27 +1187,24 @@ func TestPrintStartJobContainerGroupGolden(t *testing.T) {
 	assert.Equal(t, want, buf.String())
 }
 
-func TestStartHostEnvironmentToolCacheSuffix(t *testing.T) {
+func TestStartHostEnvironmentToolCacheSlotIsSubdirOfSharedCache(t *testing.T) {
 	cacheDir := t.TempDir()
-	rc := &RunContext{
-		Config: &Config{ActionCacheDir: cacheDir, SharedToolCache: true, ToolCacheSuffix: "-1"},
-		Env:    map[string]string{},
-		Run:    &model.Run{Workflow: &model.Workflow{Name: "wf"}},
-	}
-	require.NoError(t, rc.startHostEnvironment()(t.Context()))
-	t.Cleanup(func() { require.NoError(t, rc.cleanUpJobContainer(context.Background())) })
-	assert.Equal(t, filepath.Join(cacheDir, "tool_cache-1"), rc.JobContainer.(*container.HostEnvironment).ToolCache)
-
 	override := filepath.Join(cacheDir, "override")
-	rc = &RunContext{
-		Config: &Config{ActionCacheDir: cacheDir, SharedToolCache: true, ToolCacheSuffix: "-1"},
-		Env:    map[string]string{"RUNNER_TOOL_CACHE": override},
-		Run:    &model.Run{Workflow: &model.Workflow{Name: "wf"}},
+	for sharedCache, env := range map[string]map[string]string{
+		filepath.Join(cacheDir, "tool_cache"): {},
+		override:                              {"RUNNER_TOOL_CACHE": override},
+	} {
+		rc := &RunContext{
+			Config: &Config{ActionCacheDir: cacheDir, SharedToolCache: true, ToolCacheSlot: "uuid-1"},
+			Env:    env,
+			Run:    &model.Run{Workflow: &model.Workflow{Name: "wf"}},
+		}
+		require.NoError(t, rc.startHostEnvironment()(t.Context()))
+		t.Cleanup(func() { require.NoError(t, rc.cleanUpJobContainer(context.Background())) })
+		want := filepath.Join(sharedCache, "uuid-1")
+		assert.Equal(t, want, rc.JobContainer.(*container.HostEnvironment).ToolCache)
+		assert.Equal(t, want, rc.Env["RUNNER_TOOL_CACHE"])
 	}
-	require.NoError(t, rc.startHostEnvironment()(t.Context()))
-	t.Cleanup(func() { require.NoError(t, rc.cleanUpJobContainer(context.Background())) })
-	assert.Equal(t, override+"-1", rc.JobContainer.(*container.HostEnvironment).ToolCache)
-	assert.Equal(t, override+"-1", rc.Env["RUNNER_TOOL_CACHE"])
 }
 
 func TestRunContext_cleanupFailedStart(t *testing.T) {

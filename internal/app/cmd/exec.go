@@ -78,11 +78,8 @@ type executeArgs struct {
 
 // sharedToolCache reports whether mode mounts one tool cache for every job.
 func sharedToolCache(mode string) (bool, error) {
-	if !slices.Contains(config.ToolCacheModes, mode) {
-		return false, fmt.Errorf("invalid --tool-cache-mode %q: must be one of %q", mode, config.ToolCacheModes)
-	}
-	if mode == config.ToolCacheModePerSlot {
-		return false, fmt.Errorf("--tool-cache-mode %q needs runner.capacity slots, which exec has none of", mode)
+	if modes := []string{config.ToolCacheModeNone, config.ToolCacheModeShared}; !slices.Contains(modes, mode) {
+		return false, fmt.Errorf("invalid --tool-cache-mode %q: must be one of %q", mode, modes)
 	}
 	return mode == config.ToolCacheModeShared, nil
 }

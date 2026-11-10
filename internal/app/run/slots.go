@@ -35,9 +35,10 @@ func (a *slotAllocator) release(slot int) {
 	a.used[slot] = false
 }
 
-func toolCacheSuffix(mode string, slot int) string {
+// toolCacheSlot includes the runner UUID, as runners sharing a docker daemon or host dir all number slots from 0.
+func toolCacheSlot(mode, runnerUUID string, slot int) string {
 	if mode != config.ToolCacheModePerSlot {
 		return ""
 	}
-	return "-" + strconv.Itoa(slot)
+	return runnerUUID + "-" + strconv.Itoa(slot)
 }
