@@ -11,7 +11,7 @@ login keychain and the GUI.
 
    ```bash
    mkdir ~/gitea-runner && cd ~/gitea-runner
-   gitea-runner register --instance https://gitea.example.com --token <token> --labels macos-arm64:host
+   gitea-runner register --instance https://gitea.example.com --token <token> --labels macos-latest:host
    ```
 
 3. Replace `/Users/gitea-runner` in the file with the user's home directory,
