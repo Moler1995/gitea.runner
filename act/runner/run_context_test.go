@@ -559,11 +559,11 @@ func TestRunContext_GetBindsAndMounts(t *testing.T) {
 		_, gotmount = rc.GetBindsAndMounts(t.Context())
 		assert.Equal(t, container.DefaultToolCache, gotmount[sharedToolCacheVolume])
 
-		rc.Config.ToolCacheSlot = "uuid-1"
+		rc.Config.ToolCacheSlot = "1"
 		_, gotmount = rc.GetBindsAndMounts(t.Context())
-		assert.Equal(t, container.DefaultToolCache, gotmount[sharedToolCacheVolume+"-uuid-1"])
+		assert.Equal(t, container.DefaultToolCache, gotmount[sharedToolCacheVolume+"-1"])
 		assert.NotContains(t, gotmount, sharedToolCacheVolume)
-		assert.Contains(t, rc.validVolumes(), sharedToolCacheVolume+"-uuid-1")
+		assert.Contains(t, rc.validVolumes(), sharedToolCacheVolume+"-1")
 	})
 
 	t.Run("DaemonMountsAboveOwnerRepo", func(t *testing.T) {
@@ -1195,13 +1195,13 @@ func TestStartHostEnvironmentToolCacheSlotIsSubdirOfSharedCache(t *testing.T) {
 		override:                              {"RUNNER_TOOL_CACHE": override},
 	} {
 		rc := &RunContext{
-			Config: &Config{ActionCacheDir: cacheDir, SharedToolCache: true, ToolCacheSlot: "uuid-1"},
+			Config: &Config{ActionCacheDir: cacheDir, SharedToolCache: true, ToolCacheSlot: "1"},
 			Env:    env,
 			Run:    &model.Run{Workflow: &model.Workflow{Name: "wf"}},
 		}
 		require.NoError(t, rc.startHostEnvironment()(t.Context()))
 		t.Cleanup(func() { require.NoError(t, rc.cleanUpJobContainer(context.Background())) })
-		want := filepath.Join(sharedCache, "uuid-1")
+		want := filepath.Join(sharedCache, "1")
 		assert.Equal(t, want, rc.JobContainer.(*container.HostEnvironment).ToolCache)
 		assert.Equal(t, want, rc.Env["RUNNER_TOOL_CACHE"])
 	}

@@ -11,7 +11,7 @@ import (
 	"gitea.com/gitea/runner/internal/pkg/config"
 )
 
-// slotAllocator numbers running tasks with the lowest free slot, so at most capacity tasks stay within 0..capacity-1.
+// slotAllocator hands out the lowest free slot, so slot numbers stay below capacity.
 type slotAllocator struct {
 	mu   sync.Mutex
 	used []bool
@@ -35,10 +35,10 @@ func (a *slotAllocator) release(slot int) {
 	a.used[slot] = false
 }
 
-// toolCacheSlot includes the runner UUID, as runners sharing a docker daemon or host dir all number slots from 0.
-func toolCacheSlot(mode, runnerUUID string, slot int) string {
-	if mode != config.ToolCacheModePerSlot {
+// toolCacheSlot leaves slot 0 unnamed, so it keeps the cache a runner had before slots existed.
+func toolCacheSlot(mode string, slot int) string {
+	if mode != config.ToolCacheModeShared || slot == 0 {
 		return ""
 	}
-	return runnerUUID + "-" + strconv.Itoa(slot)
+	return strconv.Itoa(slot)
 }

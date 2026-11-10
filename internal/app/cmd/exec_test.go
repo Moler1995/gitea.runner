@@ -40,10 +40,8 @@ func TestSharedToolCache(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, shared)
 
-	for _, mode := range []string{"everyone", config.ToolCacheModePerSlot} {
-		_, err = sharedToolCache(mode)
-		require.ErrorContains(t, err, "tool-cache-mode")
-	}
+	_, err = sharedToolCache("everyone")
+	require.ErrorContains(t, err, "tool-cache-mode")
 }
 
 func TestExecuteArgsPaths(t *testing.T) {

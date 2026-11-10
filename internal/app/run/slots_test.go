@@ -21,6 +21,7 @@ func TestToolCacheSlotReusesLowestFree(t *testing.T) {
 	assert.Equal(t, 1, slots.acquire())
 	assert.Equal(t, 3, slots.acquire())
 
-	assert.Equal(t, "uuid-3", toolCacheSlot(config.ToolCacheModePerSlot, "uuid", 3))
-	assert.Empty(t, toolCacheSlot(config.ToolCacheModeShared, "uuid", 3))
+	assert.Equal(t, "3", toolCacheSlot(config.ToolCacheModeShared, 3))
+	assert.Empty(t, toolCacheSlot(config.ToolCacheModeShared, 0))
+	assert.Empty(t, toolCacheSlot(config.ToolCacheModeNone, 3))
 }
