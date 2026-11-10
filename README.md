@@ -7,6 +7,7 @@ Gitea Runner runs the jobs of Gitea Actions workflows. Register it with a Gitea 
 ### Prerequisites
 
 - Linux, macOS or Windows, or FreeBSD.
+- Gitea 1.26.2 or newer.
 - `git` 2.34.1 or newer.
 - `docker`, or `podman` with `podman.socket` enabled, for `docker` labels and Docker actions. See Docker's [install instructions](https://docs.docker.com/engine/install/).
 
@@ -14,9 +15,6 @@ In the job image, or on the host for host jobs:
 
 - `bash` or `sh`, or `pwsh` or `powershell` on Windows.
 - `node` for JavaScript actions and `hashFiles()`.
-- `git` 2.34.1 or newer for [`builtin:checkout`](docs/builtin-actions.md).
-- `git-lfs` for `builtin:checkout` with `lfs: true`.
-- `ssh` for `builtin:checkout` with `ssh-key`.
 
 Kubernetes mode needs [a few more tools](docs/kubernetes.md) in job images.
 
@@ -183,7 +181,7 @@ Setup actions like `setup-go` install tools into `RUNNER_TOOL_CACHE`. `runner.to
 | Mode | Tool cache |
 | --- | --- |
 | `none` (default) | Provided by the job image. Versions it lacks are downloaded in every job. |
-| `shared` | One volume for all jobs. Only safe with `runner.capacity: 1`. |
+| `shared` | One volume per `runner.capacity` slot, reused by later jobs. It hides the tools later job images ship, so use images without them. |
 
 To ship tools in a job image, install them to `/opt/hostedtoolcache/<tool>/<version>/<arch>` with an empty `<arch>.complete` file next to it, as the `-full` [runner images](https://gitea.com/gitea/runner-images) do:
 
@@ -244,10 +242,6 @@ volumes:
 ```
 
 Set `container.sweep: true` to remove the containers, networks and volumes most Linux container jobs create when they end, `docker compose` services included. Leave it off if jobs deploy services to the runner's Docker daemon.
-
-### Built-in actions (`uses: builtin:<name>`)
-
-`uses: builtin:checkout`, `builtin:upload-artifact` and `builtin:download-artifact` replace their `actions/` counterparts without an action download or Node in the job image, see [docs/builtin-actions.md](docs/builtin-actions.md).
 
 ### Caching (`actions/cache`)
 
