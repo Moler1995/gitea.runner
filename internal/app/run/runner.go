@@ -37,7 +37,6 @@ import (
 	"gitea.com/gitea/runner/internal/pkg/envcheck"
 	"gitea.com/gitea/runner/internal/pkg/labels"
 	"gitea.com/gitea/runner/internal/pkg/metrics"
-	"gitea.com/gitea/runner/internal/pkg/pathguard"
 	"gitea.com/gitea/runner/internal/pkg/report"
 	"gitea.com/gitea/runner/internal/pkg/telemetry"
 	"gitea.com/gitea/runner/internal/pkg/ver"
@@ -453,14 +452,6 @@ func (r *Runner) run(ctx context.Context, task *runnerv1.Task, reporter *report.
 		}
 	}()
 
-	if err := ValidateWorkdirConfig(r.cfg); err != nil {
-		return err
-	}
-	hostParent, err := hostWorkdirParent(r.cfg)
-	if err != nil {
-		return err
-	}
-
 	slot := r.slots.acquire()
 	defer r.slots.release(slot)
 
@@ -576,19 +567,10 @@ func (r *Runner) run(ctx context.Context, task *runnerv1.Task, reporter *report.
 		// Append the task ID to isolate concurrent jobs from the same repo.
 		workdirParent = filepath.Join(workdirParent, strconv.FormatInt(task.Id, 10))
 	}
-	if err := pathguard.CheckRepository(preset.Repository); err != nil {
-		return err
-	}
 	workdir := filepath.Join(workdirParent, filepath.FromSlash(preset.Repository))
-	if err := pathguard.ValidateWorkdir(workdirParent, workdir); err != nil {
-		return err
-	}
 	if runtime.GOOS == "windows" {
 		if abs, err := filepath.Abs(workdir); err == nil {
 			workdir = abs
-		}
-		if abs, err := filepath.Abs(workdirParent); err == nil {
-			workdirParent = abs
 		}
 	}
 	// Without bind_workdir, the workspace path omits the task id; concurrent host-mode jobs
@@ -600,9 +582,8 @@ func (r *Runner) run(ctx context.Context, task *runnerv1.Task, reporter *report.
 		// On Linux, Workdir will be like "/<parent_directory>/<owner>/<repo>"
 		// On Windows, Workdir will be like "\<parent_directory>\<owner>\<repo>"
 		Workdir:           workdir,
-		WorkdirParent:     workdirParent,
 		BindWorkdir:       r.cfg.Container.BindWorkdir,
-		ActionCacheDir:    hostParent,
+		ActionCacheDir:    filepath.FromSlash(r.cfg.Host.WorkdirParent),
 		AllocatePTY:       r.cfg.Runner.AllocatePTY,
 		ActionOfflineMode: r.cfg.Cache.OfflineMode,
 		ActionCloneDepth:  actionCloneDepth,
@@ -622,7 +603,6 @@ func (r *Runner) run(ctx context.Context, task *runnerv1.Task, reporter *report.
 		EventJSON:            string(eventJSON),
 		ContainerNamePrefix:  fmt.Sprintf("GITEA-ACTIONS-TASK-%d", task.Id),
 		ContainerMaxLifetime: maxLifetime,
-		CleanWorkdir:         true,
 		ContainerNetworkMode: docker_container.NetworkMode(r.cfg.Container.Network),
 		CacheContainer:       cacheContainer,
 		ContainerNetworkCreateOptions: container.NewDockerNetworkCreateExecutorInput{
@@ -871,40 +851,6 @@ func checkFreeDisk(cfg *config.Config) (bool, string) {
 		return false, fmt.Sprintf("low disk space on %s: %d MiB available, %d MiB required", root, availableMB, cfg.HealthCheck.MinFreeDiskSpaceMB)
 	}
 	return true, "ok"
-}
-
-// hostWorkdirParent returns host.workdir_parent as an absolute path, or "" when it is unset.
-func hostWorkdirParent(cfg *config.Config) (string, error) {
-	if cfg.Host.WorkdirParent == "" {
-		return "", nil
-	}
-	return filepath.Abs(filepath.FromSlash(cfg.Host.WorkdirParent))
-}
-
-// ValidateWorkdirConfig rejects a config whose workdir parents are empty, the filesystem root
-// or the home directory, before a job's teardown can be pointed at them. A relative
-// host.workdir_parent is judged by the absolute path it resolves to.
-func ValidateWorkdirConfig(cfg *config.Config) error {
-	home, _ := os.UserHomeDir() // unknown home only skips the home check
-	if err := pathguard.CheckParent("container.workdir_parent", cfg.Container.WorkdirParent, containerWorkdirRoot(cfg.Container.WorkdirParent), home); err != nil {
-		return err
-	}
-	hostParent, err := hostWorkdirParent(cfg)
-	if err != nil {
-		return fmt.Errorf("host.workdir_parent %q cannot be made absolute: %w", cfg.Host.WorkdirParent, err)
-	}
-	return pathguard.CheckParent("host.workdir_parent", cfg.Host.WorkdirParent, hostParent, home)
-}
-
-// ResolveWorkdirConfig validates the workdir parents, then makes host.workdir_parent absolute
-// so later changes of the working directory cannot move it. Call it once, before jobs run.
-func ResolveWorkdirConfig(cfg *config.Config) error {
-	if err := ValidateWorkdirConfig(cfg); err != nil {
-		return err
-	}
-	hostParent, _ := hostWorkdirParent(cfg)
-	cfg.Host.WorkdirParent = hostParent
-	return nil
 }
 
 func containerWorkdirRoot(parent string) string {

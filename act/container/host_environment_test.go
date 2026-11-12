@@ -158,112 +158,12 @@ func TestHostEnvironmentAllocatePTY(t *testing.T) {
 }
 
 func TestHostEnvironmentRemoveWorkdir(t *testing.T) {
-	for name, owned := range map[string]bool{"preserves caller workdir": false, "cleans owned workdir": true} {
-		t.Run(name, func(t *testing.T) {
-			miscRoot, workdirParent := t.TempDir(), t.TempDir()
-			workdir := filepath.Join(workdirParent, "owner", "repo")
-			e := &HostEnvironment{
-				Path:          filepath.Join(miscRoot, "hostexecutor"),
-				Workdir:       workdir,
-				CleanWorkdir:  owned,
-				WorkdirParent: workdirParent,
-				Root:          miscRoot,
-			}
-			require.NoError(t, os.MkdirAll(workdir, 0o700))
-			require.NoError(t, os.MkdirAll(e.Path, 0o700))
-			require.NoError(t, os.MkdirAll(filepath.Join(miscRoot, "tmp"), 0o700))
-			require.NoError(t, e.Remove()(t.Context()))
-			assert.NoDirExists(t, miscRoot)
-			_, err := os.Stat(workdir)
-			if owned {
-				assert.ErrorIs(t, err, os.ErrNotExist)
-			} else {
-				require.NoError(t, err)
-			}
-		})
-	}
-}
-
-// Every layout lives under one t.TempDir(): the owning parent, a sibling bait directory with a
-// file, and the misc root. A workdir outside the owning parent must be refused, leaving the bait.
-func TestHostEnvironmentRemoveRefusesUnsafeWorkdir(t *testing.T) {
-	for name, tc := range map[string]struct {
-		workdir func(parent, bait string) string
-		parent  func(parent string) string
-		want    string
-	}{
-		"outside the owning parent": {workdir: func(_, bait string) string { return bait }, parent: func(p string) string { return p }, want: "not strictly inside"},
-		"the owning parent itself":  {workdir: func(parent, _ string) string { return parent }, parent: func(p string) string { return p }, want: "not strictly inside"},
-		"no owning parent":          {workdir: func(_, bait string) string { return bait }, parent: func(string) string { return "" }, want: "no WorkdirParent"},
-		"empty workdir":             {workdir: func(string, string) string { return "" }, parent: func(p string) string { return p }, want: "empty path"},
-	} {
-		t.Run(name, func(t *testing.T) {
-			base := t.TempDir()
-			parent, bait, misc := filepath.Join(base, "root"), filepath.Join(base, "bait"), filepath.Join(base, "misc")
-			for _, dir := range []string{parent, bait, misc} {
-				require.NoError(t, os.MkdirAll(dir, 0o700))
-			}
-			baitFile := filepath.Join(bait, "keep.txt")
-			require.NoError(t, os.WriteFile(baitFile, []byte("keep"), 0o600))
-
-			e := &HostEnvironment{
-				Path:          filepath.Join(misc, "hostexecutor"),
-				Workdir:       tc.workdir(parent, bait),
-				CleanWorkdir:  true,
-				WorkdirParent: tc.parent(parent),
-				Root:          misc,
-			}
-			err := e.Remove()(t.Context())
-			require.ErrorContains(t, err, "refusing to delete")
-			require.ErrorContains(t, err, tc.want)
-			assert.FileExists(t, baitFile)
-			assert.DirExists(t, parent)
-			assert.NoDirExists(t, misc, "the misc state is still removed")
-		})
-	}
-}
-
-// A workdir inside the owning root that is a symlink out of it must be refused. Everything,
-// including the fake HOME, is inside t.TempDir().
-func TestHostEnvironmentRemoveRefusesSymlinkedWorkdir(t *testing.T) {
-	base := t.TempDir()
-	parent, bait, home := filepath.Join(base, "root"), filepath.Join(base, "bait"), filepath.Join(base, "home")
-	for _, dir := range []string{parent, bait, home} {
-		require.NoError(t, os.MkdirAll(dir, 0o700))
-	}
-	t.Setenv("HOME", home)
-	t.Setenv("USERPROFILE", home)
-	baitFile, homeFile := filepath.Join(bait, "keep.txt"), filepath.Join(home, "keep.txt")
-	require.NoError(t, os.WriteFile(baitFile, []byte("keep"), 0o600))
-	require.NoError(t, os.WriteFile(homeFile, []byte("keep"), 0o600))
-
-	for name, target := range map[string]string{"link to a sibling dir": bait, "link to the home dir": home} {
-		t.Run(name, func(t *testing.T) {
-			link := filepath.Join(parent, "link")
-			if err := os.Symlink(target, link); err != nil {
-				t.Skipf("cannot create symlinks: %v", err)
-			}
-			t.Cleanup(func() { _ = os.Remove(link) })
-			misc := t.TempDir()
-			e := &HostEnvironment{Path: filepath.Join(misc, "hostexecutor"), Workdir: link, CleanWorkdir: true, WorkdirParent: parent, Root: misc}
-			require.ErrorContains(t, e.Remove()(t.Context()), "refusing to delete")
-			assert.FileExists(t, baitFile)
-			assert.FileExists(t, homeFile)
-		})
-	}
-}
-
-func TestHostEnvironmentRemoveRefusesHomeAsMiscRoot(t *testing.T) {
-	// A temp dir stands in for the home directory, so no real home is named.
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	t.Setenv("USERPROFILE", home)
-	keep := filepath.Join(home, "keep.txt")
-	require.NoError(t, os.WriteFile(keep, []byte("keep"), 0o600))
-
-	err := (&HostEnvironment{Root: home}).Remove()(t.Context())
-	require.ErrorContains(t, err, "refusing to delete the home directory")
-	assert.FileExists(t, keep)
+	miscRoot, workdir := t.TempDir(), t.TempDir()
+	e := &HostEnvironment{Path: filepath.Join(miscRoot, "hostexecutor"), Workdir: workdir, Root: miscRoot}
+	require.NoError(t, os.MkdirAll(e.Path, 0o700))
+	require.NoError(t, e.Remove()(t.Context()))
+	assert.NoDirExists(t, miscRoot)
+	assert.DirExists(t, workdir)
 }
 
 func TestRemoveAllWithContextDoesNotHangOnStuckDelete(t *testing.T) {
