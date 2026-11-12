@@ -742,7 +742,7 @@ func cacheCredential(preset *model.GithubContext, publicURL, cacheMode string) a
 		ref = fmt.Sprintf("refs/pull/%d/head", int64(number)) // review events take github.ref from the reviewer's commit_id
 	}
 	defaultRef := branchRef(model.AsString(model.NestedMapLookup(preset.Event, "repository", "default_branch")))
-	if cacheMode == "" { // as on GitHub, only trusted events save caches for the default branch
+	if cacheMode == "" { // only trusted events save caches for the default branch
 		cacheMode = "write"
 		if ref == defaultRef && !slices.Contains([]string{"push", "workflow_dispatch", "schedule", "delete", "registry_package"}, preset.EventName) {
 			cacheMode = "read"
