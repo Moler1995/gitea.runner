@@ -62,7 +62,7 @@ type JobCredential struct {
 	Ref        string `json:"ref"`
 	BaseRef    string `json:"base_ref"`
 	DefaultRef string `json:"default_ref"`
-	Mode       string `json:"mode"` // cache-mode, empty allows everything
+	CacheMode  string `json:"cache_mode"` // empty allows everything
 
 	// Results is the instance whose artifact service this server forwards for the job, and
 	// InsecureTLS how the runner reaches it; see results.go.
@@ -219,10 +219,10 @@ func StartHandler(opts Options) (*Handler, error) {
 	}
 
 	router := http.NewServeMux()
-	router.HandleFunc("GET "+apiPath+"/cache", h.modeAuth(false, h.find))
-	router.HandleFunc("POST "+apiPath+"/caches", h.modeAuth(true, h.reserve))
-	router.HandleFunc("PATCH "+apiPath+"/caches/{id}", h.modeAuth(true, h.upload))
-	router.HandleFunc("POST "+apiPath+"/caches/{id}", h.modeAuth(true, h.commit))
+	router.HandleFunc("GET "+apiPath+"/cache", h.cacheModeAuth(false, h.find))
+	router.HandleFunc("POST "+apiPath+"/caches", h.cacheModeAuth(true, h.reserve))
+	router.HandleFunc("PATCH "+apiPath+"/caches/{id}", h.cacheModeAuth(true, h.upload))
+	router.HandleFunc("POST "+apiPath+"/caches/{id}", h.cacheModeAuth(true, h.commit))
 	router.HandleFunc("POST "+apiPath+"/clean", h.bearerAuth(h.clean))
 	// Artifact GET is signed via query-string HMAC because @actions/cache
 	// does not attach Authorization when downloading archiveLocation.
@@ -957,10 +957,10 @@ func (h *Handler) bearerAuth(handler http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// modeAuth is bearerAuth refusing what the job's cache-mode forbids, in the shapes the toolkit reports as a warning.
-func (h *Handler) modeAuth(write bool, handler http.HandlerFunc) http.HandlerFunc {
+// cacheModeAuth is bearerAuth refusing what the job's cache-mode forbids, in the shapes the toolkit reports as a warning.
+func (h *Handler) cacheModeAuth(write bool, handler http.HandlerFunc) http.HandlerFunc {
 	return h.bearerAuth(func(w http.ResponseWriter, r *http.Request) {
-		mode := credFromContext(r.Context()).Mode
+		mode := credFromContext(r.Context()).CacheMode
 		access, forbidden := "read", "write-only"
 		if write {
 			access, forbidden = "write", "read"

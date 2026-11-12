@@ -545,9 +545,9 @@ func (r *Runner) run(ctx context.Context, task *runnerv1.Task, reporter *report.
 	// lifetime.
 	cred := cacheCredential(preset, cacheURL, cmp.Or(job.CacheMode, workflow.CacheMode))
 	if cacheURL != "" {
-		envs["ACTIONS_CACHE_MODE"] = cred.Mode // @actions/cache skips what the mode forbids
-		if cred.Mode != "write" {
-			reporter.Logf("Cache mode: %s", cred.Mode)
+		envs["ACTIONS_CACHE_MODE"] = cred.CacheMode // @actions/cache skips what the mode forbids
+		if cred.CacheMode != "write" {
+			reporter.Logf("Cache mode: %s", cred.CacheMode)
 		}
 	}
 	revokeCache, resultsURL := r.registerCacheForTask(giteaRuntimeToken, cred, reporter)
@@ -753,7 +753,7 @@ func cacheCredential(preset *model.GithubContext, publicURL, cacheMode string) a
 		Ref:        ref,
 		BaseRef:    branchRef(preset.BaseRef),
 		DefaultRef: defaultRef,
-		Mode:       cacheMode,
+		CacheMode:  cacheMode,
 		PublicURL:  publicURL,
 	}
 }

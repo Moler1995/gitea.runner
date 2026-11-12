@@ -44,9 +44,9 @@ const (
 )
 
 func (h *Handler) registerV2Routes(router *http.ServeMux) {
-	router.HandleFunc("POST "+cacheServiceV2Path+"/CreateCacheEntry", h.modeAuth(true, h.v2CreateCacheEntry))
-	router.HandleFunc("POST "+cacheServiceV2Path+"/FinalizeCacheEntryUpload", h.modeAuth(true, h.v2FinalizeCacheEntryUpload))
-	router.HandleFunc("POST "+cacheServiceV2Path+"/GetCacheEntryDownloadURL", h.modeAuth(false, h.v2GetCacheEntryDownloadURL))
+	router.HandleFunc("POST "+cacheServiceV2Path+"/CreateCacheEntry", h.cacheModeAuth(true, h.v2CreateCacheEntry))
+	router.HandleFunc("POST "+cacheServiceV2Path+"/FinalizeCacheEntryUpload", h.cacheModeAuth(true, h.v2FinalizeCacheEntryUpload))
+	router.HandleFunc("POST "+cacheServiceV2Path+"/GetCacheEntryDownloadURL", h.cacheModeAuth(false, h.v2GetCacheEntryDownloadURL))
 	router.HandleFunc("PUT "+blobPath+"/{id}", h.signedAuth(blobUploadPurpose, h.v2UploadBlob))
 }
 

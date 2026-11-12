@@ -120,15 +120,15 @@ func TestCacheCredential(t *testing.T) {
 		Event: map[string]any{"repository": repository, "number": float64(3)},
 	}
 	assert.Equal(t, artifactcache.JobCredential{
-		Repo: "owner/repo", Ref: "refs/pull/3/head", BaseRef: "refs/heads/release", DefaultRef: "refs/heads/main", Mode: "write", PublicURL: "http://cache",
+		Repo: "owner/repo", Ref: "refs/pull/3/head", BaseRef: "refs/heads/release", DefaultRef: "refs/heads/main", CacheMode: "write", PublicURL: "http://cache",
 	}, cacheCredential(review, "http://cache", ""))
 
 	review.EventName, review.Ref = "pull_request_target", "refs/heads/release"
 	assert.Equal(t, "refs/heads/release", cacheCredential(review, "", "").Ref)
-	assert.Equal(t, "write", cacheCredential(review, "", "").Mode)
+	assert.Equal(t, "write", cacheCredential(review, "", "").CacheMode)
 
 	assert.Equal(t, artifactcache.JobCredential{
-		Repo: "owner/repo", Ref: "refs/heads/feature", DefaultRef: "refs/heads/main", Mode: "write",
+		Repo: "owner/repo", Ref: "refs/heads/feature", DefaultRef: "refs/heads/main", CacheMode: "write",
 	}, cacheCredential(&model.GithubContext{Repository: "owner/repo", Ref: "refs/heads/feature", Event: map[string]any{"repository": repository}}, "", ""))
 
 	for _, tc := range [][3]string{
@@ -141,7 +141,7 @@ func TestCacheCredential(t *testing.T) {
 	} {
 		cred := cacheCredential(&model.GithubContext{EventName: tc[0], Ref: "refs/heads/main", Event: map[string]any{"repository": repository}}, "", tc[1])
 		assert.Equal(t, "refs/heads/main", cred.Ref, tc)
-		assert.Equal(t, tc[2], cred.Mode, tc)
+		assert.Equal(t, tc[2], cred.CacheMode, tc)
 	}
 }
 

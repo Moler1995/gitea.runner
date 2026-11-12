@@ -1012,8 +1012,8 @@ func TestHandler_CrossRepoAndCacheModeIsolation(t *testing.T) {
 	handler.RegisterJob("token-a", JobCredential{Repo: "owner/repoA"})
 	handler.RegisterJob("token-b", JobCredential{Repo: "owner/repoB"})
 	handler.RegisterJob("token-a-pull", JobCredential{Repo: "owner/repoA", Ref: "refs/pull/1/head"})
-	handler.RegisterJob("token-a-read", JobCredential{Repo: "owner/repoA", Mode: "read"})
-	handler.RegisterJob("token-a-write-only", JobCredential{Repo: "owner/repoA", Mode: "write-only"})
+	handler.RegisterJob("token-a-read", JobCredential{Repo: "owner/repoA", CacheMode: "read"})
+	handler.RegisterJob("token-a-write-only", JobCredential{Repo: "owner/repoA", CacheMode: "write-only"})
 
 	base := handler.ExternalURL() + apiPath
 	key := "shared-key"
