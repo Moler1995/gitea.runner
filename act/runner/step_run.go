@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"runtime"
 	"slices"
 	"strings"
 
@@ -357,27 +358,27 @@ func (sr *stepRun) setupShell(ctx context.Context, eval *expressionEvaluator) (b
 
 	implicitShell := step.Shell == ""
 	if implicitShell {
-		preferred, fallback := "bash", "sh"
-		if rc.isWindowsHost() {
-			preferred, fallback = "pwsh", "powershell" // Don't use bash on windows by default, if not using a docker container
-		}
+		shellWithFallback := []string{"bash", "sh"}
 		env := maps.Clone(sr.env)
 		rc.ApplyExtraPath(ctx, &env)
-		step.Shell = rc.shellOrFallback(ctx, env, preferred, fallback)
+		if _, ok := rc.JobContainer.(*container.HostEnvironment); ok {
+			// Don't use bash on windows by default, if not using a docker container
+			if runtime.GOOS == "windows" {
+				shellWithFallback = []string{"pwsh", "powershell"}
+			}
+			step.Shell = shellWithFallback[0]
+			_, err := lookpath.LookPath2(shellWithFallback[0], env)
+			if err != nil {
+				step.Shell = shellWithFallback[1]
+			}
+		} else {
+			step.Shell = shellWithFallback[0]
+			if !rc.containerHasBash(ctx, env) {
+				step.Shell = shellWithFallback[1]
+			}
+		}
 	}
 	return implicitShell, nil
-}
-
-// shellOrFallback probes a container only for bash.
-func (rc *RunContext) shellOrFallback(ctx context.Context, env map[string]string, preferred, fallback string) string {
-	if _, ok := rc.JobContainer.(*container.HostEnvironment); ok {
-		if _, err := lookpath.LookPath2(preferred, env); err != nil {
-			return fallback
-		}
-	} else if preferred == "bash" && !rc.containerHasBash(ctx, env) {
-		return fallback
-	}
-	return preferred
 }
 
 // containerHasBash probes once per job, else every implicit-shell step pays for an exec.

@@ -21,11 +21,6 @@ import (
 	"gitea.dev/actionslib/pkg/model"
 )
 
-const (
-	pathFileCommand = "workflow/pathcmd.txt"
-	envFileCommand  = "workflow/envs.txt"
-)
-
 type step interface {
 	pre() common.Executor
 	main() common.Executor
@@ -154,7 +149,10 @@ func runStepExecutor(step step, stage stepStage, executor common.Executor) commo
 		stateFileCommand := path.Join("workflow", "statecmd.txt")
 		(*step.getEnv())["GITHUB_STATE"] = container.JoinPath(actPath, stateFileCommand)
 
+		pathFileCommand := path.Join("workflow", "pathcmd.txt")
 		(*step.getEnv())["GITHUB_PATH"] = container.JoinPath(actPath, pathFileCommand)
+
+		envFileCommand := path.Join("workflow", "envs.txt")
 		(*step.getEnv())["GITHUB_ENV"] = container.JoinPath(actPath, envFileCommand)
 
 		// Per-step summary file. Composite sub-steps share the outer job step's index

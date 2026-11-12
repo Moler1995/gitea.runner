@@ -655,11 +655,6 @@ func (rc *RunContext) startJobContainer() common.Executor {
 			rc.serviceContainers = append(rc.serviceContainers, &serviceContainer{name: serviceID, image: input.Image, container: newContainer(input)})
 		}
 
-		exposedPorts, portBindings, err := nat.ParsePortSpecs(rc.containerSpec.Ports)
-		if err != nil {
-			return fmt.Errorf("failed to parse container ports: %w", err)
-		}
-
 		ext := container.LinuxContainerEnvironmentExtensions{}
 		containerInput := &container.NewContainerInput{
 			Entrypoint:      []string{"sleep", strconv.FormatInt(int64(rc.Config.ContainerMaxLifetime.Round(time.Second).Seconds()), 10)},
@@ -671,8 +666,6 @@ func (rc *RunContext) startJobContainer() common.Executor {
 			Env:             envList,
 			NetworkMode:     networkName,
 			NetworkAliases:  []string{rc.Name},
-			ExposedPorts:    exposedPorts,
-			PortBindings:    portBindings,
 			Stdout:          logWriter,
 			Stderr:          logWriter,
 			Privileged:      rc.Config.Privileged,
@@ -1642,7 +1635,7 @@ func (rc *RunContext) getRunnerContext(ctx context.Context) map[string]any {
 	runnerContext["name"] = rc.Config.RunnerName
 	runnerContext["environment"] = "self-hosted"
 	runnerContext["workspace"] = parentDir(rc.githubWorkspace())
-	if rc.topLevelRunContext().Config.RunnerDebug() { // a composite's config has no secrets
+	if rc.Config.RunnerDebug() {
 		runnerContext["debug"] = "1"
 	}
 	return runnerContext
@@ -1686,9 +1679,7 @@ func (rc *RunContext) getGithubContext(ctx context.Context) *model.GithubContext
 		Workspace:        rc.githubWorkspace(),
 	}
 	if rc.JobContainer != nil {
-		actPath := rc.JobContainer.GetActPath()
-		ghc.EventPath = actPath + "/workflow/event.json"
-		ghc.Env, ghc.Path = container.JoinPath(actPath, envFileCommand), container.JoinPath(actPath, pathFileCommand)
+		ghc.EventPath = rc.JobContainer.GetActPath() + "/workflow/event.json"
 	}
 
 	ghc.RunnerTrackingID = rc.runnerTrackingID()
@@ -1696,7 +1687,6 @@ func (rc *RunContext) getGithubContext(ctx context.Context) *model.GithubContext
 	if preset := rc.Config.PresetGitHubContext; preset != nil {
 		merged := *preset
 		merged.Workflow, merged.Job, merged.Workspace, merged.EventPath = ghc.Workflow, ghc.Job, ghc.Workspace, ghc.EventPath
-		merged.Env, merged.Path = ghc.Env, ghc.Path
 		merged.Action, merged.ActionPath, merged.ActionRepository, merged.ActionRef = ghc.Action, ghc.ActionPath, ghc.ActionRepository, ghc.ActionRef
 		merged.RunnerPerflog, merged.RunnerTrackingID = ghc.RunnerPerflog, ghc.RunnerTrackingID
 		*ghc = merged
@@ -1851,7 +1841,7 @@ func (rc *RunContext) withGithubEnv(ctx context.Context, github *model.GithubCon
 	if workspace := parentDir(github.Workspace); workspace != "" {
 		env["RUNNER_WORKSPACE"] = workspace
 	}
-	if rc.topLevelRunContext().Config.RunnerDebug() {
+	if rc.Config.RunnerDebug() {
 		env["RUNNER_DEBUG"] = "1"
 	}
 

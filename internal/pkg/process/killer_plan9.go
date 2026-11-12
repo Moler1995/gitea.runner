@@ -26,6 +26,4 @@ func (k *Killer) Kill() error {
 	return k.p.Kill()
 }
 
-func (k *Killer) cancel(_process *os.Process, _graceful bool) error { return k.Kill() }
-
 func (k *Killer) Close() error { return nil }

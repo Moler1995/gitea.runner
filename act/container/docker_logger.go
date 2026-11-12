@@ -8,7 +8,6 @@ package container
 
 import (
 	"bufio"
-	"cmp"
 	"encoding/json/v2"
 	"errors"
 	"io"
@@ -27,7 +26,10 @@ type dockerMessage struct {
 	Progress string `json:"progress"`
 }
 
-func logDockerResponse(logger *logging.Logger, dockerResponse io.ReadCloser, log func(string, ...any)) error {
+func logDockerResponse(logger *logging.Logger, dockerResponse io.ReadCloser, isError bool) error {
+	if dockerResponse == nil {
+		return nil
+	}
 	defer dockerResponse.Close()
 
 	scanner := bufio.NewScanner(dockerResponse)
@@ -36,28 +38,41 @@ func logDockerResponse(logger *logging.Logger, dockerResponse io.ReadCloser, log
 		line := scanner.Bytes()
 		var msg dockerMessage
 		if err := json.Unmarshal(line, &msg); err != nil {
-			logger.Debugf("Unable to unmarshal line [%s] ==> %v", string(line), err)
+			writeLog(logger, false, "Unable to unmarshal line [%s] ==> %v", string(line), err)
 			continue
 		}
 
-		if message := cmp.Or(msg.Error, msg.ErrorDetail.Message); message != "" {
-			log("%s", message)
-			return errors.New(message)
+		if msg.Error != "" {
+			writeLog(logger, isError, "%s", msg.Error)
+			return errors.New(msg.Error)
+		}
+
+		if msg.ErrorDetail.Message != "" {
+			writeLog(logger, isError, "%s", msg.ErrorDetail.Message)
+			return errors.New(msg.ErrorDetail.Message)
 		}
 
 		switch {
 		case msg.Status != "":
 			if msg.Progress != "" {
-				log("%s :: %s :: %s\n", msg.Status, msg.ID, msg.Progress)
+				writeLog(logger, isError, "%s :: %s :: %s\n", msg.Status, msg.ID, msg.Progress)
 			} else {
-				log("%s :: %s\n", msg.Status, msg.ID)
+				writeLog(logger, isError, "%s :: %s\n", msg.Status, msg.ID)
 			}
 		case msg.Stream != "":
-			log("%s", msg.Stream)
+			writeLog(logger, isError, "%s", msg.Stream)
 		default:
-			logger.Debugf("Unable to handle line: %s", string(line))
+			writeLog(logger, false, "Unable to handle line: %s", string(line))
 		}
 	}
 
 	return scanner.Err()
+}
+
+func writeLog(logger *logging.Logger, isError bool, format string, args ...any) {
+	if isError {
+		logger.Errorf(format, args...)
+	} else {
+		logger.Debugf(format, args...)
+	}
 }
