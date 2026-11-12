@@ -245,7 +245,7 @@ Set `container.sweep: true` to remove the containers, networks and volumes most 
 
 ### Caching (`actions/cache`)
 
-Each runner runs its own cache server. As on GitHub, a job restores caches of its own ref, its pull request's base branch and the default branch. Only `push`, `workflow_dispatch`, `schedule`, `delete` and `registry_package` runs save caches for the default branch, other runs on it such as `pull_request_target` only restore them. A workflow or job `cache-mode` of `read`, `write`, `write-only` or `none` overrides this.
+Each runner runs its own cache server. As on GitHub, a job restores caches of its own ref, its pull request's base branch and the default branch. [Low-trust runs](https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching#cache-access-for-low-trust-workflow-triggers) like `pull_request_target` cannot save default-branch caches unless `cache-mode` allows it.
 
 #### Sharing a cache between runners
 
