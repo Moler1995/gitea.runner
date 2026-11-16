@@ -190,8 +190,8 @@ func (cr *containerReference) Inspect(ctx context.Context) (*Info, error) {
 	} else if err != nil {
 		return nil, err
 	}
-	if result.Container.Config != nil {
-		cr.containerEnv = opts.ConvertKVStringsToMap(result.Container.Config.Env)
+	if cr.containerEnvID != cr.id && result.Container.Config != nil {
+		cr.containerEnv, cr.containerEnvID = opts.ConvertKVStringsToMap(result.Container.Config.Env), cr.id
 	}
 	return containerInfoFromInspect(result.Container), nil
 }
@@ -316,16 +316,11 @@ func (cr *containerReference) UpdateFromEnv(srcPath string, env *map[string]stri
 func (cr *containerReference) UpdateFromImageEnv(env *map[string]string) common.Executor {
 	envMap := *env
 	return common.Executor(func(ctx context.Context) error {
-		if cr.containerEnv == nil {
-			inspect, err := cr.cli.ContainerInspect(ctx, cr.id, client.ContainerInspectOptions{})
-			if err != nil {
+		if cr.containerEnvID != cr.id {
+			if _, err := cr.Inspect(ctx); err != nil {
 				common.Logger(ctx).Error(err)
 				return fmt.Errorf("inspect container: %w", err)
 			}
-			if inspect.Container.Config == nil {
-				return nil
-			}
-			cr.containerEnv = opts.ConvertKVStringsToMap(inspect.Container.Config.Env)
 		}
 		for key, value := range cr.containerEnv {
 			if envMap[key] == "" {
@@ -377,8 +372,9 @@ type containerReference struct {
 	// attachDone is closed by the attach() streaming goroutine once it has
 	// drained and flushed the container's output. wait() blocks on it so the
 	// tail of the log lands before the step proceeds.
-	attachDone   chan struct{}
-	containerEnv map[string]string // fixed at creation, cached by the first inspect
+	attachDone     chan struct{}
+	containerEnv   map[string]string // fixed at creation, cached by inspect for containerEnvID
+	containerEnvID string
 	LinuxContainerEnvironmentExtensions
 }
 
@@ -784,7 +780,7 @@ func (cr *containerReference) create(capAdd, capDrop []string) common.Executor {
 		logger.Debugf("Created container name=%s id=%v from image %v (platform: %s)", input.Name, resp.ID, input.Image, input.Platform)
 		logger.Debugf("ENV ==> %v", input.Env)
 
-		cr.id, cr.containerEnv = resp.ID, nil
+		cr.id = resp.ID
 		return nil
 	}
 }

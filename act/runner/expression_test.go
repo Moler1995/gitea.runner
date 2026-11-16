@@ -550,6 +550,11 @@ jobs:
 	assert.Empty(t, inherited.workflowCallInputs)
 	assert.Equal(t, map[string]string{"token": "${{ github.token }}", "GITHUB_TOKEN": "github-token", "GITEA_TOKEN": "gitea-token", "ACTIONS_RUNTIME_TOKEN": "caller-run"}, inherited.workflowCallSecrets)
 	assert.Equal(t, "${{ github.token }}:", resolve("override", callee).ExprEval.InterpolateName(t.Context(), "${{ secrets.GITHUB_TOKEN }}:${{ secrets.GITEA_TOKEN }}"))
+	middle, err := model.ReadWorkflow(strings.NewReader("on: workflow_call\njobs:\n  test: {uses: ./reuse.yml}\n"))
+	require.NoError(t, err)
+	nested, err := (&runnerImpl{config: config, caller: &caller{runContext: resolve("override", middle)}}).newRunContext(t.Context(), &model.Run{Workflow: callee, JobID: "test"}, nil)
+	require.NoError(t, err)
+	assert.Equal(t, "github-token:gitea-token", nested.ExprEval.InterpolateName(t.Context(), "${{ secrets.GITHUB_TOKEN }}:${{ secrets.GITEA_TOKEN }}"))
 }
 
 func TestJobNameMasksSecrets(t *testing.T) {

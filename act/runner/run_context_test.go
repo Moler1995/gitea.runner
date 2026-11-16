@@ -172,11 +172,8 @@ func (fakeContainer) UpdateFromImageEnv(_env *map[string]string) common.Executor
 	return noopExecutor
 }
 
-func (c fakeContainer) GetContainerArchive(ctx context.Context, srcPath string) (io.ReadCloser, error) {
-	if c.ExecutionsEnvironment == nil {
-		return nil, os.ErrNotExist
-	}
-	return c.ExecutionsEnvironment.GetContainerArchive(ctx, srcPath)
+func (fakeContainer) GetContainerArchive(_ctx context.Context, _srcPath string) (io.ReadCloser, error) {
+	return nil, os.ErrNotExist
 }
 
 func (fakeContainer) Inspect(context.Context) (*container.Info, error) {
@@ -1399,14 +1396,14 @@ func TestRunContext_cleanupFailedStart(t *testing.T) {
 			}
 			job, service := &containerMock{}, &containerMock{}
 			for name, instance := range map[string]*containerMock{"job": job, "service": service} {
-				instance.On("Pull", true).Return(record("Pull", map[string]error{"job": testcase.pullError}[name]))
+				instance.On("Pull", true).Return(record(name+".Pull", map[string]error{"job": testcase.pullError}[name]))
 				instance.On("Create", mock.Anything, mock.Anything).Return(record(name+".Create", nil))
 				instance.On("Start", false).Return(record(name+".Start", map[string]error{"service": testcase.startError}[name]))
 				instance.On("Remove").Return(record(name+".Remove", nil))
 				instance.On("Close").Return(record(name+".Close", nil))
 			}
 			job.On("Copy", mock.Anything, mock.Anything).Return(record("job.Copy", nil))
-			job.On("GetContainerArchive", mock.Anything, "/usr/lib/os-release").Return(nil, os.ErrNotExist)
+			job.On("GetContainerArchive", mock.Anything, mock.Anything).Return(nil, os.ErrNotExist)
 			job.On("Inspect", mock.Anything).Return(&container.Info{ID: "job-id"}, nil).
 				Run(func(mock.Arguments) { operations = append(operations, "job.Inspect") })
 			for _, health := range []string{container.HealthStarting, testcase.health} {
@@ -1435,7 +1432,7 @@ func TestRunContext_cleanupFailedStart(t *testing.T) {
 			ctx := common.WithLogger(common.WithDryrun(t.Context(), true), logger)
 			rc.ExprEval = rc.NewExpressionEvaluator(ctx)
 			err = rc.startContainer().Then(rc.stopContainer()).Finally(rc.closeContainer())(ctx)
-			want := "job.Remove service.Close service.Remove Pull Pull"
+			want := "job.Remove service.Close service.Remove service.Pull job.Pull"
 			switch {
 			case testcase.pullError != nil:
 				require.ErrorIs(t, err, testcase.pullError)
@@ -1628,11 +1625,8 @@ func (c imageEnvContainer) UpdateFromImageEnv(env *map[string]string) common.Exe
 	return func(_ctx context.Context) error { maps.Copy(*env, c.imageEnv); return nil }
 }
 
-func (c imageEnvContainer) GetContainerArchive(ctx context.Context, srcPath string) (io.ReadCloser, error) {
-	if srcPath != "/usr/lib/os-release" {
-		return c.HostEnvironment.GetContainerArchive(ctx, srcPath)
-	}
-	if c.osRelease == nil {
+func (c imageEnvContainer) GetContainerArchive(_ctx context.Context, srcPath string) (io.ReadCloser, error) {
+	if srcPath != "/usr/lib/os-release" || c.osRelease == nil {
 		return nil, os.ErrNotExist
 	}
 	return io.NopCloser(bytes.NewReader(c.osRelease)), nil
@@ -1779,7 +1773,7 @@ func TestRunContextImageOS(t *testing.T) {
 		} {
 			rc := createRunsOnRunContext(t, "ubuntu-latest\nenv: {"+tc.jobEnv+"}")
 			rc.platformImage = "docker.gitea.com/runner-images:ubuntu-latest"
-			rc.JobContainer = imageEnvContainer{&container.HostEnvironment{Path: t.TempDir(), ActPath: t.TempDir(), StdOut: io.Discard}, tc.imageEnv, tc.osRelease}
+			rc.JobContainer = imageEnvContainer{&container.HostEnvironment{ActPath: t.TempDir()}, tc.imageEnv, tc.osRelease}
 			require.NoError(t, rc.copyWorkflowFiles()(ctx))
 			require.NoError(t, evaluateJobEnvAndDefaults(ctx, rc))
 			env := map[string]string{}

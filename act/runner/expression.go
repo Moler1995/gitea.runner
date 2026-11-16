@@ -324,9 +324,8 @@ func (rc *RunContext) resolveWorkflowCall(ctx context.Context) error {
 	if rc.workflowCallSecrets, err = callerEval.EvaluateCallerSecrets(secrets); err != nil {
 		return fmt.Errorf("unable to interpolate %w", err)
 	}
-	callerSecrets := getWorkflowSecrets(rc.caller.runContext)
 	for _, name := range []string{"GITHUB_TOKEN", "GITEA_TOKEN"} {
-		token, ok := callerSecrets[name]
+		token, ok := rc.Config.Secrets[name]
 		if _, mapped := common.LookupFold(rc.workflowCallSecrets, name, true); ok && !mapped {
 			rc.workflowCallSecrets[name] = token
 		}

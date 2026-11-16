@@ -165,6 +165,10 @@ func setReusedWorkflowCallerResult(rc *RunContext, runner *runnerImpl) common.Ex
 				hasFailure = true
 			}
 		}
+		if err := setJobOutputs(ctx, rc); err != nil { // a bad output fails this job, as for ordinary jobs
+			common.Logger(ctx).Errorf("##[error]%s", EscapeCommandData(err.Error()))
+			hasFailure = true
+		}
 
 		reusedWorkflowJobResult := "success"
 		reusedWorkflowJobResultMessage := "succeeded"
@@ -185,9 +189,6 @@ func setReusedWorkflowCallerResult(rc *RunContext, runner *runnerImpl) common.Ex
 			common.Logger(ctx).With("jobResult", reusedWorkflowJobResult).Infof("Job %s", reusedWorkflowJobResultMessage)
 		}
 
-		if err := setJobOutputs(ctx, rc); err != nil {
-			common.Logger(ctx).Errorf("##[error]%s", EscapeCommandData(err.Error()))
-		}
 		return nil
 	}
 }

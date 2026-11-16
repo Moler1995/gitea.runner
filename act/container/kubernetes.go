@@ -449,7 +449,7 @@ func (p *KubernetesPod) probe(ctx context.Context, container string) (string, er
 	deadline := time.Now().Add(time.Minute)
 	for delay := 100 * time.Millisecond; ; delay = min(2*delay, 2*time.Second) {
 		var stdout bytes.Buffer
-		err := p.client.exec(ctx, p.name, container, []string{"sh", "-c", `printf '%s\0%s\0%s\0%s\0%s' "$(uname -m)" "$(command -v gzip >/dev/null && echo gzip)" "$PATH" "$ImageOS" "$(cat /etc/os-release 2>/dev/null || cat /usr/lib/os-release 2>/dev/null)"`}, nil, &stdout, io.Discard)
+		err := p.client.exec(ctx, p.name, container, []string{"sh", "-c", `printf '%s\0%s\0%s\0%s\0%s' "$(uname -m)" "$(command -v gzip >/dev/null && echo gzip)" "$PATH" "${ImageOS-}" "$(cat /etc/os-release 2>/dev/null || cat /usr/lib/os-release 2>/dev/null)"`}, nil, &stdout, io.Discard)
 		var exitErr ExitCodeError
 		var apiErr *apiError
 		if err == nil || ctx.Err() != nil || errors.As(err, &exitErr) || time.Now().After(deadline) ||

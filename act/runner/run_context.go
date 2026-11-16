@@ -69,7 +69,7 @@ type RunContext struct {
 	kubernetes          bool
 	containerSpec       model.ContainerSpec // container:, resolved once with platformImage
 	containerEnv        yaml.Node           // container.env of the kept containerSpec, decoded once the job env resolves
-	defaultEnv          map[string]string   // image ImageOS and runner CA NODE_EXTRA_CA_CERTS, beneath any env the job sets
+	defaultEnv          map[string]string   // ImageOS and the runner CA's NODE_EXTRA_CA_CERTS, beneath any env the job sets
 	JobName             string
 	ActionPath          string
 	Parent              *RunContext
@@ -691,7 +691,8 @@ func (rc *RunContext) startJobContainer() common.Executor {
 		defer printStartJobContainerGroup(ctx, image, name, networkName)()
 		if err := common.NewPipelineExecutor(
 			rc.cleanupJobResources(networkName, createAndDeleteNetwork, true),
-			rc.pullImages(rc.Config.ForcePull),
+			rc.pullServicesImages(rc.Config.ForcePull),
+			rc.JobContainer.Pull(rc.Config.ForcePull),
 		)(ctx); err != nil {
 			return err
 		}
@@ -1023,9 +1024,9 @@ func (rc *RunContext) removeDockerActionImages(ctx context.Context) {
 	}
 }
 
-func (rc *RunContext) pullImages(forcePull bool) common.Executor {
+func (rc *RunContext) pullServicesImages(forcePull bool) common.Executor {
 	return func(ctx context.Context) error {
-		execs := []common.Executor{rc.JobContainer.Pull(forcePull)}
+		execs := []common.Executor{}
 		for _, svc := range rc.serviceContainers {
 			execs = append(execs, svc.container.Pull(forcePull))
 		}
@@ -1221,12 +1222,18 @@ func (rc *RunContext) copyWorkflowFiles() common.Executor {
 		imageEnvErr := rc.JobContainer.UpdateFromImageEnv(&imageEnv)(ctx)
 		rc.defaultEnv = map[string]string{}
 		imageOS, set := imageEnv["ImageOS"]
-		if !set && !rc.kubernetes { // a pod reports its release through its startup probe
-			osRelease, _ := readSingleFileFromContainerArchive(ctx, rc.JobContainer, "/usr/lib/os-release", 64<<10)
-			imageOS = container.ImageOSFromOSRelease(string(osRelease))
-			set = imageOS != ""
+		if !set {
+			if !rc.kubernetes { // a pod reports its release through its startup probe
+				for _, osReleasePath := range []string{"/usr/lib/os-release", "/etc/os-release"} { // the archive skips symlinks, as /etc's is on Ubuntu
+					if osRelease, ok := readSingleFileFromContainerArchive(ctx, rc.JobContainer, osReleasePath, 64<<10); ok {
+						imageOS = container.ImageOSFromOSRelease(string(osRelease))
+						break
+					}
+				}
+			}
+			imageOS = cmp.Or(imageOS, rc.imageOS(ctx))
 		}
-		if set {
+		if set || imageOS != "" {
 			rc.defaultEnv["ImageOS"] = imageOS
 		}
 		files := []*container.FileEntry{
@@ -1801,7 +1808,7 @@ func aliasGiteaEnv(env map[string]string) {
 	}
 }
 
-func (rc *RunContext) withGithubEnv(ctx context.Context, github *model.GithubContext, env map[string]string) {
+func (rc *RunContext) withGithubEnv(_ctx context.Context, github *model.GithubContext, env map[string]string) {
 	if _, ok := env["CI"]; !ok {
 		env["CI"] = "true"
 	}
@@ -1870,12 +1877,6 @@ func (rc *RunContext) withGithubEnv(ctx context.Context, github *model.GithubCon
 		env["ACTIONS_RUNTIME_URL"] = cmp.Or(os.Getenv("ACTIONS_RUNTIME_URL"), "http://"+net.JoinHostPort(rc.Config.ArtifactServerAddr, rc.Config.ArtifactServerPort)+"/")
 		env["ACTIONS_RUNTIME_TOKEN"] = cmp.Or(rc.runtimeToken, os.Getenv("ACTIONS_RUNTIME_TOKEN"), "token")
 	}
-
-	if _, set := common.LookupFold(env, "ImageOS", rc.isEnvCaseInsensitive()); !set {
-		if imageOS := rc.imageOS(ctx); imageOS != "" {
-			env["ImageOS"] = imageOS
-		}
-	}
 }
 
 // parentDir returns the directory containing p, or "" when p names no parent. Both
@@ -1892,7 +1893,7 @@ func parentDir(p string) string {
 // from another. The resolved image tag is preferred over the runs-on label because it
 // still names a release when the label is a rolling one such as ubuntu-latest.
 func (rc *RunContext) imageOS(ctx context.Context) string {
-	if rc.Run.Job().RunsOn() == nil {
+	if job := rc.Run.Job(); job == nil || job.RunsOn() == nil {
 		return "" // a composite action runs on a synthetic job without runs-on
 	}
 	if imageOS := imageOSFromImage(rc.platformImage); imageOS != "" {
