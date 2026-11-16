@@ -23,6 +23,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"gitea.com/gitea/runner/act/common"
@@ -83,8 +84,13 @@ func (cr *containerReference) Start(attach bool) common.Executor {
 				cr.attach().IfBool(attach),
 				cr.start(),
 				cr.wait().IfBool(attach),
-				cr.tryReadID("-u", func(id int) { cr.UID = id }),
-				cr.tryReadID("-g", func(id int) { cr.GID = id }),
+				func(ctx context.Context) error {
+					var wg sync.WaitGroup
+					wg.Go(func() { _ = cr.tryReadID("-u", func(id int) { cr.UID = id })(ctx) })
+					_ = cr.tryReadID("-g", func(id int) { cr.GID = id })(ctx)
+					wg.Wait()
+					return nil
+				},
 				func(ctx context.Context) error {
 					// If this fails, then folders have wrong permissions on non root container
 					if cr.UID != 0 || cr.GID != 0 {

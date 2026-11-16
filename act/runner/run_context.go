@@ -691,8 +691,7 @@ func (rc *RunContext) startJobContainer() common.Executor {
 		defer printStartJobContainerGroup(ctx, image, name, networkName)()
 		if err := common.NewPipelineExecutor(
 			rc.cleanupJobResources(networkName, createAndDeleteNetwork, true),
-			rc.pullServicesImages(rc.Config.ForcePull),
-			rc.JobContainer.Pull(rc.Config.ForcePull),
+			rc.pullImages(rc.Config.ForcePull),
 		)(ctx); err != nil {
 			return err
 		}
@@ -1024,9 +1023,9 @@ func (rc *RunContext) removeDockerActionImages(ctx context.Context) {
 	}
 }
 
-func (rc *RunContext) pullServicesImages(forcePull bool) common.Executor {
+func (rc *RunContext) pullImages(forcePull bool) common.Executor {
 	return func(ctx context.Context) error {
-		execs := []common.Executor{}
+		execs := []common.Executor{rc.JobContainer.Pull(forcePull)}
 		for _, svc := range rc.serviceContainers {
 			execs = append(execs, svc.container.Pull(forcePull))
 		}

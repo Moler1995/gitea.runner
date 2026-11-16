@@ -1399,7 +1399,7 @@ func TestRunContext_cleanupFailedStart(t *testing.T) {
 			}
 			job, service := &containerMock{}, &containerMock{}
 			for name, instance := range map[string]*containerMock{"job": job, "service": service} {
-				instance.On("Pull", true).Return(record(name+".Pull", map[string]error{"job": testcase.pullError}[name]))
+				instance.On("Pull", true).Return(record("Pull", map[string]error{"job": testcase.pullError}[name]))
 				instance.On("Create", mock.Anything, mock.Anything).Return(record(name+".Create", nil))
 				instance.On("Start", false).Return(record(name+".Start", map[string]error{"service": testcase.startError}[name]))
 				instance.On("Remove").Return(record(name+".Remove", nil))
@@ -1435,7 +1435,7 @@ func TestRunContext_cleanupFailedStart(t *testing.T) {
 			ctx := common.WithLogger(common.WithDryrun(t.Context(), true), logger)
 			rc.ExprEval = rc.NewExpressionEvaluator(ctx)
 			err = rc.startContainer().Then(rc.stopContainer()).Finally(rc.closeContainer())(ctx)
-			want := "job.Remove service.Close service.Remove service.Pull job.Pull"
+			want := "job.Remove service.Close service.Remove Pull Pull"
 			switch {
 			case testcase.pullError != nil:
 				require.ErrorIs(t, err, testcase.pullError)
