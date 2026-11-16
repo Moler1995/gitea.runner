@@ -17,4 +17,5 @@ jobs:
       - run: |
           test "$FROM_ENV" = exported
           test -n "$KUBERNETES_SERVICE_HOST" -a -n "${{ runner.arch }}"
+          tr '\0' '\n' < /proc/1/environ | grep -qx "ImageOS=$ImageOS"
           curl -fsS -o /dev/null http://web/

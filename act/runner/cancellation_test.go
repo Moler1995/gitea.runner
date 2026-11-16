@@ -101,10 +101,10 @@ func TestMainStepsExecutorRunsAlwaysStepsAfterInterruption(t *testing.T) {
 			assert.Equal(t, []string{"step1", "always-step"}, ran)
 			require.NoError(t, laterStepCtxErr)
 			assert.Equal(t, wantError == context.Canceled, rc.jobCancelled)
+			assert.Equal(t, "cancelled", rc.getJobContext().Status)
 			setJobResult(t.Context(), rc, rc, true)
 			if wantError == context.DeadlineExceeded {
 				assert.True(t, rc.jobFailed)
-				assert.Equal(t, "failure", rc.getJobContext().Status)
 				assert.Equal(t, "failure", rc.Run.Job().Result)
 			} else {
 				assert.Equal(t, "cancelled", rc.Run.Job().Result)
@@ -259,8 +259,11 @@ func TestReportStepErrorTreatsCancelAsInterruption(t *testing.T) {
 	assert.True(t, rc.jobCancelled)
 
 	// a real error still fails the job
-	failed := common.WithJobErrorContainer(t.Context())
-	reportStepError(failed, rc, assert.AnError)
-	require.ErrorIs(t, common.JobError(failed), assert.AnError)
-	assert.True(t, rc.jobFailed)
+	for _, stepErr := range []error{assert.AnError, context.DeadlineExceeded} {
+		rc := &RunContext{}
+		failed := common.WithJobErrorContainer(t.Context())
+		reportStepError(failed, rc, stepErr)
+		require.ErrorIs(t, common.JobError(failed), stepErr)
+		assert.Equal(t, "failure", rc.getJobContext().Status)
+	}
 }

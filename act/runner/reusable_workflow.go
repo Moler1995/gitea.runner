@@ -165,6 +165,10 @@ func setReusedWorkflowCallerResult(rc *RunContext, runner *runnerImpl) common.Ex
 				hasFailure = true
 			}
 		}
+		if err := setJobOutputs(ctx, rc); err != nil { // a bad output fails this job, as for ordinary jobs
+			common.Logger(ctx).Errorf("##[error]%s", EscapeCommandData(err.Error()))
+			hasFailure = true
+		}
 
 		reusedWorkflowJobResult := "success"
 		reusedWorkflowJobResultMessage := "succeeded"
@@ -173,14 +177,15 @@ func setReusedWorkflowCallerResult(rc *RunContext, runner *runnerImpl) common.Ex
 			reusedWorkflowJobResultMessage = "failed"
 		}
 
+		// Serialize this shared Job.Result write against the other matrix combos
+		// and setJobResult (same lockJob key).
+		unlock := lockJob(rc.Run.Job())
+		rc.result(reusedWorkflowJobResult)
+		unlock()
+
 		if rc.caller != nil {
 			rc.caller.setReusedWorkflowJobResult(rc.Run.JobID, reusedWorkflowJobResult)
 		} else {
-			// Serialize this shared Job.Result write against the other matrix combos
-			// and setJobResult (same lockJob key).
-			unlock := lockJob(rc.Run.Job())
-			rc.result(reusedWorkflowJobResult)
-			unlock()
 			common.Logger(ctx).With("jobResult", reusedWorkflowJobResult).Infof("Job %s", reusedWorkflowJobResultMessage)
 		}
 
