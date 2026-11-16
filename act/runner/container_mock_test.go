@@ -72,8 +72,9 @@ func (cm *containerMock) Exec(command []string, env map[string]string, user, wor
 
 func (cm *containerMock) GetContainerArchive(ctx context.Context, srcPath string) (io.ReadCloser, error) {
 	args := cm.Called(ctx, srcPath)
+	reader, _ := args.Get(0).(io.ReadCloser)
 	err, _ := args.Get(1).(error)
-	return args.Get(0).(io.ReadCloser), err
+	return reader, err
 }
 
 func (cm *containerMock) DumpLogs(ctx context.Context) error {

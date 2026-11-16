@@ -172,6 +172,13 @@ func (fakeContainer) UpdateFromImageEnv(_env *map[string]string) common.Executor
 	return noopExecutor
 }
 
+func (c fakeContainer) GetContainerArchive(ctx context.Context, srcPath string) (io.ReadCloser, error) {
+	if c.ExecutionsEnvironment == nil {
+		return nil, os.ErrNotExist
+	}
+	return c.ExecutionsEnvironment.GetContainerArchive(ctx, srcPath)
+}
+
 func (fakeContainer) Inspect(context.Context) (*container.Info, error) {
 	return &container.Info{ID: "fake", State: "running", Health: container.HealthNone}, nil
 }
@@ -1399,6 +1406,7 @@ func TestRunContext_cleanupFailedStart(t *testing.T) {
 				instance.On("Close").Return(record(name+".Close", nil))
 			}
 			job.On("Copy", mock.Anything, mock.Anything).Return(record("job.Copy", nil))
+			job.On("GetContainerArchive", mock.Anything, "/usr/lib/os-release").Return(nil, os.ErrNotExist)
 			job.On("Inspect", mock.Anything).Return(&container.Info{ID: "job-id"}, nil).
 				Run(func(mock.Arguments) { operations = append(operations, "job.Inspect") })
 			for _, health := range []string{container.HealthStarting, testcase.health} {
@@ -1612,11 +1620,22 @@ func TestGetJobContextReportsContainers(t *testing.T) {
 
 type imageEnvContainer struct {
 	*container.HostEnvironment
-	imageEnv map[string]string
+	imageEnv  map[string]string
+	osRelease []byte
 }
 
 func (c imageEnvContainer) UpdateFromImageEnv(env *map[string]string) common.Executor {
 	return func(_ctx context.Context) error { maps.Copy(*env, c.imageEnv); return nil }
+}
+
+func (c imageEnvContainer) GetContainerArchive(ctx context.Context, srcPath string) (io.ReadCloser, error) {
+	if srcPath != "/usr/lib/os-release" {
+		return c.HostEnvironment.GetContainerArchive(ctx, srcPath)
+	}
+	if c.osRelease == nil {
+		return nil, os.ErrNotExist
+	}
+	return io.NopCloser(bytes.NewReader(c.osRelease)), nil
 }
 
 func TestCopyWorkflowFilesHandsNodeTheRunnerCAUnlessTheJobOrImageSetsIt(t *testing.T) {
@@ -1628,7 +1647,7 @@ func TestCopyWorkflowFilesHandsNodeTheRunnerCAUnlessTheJobOrImageSetsIt(t *testi
 			Config:       &Config{CAFile: caFile},
 			Run:          &model.Run{JobID: "job", Workflow: &model.Workflow{Jobs: map[string]*model.Job{"job": {}}}},
 			Env:          maps.Clone(jobEnv),
-			JobContainer: imageEnvContainer{&container.HostEnvironment{Path: t.TempDir(), ActPath: actPath, StdOut: io.Discard}, imageEnv},
+			JobContainer: imageEnvContainer{&container.HostEnvironment{Path: t.TempDir(), ActPath: actPath, StdOut: io.Discard}, imageEnv, nil},
 		}
 		rc.containerSpec.Env = containerEnv
 		require.NoError(t, rc.copyWorkflowFiles()(t.Context()))
@@ -1745,19 +1764,27 @@ func TestRunContextContainerImageCannotSelectBackend(t *testing.T) {
 func TestRunContextImageOS(t *testing.T) {
 	ctx := t.Context()
 
-	t.Run("keeps an ImageOS from the image or the job env", func(t *testing.T) {
-		for jobEnv, want := range map[string]string{"": "ubuntu24-arm64", "ImageOS: ubuntu22": "ubuntu22"} {
-			rc := createRunsOnRunContext(t, "ubuntu-latest\nenv: {"+jobEnv+"}")
+	t.Run("keeps an ImageOS from the image, the job env or the job's Ubuntu release", func(t *testing.T) {
+		ubuntu := tarArchive(t, tarEntry{name: "os-release", body: "ID=ubuntu\nVERSION_ID=\"22.04\"\n"})
+		for _, tc := range []struct {
+			imageEnv  map[string]string
+			jobEnv    string
+			osRelease []byte
+			want      string
+		}{
+			{imageEnv: map[string]string{"ImageOS": "ubuntu24-arm64"}, osRelease: ubuntu, want: "ubuntu24-arm64"},
+			{imageEnv: map[string]string{"ImageOS": "ubuntu24-arm64"}, jobEnv: "ImageOS: ubuntu20", want: "ubuntu20"},
+			{osRelease: ubuntu, want: "ubuntu22"},
+			{osRelease: tarArchive(t, tarEntry{name: "os-release", body: "ID=debian\nVERSION_ID=\"12\"\n"}), want: "ubuntu24"},
+		} {
+			rc := createRunsOnRunContext(t, "ubuntu-latest\nenv: {"+tc.jobEnv+"}")
 			rc.platformImage = "docker.gitea.com/runner-images:ubuntu-latest"
-			rc.JobContainer = imageEnvContainer{
-				&container.HostEnvironment{Path: t.TempDir(), ActPath: t.TempDir(), StdOut: io.Discard},
-				map[string]string{"ImageOS": "ubuntu24-arm64"},
-			}
+			rc.JobContainer = imageEnvContainer{&container.HostEnvironment{Path: t.TempDir(), ActPath: t.TempDir(), StdOut: io.Discard}, tc.imageEnv, tc.osRelease}
 			require.NoError(t, rc.copyWorkflowFiles()(ctx))
 			require.NoError(t, evaluateJobEnvAndDefaults(ctx, rc))
 			env := map[string]string{}
 			require.NoError(t, setupEnv(ctx, &stepRun{RunContext: rc, Step: &model.Step{}, env: env}))
-			assert.Equal(t, want, env["ImageOS"])
+			assert.Equal(t, tc.want, env["ImageOS"])
 		}
 	})
 
