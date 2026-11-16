@@ -21,11 +21,18 @@ jobs:
       number_required: 1
     secrets: inherit
 
+  nested-reusable-workflow:
+    uses: ./.github/workflows/nested-reusable-workflow.yml
+    secrets: inherit
+
   output-test:
     runs-on: ubuntu-latest
     needs:
       - reusable-workflow
       - reusable-workflow-with-inherited-secrets
+      - nested-reusable-workflow
     steps:
       - run: '[[ "${{ needs.reusable-workflow.outputs.output == ''string'' }}" = "true" ]] || exit 1'
       - run: '[[ "${{ needs.reusable-workflow-with-inherited-secrets.outputs.output == ''string'' }}" = "true" ]] || exit 1'
+      - run: '[[ "${{ needs.nested-reusable-workflow.outputs.output == ''string'' }}" = "true" ]] || exit 1'
+      - run: '[[ "${{ needs.nested-reusable-workflow.outputs.dependent == ''string'' }}" = "true" ]] || exit 1'

@@ -54,6 +54,10 @@ func (cm *containerMock) UpdateFromEnv(srcPath string, env *map[string]string) c
 	return cm.Called(srcPath, env).Get(0).(func(context.Context) error)
 }
 
+func (cm *containerMock) UpdateFromImageEnv(_env *map[string]string) common.Executor {
+	return noopExecutor
+}
+
 func (cm *containerMock) Copy(destPath string, files ...*container.FileEntry) common.Executor {
 	return cm.Called(destPath, files).Get(0).(func(context.Context) error)
 }

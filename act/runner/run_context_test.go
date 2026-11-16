@@ -168,6 +168,10 @@ func (fakeContainer) Copy(string, ...*container.FileEntry) common.Executor {
 	return func(context.Context) error { return nil }
 }
 
+func (fakeContainer) UpdateFromImageEnv(_env *map[string]string) common.Executor {
+	return noopExecutor
+}
+
 func (fakeContainer) Inspect(context.Context) (*container.Info, error) {
 	return &container.Info{ID: "fake", State: "running", Health: container.HealthNone}, nil
 }
@@ -1741,6 +1745,22 @@ func TestRunContextContainerImageCannotSelectBackend(t *testing.T) {
 func TestRunContextImageOS(t *testing.T) {
 	ctx := t.Context()
 
+	t.Run("keeps an ImageOS from the image or the job env", func(t *testing.T) {
+		for jobEnv, want := range map[string]string{"": "ubuntu24-arm64", "ImageOS: ubuntu22": "ubuntu22"} {
+			rc := createRunsOnRunContext(t, "ubuntu-latest\nenv: {"+jobEnv+"}")
+			rc.platformImage = "docker.gitea.com/runner-images:ubuntu-latest"
+			rc.JobContainer = imageEnvContainer{
+				&container.HostEnvironment{Path: t.TempDir(), ActPath: t.TempDir(), StdOut: io.Discard},
+				map[string]string{"ImageOS": "ubuntu24-arm64"},
+			}
+			require.NoError(t, rc.copyWorkflowFiles()(ctx))
+			require.NoError(t, evaluateJobEnvAndDefaults(ctx, rc))
+			env := map[string]string{}
+			require.NoError(t, setupEnv(ctx, &stepRun{RunContext: rc, Step: &model.Step{}, env: env}))
+			assert.Equal(t, want, env["ImageOS"])
+		}
+	})
+
 	t.Run("prefers the release in the resolved image tag", func(t *testing.T) {
 		rc := createRunsOnRunContext(t, "ubuntu-latest")
 		rc.Config.PlatformPicker = func([]string) string { return "docker.gitea.com/runner-images:ubuntu-24.04" }
@@ -1755,8 +1775,8 @@ func TestRunContextImageOS(t *testing.T) {
 		assert.Equal(t, "ubuntu22", rc.imageOS(ctx))
 	})
 
-	t.Run("keeps the historical value for a rolling label with no release", func(t *testing.T) {
-		assert.Equal(t, "ubuntu20", createRunsOnRunContext(t, "ubuntu-latest").imageOS(ctx))
+	t.Run("reports the current release for the rolling ubuntu-latest label", func(t *testing.T) {
+		assert.Equal(t, "ubuntu24", createRunsOnRunContext(t, "ubuntu-latest").imageOS(ctx))
 	})
 
 	t.Run("is empty for the synthetic job of a composite action", func(t *testing.T) {
