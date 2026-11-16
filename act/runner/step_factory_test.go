@@ -14,7 +14,7 @@ import (
 )
 
 func TestStepFactoryNewStepAppliesReplaceUsesToUsesOnly(t *testing.T) {
-	replacements := map[string]string{"": "docker://image:tag", "builtin:checkout": "docker://image:tag"}
+	replacements := map[string]string{"": "docker://image:tag", "remote/replaced@v1": "docker://image:tag"}
 	rc := &RunContext{Config: &Config{ReplaceUses: func(uses string) string { return cmp.Or(replacements[uses], uses) }}}
 	for _, test := range []struct {
 		name  string
@@ -24,7 +24,7 @@ func TestStepFactoryNewStepAppliesReplaceUsesToUsesOnly(t *testing.T) {
 		{"StepRemoteAction", &model.Step{Uses: "remote/action@v1"}, &stepActionRemote{}},
 		{"StepLocalAction", &model.Step{Uses: "./action@v1"}, &stepActionLocal{}},
 		{"StepDocker", &model.Step{Uses: "docker://image:tag"}, &stepDocker{}},
-		{"StepReplaced", &model.Step{Uses: "builtin:checkout"}, &stepDocker{}},
+		{"StepReplaced", &model.Step{Uses: "remote/replaced@v1"}, &stepDocker{}},
 		{"StepRun", &model.Step{Run: "cmd"}, &stepRun{}},
 	} {
 		t.Run(test.name, func(t *testing.T) {

@@ -206,16 +206,16 @@ func TestLoadDefault_ActionReplacementsMatchWholeUsesAndChainInOrder(t *testing.
 	cfg, err := LoadDefault(write(t, `
 runner:
   action_replacements:
-    - regex: 'builtin:checkout'
+    - regex: 'actions/checkout@v4'
       replacement: actions/checkout@v6
     - regex: 'actions/(.+)'
       replacement: https://mirror.example/actions/${1}
 `))
 	require.NoError(t, err)
 	for uses, want := range map[string]string{
-		"builtin:checkout":       "https://mirror.example/actions/checkout@v6",
-		"builtin:checkout-v2":    "builtin:checkout-v2",
-		"my/actions/checkout@v6": "my/actions/checkout@v6",
+		"actions/checkout@v4":     "https://mirror.example/actions/checkout@v6",
+		"actions/checkout@v4.1.0": "https://mirror.example/actions/checkout@v4.1.0",
+		"my/actions/checkout@v4":  "my/actions/checkout@v4",
 	} {
 		assert.Equal(t, want, cfg.Runner.ReplaceUses(uses), uses)
 	}
