@@ -61,39 +61,40 @@ type LogJob struct {
 
 // Runner represents the configuration for the runner.
 type Runner struct {
-	File                  string            `yaml:"file"`                     // File specifies the file path for the runner.
-	Capacity              int               `yaml:"capacity"`                 // Capacity specifies the capacity of the runner.
-	Envs                  map[string]string `yaml:"envs"`                     // Envs stores environment variables for the runner.
-	EnvFile               string            `yaml:"env_file"`                 // EnvFile specifies the path to the file containing environment variables for the runner.
-	Timeout               time.Duration     `yaml:"timeout"`                  // Timeout specifies the duration for runner timeout.
-	ShutdownTimeout       time.Duration     `yaml:"shutdown_timeout"`         // ShutdownTimeout specifies the duration to wait for running jobs to complete during a shutdown of the runner.
-	Insecure              bool              `yaml:"insecure"`                 // Insecure indicates whether the runner operates in an insecure mode.
-	ClientCertFile        string            `yaml:"client_cert_file"`         // ClientCertFile is the PEM certificate presented to a Gitea instance that requires mutual TLS.
-	ClientKeyFile         string            `yaml:"client_key_file"`          // ClientKeyFile is the PEM private key paired with ClientCertFile.
-	CAFile                string            `yaml:"ca_file"`                  // CAFile holds PEM CA certificates trusted for the Gitea instance besides the system's.
-	ExtraHeaders          map[string]string `yaml:"extra_headers"`            // ExtraHeaders adds HTTP headers to runner API requests to Gitea.
-	FetchTimeout          time.Duration     `yaml:"fetch_timeout"`            // FetchTimeout specifies the timeout duration for fetching resources.
-	FetchInterval         time.Duration     `yaml:"fetch_interval"`           // FetchInterval specifies the interval duration for fetching resources.
-	FetchIntervalMax      time.Duration     `yaml:"fetch_interval_max"`       // FetchIntervalMax specifies the maximum backoff interval when idle.
-	WorkdirCleanupAge     time.Duration     `yaml:"workdir_cleanup_age"`      // WorkdirCleanupAge removes stale bind-workdir task directories, orphaned host-mode scratch dirs and orphaned Kubernetes job resources older than this duration during idle cleanup.
-	IdleCleanupInterval   time.Duration     `yaml:"idle_cleanup_interval"`    // IdleCleanupInterval runs the idle cleanup (stale directories, orphaned docker networks and volumes, orphaned job pods) periodically while the runner is idle. Set to 0 to disable cleanup cadence.
-	LogReportInterval     time.Duration     `yaml:"log_report_interval"`      // LogReportInterval specifies the base interval for periodic log flush.
-	LogReportMaxLatency   time.Duration     `yaml:"log_report_max_latency"`   // LogReportMaxLatency specifies the max time a log row can wait before being sent.
-	LogReportBatchSize    int               `yaml:"log_report_batch_size"`    // LogReportBatchSize triggers immediate log flush when buffer reaches this size.
-	LogReportLevel        string            `yaml:"log_report_level"`         // LogReportLevel is the lowest level of the runner's own messages sent to the job log between steps. Empty, the default, follows log.level.
-	StateReportInterval   time.Duration     `yaml:"state_report_interval"`    // StateReportInterval specifies the interval for state reporting.
-	ReportCloseTimeout    time.Duration     `yaml:"report_close_timeout"`     // ReportCloseTimeout caps each RPC attempt when flushing the final logs and task state at job completion, on a detached context so a server cancel can't block the acknowledgement.
-	Labels                []string          `yaml:"labels"`                   // Labels specify the labels of the runner. Labels are declared on each startup
-	GithubMirror          string            `yaml:"github_mirror"`            // GithubMirror defines what mirrors should be used when using github
-	ActionShallowClone    *bool             `yaml:"action_shallow_clone"`     // ActionShallowClone clones only the requested ref at depth 1 instead of every branch's full history, for reusable workflows and actions without an archive. It is a pointer to distinguish between false and not set; if not set, it defaults to true.
-	SetActEnv             *bool             `yaml:"set_act_env"`              // SetActEnv controls whether the ACT=true environment variable is injected into jobs. It is a pointer to distinguish between false and not set; if not set, it defaults to true. Set it to false so workflows gated on `if: ${{ !env.ACT }}` behave like on GitHub.
-	PatchActions          *bool             `yaml:"patch_actions"`            // PatchActions applies compatibility patches to the actions a job runs, so actions written for GitHub work against Gitea, see act/runner/patch_actions.go. It is a pointer to distinguish between false and not set; if not set, it defaults to true. Set it to false to run every action exactly as published, at the price of the artifact actions refusing.
-	AllocatePTY           bool              `yaml:"allocate_pty"`             // AllocatePTY allocates a pseudo-TTY for each step's process. Default is false, matching GitHub's actions/runner. Enable only for jobs that need an interactive terminal; tools like docker build emit redrawing progress frames into the captured log when a TTY is present. Applies to both host and docker backends.
-	DefaultImage          string            `yaml:"default_image"`            // DefaultImage is the image a job runs in when its runs-on matches none of the runner's labels. A runner without docker runs such a job on the host instead.
-	ToolCacheMode         string            `yaml:"tool_cache_mode"`          // ToolCacheMode is what the runner mounts at RUNNER_TOOL_CACHE on both backends: ToolCacheModeNone or ToolCacheModeShared.
-	PostTaskScript        string            `yaml:"post_task_script"`         // PostTaskScript is the path to an executable script run on the host after each task's cleanup completes. Empty disables the hook. On Windows use .exe/.bat/.cmd; PowerShell (.ps1) is not supported yet as the configured path.
-	PostTaskScriptTimeout time.Duration     `yaml:"post_task_script_timeout"` // PostTaskScriptTimeout caps how long the post-task script may run. Default is 5m when post_task_script is set.
-	Hooks                 RunnerHooks       `yaml:"hooks"`                    // Hooks are scripts run inside the job environment around the job's steps.
+	File                  string              `yaml:"file"`                     // File specifies the file path for the runner.
+	Capacity              int                 `yaml:"capacity"`                 // Capacity specifies the capacity of the runner.
+	Envs                  map[string]string   `yaml:"envs"`                     // Envs stores environment variables for the runner.
+	EnvFile               string              `yaml:"env_file"`                 // EnvFile specifies the path to the file containing environment variables for the runner.
+	Timeout               time.Duration       `yaml:"timeout"`                  // Timeout specifies the duration for runner timeout.
+	ShutdownTimeout       time.Duration       `yaml:"shutdown_timeout"`         // ShutdownTimeout specifies the duration to wait for running jobs to complete during a shutdown of the runner.
+	Insecure              bool                `yaml:"insecure"`                 // Insecure indicates whether the runner operates in an insecure mode.
+	ClientCertFile        string              `yaml:"client_cert_file"`         // ClientCertFile is the PEM certificate presented to a Gitea instance that requires mutual TLS.
+	ClientKeyFile         string              `yaml:"client_key_file"`          // ClientKeyFile is the PEM private key paired with ClientCertFile.
+	CAFile                string              `yaml:"ca_file"`                  // CAFile holds PEM CA certificates trusted for the Gitea instance besides the system's.
+	ExtraHeaders          map[string]string   `yaml:"extra_headers"`            // ExtraHeaders adds HTTP headers to runner API requests to Gitea.
+	FetchTimeout          time.Duration       `yaml:"fetch_timeout"`            // FetchTimeout specifies the timeout duration for fetching resources.
+	FetchInterval         time.Duration       `yaml:"fetch_interval"`           // FetchInterval specifies the interval duration for fetching resources.
+	FetchIntervalMax      time.Duration       `yaml:"fetch_interval_max"`       // FetchIntervalMax specifies the maximum backoff interval when idle.
+	WorkdirCleanupAge     time.Duration       `yaml:"workdir_cleanup_age"`      // WorkdirCleanupAge removes stale bind-workdir task directories, orphaned host-mode scratch dirs and orphaned Kubernetes job resources older than this duration during idle cleanup.
+	IdleCleanupInterval   time.Duration       `yaml:"idle_cleanup_interval"`    // IdleCleanupInterval runs the idle cleanup (stale directories, orphaned docker networks and volumes, orphaned job pods) periodically while the runner is idle. Set to 0 to disable cleanup cadence.
+	LogReportInterval     time.Duration       `yaml:"log_report_interval"`      // LogReportInterval specifies the base interval for periodic log flush.
+	LogReportMaxLatency   time.Duration       `yaml:"log_report_max_latency"`   // LogReportMaxLatency specifies the max time a log row can wait before being sent.
+	LogReportBatchSize    int                 `yaml:"log_report_batch_size"`    // LogReportBatchSize triggers immediate log flush when buffer reaches this size.
+	LogReportLevel        string              `yaml:"log_report_level"`         // LogReportLevel is the lowest level of the runner's own messages sent to the job log between steps. Empty, the default, follows log.level.
+	StateReportInterval   time.Duration       `yaml:"state_report_interval"`    // StateReportInterval specifies the interval for state reporting.
+	ReportCloseTimeout    time.Duration       `yaml:"report_close_timeout"`     // ReportCloseTimeout caps each RPC attempt when flushing the final logs and task state at job completion, on a detached context so a server cancel can't block the acknowledgement.
+	Labels                []string            `yaml:"labels"`                   // Labels specify the labels of the runner. Labels are declared on each startup
+	GithubMirror          string              `yaml:"github_mirror"`            // GithubMirror defines what mirrors should be used when using github
+	ActionReplacements    []ActionReplacement `yaml:"action_replacements"`      // ActionReplacements rewrite the `uses` of steps, see ReplaceUses.
+	ActionShallowClone    *bool               `yaml:"action_shallow_clone"`     // ActionShallowClone clones only the requested ref at depth 1 instead of every branch's full history, for reusable workflows and actions without an archive. It is a pointer to distinguish between false and not set; if not set, it defaults to true.
+	SetActEnv             *bool               `yaml:"set_act_env"`              // SetActEnv controls whether the ACT=true environment variable is injected into jobs. It is a pointer to distinguish between false and not set; if not set, it defaults to true. Set it to false so workflows gated on `if: ${{ !env.ACT }}` behave like on GitHub.
+	PatchActions          *bool               `yaml:"patch_actions"`            // PatchActions applies compatibility patches to the actions a job runs, so actions written for GitHub work against Gitea, see act/runner/patch_actions.go. It is a pointer to distinguish between false and not set; if not set, it defaults to true. Set it to false to run every action exactly as published, at the price of the artifact actions refusing.
+	AllocatePTY           bool                `yaml:"allocate_pty"`             // AllocatePTY allocates a pseudo-TTY for each step's process. Default is false, matching GitHub's actions/runner. Enable only for jobs that need an interactive terminal; tools like docker build emit redrawing progress frames into the captured log when a TTY is present. Applies to both host and docker backends.
+	DefaultImage          string              `yaml:"default_image"`            // DefaultImage is the image a job runs in when its runs-on matches none of the runner's labels. A runner without docker runs such a job on the host instead.
+	ToolCacheMode         string              `yaml:"tool_cache_mode"`          // ToolCacheMode is what the runner mounts at RUNNER_TOOL_CACHE on both backends: ToolCacheModeNone or ToolCacheModeShared.
+	PostTaskScript        string              `yaml:"post_task_script"`         // PostTaskScript is the path to an executable script run on the host after each task's cleanup completes. Empty disables the hook. On Windows use .exe/.bat/.cmd; PowerShell (.ps1) is not supported yet as the configured path.
+	PostTaskScriptTimeout time.Duration       `yaml:"post_task_script_timeout"` // PostTaskScriptTimeout caps how long the post-task script may run. Default is 5m when post_task_script is set.
+	Hooks                 RunnerHooks         `yaml:"hooks"`                    // Hooks are scripts run inside the job environment around the job's steps.
 
 	rootCAs *x509.CertPool // the system's and CAFile's, nil for the system's alone
 }
@@ -171,6 +172,22 @@ func parseSize(value string) (Size, error) {
 		return 0, fmt.Errorf("%q is not a size such as 10GB, 512MB or a plain byte count", value)
 	}
 	return Size(bytes), nil
+}
+
+// ActionReplacement replaces a step `uses` that Regex matches in full with Replacement.
+type ActionReplacement struct {
+	Regex       string `yaml:"regex"`
+	Replacement string `yaml:"replacement"`
+
+	regex *regexp.Regexp
+}
+
+// ReplaceUses applies ActionReplacements to a step `uses` in order, each to the result of the previous.
+func (r *Runner) ReplaceUses(uses string) string {
+	for _, replacement := range r.ActionReplacements {
+		uses = replacement.regex.ReplaceAllString(uses, replacement.Replacement)
+	}
+	return uses
 }
 
 // Container represents the configuration for the container.
@@ -324,6 +341,13 @@ func LoadDefault(file string) (*Config, error) {
 		if err := cfg.Runner.loadCAFile(); err != nil {
 			return nil, err
 		}
+	}
+	for index := range cfg.Runner.ActionReplacements {
+		replacement := &cfg.Runner.ActionReplacements[index]
+		if _, err := regexp.Compile(replacement.Regex); err != nil {
+			return nil, fmt.Errorf("runner.action_replacements[%d].regex: %w", index, err)
+		}
+		replacement.regex = regexp.MustCompile(`^(?:` + replacement.Regex + `)$`)
 	}
 	for _, spec := range cfg.Container.Volumes {
 		if parsed, err := container.ParseVolume(spec); err != nil || parsed.Source == "" {

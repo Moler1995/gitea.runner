@@ -78,6 +78,7 @@ type Config struct {
 	// AppURL. It is never set for github.com or a GithubMirror, so the token stays on-instance.
 	DefaultActionInstanceIsSelfHosted bool
 	PlatformPicker                    func(labels []string) string
+	ReplaceUses                       func(uses string) string // rewrites each step's uses before it is resolved
 	KubernetesPicker                  func(labels []string) container.KubernetesOptions
 	InstanceTransport                 http.RoundTripper
 	JobLoggerLevel                    *logging.Level // the level of job logger

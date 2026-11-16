@@ -17,6 +17,9 @@ type stepFactory interface {
 type stepFactoryImpl struct{}
 
 func (sf *stepFactoryImpl) newStep(stepModel *model.Step, rc *RunContext) (step, error) {
+	if stepModel.Uses != "" && stepModel.Run == "" && rc.Config.ReplaceUses != nil {
+		stepModel.Uses = rc.Config.ReplaceUses(stepModel.Uses)
+	}
 	switch stepModel.Type() {
 	case model.StepTypeInvalid:
 		return nil, fmt.Errorf("invalid run/uses syntax for job:%s step:%+v", rc.Name, stepModel)

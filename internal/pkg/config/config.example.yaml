@@ -96,6 +96,13 @@ runner:
   # and github_mirror is not empty. In this case,
   # it replaces https://github.com with the value here, which is useful for some special network environments.
   #github_mirror: ''
+  # Replaces the `uses` of steps whose regex matches it in full, ${1} is the first group.
+  # Entries apply in order, each to the result of the previous one.
+  #action_replacements:
+  #  - regex: 'builtin:checkout'
+  #    replacement: actions/checkout@v6
+  #  - regex: '(?:https://github\.com/)?actions/(.+)'
+  #    replacement: https://git.example.com/mirror/${1}
   # Extra HTTP headers for runner API requests to Gitea, e.g. reverse proxy authentication.
   # Not used for action downloads, artifacts, job summaries or jobs. Runner headers take precedence.
   # Dropped on redirects to another hostname, or to HTTP if the instance URL uses HTTPS.
