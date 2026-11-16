@@ -193,7 +193,7 @@ func TestKubernetesPodRunsJobThroughAPI(t *testing.T) {
 	path := workdir + ":" + os.Getenv("PATH")
 	kubeconfig, cluster := fakeKubernetes(t, `{"spec":{"containers":[{},{}]},"status":{"phase":"Running","containerStatuses":[
 		{"name":"job","ready":true,"state":{"running":{}}},
-		{"name":"my-db","ready":true,"state":{"running":{}}}]}}`, "PATH="+path)
+		{"name":"my-db","ready":true,"state":{"running":{}}}]}}`, "PATH="+path, "ImageOS=ubuntu24-arm64")
 	options := KubernetesOptions{Kubeconfig: kubeconfig, RunnerUUID: "runner-uuid", PodTemplates: []map[string]any{
 		{"spec": map[string]any{
 			"automountServiceAccountToken": true,
@@ -309,9 +309,9 @@ func TestKubernetesPodRunsJobThroughAPI(t *testing.T) {
 	assert.Contains(t, lastExec(), "command="+url.QueryEscape(workdir+"/act/actions/sha/"))
 	assert.Contains(t, lastExec(), url.QueryEscape("gzip -dc |"))
 
-	pathEnv := map[string]string{}
-	require.NoError(t, job.UpdateFromImageEnv(&pathEnv)(ctx))
-	assert.Equal(t, path, pathEnv["PATH"])
+	imageEnv := map[string]string{}
+	require.NoError(t, job.UpdateFromImageEnv(&imageEnv)(ctx))
+	assert.Equal(t, map[string]string{"PATH": path, "ImageOS": "ubuntu24-arm64"}, imageEnv)
 
 	info, err := service.Inspect(ctx)
 	require.NoError(t, err)

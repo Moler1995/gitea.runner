@@ -50,6 +50,7 @@ type KubernetesPod struct {
 	job              *kubernetesContainer
 	services         []*kubernetesContainer
 	arch, path       string
+	imageOS          string
 	ips              []net.IP
 	transfer         *transferServer
 	transferImage    string
@@ -432,11 +433,12 @@ func (c *kubernetesContainer) Start(_ bool) common.Executor {
 		if err != nil {
 			return err
 		}
-		probed := strings.SplitN(output, "\n", 3)
-		for len(probed) < 3 {
+		probed := strings.SplitN(output, "\x00", 5)
+		for len(probed) < 5 {
 			probed = append(probed, "")
 		}
 		c.pod.arch, c.gzip, c.pod.path = goArchToActionArch(probed[0]), probed[1] == "gzip", probed[2]
+		c.pod.imageOS = cmp.Or(probed[3], ImageOSFromOSRelease(probed[4]))
 		return nil
 	}
 }
@@ -447,7 +449,7 @@ func (p *KubernetesPod) probe(ctx context.Context, container string) (string, er
 	deadline := time.Now().Add(time.Minute)
 	for delay := 100 * time.Millisecond; ; delay = min(2*delay, 2*time.Second) {
 		var stdout bytes.Buffer
-		err := p.client.exec(ctx, p.name, container, []string{"sh", "-c", `printf '%s\n%s\n%s' "$(uname -m)" "$(command -v gzip >/dev/null && echo gzip)" "$PATH"`}, nil, &stdout, io.Discard)
+		err := p.client.exec(ctx, p.name, container, []string{"sh", "-c", `printf '%s\0%s\0%s\0%s\0%s' "$(uname -m)" "$(command -v gzip >/dev/null && echo gzip)" "$PATH" "$ImageOS" "$(cat /etc/os-release 2>/dev/null || cat /usr/lib/os-release 2>/dev/null)"`}, nil, &stdout, io.Discard)
 		var exitErr ExitCodeError
 		var apiErr *apiError
 		if err == nil || ctx.Err() != nil || errors.As(err, &exitErr) || time.Now().After(deadline) ||
@@ -582,6 +584,9 @@ func (c *kubernetesContainer) UpdateFromEnv(srcPath string, env *map[string]stri
 func (c *kubernetesContainer) UpdateFromImageEnv(env *map[string]string) common.Executor {
 	return func(context.Context) error {
 		(*env)["PATH"] = cmp.Or((*env)["PATH"], c.pod.path)
+		if c.pod.imageOS != "" {
+			(*env)["ImageOS"] = cmp.Or((*env)["ImageOS"], c.pod.imageOS)
+		}
 		return nil
 	}
 }

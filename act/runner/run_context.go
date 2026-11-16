@@ -1221,12 +1221,14 @@ func (rc *RunContext) copyWorkflowFiles() common.Executor {
 		imageEnv := map[string]string{}
 		imageEnvErr := rc.JobContainer.UpdateFromImageEnv(&imageEnv)(ctx)
 		rc.defaultEnv = map[string]string{}
-		if imageOS, set := imageEnv["ImageOS"]; set {
+		imageOS, set := imageEnv["ImageOS"]
+		if !set && !rc.kubernetes { // a pod reports its release through its startup probe
+			osRelease, _ := readSingleFileFromContainerArchive(ctx, rc.JobContainer, "/usr/lib/os-release", 64<<10)
+			imageOS = container.ImageOSFromOSRelease(string(osRelease))
+			set = imageOS != ""
+		}
+		if set {
 			rc.defaultEnv["ImageOS"] = imageOS
-		} else if osRelease, ok := readSingleFileFromContainerArchive(ctx, rc.JobContainer, "/usr/lib/os-release", 64<<10); ok {
-			if imageOS := imageOSFromOSRelease(string(osRelease)); imageOS != "" {
-				rc.defaultEnv["ImageOS"] = imageOS
-			}
 		}
 		files := []*container.FileEntry{
 			{Name: "workflow/event.json", Mode: 0o644, Body: rc.EventJSON},
@@ -1922,25 +1924,6 @@ func imageOSFromImage(image string) string {
 		return match[1] + match[2]
 	}
 	return ""
-}
-
-// imageOSFromOSRelease derives ImageOS from an os-release file, empty for anything but Ubuntu, the only Linux GitHub names one.
-func imageOSFromOSRelease(osRelease string) string {
-	var id, major string
-	for line := range strings.Lines(osRelease) {
-		key, value, _ := strings.Cut(strings.TrimSpace(line), "=")
-		value = strings.Trim(value, `"'`)
-		switch key {
-		case "ID":
-			id = value
-		case "VERSION_ID":
-			major, _, _ = strings.Cut(value, ".")
-		}
-	}
-	if id != "ubuntu" || major == "" {
-		return ""
-	}
-	return id + major
 }
 
 func registryCredentials(credentials map[string]string, prefix string) (string, string, error) {

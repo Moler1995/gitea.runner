@@ -45,14 +45,15 @@ func TestDockerEnvironmentUsesContainerPath(t *testing.T) {
 		Return(mobyclient.ContainerInspectResult{Container: container.InspectResponse{Config: &container.Config{Env: []string{
 			"PATH=/opt/node/x64/bin:/usr/bin:/bin", "CONFLICT_VAR=container-value", "SOME_RANDOM_VAR=",
 			"ANOTHER_ONE=old-value", "ANOTHER_ONE=BUT_I_HAVE_VALUE", "LITERAL='quoted'=$HOME\nsecond line",
-		}}}}, nil)
+		}}}}, nil).Once()
 	env := map[string]string{
 		"PATH":         "/custom/bin",
 		"RANDOM_VAR":   "WITH_VALUE",
 		"ANOTHER_VAR":  "",
 		"CONFLICT_VAR": "step-value",
 	}
-	require.NoError(t, (&containerReference{cli: client, id: "amd64-job"}).UpdateFromImageEnv(&env)(t.Context()))
+	cr := &containerReference{cli: client, id: "amd64-job"}
+	require.NoError(t, cr.UpdateFromImageEnv(&env)(t.Context()))
 	assert.Equal(t, map[string]string{
 		"PATH":            "/custom/bin:/opt/node/x64/bin:/usr/bin:/bin",
 		"RANDOM_VAR":      "WITH_VALUE",
@@ -62,6 +63,10 @@ func TestDockerEnvironmentUsesContainerPath(t *testing.T) {
 		"CONFLICT_VAR":    "step-value",
 		"LITERAL":         "'quoted'=$HOME\nsecond line",
 	}, env)
+	pathEnv := map[string]string{}
+	require.NoError(t, cr.UpdateFromImageEnv(&pathEnv)(t.Context()))
+	assert.Equal(t, "/opt/node/x64/bin:/usr/bin:/bin", pathEnv["PATH"])
+	client.AssertExpectations(t)
 }
 
 type mockDockerClient struct {
