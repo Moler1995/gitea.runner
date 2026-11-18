@@ -44,7 +44,7 @@ func (rc *RunContext) runJobHook(ctx context.Context, hookPath, name string) err
 	rc.CurrentStep = ""
 	defer func() { rc.CurrentStep = previousStep }()
 
-	env := rc.mergeEnv(rc.caEnv, rc.containerSpec.Env, rc.GetEnv())
+	env := rc.mergeEnv(rc.defaultEnv, rc.containerSpec.Env, rc.GetEnv())
 	rc.withGithubEnv(ctx, rc.getGithubContext(ctx), env)
 	rc.ApplyExtraPath(ctx, &env)
 

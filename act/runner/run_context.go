@@ -69,7 +69,7 @@ type RunContext struct {
 	kubernetes          bool
 	containerSpec       model.ContainerSpec // container:, resolved once with platformImage
 	containerEnv        yaml.Node           // container.env of the kept containerSpec, decoded once the job env resolves
-	caEnv               map[string]string   // NODE_EXTRA_CA_CERTS for the runner CA, beneath any env the job and its image set
+	defaultEnv          map[string]string   // ImageOS and the runner CA's NODE_EXTRA_CA_CERTS, beneath any env the job sets
 	JobName             string
 	ActionPath          string
 	Parent              *RunContext
@@ -103,6 +103,7 @@ type RunContext struct {
 	// getJobContext report the "cancelled" status so cancelled()/always() evaluate the way
 	// GitHub Actions does, letting cleanup and always() steps run while normal steps skip.
 	jobCancelled bool
+	jobTimedOut  bool
 	// jobFailed records failures outside normal main-step results, such as action pre-step
 	// failures. Those failures must still make success() false and failure() true for later
 	// main-step if evaluation.
@@ -160,12 +161,13 @@ func (rc *RunContext) markFailed() {
 // markInterrupted records the job's interruption status from a context error so later step `if` evaluations and the job result observe it,
 // keeping the timeout path symmetric with the cancel path:
 //   - context.Canceled (server cancel) marks the job cancelled, matching GitHub's "only always()/cancelled() run on cancel".
-//   - context.DeadlineExceeded (job timeout-minutes) marks the job failed, matching the "Timeout -> FAILURE" reporting semantics.
+//   - context.DeadlineExceeded (job timeout-minutes) evaluates later steps as cancelled like GitHub, but reports the job failed.
 func (rc *RunContext) markInterrupted(err error) {
 	switch {
 	case errors.Is(err, context.Canceled):
 		rc.markCancelled()
 	case errors.Is(err, context.DeadlineExceeded):
+		rc.jobTimedOut = true
 		rc.markFailed()
 	}
 }
@@ -1216,6 +1218,24 @@ func (svc *serviceContainer) healthOutputSuffix() string {
 
 func (rc *RunContext) copyWorkflowFiles() common.Executor {
 	return func(ctx context.Context) error {
+		imageEnv := map[string]string{}
+		imageEnvErr := rc.JobContainer.UpdateFromImageEnv(&imageEnv)(ctx)
+		rc.defaultEnv = map[string]string{}
+		imageOS, set := imageEnv["ImageOS"]
+		if !set {
+			if !rc.kubernetes { // a pod reports its release through its startup probe
+				for _, osReleasePath := range []string{"/usr/lib/os-release", "/etc/os-release"} { // the archive skips symlinks, as /etc's is on Ubuntu
+					if osRelease, ok := readSingleFileFromContainerArchive(ctx, rc.JobContainer, osReleasePath, 64<<10); ok {
+						imageOS = container.ImageOSFromOSRelease(string(osRelease))
+						break
+					}
+				}
+			}
+			imageOS = cmp.Or(imageOS, rc.imageOS(ctx))
+		}
+		if set || imageOS != "" {
+			rc.defaultEnv["ImageOS"] = imageOS
+		}
 		files := []*container.FileEntry{
 			{Name: "workflow/event.json", Mode: 0o644, Body: rc.EventJSON},
 			{Name: "workflow/envs.txt", Mode: 0o666},
@@ -1226,12 +1246,11 @@ func (rc *RunContext) copyWorkflowFiles() common.Executor {
 				return fmt.Errorf("read runner CA file: %w", err)
 			}
 			files = append(files, &container.FileEntry{Name: "ca.crt", Mode: 0o644, Body: string(ca)})
-			imageEnv := map[string]string{}
-			if err = rc.JobContainer.UpdateFromImageEnv(&imageEnv)(ctx); err != nil {
-				return err
+			if imageEnvErr != nil {
+				return imageEnvErr
 			}
 			if _, set := imageEnv["NODE_EXTRA_CA_CERTS"]; !set {
-				rc.caEnv = map[string]string{"NODE_EXTRA_CA_CERTS": rc.jobCAFile()}
+				rc.defaultEnv["NODE_EXTRA_CA_CERTS"] = rc.jobCAFile()
 			}
 		}
 		return rc.JobContainer.Copy(rc.JobContainer.GetActPath()+"/", files...)(ctx)
@@ -1604,7 +1623,7 @@ func (rc *RunContext) getJobContext() *model.JobContext {
 	// A cancelled run takes precedence over success/failure so cancelled() is true and
 	// success()/failure() are false, matching GitHub Actions: on cancellation only
 	// always() and cancelled() steps run.
-	if job.jobCancelled {
+	if job.jobCancelled || job.jobTimedOut {
 		jobStatus = "cancelled"
 	}
 
@@ -1789,7 +1808,7 @@ func aliasGiteaEnv(env map[string]string) {
 	}
 }
 
-func (rc *RunContext) withGithubEnv(ctx context.Context, github *model.GithubContext, env map[string]string) {
+func (rc *RunContext) withGithubEnv(_ctx context.Context, github *model.GithubContext, env map[string]string) {
 	if _, ok := env["CI"]; !ok {
 		env["CI"] = "true"
 	}
@@ -1858,10 +1877,6 @@ func (rc *RunContext) withGithubEnv(ctx context.Context, github *model.GithubCon
 		env["ACTIONS_RUNTIME_URL"] = cmp.Or(os.Getenv("ACTIONS_RUNTIME_URL"), "http://"+net.JoinHostPort(rc.Config.ArtifactServerAddr, rc.Config.ArtifactServerPort)+"/")
 		env["ACTIONS_RUNTIME_TOKEN"] = cmp.Or(rc.runtimeToken, os.Getenv("ACTIONS_RUNTIME_TOKEN"), "token")
 	}
-
-	if imageOS := rc.imageOS(ctx); imageOS != "" {
-		env["ImageOS"] = imageOS
-	}
 }
 
 // parentDir returns the directory containing p, or "" when p names no parent. Both
@@ -1878,7 +1893,7 @@ func parentDir(p string) string {
 // from another. The resolved image tag is preferred over the runs-on label because it
 // still names a release when the label is a rolling one such as ubuntu-latest.
 func (rc *RunContext) imageOS(ctx context.Context) string {
-	if rc.Run.Job().RunsOn() == nil {
+	if job := rc.Run.Job(); job == nil || job.RunsOn() == nil {
 		return "" // a composite action runs on a synthetic job without runs-on
 	}
 	if imageOS := imageOSFromImage(rc.platformImage); imageOS != "" {
@@ -1887,8 +1902,8 @@ func (rc *RunContext) imageOS(ctx context.Context) string {
 
 	for _, platformName := range slices.Backward(rc.runsOnPlatformNames(ctx)) {
 		if platformName == "ubuntu-latest" {
-			// Rolling label whose image names no release either, so keep the historical value.
-			return "ubuntu20"
+			// Rolling label whose image names no release either, so report GitHub's current ubuntu-latest.
+			return "ubuntu24"
 		} else if platformName != "" {
 			return strings.SplitN(strings.Replace(platformName, `-`, ``, 1), `.`, 2)[0]
 		}

@@ -108,3 +108,22 @@ func (*LinuxContainerEnvironmentExtensions) GetRunnerContext(ctx context.Context
 func (*LinuxContainerEnvironmentExtensions) IsEnvironmentCaseInsensitive() bool {
 	return false
 }
+
+// ImageOSFromOSRelease derives ImageOS from an os-release file, empty for anything but Ubuntu, the only Linux GitHub names one.
+func ImageOSFromOSRelease(osRelease string) string {
+	var id, major string
+	for line := range strings.Lines(osRelease) {
+		key, value, _ := strings.Cut(strings.TrimSpace(line), "=")
+		value = strings.Trim(value, `"'`)
+		switch key {
+		case "ID":
+			id = value
+		case "VERSION_ID":
+			major, _, _ = strings.Cut(value, ".")
+		}
+	}
+	if id != "ubuntu" || major == "" {
+		return ""
+	}
+	return id + major
+}
