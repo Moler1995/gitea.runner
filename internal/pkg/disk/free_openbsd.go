@@ -1,0 +1,17 @@
+// Copyright 2026 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+//go:build openbsd
+
+package disk
+
+import "golang.org/x/sys/unix"
+
+// FreeBytes reports the space available to an unprivileged user on the volume holding path.
+func FreeBytes(path string) (uint64, error) {
+	var stat unix.Statfs_t
+	if err := unix.Statfs(path, &stat); err != nil {
+		return 0, err
+	}
+	return availableBytes(stat.F_bavail, stat.F_bsize), nil
+}
