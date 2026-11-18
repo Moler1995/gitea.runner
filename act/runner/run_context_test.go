@@ -1769,7 +1769,7 @@ func TestRunContextImageOS(t *testing.T) {
 			{imageEnv: map[string]string{"ImageOS": "ubuntu24-arm64"}, osRelease: ubuntu, want: "ubuntu24-arm64"},
 			{imageEnv: map[string]string{"ImageOS": "ubuntu24-arm64"}, jobEnv: "ImageOS: ubuntu20", want: "ubuntu20"},
 			{osRelease: ubuntu, want: "ubuntu22"},
-			{osRelease: tarArchive(t, tarEntry{name: "os-release", body: "ID=debian\nVERSION_ID=\"12\"\n"}), want: "ubuntu24"},
+			{osRelease: tarArchive(t, tarEntry{name: "os-release", body: "ID=debian\nVERSION_ID=\"12\"\n"}), want: "ubuntu26"},
 		} {
 			rc := createRunsOnRunContext(t, "ubuntu-latest\nenv: {"+tc.jobEnv+"}")
 			rc.platformImage = "docker.gitea.com/runner-images:ubuntu-latest"
@@ -1797,7 +1797,7 @@ func TestRunContextImageOS(t *testing.T) {
 	})
 
 	t.Run("reports the current release for the rolling ubuntu-latest label", func(t *testing.T) {
-		assert.Equal(t, "ubuntu24", createRunsOnRunContext(t, "ubuntu-latest").imageOS(ctx))
+		assert.Equal(t, "ubuntu26", createRunsOnRunContext(t, "ubuntu-latest").imageOS(ctx))
 	})
 
 	t.Run("is empty for the synthetic job of a composite action", func(t *testing.T) {

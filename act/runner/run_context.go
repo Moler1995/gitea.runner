@@ -1903,7 +1903,7 @@ func (rc *RunContext) imageOS(ctx context.Context) string {
 	for _, platformName := range slices.Backward(rc.runsOnPlatformNames(ctx)) {
 		if platformName == "ubuntu-latest" {
 			// Rolling label whose image names no release either, so report GitHub's current ubuntu-latest.
-			return "ubuntu24"
+			return "ubuntu26"
 		} else if platformName != "" {
 			return strings.SplitN(strings.Replace(platformName, `-`, ``, 1), `.`, 2)[0]
 		}
