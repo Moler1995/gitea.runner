@@ -304,6 +304,21 @@ Hook scripts run where the job's steps run, before the first step and after the 
 
 Use them for per-job setup no workflow should carry, like registry logins or masking runner-wide secrets. They block the job, and a non-zero exit fails it. See [docs/job-hooks.md](docs/job-hooks.md).
 
+### Action replacements (`runner.action_replacements`)
+
+Rewrite the `uses` of steps before they run, for example to keep old commits using `builtin:checkout` buildable, or to fetch actions from a mirror:
+
+```yaml
+runner:
+  action_replacements:
+    - regex: 'builtin:checkout'
+      replacement: actions/checkout@v6
+    - regex: '(?:https://github\.com/)?actions/(.+)'
+      replacement: https://git.example.com/mirror/${1}
+```
+
+A regex must match the whole `uses`, and `${1}` inserts its first group. Entries apply in order, each to the result of the previous one. Steps inside composite actions are rewritten too.
+
 ### Secret masking
 
 Secrets and `::add-mask::` values are hidden in job logs, [local job logs](#local-job-logs-logjobdir), job summaries and container names. As on GitHub, a job output containing one is dropped with a warning.

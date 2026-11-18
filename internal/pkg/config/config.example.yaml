@@ -99,6 +99,8 @@ runner:
   # Replaces the `uses` of steps whose regex matches it in full, ${1} is the first group.
   # Entries apply in order, each to the result of the previous one.
   #action_replacements:
+  #  - regex: 'builtin:checkout'
+  #    replacement: actions/checkout@v6
   #  - regex: 'actions/checkout@.*'
   #    replacement: actions/checkout@v6
   #  - regex: 'actions/setup-node@(.+)'
