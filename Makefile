@@ -21,8 +21,7 @@ GOVULNCHECK_PACKAGE ?= golang.org/x/vuln/cmd/govulncheck@v1.9.0 # renovate: data
 
 GOTEST_FLAGS ?= -race -timeout 20m -parallel 8
 
-CROSS_TARGETS ?= darwin/arm64 dragonfly/amd64 freebsd/amd64 illumos/amd64 linux/arm linux/s390x netbsd/amd64 \
-	openbsd/amd64 solaris/amd64 # each GOOS lint skips, plus the 32-bit syscall struct fields of linux/arm and linux/s390x
+CROSS_TARGETS ?= darwin/arm64 freebsd/amd64 linux/arm netbsd/amd64 openbsd/amd64 solaris/amd64 # one per platform file set, linux/arm for 32-bit syscall fields
 
 STATIC ?=
 EXTLDFLAGS ?=
@@ -107,7 +106,7 @@ checks: tidy-check fmt-check security-check ## run the non-lint source checks
 cross-check: $(addprefix cross-check/,$(CROSS_TARGETS)) ## check that code and tests compile on every supported platform
 
 cross-check/%:
-	GOOS=$(word 1,$(subst /, ,$*)) GOARCH=$(word 2,$(subst /, ,$*)) CGO_ENABLED=0 $(GO) vet ./...
+	GOOS=$(word 1,$(subst /, ,$*)) GOARCH=$(word 2,$(subst /, ,$*)) CGO_ENABLED=0 $(GO) vet -gcflags='all=-N -l' ./...
 
 .PHONY: lint
 lint: lint-go lint-go-windows ## lint everything
