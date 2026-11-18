@@ -96,7 +96,7 @@ runner:
   # and github_mirror is not empty. In this case,
   # it replaces https://github.com with the value here, which is useful for some special network environments.
   #github_mirror: ''
-  # Replaces the `uses` of steps whose regex matches it in full, ${1} is the first group.
+  # Replaces the `uses` of steps whose regex matches it in full, with capture groups as ${1}, ${2} and so on.
   # Entries apply in order, each to the result of the previous one.
   #action_replacements:
   #  - regex: 'builtin:checkout'

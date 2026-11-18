@@ -317,7 +317,7 @@ runner:
       replacement: https://git.example.com/mirror/${1}
 ```
 
-A regex must match the whole `uses`, and `${1}` inserts its first group. Entries apply in order, each to the result of the previous one. Steps inside composite actions are rewritten too.
+A regex must match the whole `uses`, and the replacement can insert its capture groups as `${1}`, `${2}` and so on. Entries apply in order, each to the result of the previous one. Steps inside composite actions are rewritten too.
 
 ### Secret masking
 
