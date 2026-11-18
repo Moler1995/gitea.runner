@@ -16,7 +16,12 @@ import (
 	"gitea.com/gitea/runner/act/common"
 
 	"github.com/moby/moby/api/types/system"
+	"github.com/moby/moby/client"
 )
+
+func GetDockerClient(context.Context) (client.APIClient, error) {
+	return nil, errors.ErrUnsupported
+}
 
 func IsolatedCacheContainer(context.Context, netip.Addr, string) (string, error) {
 	return "", nil
@@ -25,13 +30,13 @@ func IsolatedCacheContainer(context.Context, netip.Addr, string) (string, error)
 // ImageExistsLocally returns a boolean indicating if an image with the
 // requested name, tag and architecture exists in the local docker image store
 func ImageExistsLocally(ctx context.Context, imageName, platform string) (bool, error) {
-	return false, errors.New("Unsupported Operation")
+	return false, errors.ErrUnsupported
 }
 
 // RemoveImage removes image from local store, the function is used to run different
 // container image architectures
 func RemoveImage(ctx context.Context, imageName string, force, pruneChildren bool) (bool, error) {
-	return false, errors.New("Unsupported Operation")
+	return false, errors.ErrUnsupported
 }
 
 func RemoveDockerJobResources(_ context.Context, _ string) error {
@@ -43,20 +48,20 @@ func NewDockerProxy(_ context.Context, _ string) *DockerProxy {
 }
 
 func StartDockerProxy(daemonSocket, dir, job string) (*DockerProxy, error) {
-	return nil, errors.New("Unsupported Operation")
+	return nil, errors.ErrUnsupported
 }
 
 // NewDockerBuildExecutor function to create a run executor for the container
 func NewDockerBuildExecutor(input NewDockerBuildExecutorInput) common.Executor {
 	return func(ctx context.Context) error {
-		return errors.New("Unsupported Operation")
+		return errors.ErrUnsupported
 	}
 }
 
 // NewDockerPullExecutor function to create a run executor for the container
 func NewDockerPullExecutor(input NewDockerPullExecutorInput) common.Executor {
 	return func(ctx context.Context) error {
-		return errors.New("Unsupported Operation")
+		return errors.ErrUnsupported
 	}
 }
 
