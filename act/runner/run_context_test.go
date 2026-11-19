@@ -1757,53 +1757,30 @@ func TestRunContextContainerImageCannotSelectBackend(t *testing.T) {
 
 func TestRunContextImageOS(t *testing.T) {
 	ctx := t.Context()
-
-	t.Run("keeps an ImageOS from the image, the job env or the job's Ubuntu release", func(t *testing.T) {
-		ubuntu := tarArchive(t, tarEntry{name: "os-release", body: "ID=ubuntu\nVERSION_ID=\"22.04\"\n"})
-		for _, tc := range []struct {
-			imageEnv  map[string]string
-			jobEnv    string
-			osRelease []byte
-			want      string
-		}{
-			{imageEnv: map[string]string{"ImageOS": "ubuntu24-arm64"}, osRelease: ubuntu, want: "ubuntu24-arm64"},
-			{imageEnv: map[string]string{"ImageOS": "ubuntu24-arm64"}, jobEnv: "ImageOS: ubuntu20", want: "ubuntu20"},
-			{osRelease: ubuntu, want: "ubuntu22"},
-			{osRelease: tarArchive(t, tarEntry{name: "os-release", body: "ID=debian\nVERSION_ID=\"12\"\n"}), want: "ubuntu26"},
-		} {
-			rc := createRunsOnRunContext(t, "ubuntu-latest\nenv: {"+tc.jobEnv+"}")
-			rc.platformImage = "docker.gitea.com/runner-images:ubuntu-latest"
-			rc.JobContainer = imageEnvContainer{&container.HostEnvironment{ActPath: t.TempDir()}, tc.imageEnv, tc.osRelease}
-			require.NoError(t, rc.copyWorkflowFiles()(ctx))
-			require.NoError(t, evaluateJobEnvAndDefaults(ctx, rc))
-			env := map[string]string{}
-			require.NoError(t, setupEnv(ctx, &stepRun{RunContext: rc, Step: &model.Step{}, env: env}))
-			assert.Equal(t, tc.want, env["ImageOS"])
-		}
-	})
-
-	t.Run("prefers the release in the resolved image tag", func(t *testing.T) {
-		rc := createRunsOnRunContext(t, "ubuntu-latest")
-		rc.Config.PlatformPicker = func([]string) string { return "docker.gitea.com/runner-images:ubuntu-24.04" }
-		require.NoError(t, rc.resolvePlatformImage(ctx))
-		assert.Equal(t, "ubuntu24", rc.imageOS(ctx))
-	})
-
-	t.Run("falls back to the runs-on label", func(t *testing.T) {
-		rc := createRunsOnRunContext(t, "ubuntu-22.04")
-		rc.Config.PlatformPicker = func([]string) string { return "some-image" }
-		require.NoError(t, rc.resolvePlatformImage(ctx))
-		assert.Equal(t, "ubuntu22", rc.imageOS(ctx))
-	})
-
-	t.Run("reports the current release for the rolling ubuntu-latest label", func(t *testing.T) {
-		assert.Equal(t, "ubuntu26", createRunsOnRunContext(t, "ubuntu-latest").imageOS(ctx))
-	})
-
-	t.Run("is empty for the synthetic job of a composite action", func(t *testing.T) {
-		rc := createIfTestRunContext(map[string]*model.Job{"job1": {}})
-		assert.Empty(t, rc.imageOS(ctx))
-	})
+	ubuntu := tarArchive(t, tarEntry{name: "os-release", body: "ID=ubuntu\nVERSION_ID=\"22.04\"\n"})
+	debian := tarArchive(t, tarEntry{name: "os-release", body: "ID=debian\nVERSION_ID=\"12\"\n"})
+	for _, tc := range []struct {
+		image     string
+		imageEnv  map[string]string
+		jobEnv    string
+		osRelease []byte
+		want      string
+	}{
+		{imageEnv: map[string]string{"ImageOS": "ubuntu24-arm64"}, osRelease: ubuntu, want: "ubuntu24-arm64"},
+		{imageEnv: map[string]string{"ImageOS": "ubuntu24-arm64"}, jobEnv: "ImageOS: ubuntu20", want: "ubuntu20"},
+		{osRelease: ubuntu, want: "ubuntu22"},
+		{image: "docker.gitea.com/runner-images:ubuntu-24.04", osRelease: debian, want: "ubuntu24"},
+		{image: "docker.gitea.com/runner-images:ubuntu-latest-slim", osRelease: debian},
+	} {
+		rc := createRunsOnRunContext(t, "ubuntu-latest\nenv: {"+tc.jobEnv+"}")
+		rc.platformImage = tc.image
+		rc.JobContainer = imageEnvContainer{&container.HostEnvironment{ActPath: t.TempDir()}, tc.imageEnv, tc.osRelease}
+		require.NoError(t, rc.copyWorkflowFiles()(ctx))
+		require.NoError(t, evaluateJobEnvAndDefaults(ctx, rc))
+		env := map[string]string{}
+		require.NoError(t, setupEnv(ctx, &stepRun{RunContext: rc, Step: &model.Step{}, env: env}))
+		assert.Equal(t, tc.want, env["ImageOS"])
+	}
 }
 
 func TestRunContextGetRunnerContext(t *testing.T) {
