@@ -23,6 +23,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"gitea.com/gitea/runner/act/common"
@@ -83,8 +84,13 @@ func (cr *containerReference) Start(attach bool) common.Executor {
 				cr.attach().IfBool(attach),
 				cr.start(),
 				cr.wait().IfBool(attach),
-				cr.tryReadID("-u", func(id int) { cr.UID = id }),
-				cr.tryReadID("-g", func(id int) { cr.GID = id }),
+				func(ctx context.Context) error {
+					var wg sync.WaitGroup
+					wg.Go(func() { _ = cr.tryReadID("-u", func(id int) { cr.UID = id })(ctx) })
+					_ = cr.tryReadID("-g", func(id int) { cr.GID = id })(ctx)
+					wg.Wait()
+					return nil
+				},
 				func(ctx context.Context) error {
 					// If this fails, then folders have wrong permissions on non root container
 					if cr.UID != 0 || cr.GID != 0 {
@@ -183,6 +189,9 @@ func (cr *containerReference) Inspect(ctx context.Context) (*Info, error) {
 		return nil, cr.missingContainerError("inspect it")
 	} else if err != nil {
 		return nil, err
+	}
+	if cr.containerEnvID != cr.id && result.Container.Config != nil {
+		cr.containerEnv, cr.containerEnvID = opts.ConvertKVStringsToMap(result.Container.Config.Env), cr.id
 	}
 	return containerInfoFromInspect(result.Container), nil
 }
@@ -307,15 +316,13 @@ func (cr *containerReference) UpdateFromEnv(srcPath string, env *map[string]stri
 func (cr *containerReference) UpdateFromImageEnv(env *map[string]string) common.Executor {
 	envMap := *env
 	return common.Executor(func(ctx context.Context) error {
-		inspect, err := cr.cli.ContainerInspect(ctx, cr.id, client.ContainerInspectOptions{})
-		if err != nil {
-			common.Logger(ctx).Error(err)
-			return fmt.Errorf("inspect container: %w", err)
+		if cr.containerEnvID != cr.id {
+			if _, err := cr.Inspect(ctx); err != nil {
+				common.Logger(ctx).Error(err)
+				return fmt.Errorf("inspect container: %w", err)
+			}
 		}
-		if inspect.Container.Config == nil {
-			return nil
-		}
-		for key, value := range opts.ConvertKVStringsToMap(inspect.Container.Config.Env) {
+		for key, value := range cr.containerEnv {
 			if envMap[key] == "" {
 				envMap[key] = value
 			} else if key == "PATH" {
@@ -365,7 +372,9 @@ type containerReference struct {
 	// attachDone is closed by the attach() streaming goroutine once it has
 	// drained and flushed the container's output. wait() blocks on it so the
 	// tail of the log lands before the step proceeds.
-	attachDone chan struct{}
+	attachDone     chan struct{}
+	containerEnv   map[string]string // fixed at creation, cached by inspect for containerEnvID
+	containerEnvID string
 	LinuxContainerEnvironmentExtensions
 }
 

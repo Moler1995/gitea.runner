@@ -503,7 +503,7 @@ jobs:
 	assert.Equal(t, "workflow", env["INPUT_FALLBACK"])
 }
 
-func TestResolveWorkflowCallToleratesMismatchesAndPassesInheritedSecretsAndRuntimeToken(t *testing.T) {
+func TestResolveWorkflowCallToleratesMismatchesAndPassesSecretsAndTokens(t *testing.T) {
 	callerWorkflow, err := model.ReadWorkflow(strings.NewReader(`
 jobs:
   call:
@@ -513,6 +513,9 @@ jobs:
   inherit:
     uses: ./reuse.yml
     secrets: inherit
+  override:
+    uses: ./reuse.yml
+    secrets: {github_token: "${{ secrets.token }}", GITEA_TOKEN: ""}
 `))
 	require.NoError(t, err)
 	callee, err := model.ReadWorkflow(strings.NewReader(`
@@ -527,7 +530,7 @@ jobs:
 	notCallable, err := model.ReadWorkflow(strings.NewReader("on: push\njobs:\n  test: {}\n"))
 	require.NoError(t, err)
 	config := &Config{
-		Secrets:             map[string]string{"token": "${{ github.token }}"},
+		Secrets:             map[string]string{"token": "${{ github.token }}", "GITHUB_TOKEN": "github-token", "GITEA_TOKEN": "gitea-token"},
 		PresetGitHubContext: &model.GithubContext{},
 		RuntimeTokens:       map[*model.Workflow]string{callerWorkflow: "caller-run"},
 	}
@@ -541,11 +544,17 @@ jobs:
 
 	called := resolve("call", callee)
 	assert.Equal(t, map[string]any{"flag": true}, called.workflowCallInputs)
-	assert.Equal(t, map[string]string{"undeclared": "${{ github.token }}"}, called.workflowCallSecrets)
+	assert.Equal(t, map[string]string{"undeclared": "${{ github.token }}", "GITHUB_TOKEN": "github-token", "GITEA_TOKEN": "gitea-token"}, called.workflowCallSecrets)
 	assert.Equal(t, "caller-run", called.GetEnv()["ACTIONS_RUNTIME_TOKEN"])
 	inherited := resolve("inherit", notCallable)
 	assert.Empty(t, inherited.workflowCallInputs)
-	assert.Equal(t, map[string]string{"token": "${{ github.token }}", "ACTIONS_RUNTIME_TOKEN": "caller-run"}, inherited.workflowCallSecrets)
+	assert.Equal(t, map[string]string{"token": "${{ github.token }}", "GITHUB_TOKEN": "github-token", "GITEA_TOKEN": "gitea-token", "ACTIONS_RUNTIME_TOKEN": "caller-run"}, inherited.workflowCallSecrets)
+	assert.Equal(t, "${{ github.token }}:", resolve("override", callee).ExprEval.InterpolateName(t.Context(), "${{ secrets.GITHUB_TOKEN }}:${{ secrets.GITEA_TOKEN }}"))
+	middle, err := model.ReadWorkflow(strings.NewReader("on: workflow_call\njobs:\n  test: {uses: ./reuse.yml}\n"))
+	require.NoError(t, err)
+	nested, err := (&runnerImpl{config: config, caller: &caller{runContext: resolve("override", middle)}}).newRunContext(t.Context(), &model.Run{Workflow: callee, JobID: "test"}, nil)
+	require.NoError(t, err)
+	assert.Equal(t, "github-token:gitea-token", nested.ExprEval.InterpolateName(t.Context(), "${{ secrets.GITHUB_TOKEN }}:${{ secrets.GITEA_TOKEN }}"))
 }
 
 func TestJobNameMasksSecrets(t *testing.T) {

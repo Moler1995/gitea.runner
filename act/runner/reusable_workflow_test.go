@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -212,4 +213,18 @@ func gitMust(t *testing.T, dir string, args ...string) {
 	}
 	out, err := cmd.CombinedOutput()
 	require.NoError(t, err, "git %v: %s", args, string(out))
+}
+
+func TestSetReusedWorkflowCallerResultFailsOnBadOutputs(t *testing.T) {
+	callerWorkflow, err := model.ReadWorkflow(strings.NewReader("jobs:\n  call: {uses: ./reuse.yml}\n"))
+	require.NoError(t, err)
+	called, err := model.ReadWorkflow(strings.NewReader("on:\n  workflow_call:\n    outputs:\n      bad: {value: \"${{ fromJSON('not-json') }}\"}\njobs:\n  inner: {uses: ./leaf.yml}\n"))
+	require.NoError(t, err)
+	config := &Config{PresetGitHubContext: &model.GithubContext{}}
+	parent, err := (&runnerImpl{config: config}).newRunContext(t.Context(), &model.Run{Workflow: callerWorkflow, JobID: "call"}, nil)
+	require.NoError(t, err)
+	rc, err := (&runnerImpl{config: config, caller: &caller{runContext: parent, reusedWorkflowJobResults: map[string]string{}}}).newRunContext(t.Context(), &model.Run{Workflow: called, JobID: "inner"}, nil)
+	require.NoError(t, err)
+	require.NoError(t, setReusedWorkflowCallerResult(rc, &runnerImpl{caller: &caller{reusedWorkflowJobResults: map[string]string{"leaf": "success"}}})(t.Context()))
+	require.Equal(t, "failure", rc.Run.Job().Result)
 }

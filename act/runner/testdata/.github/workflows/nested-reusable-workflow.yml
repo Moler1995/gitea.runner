@@ -1,0 +1,24 @@
+on:
+  workflow_call:
+    outputs:
+      output:
+        value: ${{ jobs.first.outputs.output }}
+      dependent:
+        value: ${{ jobs.dependent.outputs.output }}
+
+jobs:
+  first:
+    uses: ./.github/workflows/local-reusable-workflow.yml
+    with:
+      string_required: string
+      bool_required: true
+      number_required: 1
+    secrets: inherit
+  dependent:
+    needs: first
+    uses: ./.github/workflows/local-reusable-workflow.yml
+    with:
+      string_required: ${{ needs.first.result == 'success' && needs.first.outputs.output || 'failure' }}
+      bool_required: true
+      number_required: 1
+    secrets: inherit

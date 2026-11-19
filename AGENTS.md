@@ -11,7 +11,7 @@
 - Read `DEVELOPMENT.md` for internals and conventions
 - Ensure no trailing whitespace in edited files
 - Run `make fmt` after `.go` edits, `make tidy` after `go.mod` edits, and `make checks` for the non-lint source checks
-- Lint what changed with `make lint-go`, and `make lint-go-windows` for Windows and platform-split files
+- Lint what changed with `make lint-go`, and `make lint-go-windows` for Windows and platform-split files. Run `make cross-check` after platform-split edits
 - Fix the cause rather than disabling a linter or weakening a test. Where unavoidable, use the narrowest scope with a trailing comment giving the reason
 - Run single go tests with `go test -run '^TestName$' ./modulepath/`. `make test` self-skips the integration tests without docker or network, `make test-dind` runs the daemon-facing tests against the built dind image
 - Write the fewest, fastest tests covering the behavior, extending an existing one where possible. Prefer unit tests where logic is testable in isolation

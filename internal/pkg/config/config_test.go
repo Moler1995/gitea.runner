@@ -277,6 +277,7 @@ metrics:
 }
 
 func TestLoadDefault_WorkdirCleanup(t *testing.T) {
+	t.Setenv("EMPTY", "")
 	for _, tc := range []struct {
 		name, yaml    string
 		age, interval time.Duration
@@ -285,6 +286,8 @@ func TestLoadDefault_WorkdirCleanup(t *testing.T) {
 		{"configured interval", "\nrunner:\n  idle_cleanup_interval: 45m\n", 24 * time.Hour, 45 * time.Minute},
 		{"disabled", "\nrunner:\n  workdir_cleanup_age: 0s\n  idle_cleanup_interval: 0s\n", 0, 0},
 		{"negative", "\nrunner:\n  workdir_cleanup_age: -1s\n  idle_cleanup_interval: -1s\n", -time.Second, -time.Second},
+		{"disabled through a merge key", "\nx-base: &base\n  workdir_cleanup_age: 0s\n  idle_cleanup_interval: 0s\nrunner:\n  <<: *base\n", 0, 0},
+		{"empty keeps the default", "\nrunner:\n  workdir_cleanup_age: ${EMPTY}\n  idle_cleanup_interval:\n", 24 * time.Hour, 10 * time.Minute},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg, err := LoadDefault(write(t, tc.yaml))
@@ -463,11 +466,14 @@ func TestLoadDefault_ShippedConfigsChangeNothing(t *testing.T) {
 	assert.Empty(t, hook.AllRecords())
 }
 
-func TestLoadDefault_ClampsFetchTimeout(t *testing.T) {
+func TestLoadDefault_ClampsFetchTimeoutAndZeroFetchIntervalMaxDisablesBackoff(t *testing.T) {
 	cfg, err := LoadDefault(write(t, `
 runner:
   fetch_timeout: 120s
+  fetch_interval: 1s
+  fetch_interval_max: 0s
 `))
 	require.NoError(t, err)
 	assert.Equal(t, RequestTimeout, cfg.Runner.FetchTimeout)
+	assert.Equal(t, time.Second, cfg.Runner.FetchIntervalMax)
 }

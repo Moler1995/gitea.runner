@@ -288,8 +288,11 @@ type Config struct {
 // If file is not empty, it will be used to load the configuration.
 func LoadDefault(file string) (*Config, error) {
 	// Seeded before the file is read, so a written 0 can mean off.
-	cfg := &Config{Cache: DefaultCache(), Log: Log{Job: LogJob{Retention: 7 * 24 * time.Hour, MaxSize: 1024 * 1024 * 1024}}}
-	var definedRunnerKeys map[string]bool
+	cfg := &Config{
+		Runner: Runner{FetchIntervalMax: 5 * time.Second, WorkdirCleanupAge: 24 * time.Hour, IdleCleanupInterval: 10 * time.Minute},
+		Cache:  DefaultCache(),
+		Log:    Log{Job: LogJob{Retention: 7 * 24 * time.Hour, MaxSize: 1024 * 1024 * 1024}},
+	}
 	if file != "" {
 		content, err := os.ReadFile(file)
 		if err != nil {
@@ -306,7 +309,6 @@ func LoadDefault(file string) (*Config, error) {
 			return nil, fmt.Errorf("parse config file %q: %w", file, err)
 		}
 		warnUnknownKeys(file, &document)
-		definedRunnerKeys = definedRunnerConfigKeys(&document)
 	}
 
 	if cfg.Runner.EnvFile != "" {
@@ -434,15 +436,6 @@ func LoadDefault(file string) (*Config, error) {
 	if cfg.Runner.FetchInterval <= 0 {
 		cfg.Runner.FetchInterval = 2 * time.Second
 	}
-	if cfg.Runner.FetchIntervalMax <= 0 {
-		cfg.Runner.FetchIntervalMax = 5 * time.Second
-	}
-	if cfg.Runner.WorkdirCleanupAge == 0 && !definedRunnerKeys["workdir_cleanup_age"] {
-		cfg.Runner.WorkdirCleanupAge = 24 * time.Hour
-	}
-	if cfg.Runner.IdleCleanupInterval == 0 && !definedRunnerKeys["idle_cleanup_interval"] {
-		cfg.Runner.IdleCleanupInterval = 10 * time.Minute
-	}
 	if cfg.Runner.LogReportInterval <= 0 {
 		cfg.Runner.LogReportInterval = 5 * time.Second
 	}
@@ -483,8 +476,10 @@ func LoadDefault(file string) (*Config, error) {
 		cfg.Runner.FetchTimeout = RequestTimeout
 	}
 	if cfg.Runner.FetchIntervalMax < cfg.Runner.FetchInterval {
-		logging.Warnf("fetch_interval_max (%v) is less than fetch_interval (%v), setting fetch_interval_max to fetch_interval",
-			cfg.Runner.FetchIntervalMax, cfg.Runner.FetchInterval)
+		if cfg.Runner.FetchIntervalMax != 0 {
+			logging.Warnf("fetch_interval_max (%v) is less than fetch_interval (%v), setting fetch_interval_max to fetch_interval",
+				cfg.Runner.FetchIntervalMax, cfg.Runner.FetchInterval)
+		}
 		cfg.Runner.FetchIntervalMax = cfg.Runner.FetchInterval
 	}
 	if cfg.Runner.LogReportMaxLatency >= cfg.Runner.LogReportInterval {
@@ -572,28 +567,6 @@ func warnUnknownKeys(file string, document *yaml.Node) {
 			logging.Warnf("config file %q: %s, it will be ignored", file, loadErr)
 		}
 	}
-}
-
-func definedRunnerConfigKeys(root *yaml.Node) map[string]bool {
-	defined := map[string]bool{}
-	if len(root.Content) == 0 {
-		return defined
-	}
-
-	doc := root.Content[0]
-	for i := 0; i+1 < len(doc.Content); i += 2 {
-		key := doc.Content[i]
-		value := doc.Content[i+1]
-		if key.Value != "runner" || value.Kind != yaml.MappingNode {
-			continue
-		}
-		for j := 0; j+1 < len(value.Content); j += 2 {
-			defined[value.Content[j].Value] = true
-		}
-		break
-	}
-
-	return defined
 }
 
 func validateExtraHeaders(headers map[string]string) error {
