@@ -1,0 +1,49 @@
+name: Container hooks (Kubernetes API demo)
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  demo:
+    runs-on: container-hooks-demo
+    strategy:
+      matrix:
+        instance: [one, two]
+    services:
+      web:
+        image: traefik/whoami:v1.11.0
+        env:
+          WHOAMI_PORT_NUMBER: "18080"
+        ports: ['18080']
+    outputs:
+      value: ${{ steps.local.outputs.value }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: local
+        uses: ./.gitea/actions/local
+      - name: Persist an environment variable
+        run: echo 'PERSISTED=from-job' >> "$GITHUB_ENV"
+      - name: Check outputs, environment and service
+        env:
+          VALUE: ${{ steps.local.outputs.value }}
+          PORT: ${{ job.services.web.ports[18080] }}
+        run: |
+          test "$VALUE" = from-local-action
+          test "$PERSISTED" = from-job
+          curl -fsS "http://web:$PORT/health" > /dev/null
+          echo 'OUTPUTS_ENV_SERVICE_OK'
+      - uses: docker://busybox:1.37
+        with:
+          entrypoint: /bin/sh
+          args: -c 'test -d .git && echo from-container > container.txt && echo CONTAINER_STEP_OK'
+      - name: Check shared workspace and write summary
+        run: |
+          test "$(cat container.txt)" = from-container
+          echo '## Container hooks passed (Kubernetes API demo)' >> "$GITHUB_STEP_SUMMARY"
+  outputs:
+    needs: [demo]
+    runs-on: container-hooks-demo
+    steps:
+      - name: Check job outputs
+        env:
+          VALUE: ${{ needs.demo.outputs.value }}
+        run: test "$VALUE" = from-local-action

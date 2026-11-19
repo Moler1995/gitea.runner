@@ -5,6 +5,19 @@ Kubernetes API or a controller. The runner still evaluates workflows, downloads 
 scripts, streams masked logs and processes outputs. A shared filesystem between runner and job is
 not required. Protocol v1 supports Linux job environments.
 
+Integrating a new execution API does not require changing the runner's code: implement an adapter in an external hook that uses this protocol and select it in the runner configuration. The same interface covers preparation, command execution, file transfer and cleanup across backends.
+
+## Use cases
+
+- **Nomad:** submit jobs through the [Nomad API](https://developer.hashicorp.com/nomad/api-docs/jobs), letting the scheduler handle placement and resource management.
+- **Remote Docker hosts:** select a host from a pool or provision a temporary VM through a cloud API, run job containers through the [Docker API](https://docs.docker.com/engine/daemon/remote-access/), and release the host when the work finishes.
+- **Kubernetes with an external controller:** delegate runtime provisioning through a CRD or custom API, for example to a controller modeled on [ARC](https://docs.github.com/en/actions/concepts/runners/actions-runner-controller), with custom scaling, Pod templates, storage and scheduling rules.
+- **Job admission policies:** consult an external approval service or policy store in `prepare_job` and reject a job before provisioning its runtime. The hook implements the policy.
+
+## Activation
+
+Add this to the runner configuration:
+
 ```yaml
 container:
   hooks:
@@ -20,7 +33,39 @@ An enabled hook replaces container execution; failure never falls back to Docker
 not require a Docker daemon for hook jobs. For local execution, pass the configuration explicitly:
 `gitea-runner --config config.yaml exec --image node:24 --no-skip-checkout`.
 
-## Invocation and response
+## How it works
+
+1. `startHookJob` assembles a `HookJob` with the job container, services, workflow context and operator settings. It then creates a `HookEnvironment`, selects it as the job's execution environment and saves the cleanup function for later.
+2. `Prepare` invokes the hook with `prepare_job`. The hook prepares the runtime and services, writes paths, metadata and `state` to its response, then exits. The runner reads and validates the response only after the process has exited.
+3. The runner sets `RUNNER_*` variables from the returned paths and sends event data and workflow command files through `copy_to_job`. Generated scripts and downloaded action code use the same transport when preparing steps. `actions/checkout` normally clones the project inside the job.
+4. Steps run through `run_command_step` or `run_container_step`. Logs stream through the hook's stdout/stderr. The runner uses `copy_from_job` and its existing parsers to read local actions and collect outputs, environment changes and action state.
+5. After steps and post actions, the runner calls `cleanup_job` with the last saved `state`. Cleanup also runs after failed or cancelled prepare.
+
+```mermaid
+sequenceDiagram
+    participant R as Runner
+    participant H as Hook
+    participant J as Job environment
+    R->>H: prepare_job
+    H->>J: Prepare job and services
+    H-->>R: Paths, metadata, state
+    R->>H: copy_to_job (tar, destination)
+    H->>J: Deliver runtime files
+    loop Run steps
+        R->>H: run_command_step / run_container_step
+        H->>J: Execute command
+        J-->>H: stdout / stderr
+        H-->>R: Stream logs, respond with exitCode and state
+        R->>H: copy_from_job (source, tar)
+        H-->>R: Output, environment and state files
+    end
+    R->>H: cleanup_job
+    H->>J: Remove job resources
+```
+
+## Details
+
+### Invocation and response
 
 Each operation starts a new local process: `entrypoint cmd`, or `cmd` alone. The runner sends one
 UTF-8 JSON object through stdin, then closes stdin. stdout and stderr are streaming job logs,
@@ -72,7 +117,7 @@ on a failed command or a structured hook error, so cleanup can find partially cr
 Calls within one job are sequential. Each matrix combination has its own job ID, state and private
 exchange directory; different jobs may call the hook concurrently.
 
-## Operations
+### Operations
 
 | Command | Request `args` | Successful `result` |
 | --- | --- | --- |
@@ -86,10 +131,39 @@ exchange directory; different jobs may call the hook concurrently.
 `prepare_job` receives `name`, `container`, `services`, `paths`, `context` and `policy`.
 Container and service descriptions include `image`, optional `entryPoint` array, `entryPointArgs`,
 `environmentVariables`, `volumes`, `ports`, `options` and `registry`. Services are keyed by their
-workflow names. Registry values reference variables in the local hook process environment:
-`"registry": {"username": {"$env": "GITEA_CONTAINER_HOOK_SECRET_JOB_USERNAME"}, "password":
-{"$env": "GITEA_CONTAINER_HOOK_SECRET_JOB_PASSWORD"}}`. Resolve the named variable; the runner
-does not put registry credentials in the request JSON.
+workflow names.
+
+Registry credentials can come from the workflow's `container.credentials` or
+`services.<name>.credentials`, including expressions that read repository secrets:
+
+```yaml
+container:
+  image: registry.example.com/team/job:demo
+  credentials:
+    username: ${{ secrets.REGISTRY_USERNAME }}
+    password: ${{ secrets.REGISTRY_PASSWORD }}
+```
+
+The runner evaluates these values and automatically sets variables in the local hook process
+environment. The request JSON contains references to those variables:
+
+```json
+{
+  "registry": {
+    "username": {"$env": "GITEA_CONTAINER_HOOK_SECRET_JOB_USERNAME"},
+    "password": {"$env": "GITEA_CONTAINER_HOOK_SECRET_JOB_PASSWORD"}
+  }
+}
+```
+
+The hook reads each referenced variable, for example
+`process.env[args.container.registry.password.$env]` in Node.js. Operators do not need to set
+these variables manually: their values come from the workflow. Registry credential values are
+carried in the hook's environment rather than the request JSON.
+
+The Kubernetes demo currently rejects workflow registry credentials and uses pre-created
+`imagePullSecrets` configured through `GITEA_HOOK_IMAGE_PULL_SECRETS`. This is a demo limitation;
+the protocol already delivers workflow credentials to the hook.
 
 Context contains repository, ref, SHA, actor, event name, run ID, job key and workflow name.
 Operator policy is separate from workflow container fields: `privileged`, `usernsMode`, `network`,
@@ -118,8 +192,9 @@ This is the prepare `result`, inside the response envelope. All four paths must 
 paths, and remain stable until cleanup. The runner translates paths relative to its workspace to
 the returned job workspace, and constructs action and file-command paths under `act`. Container
 and requested service IDs must be nonempty; ports populate `job.services.<name>.ports`. Return the
-job image's environment, especially PATH. The runner supplies workflow environment and file-command
-paths on each execution, which take precedence over image defaults.
+job image's environment, especially PATH. The backend must make those values available to commands
+in the job environment. The runner supplies workflow environment and file-command paths on each
+execution, which take precedence over image defaults.
 
 `run_command_step` serves the runner's `Exec` operations, including shell steps, JavaScript/Go
 actions and internal probes. It may occur more than once per YAML step. Execute the given argv
@@ -174,9 +249,16 @@ never dump them into logs. The runner masks normal job output but cannot protect
 or external systems written by the hook. Cache/artifact endpoints must be reachable from the job;
 the runner does not attach hook workloads to Docker networks to reach them.
 
+## GitHub compatibility
+
 This is inspired by GitHub container hooks, not wire-compatible with them: `run_command_step`
 replaces `run_script_step`, file transport has two explicit operations, and responses carry an
 exit code and protocol envelope. Existing GitHub Kubernetes hooks need an adapter for dispatch,
 paths, state, copy operations and per-job resource naming. The built-in Kubernetes runtime is
 independent of this interface. The Python hook under `act/runner/testdata/container-hooks` is a
 local protocol test fixture; it runs commands on the test host and does not create containers.
+
+## Example
+
+For an executable Node.js backend and a kind walkthrough, see the
+[Container hooks (Kubernetes API demo)](../examples/container-hooks/demo/k8s).

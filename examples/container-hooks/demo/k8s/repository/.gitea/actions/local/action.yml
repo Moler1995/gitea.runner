@@ -1,0 +1,9 @@
+name: Local JavaScript action
+description: Check workspace access, outputs and post-action state
+outputs:
+  value:
+    description: Value written through GITHUB_OUTPUT
+runs:
+  using: node24
+  main: main.mjs
+  post: post.mjs

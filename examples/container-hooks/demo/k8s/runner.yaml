@@ -1,0 +1,16 @@
+log:
+  level: info
+runner:
+  file: /data/.runner
+  capacity: 2
+  timeout: 15m
+  shutdown_timeout: 30s
+cache:
+  enabled: false
+container:
+  hooks:
+    enabled: true
+    entrypoint: /usr/local/bin/node
+    cmd: /opt/container-hooks/k8s/index.mjs
+  require_docker: false
+  workdir_parent: /data/workspaces

@@ -67,6 +67,36 @@ ENV TINI_SUBREAPER=1
 USER rootless
 ENTRYPOINT ["s6-svscan","/etc/s6"]
 
+### CONTAINER HOOKS DEMO
+FROM alpine:3.24 AS kubectl
+
+ARG TARGETARCH
+ARG KUBECTL_VERSION=v1.37.2
+
+RUN apk add --no-cache curl ca-certificates && \
+    curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${TARGETARCH}/kubectl" -o /kubectl && \
+    curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${TARGETARCH}/kubectl.sha256" -o /kubectl.sha256 && \
+    printf '%s  /kubectl\n' "$(cat /kubectl.sha256)" | sha256sum -c - && chmod 755 /kubectl
+
+FROM node:24-alpine3.24 AS container-hooks-k8s-demo
+
+ARG VERSION=dev
+
+LABEL org.opencontainers.image.source="https://gitea.com/gitea/runner"
+LABEL org.opencontainers.image.version="${VERSION}"
+
+RUN apk upgrade --no-cache && apk add --no-cache tini bash git tzdata ca-certificates
+
+COPY --from=builder /opt/src/runner/gitea-runner /usr/local/bin/gitea-runner
+COPY --from=kubectl /kubectl /usr/local/bin/kubectl
+COPY scripts/run.sh /usr/local/bin/run.sh
+COPY examples/container-hooks/demo/k8s/*.mjs /opt/container-hooks/k8s/
+COPY examples/container-hooks/demo/k8s/runner.yaml /opt/container-hooks/k8s/runner.yaml
+
+ENV CONFIG_FILE=/opt/container-hooks/k8s/runner.yaml
+VOLUME /data
+ENTRYPOINT ["/sbin/tini","--","run.sh"]
+
 ### BASIC VARIANT
 #
 #
