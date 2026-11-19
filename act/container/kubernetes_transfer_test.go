@@ -27,6 +27,9 @@ import (
 const transferHelperEnv = "GITEA_RUNNER_TEST_TRANSFER_HELPER"
 
 func TestMain(m *testing.M) {
+	if os.Getenv("GITEA_RUNNER_TEST_CONTAINER_HOOK") == "1" {
+		os.Exit(runHookTestHelper())
+	}
 	if os.Getenv(transferHelperEnv) == "1" && len(os.Args) == 4 && os.Args[1] == KubernetesTransferCommand && os.Args[2] == "fetch" {
 		if err := FetchKubernetesTransfer(context.Background(), os.Stdin, os.Args[3]); err != nil {
 			fmt.Fprintln(os.Stderr, err)

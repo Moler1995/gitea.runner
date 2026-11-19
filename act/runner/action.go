@@ -141,11 +141,6 @@ func maybeCopyToActionDir(ctx context.Context, step actionStep, actionDir, actio
 		return nil
 	}
 
-	if rc.containerHooks.Enabled {
-		logger.Debugf("container-hook mode: skipping action dir copy to %s", containerActionDir)
-		return nil
-	}
-
 	containerActionDirCopy := strings.TrimSuffix(containerActionDir, actionPath)
 	logger.Debug(containerActionDirCopy)
 
@@ -208,7 +203,7 @@ func runActionImpl(step actionStep, actionDir string, remoteAction *remoteAction
 
 			rc.ApplyExtraPath(ctx, step.getEnv())
 
-			return rc.execJobContainer(containerArgs, *step.getEnv(), "", "")(ctx)
+			return rc.JobContainer.Exec(containerArgs, *step.getEnv(), "", "")(ctx)
 		case x.IsDocker():
 			location := path.Join(actionDir, actionPath)
 			if remoteAction == nil {
@@ -230,8 +225,8 @@ func runActionImpl(step actionStep, actionDir string, remoteAction *remoteAction
 
 			execFileName := action.Runs.Main + ".out"
 			return common.NewPipelineExecutor(
-				rc.execJobContainer([]string{"go", "build", "-o", execFileName, action.Runs.Main}, *step.getEnv(), "", containerActionDir),
-				rc.execJobContainer([]string{container.JoinPath(containerActionDir, execFileName)}, *step.getEnv(), "", ""),
+				rc.JobContainer.Exec([]string{"go", "build", "-o", execFileName, action.Runs.Main}, *step.getEnv(), "", containerActionDir),
+				rc.JobContainer.Exec([]string{container.JoinPath(containerActionDir, execFileName)}, *step.getEnv(), "", ""),
 			)(ctx)
 		default:
 			return fmt.Errorf("the runs.using key must be one of: %v, got %s", []string{
@@ -307,6 +302,9 @@ func execAsDocker(ctx context.Context, step actionStep, actionName, actionDir, b
 	if rc.kubernetes {
 		return errKubernetesDocker
 	}
+	if environment, ok := rc.JobContainer.(*container.HookEnvironment); ok {
+		return runHookContainerAction(ctx, environment, step, actionDir, basedir, localAction, stage)
+	}
 
 	var prepImage common.Executor
 	var image string
@@ -374,26 +372,7 @@ func execAsDocker(ctx context.Context, step actionStep, actionName, actionDir, b
 			logger.Debugf("image '%s' for architecture '%s' already exists", image, rc.Config.ContainerArchitecture)
 		}
 	}
-	ee, err := evalDockerEnv(ctx, step, action)
-	if err != nil {
-		return err
-	}
-	var cmd []string
-	if action.Runs.Args != nil {
-		// a fresh slice, the manifest is evaluated again for every stage
-		cmd = make([]string, len(action.Runs.Args))
-		for i, v := range action.Runs.Args {
-			if cmd[i], err = ee.Interpolate(ctx, v); err != nil {
-				return fmt.Errorf("unable to interpolate runs.args: %w", err)
-			}
-		}
-	} else {
-		cmd, err = shellquote.Split(stepInput(step.getStepModel(), "args"))
-		if err != nil {
-			return err
-		}
-	}
-	entrypoint, err := dockerEntrypoint(step, stage)
+	cmd, entrypoint, err := dockerActionCommand(ctx, step, stage)
 	if err != nil {
 		return err
 	}
@@ -405,6 +384,31 @@ func execAsDocker(ctx context.Context, step actionStep, actionName, actionDir, b
 		stepContainer.Create(rc.Config.ContainerCapAdd, rc.Config.ContainerCapDrop),
 		stepContainer.Start(true),
 	).Finally(stepContainer.Close())(ctx)
+}
+
+func dockerActionCommand(ctx context.Context, step actionStep, stage stepStage) ([]string, []string, error) {
+	action := step.getActionModel()
+	ee, err := evalDockerEnv(ctx, step, action)
+	if err != nil {
+		return nil, nil, err
+	}
+	var cmd []string
+	if action.Runs.Args != nil {
+		// a fresh slice, the manifest is evaluated again for every stage
+		cmd = make([]string, len(action.Runs.Args))
+		for i, v := range action.Runs.Args {
+			if cmd[i], err = ee.Interpolate(ctx, v); err != nil {
+				return nil, nil, fmt.Errorf("unable to interpolate runs.args: %w", err)
+			}
+		}
+	} else {
+		cmd, err = shellquote.Split(stepInput(step.getStepModel(), "args"))
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	entrypoint, err := dockerEntrypoint(step, stage)
+	return cmd, entrypoint, err
 }
 
 // dockerEntrypoint returns the entrypoint the action's image runs with for the given
@@ -663,7 +667,7 @@ func runPreStep(step actionStep) common.Executor {
 
 			rc.ApplyExtraPath(ctx, step.getEnv())
 
-			return rc.execJobContainer(containerArgs, *step.getEnv(), "", "")(ctx)
+			return rc.JobContainer.Exec(containerArgs, *step.getEnv(), "", "")(ctx)
 
 		case x.IsDocker():
 			return execDockerActionStage(ctx, step, stepStagePre)
@@ -689,8 +693,8 @@ func runPreStep(step actionStep) common.Executor {
 
 			execFileName := action.Runs.Pre + ".out"
 			return common.NewPipelineExecutor(
-				rc.execJobContainer([]string{"go", "build", "-o", execFileName, action.Runs.Pre}, *step.getEnv(), "", containerActionDir),
-				rc.execJobContainer([]string{container.JoinPath(containerActionDir, execFileName)}, *step.getEnv(), "", ""),
+				rc.JobContainer.Exec([]string{"go", "build", "-o", execFileName, action.Runs.Pre}, *step.getEnv(), "", containerActionDir),
+				rc.JobContainer.Exec([]string{container.JoinPath(containerActionDir, execFileName)}, *step.getEnv(), "", ""),
 			)(ctx)
 		default:
 			return nil
@@ -763,7 +767,7 @@ func runPostStep(step actionStep) common.Executor {
 
 			rc.ApplyExtraPath(ctx, step.getEnv())
 
-			return rc.execJobContainer(containerArgs, *step.getEnv(), "", "")(ctx)
+			return rc.JobContainer.Exec(containerArgs, *step.getEnv(), "", "")(ctx)
 
 		case x.IsDocker():
 			populateEnvsFromSavedState(step.getEnv(), step, rc)
@@ -786,8 +790,8 @@ func runPostStep(step actionStep) common.Executor {
 
 			execFileName := action.Runs.Post + ".out"
 			return common.NewPipelineExecutor(
-				rc.execJobContainer([]string{"go", "build", "-o", execFileName, action.Runs.Post}, *step.getEnv(), "", containerActionDir),
-				rc.execJobContainer([]string{container.JoinPath(containerActionDir, execFileName)}, *step.getEnv(), "", ""),
+				rc.JobContainer.Exec([]string{"go", "build", "-o", execFileName, action.Runs.Post}, *step.getEnv(), "", containerActionDir),
+				rc.JobContainer.Exec([]string{container.JoinPath(containerActionDir, execFileName)}, *step.getEnv(), "", ""),
 			)(ctx)
 
 		default:

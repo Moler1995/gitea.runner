@@ -245,20 +245,28 @@ func TestRunnerFallbackPlatform(t *testing.T) {
 		label         string
 		dockerRunning bool
 		want          string
+		hooks         bool
 	}{
-		{"a docker label needs no daemon probe", "ubuntu:docker://node:18", false, "mirror.example/ci:noble"},
-		{"host labels keep the image where docker runs", "ubuntu:host", true, "mirror.example/ci:noble"},
-		{"host labels without docker run on the host", "ubuntu:host", false, labels.SelfHostedPlatform},
+		{"a docker label needs no daemon probe", "ubuntu:docker://node:18", false, "mirror.example/ci:noble", false},
+		{"host labels keep the image where docker runs", "ubuntu:host", true, "mirror.example/ci:noble", false},
+		{"host labels without docker run on the host", "ubuntu:host", false, labels.SelfHostedPlatform, false},
+		{"hooks keep container jobs without Docker", "ubuntu:docker://node:18", false, "mirror.example/ci:noble", true},
+		{"hooks leave host labels on the host", "ubuntu:host", false, labels.SelfHostedPlatform, true},
+		{"hooks leave Kubernetes labels native", "ubuntu:kubernetes://node:18", false, "kubernetes://mirror.example/ci:noble", true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			reachable := dockerReachable
-			dockerReachable = func(context.Context) bool { return tt.dockerRunning }
+			dockerReachable = func(context.Context) bool {
+				assert.False(t, tt.hooks, "hooks must not probe Docker")
+				return tt.dockerRunning
+			}
 			t.Cleanup(func() { dockerReachable = reachable })
 
 			label, err := labels.Parse(tt.label)
 			require.NoError(t, err)
 			cfg := &config.Config{}
+			cfg.Container.Hooks.Enabled = tt.hooks
 			cfg.Runner.DefaultImage = "mirror.example/ci:noble"
 			r := &Runner{cfg: cfg, labels: labels.Labels{label}}
 
@@ -437,6 +445,11 @@ func TestCacheForJobIPv6WarningAndIsolationRecheck(t *testing.T) {
 	r.isolatedCacheContainer("http://unreachable")
 	r.isolatedCacheContainer("http://unreachable")
 	assert.Len(t, checked, 3)
+	r.cfg.Container.Hooks.Enabled = true
+	cacheURL, cacheContainer := r.cacheForJob(workflow.GetJob("containerized"), "alpine", logf)
+	assert.Equal(t, handler.ExternalURL(), cacheURL)
+	assert.Empty(t, cacheContainer)
+	assert.Len(t, checked, 3, "hooks must not inspect Docker for the cache")
 }
 
 func TestRestoreCalledWorkflowContext(t *testing.T) {

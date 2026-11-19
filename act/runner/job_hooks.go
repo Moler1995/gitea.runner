@@ -40,10 +40,6 @@ func (rc *RunContext) runJobHook(ctx context.Context, hookPath, name string) err
 	if hookPath == "" {
 		return nil
 	}
-	if rc.containerHooks.Enabled {
-		common.Logger(ctx).Warnf("Job hook %q skipped in custom container mode", hookPath)
-		return nil
-	}
 	previousStep := rc.CurrentStep
 	rc.CurrentStep = ""
 	defer func() { rc.CurrentStep = previousStep }()

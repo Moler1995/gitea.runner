@@ -226,6 +226,12 @@ cache:
   #sweep_interval: 1h
 
 container:
+  # Delegate container jobs to an operator-owned program; see docs/container-hooks.md.
+  # Host jobs and native kubernetes:// jobs keep their own runtime.
+  #hooks:
+  #  enabled: false
+  #  entrypoint: /usr/bin/node # Optional interpreter; omit for an executable hook.
+  #  cmd: /opt/container-hooks/index.js
   # Specifies the network to which the container will connect.
   # Could be host, bridge or the name of a custom network.
   # A runner container outside bridge cannot join it, so jobs on bridge cannot reach its cache.
@@ -309,12 +315,6 @@ container:
   # Remove the containers, networks and volumes a job creates through its Docker proxy when
   # the job ends. Leave off when jobs deploy services to the runner's Docker daemon.
   #sweep: false
-  # The runner delegates container lifecycle operations to an external entrypoint instead of calling the Docker API.
-  # Full guide: docs/container-hooks.md
-  #hooks:
-  #  enabled: false
-  #  entrypoint: "" # entrypoint is an optional interpreter used to launch cmd. Empty means cmd is executed directly
-  #  cmd: "" # path to the hook entrypoint the runner invokes for every hook event (prepare, execute, cleanup)
 
 host:
   # The parent directory of a job's working directory.

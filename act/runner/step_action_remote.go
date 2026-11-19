@@ -127,9 +127,6 @@ func (sar *stepActionRemote) prepareActionExecutor() common.Executor {
 
 		actionModel, err := sar.readAction(ctx, sar.Step, sar.actionDir, sar.remoteAction.Path, remoteReader, os.WriteFile)
 		sar.action = actionModel
-		if err == nil {
-			sar.RunContext.recordContainerHookAction(filepath.Base(sar.actionDir), sar.actionDir)
-		}
 		return err
 	}
 }
@@ -159,10 +156,6 @@ func (sar *stepActionRemote) main() common.Executor {
 			github := getStepGithubContext(ctx, sar)
 			if sar.skipsLocalCheckout(sar.remoteAction, github) {
 				printRunActionHeader(ctx, sar.Step, nil, sar.env, sar.RunContext)
-				if sar.RunContext.containerHooks.Enabled {
-					common.Logger(ctx).Debugf("Skipping local actions/checkout in container-hooks mode")
-					return nil
-				}
 				if sar.RunContext.Config.BindWorkdir {
 					common.Logger(ctx).Debugf("Skipping local actions/checkout because you bound your workspace")
 					return nil

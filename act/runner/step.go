@@ -15,7 +15,6 @@ import (
 
 	"gitea.com/gitea/runner/act/common"
 	"gitea.com/gitea/runner/act/container"
-	"gitea.com/gitea/runner/act/container/hooks"
 	"gitea.com/gitea/runner/internal/pkg/telemetry"
 
 	"gitea.dev/actionslib/pkg/exprparser"
@@ -49,13 +48,6 @@ func getStepGithubContext(ctx context.Context, step step) *model.GithubContext {
 	github := step.getRunContext().getGithubContext(ctx)
 	github.ActionRepository, github.ActionRef = stepActionIdentity(step)
 	return github
-}
-
-// stepPreparer is implemented by steps that create their own container
-// (e.g., uses: docker://...). It returns a declarative description
-// without performing any actions. Used to collect prepare-input.json.
-type stepPreparer interface {
-	prepareContainerStep() (*hooks.ContainerStepSpec, error)
 }
 
 type stepStage int
@@ -155,9 +147,6 @@ func runStepExecutor(step step, stage stepStage, executor common.Executor) commo
 
 		// Prepare and clean Runner File Commands
 		actPath := rc.JobContainer.GetActPath()
-		if rc.containerHooks.Enabled {
-			actPath = rc.containerHooks.ActPath
-		}
 
 		outputFileCommand := path.Join("workflow", "outputcmd.txt")
 		(*step.getEnv())["GITHUB_OUTPUT"] = container.JoinPath(actPath, outputFileCommand)
@@ -194,19 +183,9 @@ func runStepExecutor(step step, stage stepStage, executor common.Executor) commo
 			initialFiles = append([]*container.FileEntry{{Name: summaryFileCommand, Mode: 0o666}}, files...)
 			topRC.summaryFileInitialized[stepSummaryIndex] = true
 		}
-		var fileCommandInitErr error
-		if rc.containerHooks.Enabled {
-			paths := make([]string, 0, len(initialFiles))
-			for _, f := range initialFiles {
-				paths = append(paths, path.Join(actPath, f.Name))
-			}
-			rc.containerHooks.StepFileCmds = paths
-			rc.containerHooks.StepFileCmdContents = nil
-		} else {
-			fileCommandInitErr = rc.JobContainer.Copy(actPath, initialFiles...)(ctx)
-			if fileCommandInitErr != nil && len(initialFiles) > len(files) {
-				fileCommandInitErr = rc.JobContainer.Copy(actPath, files...)(ctx) // a broken summary must not block the resets
-			}
+		fileCommandInitErr := rc.JobContainer.Copy(actPath, initialFiles...)(ctx)
+		if fileCommandInitErr != nil && len(initialFiles) > len(files) {
+			fileCommandInitErr = rc.JobContainer.Copy(actPath, files...)(ctx) // a broken summary must not block the resets
 		}
 
 		timeoutctx, cancelTimeOut := evaluateStepTimeout(ctx, step)
@@ -221,11 +200,7 @@ func runStepExecutor(step step, stage stepStage, executor common.Executor) commo
 			fileCommandCtx, cancelFileCommands = context.WithTimeout(context.WithoutCancel(ctx), jobCleanupTimeout)
 			defer cancelFileCommands()
 		}
-		if rc.containerHooks.Enabled {
-			if hookErr := rc.parseFileCommandsFromContainerHook(fileCommandCtx); hookErr != nil && err == nil {
-				err = hookErr
-			}
-		} else if fileCommandInitErr == nil {
+		if fileCommandInitErr == nil {
 			if fileErr := processRunnerEnvFileCommand(fileCommandCtx, envFileCommand, rc, rc.setEnvFile); fileErr != nil && err == nil {
 				err = fileErr
 			}
@@ -239,9 +214,7 @@ func runStepExecutor(step step, stage stepStage, executor common.Executor) commo
 				err = fileErr
 			}
 		}
-		if !rc.containerHooks.Enabled {
-			_ = rc.JobContainer.Copy(actPath, files...)(fileCommandCtx)
-		}
+		_ = rc.JobContainer.Copy(actPath, files...)(fileCommandCtx)
 
 		if err == nil {
 			logger.With("stepResult", stepResult.Conclusion).Infof("Success - %s %s", stage, stepString)

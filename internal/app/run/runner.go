@@ -30,7 +30,6 @@ import (
 	"gitea.com/gitea/runner/act/common"
 	"gitea.com/gitea/runner/act/common/logging"
 	"gitea.com/gitea/runner/act/container"
-	"gitea.com/gitea/runner/act/container/hooks"
 	"gitea.com/gitea/runner/act/runner"
 	"gitea.com/gitea/runner/internal/pkg/client"
 	"gitea.com/gitea/runner/internal/pkg/config"
@@ -191,6 +190,9 @@ func (r *Runner) OnIdle(ctx context.Context) {
 }
 
 func (r *Runner) cleanupOrphanDockerResources(ctx context.Context) {
+	if r.cfg.Container.Hooks.Enabled {
+		return
+	}
 	ctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
 	if r.uuid == "" || (!r.requiresDocker() && !dockerReachable(ctx)) {
@@ -403,7 +405,7 @@ var dockerReachable = func(ctx context.Context) bool {
 }
 
 func (r *Runner) requiresDocker() bool {
-	return r.labels.RequireDocker() || r.cfg.Container.RequireDocker
+	return !r.cfg.Container.Hooks.Enabled && (r.labels.RequireDocker() || r.cfg.Container.RequireDocker)
 }
 
 func (r *Runner) usesKubernetes() bool {
@@ -436,10 +438,14 @@ func (r *Runner) kubernetesOptions(runsOn []string) container.KubernetesOptions 
 // runs-on does, since Gitea sends those to every runner.
 func (r *Runner) fallbackPlatform(ctx context.Context) string {
 	switch {
+	case r.cfg.Container.Hooks.Enabled && r.labels.RequireDocker():
+		return r.cfg.Runner.DefaultImage
 	case r.requiresDocker():
 		return r.cfg.Runner.DefaultImage
 	case r.usesKubernetes():
 		return labels.SchemeKubernetes + "://" + r.cfg.Runner.DefaultImage
+	case r.cfg.Container.Hooks.Enabled:
+		return labels.SelfHostedPlatform
 	case dockerReachable(ctx):
 		return r.cfg.Runner.DefaultImage
 	}
@@ -620,11 +626,6 @@ func (r *Runner) run(ctx context.Context, task *runnerv1.Task, reporter *report.
 			// told apart from one belonging to another runner on the same daemon
 			RunnerUUID: r.uuid,
 		},
-		ContainerHooks: hooks.Config{
-			Enabled:    r.cfg.Container.Hooks.Enabled,
-			Entrypoint: r.cfg.Container.Hooks.Entrypoint,
-			Cmd:        r.cfg.Container.Hooks.Cmd,
-		},
 		ContainerOptions:                  r.cfg.Container.Options,
 		ServiceReadyTimeout:               r.cfg.Container.ServiceReadyTimeout,
 		Sweep:                             r.cfg.Container.Sweep,
@@ -647,6 +648,7 @@ func (r *Runner) run(ctx context.Context, task *runnerv1.Task, reporter *report.
 		InstanceTransport:                 r.instanceTransport,
 		RunnerName:                        r.name,
 		KubernetesPicker:                  r.kubernetesOptions,
+		ContainerHooks:                    r.cfg.Container.Hooks,
 	}
 
 	rr, err := runner.New(runnerConfig)
@@ -968,7 +970,7 @@ func warnIgnoredCacheSecret(cfg *config.Config) {
 func (r *Runner) cacheForJob(job *model.Job, platform string, logf func(string, ...any)) (string, string) {
 	cacheURL := r.cacheHandler.RefreshExternalURL()
 	jobContainer := job.Container()
-	if cacheURL == "" || strings.HasPrefix(platform, labels.SchemeKubernetes+"://") || (jobContainer == nil || jobContainer.Image == "") && platform == labels.SelfHostedPlatform {
+	if cacheURL == "" || r.cfg.Container.Hooks.Enabled || strings.HasPrefix(platform, labels.SchemeKubernetes+"://") || (jobContainer == nil || jobContainer.Image == "") && platform == labels.SelfHostedPlatform {
 		return cacheURL, ""
 	}
 	if cacheContainer := r.isolatedCacheContainer(cacheURL); cacheContainer != "" {

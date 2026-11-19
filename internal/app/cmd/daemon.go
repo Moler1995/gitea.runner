@@ -110,7 +110,7 @@ func runDaemon(ctx context.Context, daemArgs *daemonArgs, configFile *string) fu
 			logging.Debugf("cannot resolve the docker socket path, so Docker API calls are not exempted from the proxy: %v", err)
 		}
 
-		if ls.RequireDocker() || cfg.Container.RequireDocker {
+		if !cfg.Container.Hooks.Enabled && (ls.RequireDocker() || cfg.Container.RequireDocker) {
 			// Wait for dockerd be ready
 			if timeout := cfg.Container.DockerTimeout; timeout > 0 {
 				tctx, cancel := context.WithTimeout(ctx, timeout)

@@ -44,9 +44,6 @@ func (sr *stepRun) main() common.Executor {
 			if err != nil {
 				return err
 			}
-			if sr.RunContext.containerHooks.Enabled {
-				return nil
-			}
 			return sr.RunContext.JobContainer.Copy(sr.RunContext.JobContainer.GetActPath(), &container.FileEntry{
 				Name: scriptName,
 				Mode: 0o755,
@@ -58,9 +55,6 @@ func (sr *stepRun) main() common.Executor {
 			// Apply ::add-path:: effects before printing so PATH is accurate in the env: block.
 			rc.ApplyExtraPath(ctx, &sr.env)
 			sr.printRunScriptActionDetails(ctx)
-			if rc.containerHooks.Enabled {
-				return rc.runScriptStepInContainerHook(sr.interpolatedScript, sr.env, sr.WorkingDirectory)(ctx)
-			}
 			if he, ok := rc.JobContainer.(*container.HostEnvironment); ok && he != nil {
 				return he.ExecWithCmdLine(sr.cmd, sr.cmdline, sr.env, sr.WorkingDirectory)(ctx)
 			}

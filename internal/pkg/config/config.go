@@ -18,7 +18,6 @@ import (
 
 	"gitea.com/gitea/runner/act/common/logging"
 	"gitea.com/gitea/runner/act/container"
-	"gitea.com/gitea/runner/act/container/hooks"
 
 	"github.com/docker/go-connections/tlsconfig"
 	"github.com/docker/go-units"
@@ -176,7 +175,7 @@ func parseSize(value string) (Size, error) {
 
 // Container represents the configuration for the container.
 type Container struct {
-	Hooks                hooks.Config                  `yaml:"hooks"`                  // configures the container-hooks mode
+	Hooks                container.HookConfig          `yaml:"hooks"`                  // Hooks delegates Docker-mode jobs to an operator-owned program.
 	Network              string                        `yaml:"network"`                // Network specifies the network for the container.
 	NetworkCreateOptions ContainerNetworkCreateOptions `yaml:"network_create_options"` // Add options when the network need to be created by the runner
 	NetworkMode          string                        `yaml:"network_mode"`           // Deprecated: use Network instead. Could be removed after Gitea 1.20

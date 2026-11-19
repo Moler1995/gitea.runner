@@ -18,7 +18,6 @@ import (
 	"gitea.com/gitea/runner/act/common"
 	"gitea.com/gitea/runner/act/common/logging"
 	"gitea.com/gitea/runner/act/container"
-	"gitea.com/gitea/runner/act/container/hooks"
 	"gitea.com/gitea/runner/act/ghcontext"
 
 	"gitea.dev/actionslib/pkg/model"
@@ -80,6 +79,7 @@ type Config struct {
 	DefaultActionInstanceIsSelfHosted bool
 	PlatformPicker                    func(labels []string) string
 	KubernetesPicker                  func(labels []string) container.KubernetesOptions
+	ContainerHooks                    container.HookConfig
 	InstanceTransport                 http.RoundTripper
 	JobLoggerLevel                    *logging.Level // the level of job logger
 	ValidVolumes                      []string       // only volumes (and bind mounts) in this slice can be mounted on the job container or service containers
@@ -96,7 +96,6 @@ type Config struct {
 	RunnerName                        string         // name this runner registered with, reported as `runner.name`, defaults to the hostname
 	JobStartedHook                    string         // script run inside the job environment before the job's first step; ACTIONS_RUNNER_HOOK_JOB_STARTED is read from Env when empty
 	JobCompletedHook                  string         // script run inside the job environment after the job's last step; ACTIONS_RUNNER_HOOK_JOB_COMPLETED is read from Env when empty
-	ContainerHooks                    hooks.Config   // configures the container-hooks mode
 }
 
 // RunnerDebug reports whether debug logging is on, exposed as `runner.debug` and RUNNER_DEBUG.
@@ -356,15 +355,14 @@ func (runner *runnerImpl) newRunContext(ctx context.Context, run *model.Run, mat
 
 func (runner *runnerImpl) newCombinationRunContext(ctx context.Context, run *model.Run, matrix map[string]any, index, total int) (*RunContext, error) {
 	rc := &RunContext{
-		Config:         runner.config,
-		Run:            run,
-		EventJSON:      runner.eventJSON,
-		StepResults:    make(map[string]*model.StepResult),
-		Matrix:         matrix,
-		caller:         runner.caller,
-		containerHooks: &containerHooks{StepSpecs: make(map[int]*hooks.ContainerStepSpec)},
-		jobIndex:       index,
-		jobTotal:       total,
+		Config:      runner.config,
+		Run:         run,
+		EventJSON:   runner.eventJSON,
+		StepResults: make(map[string]*model.StepResult),
+		Matrix:      matrix,
+		caller:      runner.caller,
+		jobIndex:    index,
+		jobTotal:    total,
 
 		runtimeToken: runner.config.RuntimeTokens[run.Workflow],
 	}

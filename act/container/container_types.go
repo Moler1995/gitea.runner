@@ -89,6 +89,9 @@ const runnerUUIDLabel = "com.gitea.runner.uuid"
 // fragment, missingContainerError composes it into the message every operation shares.
 var ErrContainerNotFound = errors.New("does not exist")
 
+// ErrArchiveUnavailable distinguishes a failed transfer from an optional file that is absent.
+var ErrArchiveUnavailable = errors.New("archive transfer failed")
+
 // DockerProxy is a job's docker socket, fronting the daemon's for the job's lifetime.
 type DockerProxy struct {
 	Socket    string

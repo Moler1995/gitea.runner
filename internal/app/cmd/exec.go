@@ -498,37 +498,44 @@ func runExec(ctx context.Context, execArgs *executeArgs) func(cmd *cobra.Command
 		}
 
 		// run the plan
-		config, err := execArgs.runnerConfig(eventName, env, proxyEnv, maxLifetime, shared)
+		runnerConfig, err := execArgs.runnerConfig(eventName, env, proxyEnv, maxLifetime, shared)
 		if err != nil {
 			return err
 		}
+		if flag := cmd.Flag("config"); flag != nil && flag.Value.String() != "" {
+			cfg, err := config.LoadDefault(flag.Value.String())
+			if err != nil {
+				return err
+			}
+			runnerConfig.ContainerHooks = cfg.Container.Hooks
+		}
 
-		config.Env["ACT_EXEC"] = "true"
+		runnerConfig.Env["ACT_EXEC"] = "true"
 		inheritedToken := cmp.Or(env["ACTIONS_RUNTIME_TOKEN"], os.Getenv("ACTIONS_RUNTIME_TOKEN"))
-		config.RuntimeTokens = map[*model.Workflow]string{}
+		runnerConfig.RuntimeTokens = map[*model.Workflow]string{}
 		sameFile := map[string]int{}
 		for _, stage := range plan.Stages {
 			for _, run := range stage.Runs {
-				if config.RuntimeTokens[run.Workflow] != "" {
+				if runnerConfig.RuntimeTokens[run.Workflow] != "" {
 					continue
 				}
 				sameFile[run.Workflow.File]++
 				workflowRun := fmt.Sprintf("%s/%s/%d", cmp.Or(env["GITHUB_RUN_ID"], "1"), run.Workflow.File, sameFile[run.Workflow.File]) // each workflow its own run as on GitHub, also when file names repeat across directories
 				token := cmp.Or(inheritedToken, artifacts.LocalRuntimeToken(workflowRun, maxLifetime))
-				config.RuntimeTokens[run.Workflow] = token
-				config.ExtraMasks = append(config.ExtraMasks, token)
+				runnerConfig.RuntimeTokens[run.Workflow] = token
+				runnerConfig.ExtraMasks = append(runnerConfig.ExtraMasks, token)
 				handler.RegisterJob(token, artifactcache.JobCredential{Repo: "__local/__exec", Results: "http://" + net.JoinHostPort(execArgs.artifactServerAddr, execArgs.artifactServerPort)})
 			}
 		}
 
-		config.Token = cmp.Or(config.Secrets["GITEA_TOKEN"], config.Secrets["GITHUB_TOKEN"])
+		runnerConfig.Token = cmp.Or(runnerConfig.Secrets["GITEA_TOKEN"], runnerConfig.Secrets["GITHUB_TOKEN"])
 
 		if !execArgs.debug {
 			logLevel := logging.LevelInfo
-			config.JobLoggerLevel = &logLevel
+			runnerConfig.JobLoggerLevel = &logLevel
 		}
 
-		r, err := runner.New(config)
+		r, err := runner.New(runnerConfig)
 		if err != nil {
 			return err
 		}
