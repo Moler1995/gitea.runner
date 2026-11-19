@@ -20,6 +20,10 @@ import (
 	"github.com/kballard/go-shellquote"
 )
 
+func (rc *RunContext) IsContainerHooks() bool {
+	return !rc.kubernetes && !rc.IsHostEnv() && rc.Config.ContainerHooks.Enabled
+}
+
 func (rc *RunContext) startHookJob() common.Executor {
 	return func(ctx context.Context) error {
 		spec := rc.containerSpec

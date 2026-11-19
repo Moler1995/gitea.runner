@@ -1340,7 +1340,7 @@ func (rc *RunContext) startContainer() common.Executor {
 			err = rc.startKubernetesPod()(ctx)
 		case rc.IsHostEnv():
 			err = rc.startHostEnvironment()(ctx)
-		case rc.Config.ContainerHooks.Enabled:
+		case rc.IsContainerHooks():
 			err = rc.startHookJob()(ctx)
 		default:
 			err = rc.startJobContainer()(ctx)
