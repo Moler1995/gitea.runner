@@ -4,52 +4,177 @@
 package config
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
+	"io"
+	"log"
+	"math/big"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/sirupsen/logrus/hooks/test"
+	"gitea.com/gitea/runner/act/common/logging/logtest"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-func TestLoadDefault_RejectsExternalServerWithoutSecret(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "config.yaml")
-	require.NoError(t, os.WriteFile(path, []byte(`
-cache:
-  enabled: true
-  external_server: "http://cache.invalid/"
-`), 0o600))
+func TestClientCertIsValidatedAndAbsoluteOnLoadReadOnUseAndOfferedOnlyWhenAccepted(t *testing.T) {
+	require.True(t, (&Runner{Insecure: true}).TLSConfig().InsecureSkipVerify)
 
-	_, err := LoadDefault(path)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "external_secret")
+	dir := t.TempDir()
+	certPath, keyPath := filepath.Join(dir, "client.crt"), filepath.Join(dir, "client.key")
+	writePair := func() []byte {
+		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		require.NoError(t, err)
+		template := &x509.Certificate{SerialNumber: big.NewInt(1)}
+		der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+		require.NoError(t, err)
+		keyDER, err := x509.MarshalPKCS8PrivateKey(key)
+		require.NoError(t, err)
+		require.NoError(t, os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600))
+		require.NoError(t, os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}), 0o600))
+		return der
+	}
+	load := func(certFile, keyFile string) (*Config, error) {
+		return LoadDefault(write(t, "runner:\n  client_cert_file: '"+certFile+"'\n  client_key_file: '"+keyFile+"'\n"))
+	}
+	writePair()
+
+	_, err := load(certPath, "")
+	require.ErrorContains(t, err, "must be set together")
+	_, err = load(keyPath, keyPath)
+	require.ErrorContains(t, err, "load runner client certificate")
+
+	t.Chdir(dir)
+	cfg, err := load("client.crt", "client.key")
+	require.NoError(t, err)
+	require.True(t, filepath.IsAbs(cfg.Runner.ClientCertFile))
+	require.True(t, filepath.IsAbs(cfg.Runner.ClientKeyFile))
+	renewed := writePair()
+	info := &tls.CertificateRequestInfo{Version: tls.VersionTLS13, SignatureSchemes: []tls.SignatureScheme{tls.ECDSAWithP256AndSHA256}}
+	pair, err := cfg.Runner.TLSConfig().GetClientCertificate(info)
+	require.NoError(t, err)
+	require.Equal(t, renewed, pair.Certificate[0])
+	info.AcceptableCAs = [][]byte{[]byte("another CA")}
+	pair, err = cfg.Runner.TLSConfig().GetClientCertificate(info)
+	require.NoError(t, err)
+	require.Empty(t, pair.Certificate)
 }
 
-func TestLoadDefault_AcceptsExternalServerWithSecret(t *testing.T) {
+func TestCAFileIsValidatedAndAbsoluteOnLoadAndTrustedBesidesTheSystem(t *testing.T) {
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(_writer http.ResponseWriter, _request *http.Request) {}))
+	server.Config.ErrorLog = log.New(io.Discard, "", 0)
+	server.StartTLS()
+	defer server.Close()
 	dir := t.TempDir()
-	path := filepath.Join(dir, "config.yaml")
-	require.NoError(t, os.WriteFile(path, []byte(`
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "ca.crt"), pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "empty.crt"), nil, 0o600))
+	load := func(file string) (*Config, error) { return LoadDefault(write(t, "runner:\n  ca_file: '"+file+"'\n")) }
+
+	t.Chdir(dir)
+	_, err := load("empty.crt")
+	require.ErrorContains(t, err, "failed to append certificates")
+	_, err = load("missing.crt")
+	require.ErrorContains(t, err, "could not read CA certificate")
+	cfg, err := load("ca.crt")
+	require.NoError(t, err)
+	require.Equal(t, filepath.Join(dir, "ca.crt"), cfg.Runner.CAFile)
+
+	get := func(runner *Runner) error {
+		resp, err := (&http.Client{Transport: &http.Transport{TLSClientConfig: runner.TLSConfig()}}).Get(server.URL)
+		if err == nil {
+			resp.Body.Close()
+		}
+		return err
+	}
+	require.Error(t, get(&Runner{}))
+	require.NoError(t, get(&cfg.Runner))
+}
+
+func TestLoadDefault_RejectsContainerVolumesWithoutSource(t *testing.T) {
+	cfg, err := LoadDefault(write(t, "container:\n  volumes: ['/etc/ssl/certs:/etc/ssl/certs:ro', 'data:/data']\n"))
+	require.NoError(t, err)
+	require.Equal(t, []string{"/etc/ssl/certs:/etc/ssl/certs:ro", "data:/data"}, cfg.Container.Volumes)
+	for _, spec := range []string{"/etc/ssl/certs", "/a:/b:ro:/c"} {
+		_, err = LoadDefault(write(t, "container:\n  volumes: ['"+spec+"']\n"))
+		require.ErrorContains(t, err, "is not source:target", spec)
+	}
+}
+
+func TestLoadDefault_ExpandsEnvironmentValues(t *testing.T) {
+	t.Setenv("RUNNER_CAPACITY", "4")
+	t.Setenv("RUNNER_LABEL", "linux:host")
+	t.Setenv("RUNNER_KEY", "fetch_timeout")
+	t.Setenv("RUNNER_EMPTY", "")
+	t.Setenv("RUNNER_MISSING", "")
+	require.NoError(t, os.Unsetenv("RUNNER_MISSING"))
+	path := write(t, `runner:
+  capacity: ${RUNNER_CAPACITY}
+  labels:
+    - ${RUNNER_LABEL}
+  envs:
+    LITERAL: $${RUNNER_LABEL}
+  ${RUNNER_KEY}: 1s
 cache:
-  enabled: true
-  external_server: "http://cache.invalid/"
+  enabled: ${RUNNER_EMPTY}
+`)
+
+	cfg, err := LoadDefault(path)
+	require.NoError(t, err)
+	assert.Equal(t, 4, cfg.Runner.Capacity)
+	assert.Equal(t, []string{"linux:host"}, cfg.Runner.Labels)
+	assert.Equal(t, map[string]string{"LITERAL": "${RUNNER_LABEL}"}, cfg.Runner.Envs)
+	assert.Equal(t, 5*time.Second, cfg.Runner.FetchTimeout)
+	assert.True(t, *cfg.Cache.Enabled)
+
+	_, err = LoadDefault(write(t, "runner:\n\n  capacity: ${RUNNER_MISSING}\n  file: ${RUNNER_MISSING}\n"))
+	require.ErrorContains(t, err, "line 3: ${RUNNER_MISSING} is not set\nline 4: ${RUNNER_MISSING} is not set")
+	_, err = LoadDefault(write(t, "runner:\n\n  capacity: ${RUNNER_LABEL}\n"))
+	require.ErrorContains(t, err, "line 3:")
+}
+
+func TestLoadDefault_CacheS3(t *testing.T) {
+	dir := t.TempDir()
+	accessPath := filepath.Join(dir, "access.key")
+	require.NoError(t, os.WriteFile(accessPath, []byte("access\n"), 0o600))
+	path := filepath.Join(dir, "config.yaml")
+	content := `
+cache:
+  s3:
+    endpoint: "http://minio:9000"
+    bucket: "caches"
+    prefix: "/runners/"
+    access_key_file: '` + accessPath + `'
+    secret_key: "secret"
+`
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+
+	cfg, err := LoadDefault(path)
+	require.NoError(t, err)
+	assert.Equal(t, CacheS3{
+		Endpoint: "http://minio:9000", Bucket: "caches", Prefix: "runners",
+		AccessKey: "access", AccessKeyFile: accessPath, SecretKey: "secret",
+	}, *cfg.Cache.S3)
+
+	require.NoError(t, os.WriteFile(path, []byte(content+`  external_server: "http://cache.invalid/"
   external_secret: "shh"
 `), 0o600))
-
-	_, err := LoadDefault(path)
-	require.NoError(t, err)
+	_, err = LoadDefault(path)
+	assert.ErrorContains(t, err, "cache.s3 and cache.external_server cannot both be set")
 }
 
 func TestLoadDefault_ToolCacheMode(t *testing.T) {
-	cfg, err := LoadDefault("")
-	require.NoError(t, err)
-	assert.Equal(t, ToolCacheModeNone, cfg.Runner.ToolCacheMode)
-
-	path := filepath.Join(t.TempDir(), "config.yaml")
-	require.NoError(t, os.WriteFile(path, []byte("runner:\n  tool_cache_mode: shared\n"), 0o600))
-	cfg, err = LoadDefault(path)
+	path := write(t, "runner:\n  tool_cache_mode: shared\n")
+	cfg, err := LoadDefault(path)
 	require.NoError(t, err)
 	assert.Equal(t, ToolCacheModeShared, cfg.Runner.ToolCacheMode)
 
@@ -59,16 +184,48 @@ func TestLoadDefault_ToolCacheMode(t *testing.T) {
 	assert.Contains(t, err.Error(), "tool_cache_mode")
 }
 
-func TestLoadDefault_DefaultsWorkdirCleanupAge(t *testing.T) {
+func TestLoadDefault_KubernetesTransferMode(t *testing.T) {
+	cfg, err := LoadDefault(write(t, "kubernetes:\n  transfer:\n    host: 10.0.0.5\n"))
+	require.NoError(t, err)
+	assert.Equal(t, KubernetesTransferModeAPI, cfg.Kubernetes.Transfer.Mode, "copies stay on the API server unless asked")
+
+	cfg, err = LoadDefault(write(t, "kubernetes:\n  transfer:\n    mode: direct\n"))
+	require.NoError(t, err)
+	assert.Equal(t, KubernetesTransferModeDirect, cfg.Kubernetes.Transfer.Mode)
+
+	_, err = LoadDefault(write(t, "kubernetes:\n  transfer:\n    mode: fast\n"))
+	require.ErrorContains(t, err, "kubernetes.transfer.mode")
+}
+
+func TestLoadDefault_RejectsInvalidLogReportLevel(t *testing.T) {
+	_, err := LoadDefault(write(t, "runner:\n  log_report_level: loud\n"))
+	require.ErrorContains(t, err, "runner.log_report_level")
+}
+
+func TestLoadDefault_LoadsExtraHeaders(t *testing.T) {
+	path := write(t, "runner:\n  extra_headers:\n    X-Proxy-Token: proxy-token\n")
+	cfg, err := LoadDefault(path)
+	require.NoError(t, err)
+	assert.Equal(t, map[string]string{"X-Proxy-Token": "proxy-token"}, cfg.Runner.ExtraHeaders)
+
+	for _, headers := range []string{
+		"X-Proxy Token: proxy-token\n",
+		"X-Proxy-Token: |\n      proxy-token\n",
+		"X-Proxy-Token: a\n    x-proxy-token: b\n",
+	} {
+		require.NoError(t, os.WriteFile(path, []byte("runner:\n  extra_headers:\n    "+headers), 0o600))
+		_, err = LoadDefault(path)
+		assert.ErrorContains(t, err, "runner.extra_headers", headers)
+	}
+}
+
+func TestLoadDefault_Defaults(t *testing.T) {
 	cfg, err := LoadDefault("")
 	require.NoError(t, err)
 	assert.Equal(t, 24*time.Hour, cfg.Runner.WorkdirCleanupAge)
 	assert.Equal(t, 10*time.Minute, cfg.Runner.IdleCleanupInterval)
-}
-
-func TestLoadDefault_HealthChecksAreOptIn(t *testing.T) {
-	cfg, err := LoadDefault("")
-	require.NoError(t, err)
+	assert.Equal(t, DefaultImage, cfg.Runner.DefaultImage)
+	assert.Equal(t, ToolCacheModeNone, cfg.Runner.ToolCacheMode)
 	assert.False(t, cfg.HealthCheck.Enabled)
 	assert.Equal(t, int64(1024), cfg.HealthCheck.MinFreeDiskSpaceMB)
 	assert.Empty(t, cfg.HealthCheck.Script)
@@ -78,9 +235,7 @@ func TestLoadDefault_HealthChecksAreOptIn(t *testing.T) {
 }
 
 func TestLoadDefault_DiskAndReadinessSettings(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "config.yaml")
-	require.NoError(t, os.WriteFile(path, []byte(`
+	cfg, err := LoadDefault(write(t, `
 health_check:
   enabled: true
   min_free_disk_space_mb: 4096
@@ -89,9 +244,7 @@ health_check:
   timeout: 3s
 metrics:
   readiness_grace: 45s
-`), 0o600))
-
-	cfg, err := LoadDefault(path)
+`))
 	require.NoError(t, err)
 	assert.True(t, cfg.HealthCheck.Enabled)
 	assert.Equal(t, int64(4096), cfg.HealthCheck.MinFreeDiskSpaceMB)
@@ -101,98 +254,53 @@ metrics:
 	assert.Equal(t, 45*time.Second, cfg.Metrics.ReadinessGrace)
 }
 
-func TestLoadDefault_UsesConfiguredWorkdirCleanupAge(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "config.yaml")
-	require.NoError(t, os.WriteFile(path, []byte(`
-runner:
-  workdir_cleanup_age: 2h30m
-`), 0o600))
-
-	cfg, err := LoadDefault(path)
-	require.NoError(t, err)
-	assert.Equal(t, 150*time.Minute, cfg.Runner.WorkdirCleanupAge)
-}
-
-func TestLoadDefault_UsesConfiguredIdleCleanupInterval(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "config.yaml")
-	require.NoError(t, os.WriteFile(path, []byte(`
-runner:
-  idle_cleanup_interval: 45m
-`), 0o600))
-
-	cfg, err := LoadDefault(path)
-	require.NoError(t, err)
-	assert.Equal(t, 45*time.Minute, cfg.Runner.IdleCleanupInterval)
-}
-
-func TestLoadDefault_AllowsDisablingWorkdirCleanup(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "config.yaml")
-	require.NoError(t, os.WriteFile(path, []byte(`
-runner:
-  workdir_cleanup_age: 0s
-  idle_cleanup_interval: 0s
-`), 0o600))
-
-	cfg, err := LoadDefault(path)
-	require.NoError(t, err)
-	assert.Equal(t, time.Duration(0), cfg.Runner.WorkdirCleanupAge)
-	assert.Equal(t, time.Duration(0), cfg.Runner.IdleCleanupInterval)
-}
-
-func TestLoadDefault_AllowsNegativeWorkdirCleanupValues(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "config.yaml")
-	require.NoError(t, os.WriteFile(path, []byte(`
-runner:
-  workdir_cleanup_age: -1s
-  idle_cleanup_interval: -1s
-`), 0o600))
-
-	cfg, err := LoadDefault(path)
-	require.NoError(t, err)
-	assert.Equal(t, -1*time.Second, cfg.Runner.WorkdirCleanupAge)
-	assert.Equal(t, -1*time.Second, cfg.Runner.IdleCleanupInterval)
+func TestLoadDefault_WorkdirCleanup(t *testing.T) {
+	t.Setenv("EMPTY", "")
+	for _, tc := range []struct {
+		name, yaml    string
+		age, interval time.Duration
+	}{
+		{"configured age", "\nrunner:\n  workdir_cleanup_age: 2h30m\n", 150 * time.Minute, 10 * time.Minute},
+		{"configured interval", "\nrunner:\n  idle_cleanup_interval: 45m\n", 24 * time.Hour, 45 * time.Minute},
+		{"disabled", "\nrunner:\n  workdir_cleanup_age: 0s\n  idle_cleanup_interval: 0s\n", 0, 0},
+		{"negative", "\nrunner:\n  workdir_cleanup_age: -1s\n  idle_cleanup_interval: -1s\n", -time.Second, -time.Second},
+		{"disabled through a merge key", "\nx-base: &base\n  workdir_cleanup_age: 0s\n  idle_cleanup_interval: 0s\nrunner:\n  <<: *base\n", 0, 0},
+		{"empty keeps the default", "\nrunner:\n  workdir_cleanup_age: ${EMPTY}\n  idle_cleanup_interval:\n", 24 * time.Hour, 10 * time.Minute},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := LoadDefault(write(t, tc.yaml))
+			require.NoError(t, err)
+			assert.Equal(t, tc.age, cfg.Runner.WorkdirCleanupAge)
+			assert.Equal(t, tc.interval, cfg.Runner.IdleCleanupInterval)
+		})
+	}
 }
 
 func TestLoadDefault_LoadsPostTaskScript(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "config.yaml")
-	require.NoError(t, os.WriteFile(path, []byte(`
-runner:
-  post_task_script: /usr/local/bin/post-task.sh
-  post_task_script_timeout: 2m
-`), 0o600))
-
-	cfg, err := LoadDefault(path)
-	require.NoError(t, err)
-	assert.Equal(t, "/usr/local/bin/post-task.sh", cfg.Runner.PostTaskScript)
-	assert.Equal(t, 2*time.Minute, cfg.Runner.PostTaskScriptTimeout)
+	for _, tc := range []struct {
+		name, timeout string
+		want          time.Duration
+	}{
+		{"configured timeout", "  post_task_script_timeout: 2m\n", 2 * time.Minute},
+		{"default timeout", "", 5 * time.Minute},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := LoadDefault(write(t, "\nrunner:\n  post_task_script: /usr/local/bin/post-task.sh\n"+tc.timeout))
+			require.NoError(t, err)
+			assert.Equal(t, "/usr/local/bin/post-task.sh", cfg.Runner.PostTaskScript)
+			assert.Equal(t, tc.want, cfg.Runner.PostTaskScriptTimeout)
+		})
+	}
 }
 
-func TestLoadDefault_DefaultsPostTaskScriptTimeout(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "config.yaml")
-	require.NoError(t, os.WriteFile(path, []byte(`
-runner:
-  post_task_script: /usr/local/bin/post-task.sh
-`), 0o600))
-
-	cfg, err := LoadDefault(path)
-	require.NoError(t, err)
-	assert.Equal(t, 5*time.Minute, cfg.Runner.PostTaskScriptTimeout)
+func write(t *testing.T, body string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(body), 0o600))
+	return path
 }
 
 func TestLoadDefault_LoadsCacheEviction(t *testing.T) {
-	write := func(t *testing.T, body string) string {
-		t.Helper()
-		path := filepath.Join(t.TempDir(), "config.yaml")
-		require.NoError(t, os.WriteFile(path, []byte(body), 0o600))
-		return path
-	}
-
 	t.Run("sizes accept any spelling of the unit", func(t *testing.T) {
 		cfg, err := LoadDefault(write(t, "cache:\n  retention: 336h\n  repo_size_limit: 50gb\n  size_limit: 1TiB\n  sweep_interval: 15m\n"))
 		require.NoError(t, err)
@@ -216,191 +324,110 @@ func TestLoadDefault_LoadsCacheEviction(t *testing.T) {
 	})
 }
 
+func TestLoadDefault_LoadsJobLogs(t *testing.T) {
+	cfg, err := LoadDefault(write(t, "log:\n  job:\n    dir: /var/log/jobs\n    retention: 0s\n    max_size: 100MB\n"))
+	require.NoError(t, err)
+	assert.Equal(t, "/var/log/jobs", cfg.Log.Job.Dir)
+	assert.Zero(t, cfg.Log.Job.Retention, "zero keeps every task directory")
+	assert.Equal(t, Size(100*1024*1024), cfg.Log.Job.MaxSize)
+}
+
 func TestLoadDefault_LoadsJobHooks(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "config.yaml")
-	require.NoError(t, os.WriteFile(path, []byte(`
+	cfg, err := LoadDefault(write(t, `
 runner:
   hooks:
     job_started: /hooks/started.sh
     job_completed: /hooks/completed.sh
-`), 0o600))
-
-	cfg, err := LoadDefault(path)
+`))
 	require.NoError(t, err)
 	assert.Equal(t, "/hooks/started.sh", cfg.Runner.Hooks.JobStarted)
 	assert.Equal(t, "/hooks/completed.sh", cfg.Runner.Hooks.JobCompleted)
 }
 
-// TestLoadDefault_MalformedYAMLReturnsParseError pins the error surfaced for
-// invalid YAML to the canonical "parse config file" message rather than the
-// "for defaults metadata" variant — i.e. the main yaml.Unmarshal runs first.
 func TestLoadDefault_MalformedYAMLReturnsParseError(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "config.yaml")
-	require.NoError(t, os.WriteFile(path, []byte("runner:\n  capacity: [unterminated\n"), 0o600))
-
-	_, err := LoadDefault(path)
+	_, err := LoadDefault(write(t, "runner:\n  capacity: [unterminated\n"))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "parse config file")
 	assert.NotContains(t, err.Error(), "defaults metadata")
 }
 
 func TestLoadDefault_WarnsOnUnknownKeysButStillLoads(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "config.yaml")
-	require.NoError(t, os.WriteFile(path, []byte("container:\n  volumes:\n    - /host:/ctr\n  privileged: true\n"), 0o600))
+	hook := logtest.SetDefault(t)
 
-	hook := test.NewGlobal()
-	defer hook.Reset()
-
-	cfg, err := LoadDefault(path)
+	cfg, err := LoadDefault(write(t, "container:\n  mounts:\n    - /host:/ctr\n  privileged: true\n"))
 	require.NoError(t, err)
 	assert.True(t, cfg.Container.Privileged)
-	require.Len(t, hook.Entries, 1)
-	assert.Contains(t, hook.LastEntry().Message, "field volumes not found")
+	require.Len(t, hook.AllRecords(), 1)
+	assert.Contains(t, hook.LastRecord().Message, "field mounts not found")
 }
 
 func TestContainerNetworkCreateOptions(t *testing.T) {
-	// Verify that the enable_ipv4/enable_ipv6 YAML keys unmarshal into the *bool fields,
-	// distinguishing an explicit true/false from an omitted key (nil). A nil here is
-	// forwarded as-is to Docker, which applies its own default.
-	loadOptions := func(t *testing.T, yaml string) ContainerNetworkCreateOptions {
-		t.Helper()
-		dir := t.TempDir()
-		path := filepath.Join(dir, "config.yaml")
-		require.NoError(t, os.WriteFile(path, []byte(yaml), 0o600))
-
-		cfg, err := LoadDefault(path)
-		require.NoError(t, err)
-		return cfg.Container.NetworkCreateOptions
+	for _, tc := range []struct {
+		name, yaml string
+		want       ContainerNetworkCreateOptions
+	}{
+		{"enable_ipv6 true unmarshals to non-nil true", "container:\n  network_create_options:\n    enable_ipv6: true\n", ContainerNetworkCreateOptions{EnableIPv6: new(true)}},
+		{"enable_ipv6 false unmarshals to non-nil false", "container:\n  network_create_options:\n    enable_ipv6: false\n", ContainerNetworkCreateOptions{EnableIPv6: new(false)}},
+		{"enable_ipv4 false unmarshals to non-nil false", "container:\n  network_create_options:\n    enable_ipv4: false\n", ContainerNetworkCreateOptions{EnableIPv4: new(false)}},
+		{"omitted keys stay nil", "container:\n  network_create_options:\n    enable_ipv4: true\n", ContainerNetworkCreateOptions{EnableIPv4: new(true)}},
+		{"omitted block leaves both nil", "container:\n  network: \"\"\n", ContainerNetworkCreateOptions{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := LoadDefault(write(t, tc.yaml))
+			require.NoError(t, err)
+			require.Equal(t, tc.want, cfg.Container.NetworkCreateOptions)
+		})
 	}
-
-	t.Run("enable_ipv6 true unmarshals to non-nil true", func(t *testing.T) {
-		opts := loadOptions(t, "container:\n  network_create_options:\n    enable_ipv6: true\n")
-		require.NotNil(t, opts.EnableIPv6)
-		assert.True(t, *opts.EnableIPv6)
-	})
-
-	t.Run("enable_ipv6 false unmarshals to non-nil false", func(t *testing.T) {
-		opts := loadOptions(t, "container:\n  network_create_options:\n    enable_ipv6: false\n")
-		require.NotNil(t, opts.EnableIPv6)
-		assert.False(t, *opts.EnableIPv6)
-	})
-
-	t.Run("enable_ipv4 false unmarshals to non-nil false", func(t *testing.T) {
-		opts := loadOptions(t, "container:\n  network_create_options:\n    enable_ipv4: false\n")
-		require.NotNil(t, opts.EnableIPv4)
-		assert.False(t, *opts.EnableIPv4)
-	})
-
-	t.Run("omitted keys stay nil", func(t *testing.T) {
-		opts := loadOptions(t, "container:\n  network_create_options:\n    enable_ipv4: true\n")
-		require.NotNil(t, opts.EnableIPv4)
-		assert.True(t, *opts.EnableIPv4)
-		assert.Nil(t, opts.EnableIPv6, "an omitted enable_ipv6 must remain nil so Docker's default applies")
-	})
-
-	t.Run("omitted block leaves both nil", func(t *testing.T) {
-		opts := loadOptions(t, "container:\n  network: \"\"\n")
-		assert.Nil(t, opts.EnableIPv4)
-		assert.Nil(t, opts.EnableIPv6)
-	})
 }
 
-func TestLoadDefault_ReadsExternalSecretFromFile(t *testing.T) {
-	dir := t.TempDir()
-	secretPath := filepath.Join(dir, "cache.secret")
-	require.NoError(t, os.WriteFile(secretPath, []byte("  s3cr3t\n"), 0o600))
-
-	path := filepath.Join(dir, "config.yaml")
-	require.NoError(t, os.WriteFile(path, []byte(`
-cache:
-  enabled: true
-  external_server: "http://cache.invalid/"
-  external_secret_file: "`+secretPath+`"
-`), 0o600))
-
-	cfg, err := LoadDefault(path)
-	require.NoError(t, err)
-	assert.Equal(t, "s3cr3t", cfg.Cache.ExternalSecret)
+func TestLoadDefault_ExternalCacheSecret(t *testing.T) {
+	const externalCache = "\ncache:\n  enabled: true\n  external_server: \"http://cache.invalid/\"\n"
+	for _, tc := range []struct {
+		name, yaml, fileContent, wantSecret, wantErr string
+	}{
+		{name: "without secret", yaml: externalCache, wantErr: "external_secret"},
+		{name: "inline secret", yaml: externalCache + "  external_secret: \"shh\"\n"},
+		{
+			name: "from file", yaml: externalCache + "  external_secret_file: '$DIR/cache.secret'\n",
+			fileContent: "  s3cr3t\n", wantSecret: "s3cr3t",
+		},
+		{
+			name: "from file when disabled", yaml: "\ncache:\n  enabled: false\n  external_secret_file: '$DIR/cache.secret'\n",
+			fileContent: "s3cr3t", wantSecret: "s3cr3t",
+		},
+		{
+			name: "inline and file conflict", yaml: externalCache + "  external_secret: \"inline\"\n  external_secret_file: '$DIR/cache.secret'\n",
+			fileContent: "s3cr3t", wantErr: "both set",
+		},
+		{name: "missing file", yaml: externalCache + "  external_secret_file: '$DIR/absent.secret'\n", wantErr: "read cache.external_secret_file"},
+		{
+			name: "empty file", yaml: externalCache + "  external_secret_file: '$DIR/cache.secret'\n",
+			fileContent: "\n  \n", wantErr: "contains no secret",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if tc.fileContent != "" {
+				require.NoError(t, os.WriteFile(filepath.Join(dir, "cache.secret"), []byte(tc.fileContent), 0o600))
+			}
+			path := filepath.Join(dir, "config.yaml")
+			require.NoError(t, os.WriteFile(path, []byte(strings.ReplaceAll(tc.yaml, "$DIR", dir)), 0o600))
+			cfg, err := LoadDefault(path)
+			if tc.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.wantErr)
+			} else {
+				require.NoError(t, err)
+				if tc.wantSecret != "" {
+					assert.Equal(t, tc.wantSecret, cfg.Cache.ExternalSecret)
+				}
+			}
+		})
+	}
 }
 
-func TestLoadDefault_ReadsExternalSecretFromFileWhenCacheDisabled(t *testing.T) {
-	dir := t.TempDir()
-	secretPath := filepath.Join(dir, "cache.secret")
-	require.NoError(t, os.WriteFile(secretPath, []byte("s3cr3t"), 0o600))
-
-	// the file has to be resolved even when cache is disabled
-	path := filepath.Join(dir, "config.yaml")
-	require.NoError(t, os.WriteFile(path, []byte(`
-cache:
-  enabled: false
-  external_secret_file: "`+secretPath+`"
-`), 0o600))
-
-	cfg, err := LoadDefault(path)
-	require.NoError(t, err)
-	assert.Equal(t, "s3cr3t", cfg.Cache.ExternalSecret)
-}
-
-func TestLoadDefault_RejectsBothExternalSecretAndFile(t *testing.T) {
-	dir := t.TempDir()
-	secretPath := filepath.Join(dir, "cache.secret")
-	require.NoError(t, os.WriteFile(secretPath, []byte("s3cr3t"), 0o600))
-
-	path := filepath.Join(dir, "config.yaml")
-	require.NoError(t, os.WriteFile(path, []byte(`
-cache:
-  enabled: true
-  external_server: "http://cache.invalid/"
-  external_secret: "inline"
-  external_secret_file: "`+secretPath+`"
-`), 0o600))
-
-	_, err := LoadDefault(path)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "both set")
-}
-
-func TestLoadDefault_RejectsMissingExternalSecretFile(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "config.yaml")
-	require.NoError(t, os.WriteFile(path, []byte(`
-cache:
-  enabled: true
-  external_server: "http://cache.invalid/"
-  external_secret_file: "`+filepath.Join(dir, "absent.secret")+`"
-`), 0o600))
-
-	_, err := LoadDefault(path)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "read cache.external_secret_file")
-}
-
-func TestLoadDefault_RejectsEmptyExternalSecretFile(t *testing.T) {
-	dir := t.TempDir()
-	secretPath := filepath.Join(dir, "cache.secret")
-	require.NoError(t, os.WriteFile(secretPath, []byte("\n  \n"), 0o600))
-
-	path := filepath.Join(dir, "config.yaml")
-	require.NoError(t, os.WriteFile(path, []byte(`
-cache:
-  enabled: true
-  external_server: "http://cache.invalid/"
-  external_secret_file: "`+secretPath+`"
-`), 0o600))
-
-	_, err := LoadDefault(path)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "contains no secret")
-}
-
-// The shipped configs must parse, hold no key the config does not know, and leave
-// every option at its default, as all of their values are commented out.
 func TestLoadDefault_ShippedConfigsChangeNothing(t *testing.T) {
-	hook := test.NewGlobal()
-	defer hook.Reset()
+	hook := logtest.SetDefault(t)
 
 	defaults, err := LoadDefault("")
 	require.NoError(t, err)
@@ -414,17 +441,17 @@ func TestLoadDefault_ShippedConfigsChangeNothing(t *testing.T) {
 		require.NoError(t, err, name)
 		assert.Equal(t, defaults, cfg, name)
 	}
-	assert.Empty(t, hook.AllEntries())
+	assert.Empty(t, hook.AllRecords())
 }
 
-func TestLoadDefault_ClampsFetchTimeout(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "config.yaml")
-	require.NoError(t, os.WriteFile(path, []byte(`
+func TestLoadDefault_ClampsFetchTimeoutAndZeroFetchIntervalMaxDisablesBackoff(t *testing.T) {
+	cfg, err := LoadDefault(write(t, `
 runner:
   fetch_timeout: 120s
-`), 0o600))
-
-	cfg, err := LoadDefault(path)
+  fetch_interval: 1s
+  fetch_interval_max: 0s
+`))
 	require.NoError(t, err)
 	assert.Equal(t, RequestTimeout, cfg.Runner.FetchTimeout)
+	assert.Equal(t, time.Second, cfg.Runner.FetchIntervalMax)
 }

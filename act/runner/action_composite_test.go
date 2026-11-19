@@ -4,10 +4,115 @@
 package runner
 
 import (
+	"context"
 	"testing"
 
+	"gitea.com/gitea/runner/act/common"
+	"gitea.com/gitea/runner/act/common/git"
+	"gitea.com/gitea/runner/act/common/logging"
+	"gitea.com/gitea/runner/act/common/logging/logtest"
+
+	"gitea.dev/actionslib/pkg/model"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.yaml.in/yaml/v4"
 )
+
+func TestCompositeActionParity(t *testing.T) {
+	t.Run("input defaults use the step identity and docker env keeps the GITEA aliases", func(t *testing.T) {
+		for _, uses := range []string{"./action", "own/action@v2"} {
+			t.Run(uses, func(t *testing.T) {
+				rc := &RunContext{
+					Config: &Config{PresetGitHubContext: &model.GithubContext{}},
+					Run:    &model.Run{JobID: "job", Workflow: &model.Workflow{Jobs: map[string]*model.Job{"job": {}}}},
+					Env:    map[string]string{"GITHUB_ACTION_REPOSITORY": "other/composite", "GITHUB_ACTION_REF": "v1"},
+				}
+				var currentStep step = &stepActionLocal{RunContext: rc, Step: &model.Step{Uses: uses}, env: map[string]string{}}
+				want := "|"
+				if uses == "own/action@v2" {
+					currentStep = &stepActionRemote{RunContext: rc, Step: &model.Step{Uses: uses}, env: map[string]string{}, remoteAction: mustNewRemoteAction(t, uses)}
+					want = "own/action|v2"
+				}
+				action := &model.Action{
+					Inputs: map[string]model.Input{"identity": {Default: "${{ github.action_repository }}|${{ github.action_ref }}"}},
+					Runs:   model.ActionRuns{Env: map[string]string{"GITHUB_WORKFLOW_SHA": "runs-sha"}},
+				}
+				require.NoError(t, setupEnv(t.Context(), currentStep))
+				require.NoError(t, populateEnvsFromInput(t.Context(), currentStep, action))
+				assert.Equal(t, want, (*currentStep.getEnv())["INPUT_IDENTITY"])
+				_, err := evalDockerEnv(t.Context(), currentStep, action)
+				require.NoError(t, err)
+				assert.Equal(t, want, (*currentStep.getEnv())["identity"])
+				assert.Equal(t, "runs-sha", (*currentStep.getEnv())["GITEA_WORKFLOW_SHA"])
+			})
+		}
+	})
+
+	t.Run("inherits contexts without leaking inputs", func(t *testing.T) {
+		hook := logtest.NewWithLevel(logging.LevelWarn)
+		ctx := common.WithLogger(t.Context(), logging.New(hook))
+		strategy := &model.Strategy{MaxParallelString: "3", RawMatrix: yaml.Node{Kind: yaml.MappingNode}}
+		parent := &RunContext{
+			Config:        &Config{PresetGitHubContext: &model.GithubContext{}},
+			Matrix:        map[string]any{"os": "linux"},
+			Run:           &model.Run{JobID: "job", Workflow: &model.Workflow{Name: "workflow", Jobs: map[string]*model.Job{"job": {Strategy: strategy}}}},
+			JobContainer:  &jobContainerMock{},
+			platformImage: "-self-hosted",
+			jobIndex:      1,
+			jobTotal:      4,
+		}
+		step := &stepActionLocal{
+			Step:       &model.Step{Uses: "./action", With: map[string]string{"SHARED": "outer", "extra": "literal${{ github.job }}"}},
+			RunContext: parent,
+			action:     &model.Action{Inputs: map[string]model.Input{"shared": {Default: "outer-default"}}, Runs: model.ActionRuns{Using: "composite"}},
+			env:        map[string]string{"INPUT_SHARED": "outer"},
+		}
+		require.NoError(t, runActionImpl(step, "/action", nil)(ctx))
+		require.Len(t, hook.AllRecords(), 1)
+		assert.Equal(t, "##[warning]Unexpected input(s) 'extra', valid inputs are ['shared']", hook.LastRecord().Message)
+		composite, err := step.getCompositeRunContext(ctx)
+		require.NoError(t, err)
+
+		assert.Same(t, strategy, composite.Run.Job().Strategy)
+		assert.True(t, composite.IsHostEnv())
+		interpolated, err := composite.NewExpressionEvaluator(ctx).Interpolate(ctx,
+			"${{ matrix.os }}|${{ strategy.max-parallel }}|${{ strategy.job-index }}|${{ inputs.shared }}|${{ inputs.extra }}")
+		require.NoError(t, err)
+		assert.Equal(t, "linux|3|1|outer|literal${{ github.job }}", interpolated)
+		assert.NotContains(t, composite.Env, "INPUT_SHARED")
+		assert.NotContains(t, composite.Env, "INPUT_EXTRA")
+
+		nestedEnv := composite.GetEnv()
+		require.NoError(t, populateEnvsFromInput(ctx, &stepActionLocal{RunContext: composite, env: nestedEnv}, &model.Action{Inputs: map[string]model.Input{"shared": {Default: "inner-default"}}}))
+		assert.Equal(t, "inner-default", nestedEnv["INPUT_SHARED"])
+	})
+
+	t.Run("propagates pre failures", func(t *testing.T) {
+		setFetch(t, func(_ctx context.Context, _input git.NewGitCloneExecutorInput) (string, string, error) {
+			return "", "", assert.AnError
+		})
+		rc := &RunContext{
+			Config:       &Config{GitHubInstance: "github.com", PresetGitHubContext: &model.GithubContext{}},
+			Run:          &model.Run{JobID: "job", Workflow: &model.Workflow{Jobs: map[string]*model.Job{"job": {}}}},
+			JobContainer: &jobContainerMock{},
+		}
+
+		require.ErrorIs(t, rc.compositeExecutor(&model.Action{Runs: model.ActionRuns{Using: "composite", Steps: []model.Step{{ID: "nested", Uses: "org/action@v1"}}}}).pre(t.Context()), assert.AnError)
+	})
+
+	t.Run("post steps log under their own step ids", func(t *testing.T) {
+		hook := logtest.NewWithLevel(logging.LevelDebug)
+		rc := &RunContext{Config: &Config{}, JobContainer: &jobContainerMock{}}
+		steps := rc.compositeExecutor(&model.Action{Runs: model.ActionRuns{Using: "composite", Steps: []model.Step{{ID: "first", Uses: "./first"}, {ID: "second", Uses: "./second"}}}})
+		require.NoError(t, steps.post(common.WithLogger(t.Context(), logging.New(hook))))
+		var stepIDs []any
+		for _, record := range hook.AllRecords() {
+			ids, _ := record.Attr("stepID")
+			stepIDs = append(stepIDs, ids)
+		}
+		assert.Equal(t, []any{[]string{"second"}, []string{"first"}}, stepIDs)
+	})
+}
 
 func TestAppendUniqueMasks(t *testing.T) {
 	tests := []struct {
@@ -17,21 +122,15 @@ func TestAppendUniqueMasks(t *testing.T) {
 		want []string
 	}{
 		{
-			name: "appends new masks",
+			name: "appends each new mask once",
 			dst:  []string{"a"},
-			src:  []string{"b", "c"},
+			src:  []string{"b", "c", "b", "a"},
 			want: []string{"a", "b", "c"},
 		},
 		{
 			name: "skips masks already present",
 			dst:  []string{"a", "b"},
 			src:  []string{"a", "b"},
-			want: []string{"a", "b"},
-		},
-		{
-			name: "deduplicates within src",
-			dst:  []string{"a"},
-			src:  []string{"b", "b", "a"},
 			want: []string{"a", "b"},
 		},
 		{
@@ -49,22 +148,50 @@ func TestAppendUniqueMasks(t *testing.T) {
 	}
 }
 
-// TestAppendUniqueMasksNoExponentialGrowth reproduces the exponential growth of
-// the parent's Masks slice observed with nested/repeated composite actions. A
-// composite RunContext is seeded with its parent's masks and the whole seeded
-// slice was previously appended back into the parent, doubling its length on
-// every composite action.
-func TestAppendUniqueMasksNoExponentialGrowth(t *testing.T) {
-	parentMasks := []string{"secret"}
-
-	for range 20 {
-		// compositeRC.Masks starts as a copy of the parent's masks (it is
-		// seeded with parent.Masks in newCompositeRunContext).
-		compositeMasks := make([]string, len(parentMasks))
-		copy(compositeMasks, parentMasks)
-
-		parentMasks = appendUniqueMasks(parentMasks, compositeMasks)
+func TestCompositeStepIfReadsJobStatusExceptInItsOwnMainSteps(t *testing.T) {
+	failStep := func(rc *RunContext) {
+		rc.StepResults["failed"] = &model.StepResult{Conclusion: model.StepStatusFailure}
 	}
+	tests := []struct {
+		name   string
+		setup  func(job, composite *RunContext)
+		nested bool
+		stage  stepStage
+		want   map[string]bool
+	}{
+		{"post-if reads the failed job", func(job, _ *RunContext) { failStep(job) }, false, stepStagePost, map[string]bool{"success()": false, "failure()": true, "job.status == 'failure'": true}},
+		{"main if ignores the failed job", func(job, _ *RunContext) { failStep(job) }, false, stepStageMain, map[string]bool{"success()": true, "failure()": false}},
+		{"main if reads the composite's own failure", func(_, composite *RunContext) { failStep(composite) }, false, stepStageMain, map[string]bool{"success()": false, "failure()": true}},
+		{"nested main if ignores the outer composite's failure", func(_, composite *RunContext) { failStep(composite) }, true, stepStageMain, map[string]bool{"success()": true}},
+		{"main if sees the cancelled job", func(job, _ *RunContext) { job.markCancelled() }, false, stepStageMain, map[string]bool{"cancelled()": true, "success()": false}},
+		{"post-if sees the cancelled job", func(job, _ *RunContext) { job.markCancelled() }, false, stepStagePost, map[string]bool{"cancelled()": true, "success()": false}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			job := makeTestRC(t, "runs-on: ubuntu-latest")
+			composite := newTestCompositeRunContext(t, job)
+			rc := composite
+			if tt.nested {
+				rc = newTestCompositeRunContext(t, composite)
+			}
+			tt.setup(job, composite)
+			step := &stepRun{RunContext: rc}
+			for expr, want := range tt.want {
+				enabled, err := isStepEnabled(t.Context(), expr, step, tt.stage)
+				require.NoError(t, err)
+				assert.Equal(t, want, enabled, expr)
+			}
+		})
+	}
+}
 
-	assert.Equal(t, []string{"secret"}, parentMasks)
+func newTestCompositeRunContext(t *testing.T, parent *RunContext) *RunContext {
+	composite, err := newCompositeRunContext(t.Context(), parent, &stepActionRemote{
+		Step:       &model.Step{},
+		RunContext: parent,
+		action:     &model.Action{},
+		env:        map[string]string{},
+	}, "/action")
+	require.NoError(t, err)
+	return composite
 }

@@ -5,91 +5,156 @@
 package runner
 
 import (
+	"cmp"
 	"context"
 	"fmt"
-	"regexp"
+	"maps"
+	"os"
 	"strings"
+	"unicode"
 
 	"gitea.com/gitea/runner/act/common"
 )
 
-var commandPatternGA *regexp.Regexp
-
-var commandPatternADO *regexp.Regexp
-
-func init() {
-	commandPatternGA = regexp.MustCompile("^::([^ ]+)( (.+))?::([^\r\n]*)[\r\n]+$")
-	commandPatternADO = regexp.MustCompile("^##\\[([^ ]+)( (.+))?]([^\r\n]*)[\r\n]+$")
-}
-
-func tryParseRawActionCommand(line string) (command string, kvPairs map[string]string, arg string, ok bool) {
-	if m := commandPatternGA.FindStringSubmatch(line); m != nil {
-		command = m[1]
-		kvPairs = parseKeyValuePairs(m[3], ",")
-		arg = m[4]
-		ok = true
-	} else if m := commandPatternADO.FindStringSubmatch(line); m != nil {
-		command = m[1]
-		kvPairs = parseKeyValuePairs(m[3], ";")
-		arg = m[4]
-		ok = true
+// parseActionCommand parses like GitHub's runner, but rejects a bare \r GitHub would split at and keeps a value's leading '=' so masks match.
+func parseActionCommand(line, resumeCommand string) (command string, properties map[string]string, data string, ok bool) {
+	line = strings.TrimRight(line, "\r\n")
+	if strings.ContainsAny(line, "\r\n") {
+		return "", nil, "", false
 	}
-	return command, kvPairs, arg, ok
+	trimmed := strings.TrimLeftFunc(line, unicode.IsSpace)
+	for _, legacy := range []bool{false, true} {
+		header, found := strings.CutPrefix(trimmed, "::")
+		separator, propertySeparator, unescapeProperty, unescapeData := "::", ",", commandPropertyUnescaper.Replace, UnescapeCommandData
+		if legacy {
+			_, header, found = strings.Cut(line, "##[")
+			separator, propertySeparator, unescapeProperty, unescapeData = "]", ";", UnescapeLegacyCommand, UnescapeLegacyCommand
+		}
+		if !found {
+			continue
+		}
+		header, data, found := strings.Cut(header, separator)
+		if !found {
+			continue
+		}
+		command, propertyList, _ := strings.Cut(header, " ")
+		command = strings.ToLower(command)
+		switch command {
+		case "stop-commands", "set-env", "set-output", "save-state", "add-path", "add-mask", "add-matcher",
+			"remove-matcher", "warning", "error", "notice", "debug", "group", "endgroup", "echo":
+		default:
+			if resumeCommand == "" || !strings.EqualFold(command, resumeCommand) {
+				continue
+			}
+		}
+		if !legacy {
+			propertyList = strings.TrimSpace(propertyList)
+		}
+		properties := map[string]string{}
+		for property := range strings.SplitSeq(propertyList, propertySeparator) {
+			if key, value, _ := strings.Cut(strings.TrimLeft(property, "="), "="); value != "" {
+				properties[strings.ToLower(key)] = unescapeProperty(value)
+			}
+		}
+		return command, properties, unescapeData(data), true
+	}
+	return "", nil, "", false
 }
 
+// commandHandler reports whether a line is logged, keeping per-handler command state as GitHub does.
 func (rc *RunContext) commandHandler(ctx context.Context) common.LineHandler {
-	logger := common.Logger(ctx)
+	rawLogger := common.Logger(ctx).With(rawOutputField, true)
+	debug := rc.topLevelRunContext().Config.RunnerDebug()
+	echo := debug
 	resumeCommand := ""
 	return func(line string) bool {
-		command, kvPairs, arg, ok := tryParseRawActionCommand(line)
+		command, kvPairs, arg, ok := parseActionCommand(line, resumeCommand)
 		if !ok {
 			return true
 		}
-
 		if resumeCommand != "" {
-			// There should not be any emojis in the log output for Gitea.
-			// Return true (not false) so the line still reaches the raw_output
-			// log handler; otherwise everything between ::stop-commands:: and
-			// its end token is silently dropped from the step log.
-			logger.Infof("%s", line)
 			// Resumed here rather than from the switch, because the end token is arbitrary
 			// and a token naming a real command would otherwise never resume.
-			if command == resumeCommand {
+			if strings.EqualFold(command, resumeCommand) {
 				resumeCommand = ""
 			}
 			return true
 		}
-		arg = UnescapeCommandData(arg)
-		kvPairs = unescapeKvPairs(kvPairs)
+		echoed := echo
 		if (command == "set-env" || command == "add-path") && rc.refuseUnsecureCommand(ctx, command) {
-			return true
+			return echoed
 		}
 		switch command {
 		case "set-env":
-			rc.setEnv(ctx, kvPairs, arg)
+			rc.setEnv(ctx, kvPairs, arg, true)
 		case "set-output":
 			rc.setOutput(ctx, kvPairs, arg)
 		case "add-path":
-			rc.addPath(ctx, arg)
+			rc.addPath(arg)
+		case "save-state":
+			rc.saveState(ctx, kvPairs, arg)
+		case "echo":
+			switch strings.ToLower(strings.TrimSpace(arg)) {
+			case "on":
+				echo = true
+			case "off":
+				echo = false
+			}
 		case "add-mask":
-			rc.AddMask(arg)
-			logger.Infof("%s", "***")
-			// The raw line is still forwarded, carrying the secret: that is how the reporter
-			// learns the mask, and it drops the row rather than writing it out.
+			rc.AddMask(ctx, arg)
+			if echoed {
+				rawLogger.Infof("::add-mask::***")
+			}
+			return false
 		case "stop-commands":
 			resumeCommand = arg
-			logger.Infof("%s", line)
-		case "save-state":
-			logger.Infof("%s", line)
-			rc.saveState(ctx, kvPairs, arg)
-		default:
-			// ::debug::, ::error::, ::warning::, ::add-matcher:: and anything unrecognised are
-			// passed through for the reporter and Gitea's web UI to render.
-			logger.Infof("%s", line)
+			if len(arg) > 6 { // as on GitHub, so the log does not give away the resume token
+				rc.AddMask(ctx, arg)
+			}
+			return true
+		case "debug":
+			return debug
+		case "notice", "warning", "error":
+			rawLogger.Infof("%s", formatAnnotation(command, kvPairs, arg))
+			return false
+		case "group", "endgroup":
+			if strings.HasPrefix(line, "::"+command+"::") || strings.HasPrefix(line, "##["+command+"]") {
+				return true
+			}
+			rawLogger.Infof("::%s::%s", command, EscapeCommandData(arg))
+			return false
 		}
+		return echoed
+	}
+}
 
-		// return true to let gitea's logger handle these special outputs also
-		return true
+// formatAnnotation folds the location and title into the message, as Gitea's web UI drops command properties.
+func formatAnnotation(level string, properties map[string]string, message string) string {
+	prefix := properties["file"]
+	if prefix != "" {
+		if line := properties["line"]; line != "" {
+			prefix += ":" + line
+			if col := cmp.Or(properties["col"], properties["column"]); col != "" {
+				prefix += ":" + col
+			}
+		}
+		prefix += ": "
+	}
+	if title := properties["title"]; title != "" {
+		prefix += title + ": "
+	}
+	return "::" + level + "::" + EscapeCommandData(prefix+message)
+}
+
+// serviceCommandHandler applies only ::add-mask::, so a service cannot set the job's env, outputs or state.
+func (rc *RunContext) serviceCommandHandler(ctx context.Context) common.LineHandler {
+	return func(line string) bool {
+		command, _, arg, ok := parseActionCommand(line, "")
+		if !ok || command != "add-mask" {
+			return true
+		}
+		rc.AddMask(ctx, arg)
+		return false
 	}
 }
 
@@ -99,12 +164,21 @@ const allowUnsecureCommandsVar = "ACTIONS_ALLOW_UNSECURE_COMMANDS"
 // not run, recording the error that fails the step. GitHub disabled both because a step that
 // echoes untrusted content can use them to set NODE_OPTIONS or PATH for every later step.
 func (rc *RunContext) refuseUnsecureCommand(ctx context.Context, command string) bool {
-	if rc.allowUnsecureCommandsOptIn() {
+	if isTruthyEnv(os.Getenv(allowUnsecureCommandsVar)) { // the runner's own opt-in wins, as on GitHub
 		return false
+	}
+	caseInsensitive := rc.JobContainer != nil && rc.JobContainer.IsEnvironmentCaseInsensitive()
+	for _, env := range []map[string]string{rc.currentStepEnv(), rc.Env, rc.GlobalEnv} {
+		if value, ok := common.LookupFold(env, allowUnsecureCommandsVar, caseInsensitive); ok {
+			if isTruthyEnv(value) {
+				return false
+			}
+			break
+		}
 	}
 
 	// The step executor logs the failure itself, so keep this line's wording distinct.
-	common.Logger(ctx).WithField(rawOutputField, true).Errorf("##[error]%s", EscapeCommandData(fmt.Sprintf(
+	common.Logger(ctx).With(rawOutputField, true).Errorf("##[error]%s", EscapeCommandData(fmt.Sprintf(
 		"The `%s` command is disabled: it can set the environment of every later step from untrusted output. "+
 			"Write to $GITHUB_ENV or $GITHUB_PATH instead, or set ACTIONS_ALLOW_UNSECURE_COMMANDS to allow it",
 		command)))
@@ -115,14 +189,6 @@ func (rc *RunContext) refuseUnsecureCommand(ctx context.Context, command string)
 		rc.unsecureCommandErr = fmt.Errorf("the `%s` workflow command is disabled", command)
 	}
 	return true
-}
-
-// allowUnsecureCommandsOptIn reports whether the workflow itself asked for the deprecated
-// commands, from any env scope, as it can on GitHub.
-func (rc *RunContext) allowUnsecureCommandsOptIn() bool {
-	return isTruthyEnv(rc.currentStepEnv()[allowUnsecureCommandsVar]) ||
-		isTruthyEnv(rc.Env[allowUnsecureCommandsVar]) ||
-		isTruthyEnv(rc.GlobalEnv[allowUnsecureCommandsVar])
 }
 
 // isTruthyEnv mirrors GitHub's bool.TryParse: only "true", in any casing.
@@ -139,9 +205,28 @@ func (rc *RunContext) takeUnsecureCommandError() error {
 	return err
 }
 
-func (rc *RunContext) setEnv(ctx context.Context, kvPairs map[string]string, arg string) {
+// runWithCommands runs executor judging its workflow commands by env, failing it on a refused one.
+func (rc *RunContext) runWithCommands(ctx context.Context, env map[string]string, executor common.Executor) error {
+	rc.setCurrentStepEnv(maps.Clone(env)) // the executor keeps writing to env while the command handler reads it
+	defer rc.setCurrentStepEnv(nil)
+	_ = rc.takeUnsecureCommandError() // a refusal from before belongs to no step
+	err := executor(ctx)
+	if refusal := rc.takeUnsecureCommandError(); err == nil {
+		return refusal
+	}
+	return err
+}
+
+func (rc *RunContext) setEnv(ctx context.Context, kvPairs map[string]string, arg string, fromCommand bool) {
 	name := kvPairs["name"]
-	common.Logger(ctx).Infof("::set-env:: %s=%s", name, arg)
+	if strings.EqualFold(name, "NODE_OPTIONS") {
+		message := "Can't store NODE_OPTIONS output parameter using '$GITHUB_ENV' command."
+		if fromCommand {
+			message = "Can't update NODE_OPTIONS environment variable using ::set-env:: command."
+		}
+		common.Logger(ctx).With(rawOutputField, true).Errorf("##[error]%s", EscapeCommandData(message))
+		return
+	}
 	if rc.Env == nil {
 		rc.Env = make(map[string]string)
 	}
@@ -159,27 +244,23 @@ func (rc *RunContext) setEnv(ctx context.Context, kvPairs map[string]string, arg
 	mergeIntoMap(rc.GlobalEnv, newenv)
 }
 
+func (rc *RunContext) setEnvFile(ctx context.Context, kvPairs map[string]string, arg string) {
+	rc.setEnv(ctx, kvPairs, arg, false)
+}
+
 func (rc *RunContext) setOutput(ctx context.Context, kvPairs map[string]string, arg string) {
-	logger := common.Logger(ctx)
 	stepID := rc.CurrentStep
-	outputName := kvPairs["name"]
-	if outputMapping, ok := rc.OutputMappings[MappableOutput{StepID: stepID, OutputName: outputName}]; ok {
-		stepID = outputMapping.StepID
-		outputName = outputMapping.OutputName
-	}
 
 	result, ok := rc.StepResults[stepID]
 	if !ok {
-		logger.Infof("No outputs registered for step '%s'", stepID)
+		common.Logger(ctx).Infof("No outputs registered for step '%s'", stepID)
 		return
 	}
 
-	logger.Infof("::set-output:: %s=%s", outputName, arg)
-	result.Outputs[outputName] = arg
+	result.Outputs[kvPairs["name"]] = arg
 }
 
-func (rc *RunContext) addPath(ctx context.Context, arg string) {
-	common.Logger(ctx).Infof("::add-path:: %s", arg)
+func (rc *RunContext) addPath(arg string) {
 	extraPath := []string{arg}
 	for _, v := range rc.ExtraPath {
 		if v != arg {
@@ -189,23 +270,12 @@ func (rc *RunContext) addPath(ctx context.Context, arg string) {
 	rc.ExtraPath = extraPath
 }
 
-func parseKeyValuePairs(kvPairs, separator string) map[string]string {
-	rtn := make(map[string]string)
-	kvPairList := strings.SplitSeq(kvPairs, separator)
-	for kvPair := range kvPairList {
-		kv := strings.Split(kvPair, "=")
-		if len(kv) == 2 {
-			rtn[kv[0]] = kv[1]
-		}
-	}
-	return rtn
-}
-
 // A Replacer never rescans what it wrote, so "%250A" stays a literal "%0A".
 var (
 	commandDataEscaper       = strings.NewReplacer("%", "%25", "\r", "%0D", "\n", "%0A")
 	commandDataUnescaper     = strings.NewReplacer("%25", "%", "%0D", "\r", "%0A", "\n")
 	commandPropertyUnescaper = strings.NewReplacer("%25", "%", "%0D", "\r", "%0A", "\n", "%3A", ":", "%2C", ",")
+	legacyCommandUnescaper   = strings.NewReplacer("%3B", ";", "%0D", "\r", "%0A", "\n", "%5D", "]", "%25", "%")
 )
 
 // EscapeCommandData encodes the data part of a "::cmd::" or "##[cmd]" line the runner writes itself,
@@ -218,15 +288,9 @@ func UnescapeCommandData(arg string) string {
 	return commandDataUnescaper.Replace(arg)
 }
 
-func unescapeCommandProperty(arg string) string {
-	return commandPropertyUnescaper.Replace(arg)
-}
-
-func unescapeKvPairs(kvPairs map[string]string) map[string]string {
-	for k, v := range kvPairs {
-		kvPairs[k] = unescapeCommandProperty(v)
-	}
-	return kvPairs
+// UnescapeLegacyCommand decodes a "##[cmd]" line, which also spells ";" and "]" escaped.
+func UnescapeLegacyCommand(arg string) string {
+	return legacyCommandUnescaper.Replace(arg)
 }
 
 func (rc *RunContext) saveState(_ context.Context, kvPairs map[string]string, arg string) {

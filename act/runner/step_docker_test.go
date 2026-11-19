@@ -5,9 +5,7 @@
 package runner
 
 import (
-	"bytes"
-	"context"
-	"io"
+	"slices"
 	"strings"
 	"testing"
 
@@ -15,8 +13,8 @@ import (
 
 	"gitea.dev/actionslib/pkg/model"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+	"go.yaml.in/yaml/v4"
 )
 
 func TestStepDockerMain(t *testing.T) {
@@ -24,22 +22,22 @@ func TestStepDockerMain(t *testing.T) {
 
 	var input *container.NewContainerInput
 
-	// mock the new container call
 	origContainerNewContainer := ContainerNewContainer
 	ContainerNewContainer = func(containerInput *container.NewContainerInput) container.ExecutionsEnvironment {
 		input = containerInput
 		return cm
 	}
-	defer (func() {
+	defer func() {
 		ContainerNewContainer = origContainerNewContainer
-	})()
+	}()
 
-	ctx := context.Background()
+	ctx := t.Context()
 
 	sd := &stepDocker{
 		RunContext: &RunContext{
 			StepResults: map[string]*model.StepResult{},
 			Config: &Config{
+				PresetGitHubContext: &model.GithubContext{},
 				Secrets: map[string]string{
 					"DOCKER_USERNAME": "docker-user",
 					"DOCKER_PASSWORD": "docker-password",
@@ -60,113 +58,59 @@ func TestStepDockerMain(t *testing.T) {
 				},
 			},
 			JobContainer: cm,
+			Env:          map[string]string{"GITHUB_ACTION_REPOSITORY": "other/composite", "GITHUB_ACTION_REF": "v1"},
 		},
 		Step: &model.Step{
 			ID:               "1",
 			Uses:             "docker://node:14",
 			WorkingDirectory: "workdir",
+			If:               yaml.Node{Value: "github.action_repository == 'other/composite' && github.action_ref == 'v1'"},
 		},
 	}
+	require.NoError(t, sd.Step.RawWith.Encode(map[string]string{"args": "identity:${{ github.action_repository }}:${{ github.action_ref }}"}))
 	sd.RunContext.ExprEval = sd.RunContext.NewExpressionEvaluator(ctx)
 
-	cm.On("Pull", false).Return(func(ctx context.Context) error {
-		return nil
-	})
+	cm.On("Pull", false).Return(noopExecutor)
 
-	cm.On("Remove").Return(func(ctx context.Context) error {
-		return nil
-	})
+	cm.On("Remove").Return(noopExecutor)
 
-	cm.On("Create", []string(nil), []string(nil)).Return(func(ctx context.Context) error {
-		return nil
-	})
+	cm.On("Create", []string(nil), []string(nil)).Return(noopExecutor)
 
-	cm.On("Start", true).Return(func(ctx context.Context) error {
-		return nil
-	})
+	cm.On("Start", true).Return(noopExecutor)
 
-	cm.On("Close").Return(func(ctx context.Context) error {
-		return nil
-	})
+	cm.On("Close").Return(noopExecutor)
 
-	cm.On("Copy", "/var/run/act", mock.AnythingOfType("[]*container.FileEntry")).Return(func(ctx context.Context) error {
-		return nil
-	})
-
-	cm.On("UpdateFromEnv", "/var/run/act/workflow/envs.txt", mock.AnythingOfType("*map[string]string")).Return(func(ctx context.Context) error {
-		return nil
-	})
-
-	cm.On("UpdateFromEnv", "/var/run/act/workflow/statecmd.txt", mock.AnythingOfType("*map[string]string")).Return(func(ctx context.Context) error {
-		return nil
-	})
-
-	cm.On("UpdateFromEnv", "/var/run/act/workflow/outputcmd.txt", mock.AnythingOfType("*map[string]string")).Return(func(ctx context.Context) error {
-		return nil
-	})
-
-	cm.On("GetContainerArchive", ctx, "/var/run/act/workflow/pathcmd.txt").Return(io.NopCloser(&bytes.Buffer{}), nil)
-
-	err := sd.main()(ctx)
-	assert.NoError(t, err) //nolint:testifylint // pre-existing issue from nektos/act
+	expectStepFileCommands(t, cm)
+	require.NoError(t, sd.main()(ctx))
 
 	assert.Equal(t, "node:14", input.Image)
+	assert.Equal(t, []string{"identity::"}, input.Cmd)
+	assert.Contains(t, input.Env, "GITHUB_ACTION_REPOSITORY=")
+	assert.Contains(t, input.Env, "GITHUB_ACTION_REF=")
+	assert.Equal(t, "other/composite", sd.RunContext.Env["GITHUB_ACTION_REPOSITORY"])
+	assert.Equal(t, "v1", sd.RunContext.Env["GITHUB_ACTION_REF"])
 
-	// DOCKER_USERNAME/DOCKER_PASSWORD secrets should not be used as implicit pull credentials for docker:// action containers.
 	assert.Empty(t, input.Username)
 	assert.Empty(t, input.Password)
+	assert.True(t, input.AutoRemove)
 
 	cm.AssertExpectations(t)
 }
 
-// With AutoRemove the daemon reaps the container on exit, so act must not remove it afterwards.
-func TestStepDockerAutoRemove(t *testing.T) {
-	orig := ContainerNewContainer
-	defer func() { ContainerNewContainer = orig }()
-
-	for _, tc := range []struct {
-		autoRemove bool
-		removes    int
+func TestStepDockerNewStepContainer(t *testing.T) {
+	inheritedPath := (&container.LinuxContainerEnvironmentExtensions{}).DefaultPathVariable()
+	for _, test := range []struct {
+		name, platform, image, path, greeting string
+		allocPTY, expectDefault, keepsPath    bool
 	}{
-		{false, 2}, // stale + post-run
-		{true, 1},  // post-run skipped
+		{name: "allocate PTY/off", platform: "node:14", image: "node:14", greeting: "hi"},
+		{name: "allocate PTY/on", platform: "node:14", image: "node:14", greeting: "hi", allocPTY: true},
+		{name: "docker mode attaches to job container network", platform: "node:14", image: "alpine:3.20", path: inheritedPath, greeting: "hello", keepsPath: true},
+		{name: "host mode uses default network and the image's PATH", platform: "-self-hosted", image: "alpine:3.20", path: inheritedPath, greeting: "hello", expectDefault: true},
+		{name: "host mode keeps a PATH that is not the runner's", platform: "-self-hosted", image: "alpine:3.20", path: "/custom/bin", greeting: "hello", expectDefault: true, keepsPath: true},
 	} {
-		cm := &containerMock{}
-		ContainerNewContainer = func(*container.NewContainerInput) container.ExecutionsEnvironment { return cm }
-
-		sd := &stepDocker{
-			RunContext: &RunContext{
-				Config:       &Config{AutoRemove: tc.autoRemove},
-				Run:          &model.Run{JobID: "1", Workflow: &model.Workflow{Jobs: map[string]*model.Job{"1": {}}}},
-				JobContainer: cm,
-			},
-			Step: &model.Step{ID: "1", Uses: "docker://node:14"},
-		}
-
-		removes := 0
-		cm.On("Pull", false).Return(func(context.Context) error { return nil })
-		cm.On("Remove").Return(func(context.Context) error { removes++; return nil })
-		cm.On("Create", []string(nil), []string(nil)).Return(func(context.Context) error { return nil })
-		cm.On("Start", true).Return(func(context.Context) error { return nil })
-		cm.On("Close").Return(func(context.Context) error { return nil })
-
-		require.NoError(t, sd.runUsesContainer()(context.Background()))
-		cm.AssertExpectations(t)
-		assert.Equal(t, tc.removes, removes)
-	}
-}
-
-func TestStepDockerNewStepContainerAllocatePTY(t *testing.T) {
-	for _, tc := range []struct {
-		name     string
-		allocPTY bool
-	}{
-		{name: "off", allocPTY: false},
-		{name: "on", allocPTY: true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
+		t.Run(test.name, func(t *testing.T) {
 			cm := &containerMock{}
-
 			var captured *container.NewContainerInput
 			origContainerNewContainer := ContainerNewContainer
 			ContainerNewContainer = func(input *container.NewContainerInput) container.ExecutionsEnvironment {
@@ -177,119 +121,71 @@ func TestStepDockerNewStepContainerAllocatePTY(t *testing.T) {
 				ContainerNewContainer = origContainerNewContainer
 			}()
 
-			ctx := context.Background()
+			ctx := t.Context()
 			sd := &stepDocker{
 				RunContext: &RunContext{
 					StepResults: map[string]*model.StepResult{},
 					Config: &Config{
-						AllocatePTY: tc.allocPTY,
-						PlatformPicker: func(_ []string) string {
-							return "node:14"
+						PresetGitHubContext: &model.GithubContext{},
+						AllocatePTY:         test.allocPTY,
+						PlatformPicker: func(_platforms []string) string {
+							return test.platform
 						},
 					},
-					Run: &model.Run{
-						JobID: "1",
-						Workflow: &model.Workflow{
-							Jobs: map[string]*model.Job{"1": {}},
-						},
-					},
+					Run:          &model.Run{JobID: "1", Workflow: &model.Workflow{Jobs: map[string]*model.Job{"1": {}}}},
 					JobContainer: cm,
 				},
-				Step: &model.Step{ID: "1", Uses: "docker://node:14"},
+				Step: &model.Step{ID: "1", Uses: "docker://" + test.image},
 			}
 			sd.RunContext.ExprEval = sd.RunContext.NewExpressionEvaluator(ctx)
+			if test.path != "" {
+				sd.env = map[string]string{"PATH": test.path}
+				require.NoError(t, sd.RunContext.resolvePlatformImage(ctx))
+				assert.Equal(t, test.expectDefault, sd.RunContext.IsHostEnv(), "IsHostEnv mismatch for platform %q", test.platform)
+			}
 
-			_ = sd.newStepContainer(ctx, "node:14", []string{"echo", "hi"}, nil)
-			assert.Equal(t, tc.allocPTY, captured.AllocatePTY)
+			newStepContainer(ctx, sd, test.image, []string{"echo", test.greeting}, nil, "")
+			assert.Equal(t, test.allocPTY, captured.AllocatePTY)
+			if test.path != "" {
+				assert.Equal(t, test.keepsPath, slices.Contains(captured.Env, "PATH="+test.path))
+				if test.expectDefault {
+					assert.Equal(t, "default", captured.NetworkMode,
+						"host-mode step container must use 'default' network, got %q", captured.NetworkMode)
+				} else {
+					assert.True(t, strings.HasPrefix(captured.NetworkMode, "container:"),
+						"docker-mode step container must attach to job container network, got %q", captured.NetworkMode)
+				}
+			}
 		})
 	}
 }
 
-func TestStepDockerPrePost(t *testing.T) {
-	ctx := context.Background()
-	sd := &stepDocker{}
-
-	err := sd.pre()(ctx)
-	assert.NoError(t, err) //nolint:testifylint // pre-existing issue from nektos/act
-
-	err = sd.post()(ctx)
-	assert.NoError(t, err)
-}
-
-func TestStepDockerNewStepContainerNetworkMode(t *testing.T) {
-	cases := []struct {
-		name          string
-		platform      string
-		expectDefault bool
+func TestWindowsHostContainerActions(t *testing.T) {
+	for _, test := range []struct {
+		name, hostOS string
+		jobContainer container.ExecutionsEnvironment
+		wantError    bool
 	}{
-		{
-			name:          "docker mode attaches to job container network",
-			platform:      "node:14",
-			expectDefault: false,
-		},
-		{
-			name:          "host mode uses default network",
-			platform:      "-self-hosted",
-			expectDefault: true,
-		},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			cm := &containerMock{}
-
-			var captured *container.NewContainerInput
-			origContainerNewContainer := ContainerNewContainer
-			ContainerNewContainer = func(input *container.NewContainerInput) container.ExecutionsEnvironment {
-				captured = input
-				return cm
+		{name: "Windows host", hostOS: "windows", jobContainer: &container.HostEnvironment{}, wantError: true},
+		{name: "Linux host", hostOS: "linux", jobContainer: &container.HostEnvironment{}},
+		{name: "macOS host", hostOS: "darwin", jobContainer: &container.HostEnvironment{}},
+		{name: "Windows with Linux job container", hostOS: "windows", jobContainer: &containerMock{}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			original := hostOS
+			hostOS = test.hostOS
+			t.Cleanup(func() { hostOS = original })
+			rc := &RunContext{JobContainer: test.jobContainer, kubernetes: true}
+			wantError := errKubernetesDocker.Error()
+			if test.wantError {
+				wantError = errWindowsHostContainer.Error()
 			}
-			defer func() {
-				ContainerNewContainer = origContainerNewContainer
-			}()
-
-			ctx := context.Background()
-
-			platform := tc.platform
-			sd := &stepDocker{
-				RunContext: &RunContext{
-					StepResults: map[string]*model.StepResult{},
-					Config: &Config{
-						PlatformPicker: func(_ []string) string {
-							return platform
-						},
-					},
-					Run: &model.Run{
-						JobID: "1",
-						Workflow: &model.Workflow{
-							Jobs: map[string]*model.Job{
-								"1": {},
-							},
-						},
-					},
-					JobContainer: cm,
-				},
-				Step: &model.Step{
-					ID:   "1",
-					Uses: "docker://alpine:3.20",
-				},
-			}
-			sd.RunContext.ExprEval = sd.RunContext.NewExpressionEvaluator(ctx)
-
-			assert.Equal(t, tc.expectDefault, sd.RunContext.IsHostEnv(ctx),
-				"IsHostEnv mismatch for platform %q", tc.platform)
-
-			_ = sd.newStepContainer(ctx, "alpine:3.20", []string{"echo", "hello"}, nil)
-
-			if tc.expectDefault {
-				assert.Equal(t, "default", captured.NetworkMode,
-					"host-mode step container must use 'default' network, got %q",
-					captured.NetworkMode)
-			} else {
-				assert.True(t, strings.HasPrefix(captured.NetworkMode, "container:"),
-					"docker-mode step container must attach to job container network, got %q",
-					captured.NetworkMode)
-			}
+			t.Run("docker step", func(t *testing.T) {
+				require.EqualError(t, (&stepDocker{RunContext: rc}).runUsesContainer()(t.Context()), wantError)
+			})
+			t.Run("container action", func(t *testing.T) {
+				require.EqualError(t, execAsDocker(t.Context(), &stepActionRemote{RunContext: rc}, "action", "", "", false, stepStageMain), wantError)
+			})
 		})
 	}
 }

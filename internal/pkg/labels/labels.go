@@ -5,12 +5,17 @@ package labels
 
 import (
 	"errors"
+	"slices"
 	"strings"
 )
 
 const (
-	SchemeHost   = "host"
-	SchemeDocker = "docker"
+	SchemeHost       = "host"
+	SchemeDocker     = "docker"
+	SchemeKubernetes = "kubernetes"
+
+	// SelfHostedPlatform is the platform marker act treats as "run on the host".
+	SelfHostedPlatform = "-self-hosted"
 )
 
 type Label struct {
@@ -27,20 +32,14 @@ func Parse(str string) (*Label, error) {
 		return nil, errors.New("empty label")
 	}
 
-	splits := strings.SplitN(str, ":", 3)
-	label := &Label{
-		Name:   splits[0],
-		Schema: SchemeHost,
-		Arg:    "",
+	name, remainder, hasSchema := strings.Cut(str, ":")
+	label := &Label{Name: name, Schema: SchemeHost}
+	if hasSchema {
+		label.Schema, label.Arg, _ = strings.Cut(remainder, ":")
 	}
-	if len(splits) >= 2 {
-		label.Schema = splits[1]
-	}
-	if len(splits) >= 3 {
-		label.Arg = splits[2]
-	}
-	if label.Schema != SchemeHost && label.Schema != SchemeDocker {
-		// Not a schema we know: the colon belongs to the label name itself.
+	kubernetes := label.Schema == SchemeKubernetes && strings.HasPrefix(label.Arg, "//") && len(label.Arg) > 2
+	if label.Schema != SchemeHost && label.Schema != SchemeDocker && !kubernetes {
+		// Not a schema we know, or kubernetes without an image: the colon belongs to the label name itself.
 		return &Label{
 			Name:   str,
 			Schema: SchemeHost,
@@ -53,14 +52,10 @@ func Parse(str string) (*Label, error) {
 type Labels []*Label
 
 func (l Labels) RequireDocker() bool {
-	for _, label := range l {
-		if label.Schema == SchemeDocker {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(l, func(label *Label) bool { return label.Schema == SchemeDocker })
 }
 
+// PickPlatform returns the platform of the first runs-on entry this runner has a label for, or "".
 func (l Labels) PickPlatform(runsOn []string) string {
 	platforms := make(map[string]string, len(l))
 	for _, label := range l {
@@ -68,10 +63,11 @@ func (l Labels) PickPlatform(runsOn []string) string {
 		case SchemeDocker:
 			// "//" will be ignored
 			platforms[label.Name] = strings.TrimPrefix(label.Arg, "//")
+		case SchemeKubernetes:
+			platforms[label.Name] = SchemeKubernetes + ":" + label.Arg
 		case SchemeHost:
-			platforms[label.Name] = "-self-hosted"
+			platforms[label.Name] = SelfHostedPlatform
 		default:
-			// unreachable: Parse only produces host or docker schemas
 			continue
 		}
 	}
@@ -80,18 +76,7 @@ func (l Labels) PickPlatform(runsOn []string) string {
 			return v
 		}
 	}
-
-	// TODO: support multiple labels
-	// like:
-	//   ["ubuntu-22.04"] => "ubuntu:22.04"
-	//   ["with-gpu"] => "linux:with-gpu"
-	//   ["ubuntu-22.04", "with-gpu"] => "ubuntu:22.04_with-gpu"
-
-	// return default.
-	// So the runner receives a task with a label that the runner doesn't have,
-	// it happens when the user have edited the label of the runner in the web UI.
-	// TODO: it may be not correct, what if the runner is used as host mode only?
-	return "docker.gitea.com/runner-images:ubuntu-latest"
+	return ""
 }
 
 func (l Labels) Names() []string {

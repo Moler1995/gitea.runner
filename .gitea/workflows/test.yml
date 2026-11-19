@@ -1,36 +1,41 @@
 name: checks
 on:
-  push:
-    branches:
-      - main
   pull_request:
+  workflow_dispatch:
+
+env:
+  # The runner image ships a stale docker.io login; point docker at an empty config so
+  # image pulls go straight to anonymous instead of attempting (and failing) that auth
+  # first. The path must be a literal: the `runner` context is unavailable in workflow-level
+  # env, so `${{ runner.temp }}` would resolve to empty and config.Dir() would fall back
+  # to ~/.docker with the stale credentials.
+  DOCKER_CONFIG: /tmp/docker-noauth
 
 jobs:
   lint:
     name: check and test
     runs-on: ubuntu-latest
-    env:
-      # The runner image ships a stale docker.io login; point docker at an empty config so
-      # image pulls go straight to anonymous instead of attempting (and failing) that auth
-      # first. The path must be a literal: the `runner` context is unavailable in job-level
-      # env, so `${{ runner.temp }}` would resolve to empty and config.Dir() would fall back
-      # to ~/.docker with the stale credentials.
-      DOCKER_CONFIG: /tmp/docker-noauth
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
-        with:
-          go-version-file: 'go.mod'
-          check-latest: true
+      - uses: ./.gitea/actions/go-setup
       - name: prepare anonymous docker config
         run: mkdir -p "$DOCKER_CONFIG" && echo '{}' > "$DOCKER_CONFIG/config.json"
       # Pre-pull act/runner's two largest base images so a slow pull can't dominate `make test`;
       # the rest (alpine/ubuntu) pull on demand, absorbed by the make-test -timeout. The host
-      # daemon retains them between runs, so this is usually a fast manifest re-check.
+      # daemon retains them between runs, and their digest pins skip the registry when it has them.
       - name: pre-pull test images
+        env:
+          TEST_JOB_IMAGE: node:26-bookworm-slim@sha256:bc0a2afd3b74ce12222fc8bab99271e66257f021078f5f4a5d687a77d280c1d9 # renovate: datasource=docker
+          TEST_SERVICE_IMAGE: nginx:alpine@sha256:a3554c0d0b48177b1413c26e01f695334428020d9df01243fbae3e11cfd17417 # renovate: datasource=docker
         run: |
-          for img in node:24-bookworm-slim nginx:alpine; do
-            for try in 1 2 3; do docker pull "$img" && break || sleep 5; done
+          for image in "$TEST_JOB_IMAGE" "$TEST_SERVICE_IMAGE"; do
+            if [ "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$image" 2>/dev/null)" != linux/amd64 ]; then
+              for attempt in 1 2 3; do
+                docker pull "$image" && break
+                [ "$attempt" = 3 ] || sleep 5
+              done
+            fi
+            docker tag "$image" "${image%@*}"
           done
       - name: lint
         run: make lint
@@ -45,7 +50,60 @@ jobs:
       # after `make test` so the images it needs are already present on the host daemon.
       - name: test against dind image
         run: make test-dind
+      - name: test against podman
+        run: make test-dind TARGET=podman
       - name: coverage report
         run: |
           make coverage-report
           cat .tmp/coverage.md >> "$GITHUB_STEP_SUMMARY"
+
+  cross:
+    name: cross-compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: ./.gitea/actions/go-setup
+      - name: cross-compile
+        run: make cross-check
+
+  windows:
+    name: test on windows
+    runs-on: ubuntu-latest-kvm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: ./.gitea/actions/go-setup
+      - name: prepare anonymous docker config
+        run: mkdir -p "$DOCKER_CONFIG" && echo '{}' > "$DOCKER_CONFIG/config.json"
+      - name: windows vm cache key
+        id: windows-vm
+        run: echo "key=windows-vm-$(grep '^WINDOWS_TEST_IMAGE' Makefile | cat - scripts/test-windows.sh scripts/test-windows-setup.ps1 | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/windows-vm
+          key: ${{ steps.windows-vm.outputs.key }}
+      - name: test on windows
+        id: test-windows
+        run: WINDOWS_TEST_CACHE="$HOME/.cache/windows-vm" make test-windows
+        env:
+          WINDOWS_TEST_TIMEOUT: 45
+      - if: always() && steps.test-windows.outputs.save-cache == 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/windows-vm
+          key: ${{ steps.windows-vm.outputs.key }}
+
+  e2e:
+    name: gitea compatibility (${{ matrix.gitea_image }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        gitea_image:
+          - gitea/gitea:latest
+          - gitea/gitea:main-nightly
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: ./.gitea/actions/go-setup
+      - name: prepare anonymous docker config
+        run: mkdir -p "$DOCKER_CONFIG" && echo '{}' > "$DOCKER_CONFIG/config.json"
+      - name: e2e compatibility
+        run: make test-e2e E2E_GITEA_IMAGE=${{ matrix.gitea_image }}

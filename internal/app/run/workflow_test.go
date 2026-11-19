@@ -10,25 +10,20 @@ import (
 	runnerv1 "gitea.dev/actionslib/runner/v1"
 	"github.com/stretchr/testify/require"
 	"go.yaml.in/yaml/v4"
-	"gotest.tools/v3/assert"
 )
 
 func Test_generateWorkflow(t *testing.T) {
-	type args struct {
-		task *runnerv1.Task
-	}
 	tests := []struct {
 		name    string
-		args    args
+		payload string
+		needs   map[string]*runnerv1.TaskNeed
 		assert  func(t *testing.T, wf *model.Workflow)
-		want1   string
+		jobID   string
 		wantErr bool
 	}{
 		{
 			name: "has needs",
-			args: args{
-				task: &runnerv1.Task{
-					WorkflowPayload: []byte(`
+			payload: `
 name: Build and deploy
 on: push
 
@@ -40,34 +35,29 @@ jobs:
       - uses: actions/checkout@v3
       - run: ./deploy --build ${{ needs.job1.outputs.output1 }}
       - run: ./deploy --build ${{ needs.job2.outputs.output2 }}
-`),
-					Needs: map[string]*runnerv1.TaskNeed{
-						"job1": {
-							Outputs: map[string]string{
-								"output1": "output1 value",
-							},
-							Result: runnerv1.Result_RESULT_SUCCESS,
-						},
-						"job2": {
-							Outputs: map[string]string{
-								"output2": "output2 value",
-							},
-							Result: runnerv1.Result_RESULT_SUCCESS,
-						},
+`,
+			needs: map[string]*runnerv1.TaskNeed{
+				"job1": {
+					Outputs: map[string]string{
+						"output1": "output1 value",
 					},
+					Result: runnerv1.Result_RESULT_SUCCESS,
+				},
+				"job2": {
+					Outputs: map[string]string{
+						"output2": "output2 value",
+					},
+					Result: runnerv1.Result_RESULT_SUCCESS,
 				},
 			},
 			assert: func(t *testing.T, wf *model.Workflow) {
-				assert.DeepEqual(t, wf.GetJob("job9").Needs(), []string{"job1", "job2"})
+				require.Equal(t, []string{"job1", "job2"}, wf.GetJob("job9").Needs())
 			},
-			want1:   "job9",
-			wantErr: false,
+			jobID: "job9",
 		},
 		{
 			name: "no needs",
-			args: args{
-				task: &runnerv1.Task{
-					WorkflowPayload: []byte(`
+			payload: `
 name: Simple workflow
 on: push
 
@@ -77,23 +67,18 @@ jobs:
     steps:
       - uses: actions/checkout@v3
       - run: echo "hello"
-`),
-					Needs: map[string]*runnerv1.TaskNeed{},
-				},
-			},
+`,
+			needs: map[string]*runnerv1.TaskNeed{},
 			assert: func(t *testing.T, wf *model.Workflow) {
 				job := wf.GetJob("test")
-				assert.DeepEqual(t, job.Needs(), []string{})
-				assert.Equal(t, len(job.Steps), 2)
+				require.Equal(t, []string{}, job.Needs())
+				require.Len(t, job.Steps, 2)
 			},
-			want1:   "test",
-			wantErr: false,
+			jobID: "test",
 		},
 		{
 			name: "needs list",
-			args: args{
-				task: &runnerv1.Task{
-					WorkflowPayload: []byte(`
+			payload: `
 name: Workflow with list needs
 on: push
 
@@ -103,40 +88,34 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - run: echo "deploying"
-`),
-					Needs: map[string]*runnerv1.TaskNeed{
-						"build": {
-							Outputs: map[string]string{},
-							Result:  runnerv1.Result_RESULT_SUCCESS,
-						},
-						"test": {
-							Outputs: map[string]string{
-								"coverage": "80%",
-							},
-							Result: runnerv1.Result_RESULT_SUCCESS,
-						},
-						"lint": {
-							Outputs: map[string]string{},
-							Result:  runnerv1.Result_RESULT_FAILURE,
-						},
+`,
+			needs: map[string]*runnerv1.TaskNeed{
+				"build": {
+					Outputs: map[string]string{},
+					Result:  runnerv1.Result_RESULT_SUCCESS,
+				},
+				"test": {
+					Outputs: map[string]string{
+						"coverage": "80%",
 					},
+					Result: runnerv1.Result_RESULT_SUCCESS,
+				},
+				"lint": {
+					Outputs: map[string]string{},
+					Result:  runnerv1.Result_RESULT_FAILURE,
 				},
 			},
 			assert: func(t *testing.T, wf *model.Workflow) {
 				job := wf.GetJob("deploy")
-				needs := job.Needs()
-				assert.DeepEqual(t, needs, []string{"build", "lint", "test"})
-				assert.Equal(t, wf.Jobs["test"].Outputs["coverage"], "80%")
-				assert.Equal(t, wf.Jobs["lint"].Result, "failure")
+				require.Equal(t, []string{"build", "lint", "test"}, job.Needs())
+				require.Equal(t, "80%", wf.Jobs["test"].Outputs["coverage"])
+				require.Equal(t, "failure", wf.Jobs["lint"].Result)
 			},
-			want1:   "deploy",
-			wantErr: false,
+			jobID: "deploy",
 		},
 		{
 			name: "workflow env and defaults",
-			args: args{
-				task: &runnerv1.Task{
-					WorkflowPayload: []byte(`
+			payload: `
 name: Complex workflow
 on:
   push:
@@ -160,25 +139,19 @@ jobs:
           node-version: "18"
       - run: npm ci
       - run: npm run build
-`),
-					Needs: map[string]*runnerv1.TaskNeed{},
-				},
-			},
+`,
+			needs: map[string]*runnerv1.TaskNeed{},
 			assert: func(t *testing.T, wf *model.Workflow) {
-				assert.Equal(t, wf.Name, "Complex workflow")
-				assert.Equal(t, wf.Env["NODE_ENV"], "production")
-				assert.Equal(t, wf.Env["CI"], "true")
-				job := wf.GetJob("build")
-				assert.Equal(t, len(job.Steps), 4)
+				require.Equal(t, "Complex workflow", wf.Name)
+				require.Equal(t, "production", wf.Env["NODE_ENV"])
+				require.Equal(t, "true", wf.Env["CI"])
+				require.Len(t, wf.GetJob("build").Steps, 4)
 			},
-			want1:   "build",
-			wantErr: false,
+			jobID: "build",
 		},
 		{
 			name: "job with container and services",
-			args: args{
-				task: &runnerv1.Task{
-					WorkflowPayload: []byte(`
+			payload: `
 name: Integration tests
 on: push
 
@@ -193,24 +166,18 @@ jobs:
     steps:
       - uses: actions/checkout@v3
       - run: npm test
-`),
-					Needs: map[string]*runnerv1.TaskNeed{},
-				},
-			},
+`,
+			needs: map[string]*runnerv1.TaskNeed{},
 			assert: func(t *testing.T, wf *model.Workflow) {
 				job := wf.GetJob("integration")
-				container := job.Container()
-				assert.Equal(t, container.Image, "node:18")
-				assert.Equal(t, job.Services["postgres"].Image, "postgres:15")
+				require.Equal(t, "node:18", job.Container().Image)
+				require.Equal(t, "postgres:15", job.Services["postgres"].Image)
 			},
-			want1:   "integration",
-			wantErr: false,
+			jobID: "integration",
 		},
 		{
 			name: "job with matrix strategy",
-			args: args{
-				task: &runnerv1.Task{
-					WorkflowPayload: []byte(`
+			payload: `
 name: Matrix build
 on: push
 
@@ -223,40 +190,28 @@ jobs:
     steps:
       - uses: actions/checkout@v3
       - run: go test ./...
-`),
-					Needs: map[string]*runnerv1.TaskNeed{},
-				},
-			},
+`,
+			needs: map[string]*runnerv1.TaskNeed{},
 			assert: func(t *testing.T, wf *model.Workflow) {
-				job := wf.GetJob("test")
-				matrixes, err := job.GetMatrixes()
+				matrixes, err := wf.GetJob("test").GetMatrixes()
 				require.NoError(t, err)
-				assert.Equal(t, len(matrixes), 2)
+				require.Len(t, matrixes, 2)
 			},
-			want1:   "test",
-			wantErr: false,
+			jobID: "test",
 		},
 		{
-			name: "special yaml characters in values",
-			args: args{
-				task: &runnerv1.Task{
-					WorkflowPayload: []byte("name: \"Special: characters & test\"\non: push\n\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: 'echo \"hello: world\"'\n      - run: 'echo \"quotes & ampersands\"'\n      - run: |\n          echo \"multiline\"\n          echo \"script\"\n"),
-					Needs:           map[string]*runnerv1.TaskNeed{},
-				},
-			},
+			name:    "special yaml characters in values",
+			payload: "name: \"Special: characters & test\"\non: push\n\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: 'echo \"hello: world\"'\n      - run: 'echo \"quotes & ampersands\"'\n      - run: |\n          echo \"multiline\"\n          echo \"script\"\n",
+			needs:   map[string]*runnerv1.TaskNeed{},
 			assert: func(t *testing.T, wf *model.Workflow) {
-				assert.Equal(t, wf.Name, "Special: characters & test")
-				job := wf.GetJob("test")
-				assert.Equal(t, len(job.Steps), 3)
+				require.Equal(t, "Special: characters & test", wf.Name)
+				require.Len(t, wf.GetJob("test").Steps, 3)
 			},
-			want1:   "test",
-			wantErr: false,
+			jobID: "test",
 		},
 		{
 			name: "invalid yaml",
-			args: args{
-				task: &runnerv1.Task{
-					WorkflowPayload: []byte(`
+			payload: `
 name: Bad workflow
 on: push
 jobs:
@@ -265,25 +220,21 @@ jobs:
     steps:
     - run: echo "ok"
      bad-indent: true
-`),
-					Needs: map[string]*runnerv1.TaskNeed{},
-				},
-			},
-			assert:  nil,
-			want1:   "",
+`,
+			needs:   map[string]*runnerv1.TaskNeed{},
 			wantErr: true,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, got1, err := generateWorkflow(tt.args.task)
+			got, got1, err := generateWorkflow(&runnerv1.Task{WorkflowPayload: []byte(tt.payload), Needs: tt.needs})
 			if tt.wantErr {
 				require.Error(t, err)
 				return
 			}
 			require.NoError(t, err)
 			tt.assert(t, got)
-			assert.Equal(t, got1, tt.want1)
+			require.Equal(t, tt.jobID, got1)
 		})
 	}
 }
@@ -301,7 +252,7 @@ func Test_yamlV4NodeRoundTrip(t *testing.T) {
 
 		out, err := yaml.Marshal(&node)
 		require.NoError(t, err)
-		assert.Equal(t, string(out), "- a\n- b\n- c\n")
+		require.Equal(t, "- a\n- b\n- c\n", string(out))
 	})
 
 	t.Run("unmarshal and re-marshal workflow", func(t *testing.T) {
@@ -310,7 +261,7 @@ func Test_yamlV4NodeRoundTrip(t *testing.T) {
 		var wf map[string]any
 		err := yaml.Unmarshal(input, &wf)
 		require.NoError(t, err)
-		assert.Equal(t, wf["name"], "test")
+		require.Equal(t, "test", wf["name"])
 
 		out, err := yaml.Marshal(wf)
 		require.NoError(t, err)
@@ -318,11 +269,10 @@ func Test_yamlV4NodeRoundTrip(t *testing.T) {
 		var wf2 map[string]any
 		err = yaml.Unmarshal(out, &wf2)
 		require.NoError(t, err)
-		assert.Equal(t, wf2["name"], "test")
+		require.Equal(t, "test", wf2["name"])
 	})
 
 	t.Run("node kind constants", func(t *testing.T) {
-		// Verify yaml/v4 node kind constants are usable (same API as v3)
 		require.NotEqual(t, yaml.ScalarNode, yaml.SequenceNode)
 		require.NotEqual(t, yaml.SequenceNode, yaml.MappingNode)
 	})

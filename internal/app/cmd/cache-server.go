@@ -4,16 +4,15 @@
 package cmd
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
-	"os"
-	"os/signal"
 
 	"gitea.com/gitea/runner/act/artifactcache"
+	"gitea.com/gitea/runner/act/common/logging"
 	"gitea.com/gitea/runner/internal/app/run"
 	"gitea.com/gitea/runner/internal/pkg/config"
 
-	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 )
 
@@ -31,46 +30,29 @@ func runCacheServer(configFile *string, cacheArgs *cacheServerArgs) func(cmd *co
 		}
 
 		initLogging(cfg)
-
-		var (
-			dir  = cfg.Cache.Dir
-			host = cfg.Cache.Host
-			port = cfg.Cache.Port
-		)
-
-		// cacheArgs has higher priority
-		if cacheArgs.Dir != "" {
-			dir = cacheArgs.Dir
-		}
-		if cacheArgs.Host != "" {
-			host = cacheArgs.Host
-		}
-		if cacheArgs.Port != 0 {
-			port = cacheArgs.Port
+		if cfg.Cache.S3 != nil {
+			return errors.New("cache-server does not support cache.s3; set cache.s3 on the runners instead")
 		}
 
-		secret := cfg.Cache.ExternalSecret
-		if secret == "" {
+		if cfg.Cache.ExternalSecret == "" {
 			return errors.New("cache.external_secret (or cache.external_secret_file) must be set for cache-server; configure the same value on each runner that points at this server via cache.external_server")
 		}
 		cacheHandler, err := artifactcache.StartHandler(artifactcache.Options{
-			Dir:            dir,
-			OutboundIP:     host,
-			Port:           port,
-			InternalSecret: secret,
+			Dir:            cmp.Or(cacheArgs.Dir, cfg.Cache.Dir),
+			OutboundIP:     cmp.Or(cacheArgs.Host, cfg.Cache.Host),
+			Port:           cmp.Or(cacheArgs.Port, cfg.Cache.Port),
+			InternalSecret: cfg.Cache.ExternalSecret,
 			Policy:         run.CachePolicy(cfg),
-			Logger:         log.StandardLogger().WithField("module", "cache_request"),
+			Logger:         logging.Default().With("module", "cache_request"),
 		})
 		if err != nil {
 			return err
 		}
 
-		log.Infof("cache server is listening on %v", cacheHandler.ExternalURL())
+		logging.Infof("cache server is listening on %v", cacheHandler.ExternalURL())
 
-		c := make(chan os.Signal, 1)
-		signal.Notify(c, os.Interrupt)
-		<-c
+		<-cmd.Context().Done()
 
-		return nil
+		return cacheHandler.Close()
 	}
 }

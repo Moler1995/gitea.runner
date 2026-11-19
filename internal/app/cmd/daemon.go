@@ -5,8 +5,10 @@ package cmd
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path"
 	"path/filepath"
@@ -16,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"gitea.com/gitea/runner/act/common/logging"
 	"gitea.com/gitea/runner/internal/app/poll"
 	"gitea.com/gitea/runner/internal/app/run"
 	"gitea.com/gitea/runner/internal/pkg/client"
@@ -24,12 +27,14 @@ import (
 	"gitea.com/gitea/runner/internal/pkg/labels"
 	"gitea.com/gitea/runner/internal/pkg/lock"
 	"gitea.com/gitea/runner/internal/pkg/metrics"
+	"gitea.com/gitea/runner/internal/pkg/report"
+	"gitea.com/gitea/runner/internal/pkg/telemetry"
 	"gitea.com/gitea/runner/internal/pkg/ver"
 
-	"connectrpc.com/connect"
-	"github.com/mattn/go-isatty"
-	log "github.com/sirupsen/logrus"
+	"connectrpc.com/connect/v2"
+	runnerv1 "gitea.dev/actionslib/runner/v1"
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 )
 
 func runDaemon(ctx context.Context, daemArgs *daemonArgs, configFile *string) func(cmd *cobra.Command, args []string) error {
@@ -40,11 +45,11 @@ func runDaemon(ctx context.Context, daemArgs *daemonArgs, configFile *string) fu
 		}
 
 		initLogging(cfg)
-		log.Infoln("Starting runner daemon")
+		logging.Info("Starting runner daemon")
 
 		reg, err := config.LoadRegistration(cfg.Runner.File)
 		if os.IsNotExist(err) {
-			log.Error("registration file not found, please register the runner first")
+			logging.Error("registration file not found, please register the runner first")
 			return err
 		} else if err != nil {
 			return fmt.Errorf("failed to load registration file: %w", err)
@@ -54,20 +59,33 @@ func runDaemon(ctx context.Context, daemArgs *daemonArgs, configFile *string) fu
 		// processes with the same identity are indistinguishable to Gitea and
 		// end up cancelling each other's jobs.
 		releaseLock, err := lock.TryLock(cfg.Runner.File)
-		if errors.Is(err, lock.ErrLocked) {
-			log.Errorf("another gitea-runner process is already using %q; each runner process needs its own runner file (runner.file)", cfg.Runner.File)
+		switch {
+		case errors.Is(err, lock.ErrLocked):
+			logging.Errorf("another gitea-runner process is already using %q; each runner process needs its own runner file (runner.file)", cfg.Runner.File)
 			return err
-		} else if err != nil {
+		case err != nil:
 			// Best-effort guard: if the lock file can't be created (e.g. a
 			// read-only runner-file mount), warn and start anyway rather than
 			// refusing to run.
-			log.Warnf("could not lock runner file %q, continuing without the single-process guard: %v", cfg.Runner.File, err)
-		} else {
+			logging.Warnf("could not lock runner file %q, continuing without the single-process guard: %v", cfg.Runner.File, err)
+		default:
 			// Held until shutdown finishes: the draining runner still owns this
 			// identity on the server, so releasing early would let a restart
 			// reintroduce the duplicate-identity job cancellations.
 			defer func() { _ = releaseLock() }()
 		}
+
+		shutdownTelemetry, err := telemetry.Setup(ctx, reg.UUID, reg.Name, metrics.Registry)
+		if err != nil {
+			logging.WithError(err).Warn("OpenTelemetry export failed to start")
+		}
+		defer func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := shutdownTelemetry(ctx); err != nil {
+				logging.WithError(err).Warn("OpenTelemetry export failed to flush")
+			}
+		}()
 
 		lbls := resolveLabels(daemArgs.Labels, cfg.Runner.Labels, reg.Labels)
 
@@ -75,13 +93,13 @@ func runDaemon(ctx context.Context, daemArgs *daemonArgs, configFile *string) fu
 		for _, l := range lbls {
 			label, err := labels.Parse(l)
 			if err != nil {
-				log.WithError(err).Warnf("ignored invalid label %q", l)
+				logging.WithError(err).Warnf("ignored invalid label %q", l)
 				continue
 			}
 			ls = append(ls, label)
 		}
 		if len(ls) == 0 {
-			log.Warn("no labels configured, runner may not be able to pick up jobs")
+			logging.Warn("no labels configured, runner may not be able to pick up jobs")
 		}
 
 		// Before the first Docker API call: the standard library resolves the proxy
@@ -89,7 +107,7 @@ func runDaemon(ctx context.Context, daemArgs *daemonArgs, configFile *string) fu
 		if dockerSocketPath, err := getDockerSocketPath(cfg.Container.DockerHost); err == nil {
 			run.BypassProxyForDockerHost(dockerSocketPath)
 		} else {
-			log.Debugf("cannot resolve the docker socket path, so Docker API calls are not exempted from the proxy: %v", err)
+			logging.Debugf("cannot resolve the docker socket path, so Docker API calls are not exempted from the proxy: %v", err)
 		}
 
 		if ls.RequireDocker() || cfg.Container.RequireDocker {
@@ -101,20 +119,20 @@ func runDaemon(ctx context.Context, daemArgs *daemonArgs, configFile *string) fu
 				for keepRunning {
 					dockerSocketPath, err := getDockerSocketPath(cfg.Container.DockerHost)
 					if err != nil {
-						log.Errorf("Failed to get socket path: %s", err.Error())
+						logging.Errorf("Failed to get socket path: %s", err.Error())
 					} else if err = envcheck.CheckIfDockerRunning(tctx, dockerSocketPath); errors.Is(err, context.Canceled) {
-						log.Infof("Docker wait timeout of %s expired", timeout.String())
+						logging.Infof("Docker wait timeout of %s expired", timeout.String())
 						break
 					} else if err != nil {
-						log.Errorf("Docker connection failed: %s", err.Error())
+						logging.Errorf("Docker connection failed: %s", err.Error())
 					} else {
-						log.Infof("Docker is ready")
+						logging.Infof("Docker is ready")
 						break
 					}
 					select {
 					case <-time.After(time.Second):
 					case <-tctx.Done():
-						log.Infof("Docker wait timeout of %s expired", timeout.String())
+						logging.Infof("Docker wait timeout of %s expired", timeout.String())
 						keepRunning = false
 					}
 				}
@@ -145,87 +163,109 @@ func runDaemon(ctx context.Context, daemArgs *daemonArgs, configFile *string) fu
 			}
 		}
 
-		if !slices.Equal(reg.Labels, ls.ToStrings()) {
-			reg.Labels = ls.ToStrings()
+		if labelStrings := ls.ToStrings(); !slices.Equal(reg.Labels, labelStrings) {
+			reg.Labels = labelStrings
 			if err := config.SaveRegistration(cfg.Runner.File, reg); err != nil {
 				return fmt.Errorf("failed to save runner config: %w", err)
 			}
-			log.Infof("labels updated to: %v", reg.Labels)
+			logging.Infof("labels updated to: %v", reg.Labels)
 		}
 
 		cli := client.New(
 			reg.Address,
-			cfg.Runner.Insecure,
+			cfg.Runner.TLSConfig(),
 			reg.UUID,
 			reg.Token,
 			config.RequestTimeout,
+			cfg.Runner.ExtraHeaders,
 		)
 
 		runner := run.NewRunner(cfg, reg, cli)
 		defer func() {
 			if err := runner.Close(); err != nil {
-				log.Warnf("runner %s: cache server shutdown: %v", reg.Name, err)
+				logging.Warnf("runner %s: cache server shutdown: %v", reg.Name, err)
 			}
 		}()
 
 		// declare the labels of the runner before fetching tasks
-		resp, err := runner.Declare(ctx, ls.Names())
-		if err != nil && connect.CodeOf(err) == connect.CodeUnimplemented {
-			log.Errorf("Your Gitea version is too old to support runner declare, please upgrade to v1.21 or later")
-			return err
-		} else if err != nil {
-			log.WithError(err).Error("fail to invoke Declare")
-			return err
-		} else {
-			log.Infof("runner: %s, with version: %s, with labels: %v, declare successfully",
-				resp.Msg.Runner.Name, resp.Msg.Runner.Version, resp.Msg.Runner.Labels)
+		var resp *runnerv1.DeclareResponse
+		for attempt := 0; ; attempt++ {
+			resp, err = runner.Declare(ctx, ls.Names())
+			if err == nil || !shouldRetryDeclare(err) || ctx.Err() != nil {
+				break
+			}
+			if attempt == 0 {
+				logging.WithError(err).Warn("fail to invoke Declare, retrying until Gitea is reachable")
+			} else {
+				logging.WithError(err).Debug("fail to invoke Declare, retrying")
+			}
+			select {
+			case <-time.After(declareRetryDelay):
+			case <-ctx.Done():
+			}
 		}
-		runner.SetCapabilitiesFromDeclare(resp)
+		switch {
+		case err != nil && ctx.Err() != nil && !client.IsRegistrationRejected(err):
+			return nil
+		case err != nil && connect.CodeOf(err) == connect.CodeUnimplemented:
+			logging.Errorf("Your Gitea version is too old to support runner declare, please upgrade to v%s or later", ver.MinGiteaVersion)
+			return err
+		case err != nil:
+			logging.WithError(err).Error("fail to invoke Declare")
+			if client.IsRegistrationRejected(err) {
+				removeEphemeralRegistration(reg, cfg.Runner.File)
+			}
+			return err
+		default:
+			logging.Infof("runner: %s, with version: %s, with labels: %v, declare successfully",
+				resp.Runner.Name, resp.Runner.Version, resp.Runner.Labels)
+		}
 
 		poller := poll.New(cfg, cli, runner)
 
+		metrics.Init() // OTLP exports the registry even without the server
+		metrics.RunnerInfo.WithLabelValues(ver.Version(), resp.Runner.Name).Set(1)
+		metrics.RunnerCapacity.Set(float64(cfg.Runner.Capacity))
+		metrics.RegisterUptimeFunc(time.Now())
+		metrics.RegisterRunningJobsFunc(runner.RunningCount, cfg.Runner.Capacity)
+		metrics.RegisterStateFunc(func() string {
+			if runner.RunningCount() > 0 {
+				return metrics.LabelStateBusy
+			}
+			if ready, _ := poller.Ready(cfg.Metrics.ReadinessGrace); !ready {
+				return metrics.LabelStateUnavailable
+			}
+			return metrics.LabelStateIdle
+		})
 		if cfg.Metrics.Enabled {
-			metrics.Init()
-			metrics.RunnerInfo.WithLabelValues(ver.Version(), resp.Msg.Runner.Name).Set(1)
-			metrics.RunnerCapacity.Set(float64(cfg.Runner.Capacity))
-			metrics.RegisterUptimeFunc(time.Now())
-			metrics.RegisterRunningJobsFunc(runner.RunningCount, cfg.Runner.Capacity)
 			metrics.StartServer(ctx, cfg.Metrics.Addr, func() (bool, string) {
 				return poller.Ready(cfg.Metrics.ReadinessGrace)
 			})
 		}
 
 		if daemArgs.Once || reg.Ephemeral {
-			done := make(chan struct{})
-			go func() {
-				defer close(done)
-				poller.PollOnce()
-			}()
-
-			// shutdown when we complete a job or cancel is requested
-			select {
-			case <-ctx.Done():
-			case <-done:
-			}
+			go poller.PollOnce(func() { removeEphemeralRegistration(reg, cfg.Runner.File) })
 		} else {
 			go poller.Poll()
-
-			// Stop either on an external cancellation or when the poller shuts
-			// itself down (e.g. after the runner has been unregistered).
-			select {
-			case <-ctx.Done():
-			case <-poller.Done():
-			}
 		}
 
-		log.Infof("runner: %s shutdown initiated, waiting %s for running jobs to complete before shutting down", resp.Msg.Runner.Name, cfg.Runner.ShutdownTimeout)
+		select {
+		case <-ctx.Done():
+		case <-poller.Done():
+		}
+
+		logging.Infof("runner: %s shutdown initiated, waiting %s for running jobs to complete before shutting down", resp.Runner.Name, cfg.Runner.ShutdownTimeout)
 
 		ctx, cancel := context.WithTimeout(context.Background(), cfg.Runner.ShutdownTimeout)
 		defer cancel()
 
 		err = poller.Shutdown(ctx)
 		if err != nil {
-			log.Warnf("runner: %s cancelled in progress jobs during shutdown", resp.Msg.Runner.Name)
+			logging.Warnf("runner: %s cancelled in progress jobs during shutdown", resp.Runner.Name)
+		}
+
+		if poller.RegistrationRejected() {
+			removeEphemeralRegistration(reg, cfg.Runner.File)
 		}
 
 		if poller.Unregistered() {
@@ -233,6 +273,17 @@ func runDaemon(ctx context.Context, daemArgs *daemonArgs, configFile *string) fu
 		}
 
 		return nil
+	}
+}
+
+func removeEphemeralRegistration(reg *config.Registration, file string) {
+	if !reg.Ephemeral {
+		return
+	}
+	if err := os.Remove(file); err == nil {
+		logging.Infof("removed the spent ephemeral registration %q", file)
+	} else if !os.IsNotExist(err) {
+		logging.WithError(err).Warn("failed to remove the spent ephemeral registration")
 	}
 }
 
@@ -263,48 +314,57 @@ func splitLabels(s string) []string {
 	return lbls
 }
 
-// initLogging setup the global logrus logger.
+// initLogging sets up the process-wide logger.
 func initLogging(cfg *config.Config) {
 	callPrettyfier := func(f *runtime.Frame) (string, string) {
-		// get function name
-		s := strings.Split(f.Function, ".")
-		funcname := "[" + s[len(s)-1] + "]"
-		// get file name and line number
 		_, filename := path.Split(f.File)
-		filename = "[" + filename + ":" + strconv.Itoa(f.Line) + "]"
-		return funcname, filename
+		return "[" + f.Function[strings.LastIndexByte(f.Function, '.')+1:] + "]", "[" + filename + ":" + strconv.Itoa(f.Line) + "]"
 	}
 
-	isTerm := isatty.IsTerminal(os.Stdout.Fd())
-	format := &log.TextFormatter{
+	isTerm := term.IsTerminal(int(os.Stdout.Fd()))
+	logging.SetTextFormat(logging.TextOptions{
 		DisableColors:    !isTerm,
 		FullTimestamp:    true,
 		CallerPrettyfier: callPrettyfier,
-	}
-	log.SetFormatter(format)
+		Filter:           report.MaskGlobal,
+	})
 
 	l := cfg.Log.Level
 	if l == "" {
-		log.Infof("Log level not set, sticking to info")
+		logging.Infof("Log level not set, sticking to info")
 		return
 	}
 
-	level, err := log.ParseLevel(l)
+	level, err := logging.ParseLevel(l)
 	if err != nil {
-		log.WithError(err).
+		logging.WithError(err).
 			Errorf("invalid log level: %q", l)
 	}
 
 	// debug level
 	switch level {
-	case log.DebugLevel, log.TraceLevel:
-		log.SetReportCaller(true) // Only in debug or trace because it takes a performance toll
-		log.Infof("Log level %s requested, setting up report caller for further debugging", level)
+	case logging.LevelDebug, logging.LevelTrace:
+		logging.SetReportCaller(true) // Only in debug or trace because it takes a performance toll
+		logging.Infof("Log level %s requested, setting up report caller for further debugging", level)
 	}
 
-	if log.GetLevel() != level {
-		log.Infof("log level set to %v", level)
-		log.SetLevel(level)
+	if logging.GetLevel() != level {
+		logging.Infof("log level set to %v", level)
+		logging.SetLevel(level)
+	}
+}
+
+var declareRetryDelay = 30 * time.Second
+
+func shouldRetryDeclare(err error) bool {
+	if errors.As(err, new(*tls.CertificateVerificationError)) || errors.As(err, new(tls.AlertError)) || errors.Is(err, http.ErrSchemeMismatch) { // misconfigurations never heal
+		return false
+	}
+	switch connect.CodeOf(err) {
+	case connect.CodeUnauthenticated, connect.CodeUnimplemented, connect.CodePermissionDenied, connect.CodeInvalidArgument:
+		return false
+	default:
+		return !client.IsRegistrationRejected(err)
 	}
 }
 
@@ -330,11 +390,12 @@ func getDockerSocketPath(configDockerHost string) (string, error) {
 	}
 
 	for _, p := range commonSocketPaths {
-		if _, err := os.Lstat(os.ExpandEnv(p)); err == nil {
+		socket := os.ExpandEnv(p)
+		if _, err := os.Lstat(socket); err == nil {
 			if strings.HasPrefix(p, `\\.\`) {
-				return "npipe://" + filepath.ToSlash(os.ExpandEnv(p)), nil
+				return "npipe://" + filepath.ToSlash(socket), nil
 			}
-			return "unix://" + filepath.ToSlash(os.ExpandEnv(p)), nil
+			return "unix://" + filepath.ToSlash(socket), nil
 		}
 	}
 

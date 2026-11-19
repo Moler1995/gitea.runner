@@ -7,7 +7,6 @@ import (
 	"cmp"
 	"context"
 	"fmt"
-	"maps"
 	"path"
 	"strings"
 
@@ -42,34 +41,35 @@ func (rc *RunContext) runJobHook(ctx context.Context, hookPath, name string) err
 		return nil
 	}
 	if rc.containerHooks.Enabled {
-		// TODO: implement required
 		common.Logger(ctx).Warnf("Job hook %q skipped in custom container mode", hookPath)
 		return nil
 	}
+	previousStep := rc.CurrentStep
+	rc.CurrentStep = ""
+	defer func() { rc.CurrentStep = previousStep }()
 
-	cmd, shell := hookCommand(hookPath)
-	rawLogger := common.Logger(ctx).WithField(rawOutputField, true)
-	defer rawLogger.Infof("::endgroup::")
-	rawLogger.Infof("::group::Run '%s'", EscapeCommandData(hookPath))
-	rawLogger.Infof("A %s hook has been configured by the runner administrator", name)
-	if shell != "" {
-		rawLogger.Infof("shell: %s", shell)
-	}
-
-	env := maps.Clone(rc.GetEnv())
-	if jobContainer := rc.Run.Job().Container(); jobContainer != nil {
-		maps.Copy(env, jobContainer.Env)
-	}
+	env := rc.mergeEnv(rc.defaultEnv, rc.containerSpec.Env, rc.GetEnv())
 	rc.withGithubEnv(ctx, rc.getGithubContext(ctx), env)
 	rc.ApplyExtraPath(ctx, &env)
 
+	cmd, shell := hookCommand(hookPath, func(preferred, fallback string) string { return rc.shellOrFallback(ctx, env, preferred, fallback) })
+	rawLogger := common.Logger(ctx).With(rawOutputField, true)
+	rawLogger.Infof("A %s hook has been configured by the runner administrator", name)
+	rawLogger.Infof("::group::Run '%s'", EscapeCommandData(hookPath))
+	if shell != "" {
+		rawLogger.Infof("shell: %s", shell)
+	}
+	rawLogger.Infof("::endgroup::")
+
 	err := rc.setupHookFileCommands(ctx, env)
 	if err == nil {
-		err = rc.JobContainer.Exec(cmd, env, "", "")(ctx)
+		err = rc.runWithCommands(ctx, env, func(ctx context.Context) error {
+			return rc.withCommandLogWriter(ctx, rc.JobContainer.Exec(cmd, env, "", ""))
+		})
+		if processErr := rc.processHookFileCommands(ctx); err == nil { // a failed hook still exports what it set up
+			err = processErr
+		}
 	}
-	// Processed even on failure, so a hook that exports what it managed to set up before
-	// failing still hands it to the job.
-	err = cmp.Or(err, rc.processHookFileCommands(ctx))
 	if err == nil {
 		return nil
 	}
@@ -86,10 +86,9 @@ func (rc *RunContext) runJobHook(ctx context.Context, hookPath, name string) err
 // the first one wrote.
 func (rc *RunContext) setupHookFileCommands(ctx context.Context, env map[string]string) error {
 	actPath := rc.JobContainer.GetActPath()
-	env["GITHUB_ENV"] = path.Join(actPath, hookEnvFileCommand)
-	env["GITHUB_PATH"] = path.Join(actPath, hookPathFileCommand)
-	env["GITEA_ENV"] = env["GITHUB_ENV"]
-	env["GITEA_PATH"] = env["GITHUB_PATH"]
+	env["GITHUB_ENV"] = container.JoinPath(actPath, hookEnvFileCommand)
+	env["GITHUB_PATH"] = container.JoinPath(actPath, hookPathFileCommand)
+	aliasGiteaEnv(env)
 
 	return rc.JobContainer.Copy(actPath,
 		&container.FileEntry{Name: hookEnvFileCommand, Mode: 0o666},
@@ -98,22 +97,25 @@ func (rc *RunContext) setupHookFileCommands(ctx context.Context, env map[string]
 }
 
 func (rc *RunContext) processHookFileCommands(ctx context.Context) error {
-	if err := processRunnerEnvFileCommand(ctx, hookEnvFileCommand, rc, rc.setEnv); err != nil {
-		return err
+	err := processRunnerEnvFileCommand(ctx, hookEnvFileCommand, rc, rc.setEnvFile)
+	if pathErr := rc.UpdateExtraPath(ctx, container.JoinPath(rc.JobContainer.GetActPath(), hookPathFileCommand)); pathErr != nil && err == nil {
+		err = pathErr
 	}
-	return rc.UpdateExtraPath(ctx, path.Join(rc.JobContainer.GetActPath(), hookPathFileCommand))
+	return err
 }
 
 // hookCommand mirrors actions/runner, which deliberately does not apply the shell flags it
 // gives `run:` steps — a hook sets its own. See docs/adrs/1751-runner-job-hooks.md there.
 // The second return value is how the invocation is shown in the log, empty when the file is
 // executed directly.
-func hookCommand(hookPath string) (cmd []string, shell string) {
+func hookCommand(hookPath string, shellOrFallback func(preferred, fallback string) string) (cmd []string, shell string) {
 	switch strings.ToLower(path.Ext(hookPath)) {
 	case ".sh":
-		return []string{"bash", "-e", hookPath}, "bash -e {0}"
+		shellName := shellOrFallback("bash", "sh")
+		return []string{shellName, "-e", hookPath}, shellName + " -e {0}"
 	case ".ps1":
-		return []string{"pwsh", "-command", ". '" + hookPath + "'"}, `pwsh -command ". '{0}'"`
+		shellName := shellOrFallback("pwsh", "powershell")
+		return []string{shellName, "-command", ". '" + expressionStringEscape(hookPath) + "'"}, shellName + ` -command ". '{0}'"`
 	default:
 		return []string{hookPath}, ""
 	}

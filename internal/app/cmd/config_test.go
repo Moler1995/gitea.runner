@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	"gitea.com/gitea/runner/internal/pkg/config"
@@ -38,7 +39,7 @@ func TestConfigCmdInitWritesTheMinimalConfig(t *testing.T) {
 
 	out, _, err := runConfigCmd(t, file, "init")
 	require.NoError(t, err)
-	assert.Contains(t, out, file)
+	assert.Equal(t, "wrote config file "+strconv.Quote(file)+"\n", out)
 	content, err := os.ReadFile(file)
 	require.NoError(t, err)
 	assert.Equal(t, config.Minimal, string(content))
@@ -96,4 +97,15 @@ func TestConfigCmdResolvesTheConfigFile(t *testing.T) {
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "--config")
 	})
+}
+
+func TestConfigCmdRunnerFileUsesConfiguredPathOrDefault(t *testing.T) {
+	out, _, err := runConfigCmd(t, "", "runner-file")
+	require.NoError(t, err)
+	assert.Equal(t, ".runner\n", out)
+	file := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(file, []byte("runner:\n  file: 'state dir/registration.json'\n"), 0o600))
+	out, _, err = runConfigCmd(t, file, "runner-file")
+	require.NoError(t, err)
+	assert.Equal(t, "state dir/registration.json\n", out)
 }

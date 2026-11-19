@@ -6,14 +6,14 @@ package runner
 
 import (
 	"bytes"
-	"context"
+	"io"
 	"strings"
 	"testing"
 
 	"gitea.com/gitea/runner/act/common"
+	"gitea.com/gitea/runner/act/common/logging"
 
 	"gitea.dev/actionslib/pkg/model"
-	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	yaml "go.yaml.in/yaml/v4"
@@ -84,17 +84,14 @@ env:
 	require.NoError(t, yaml.Unmarshal([]byte(raw), &step))
 
 	buf := &bytes.Buffer{}
-	logger := logrus.New()
-	logger.SetOutput(buf)
-	logger.SetLevel(logrus.InfoLevel)
-	logger.SetFormatter(&jobLogFormatter{color: cyan})
-	entry := logger.WithFields(logrus.Fields{"job": "j1"})
-	ctx := common.WithLogger(context.Background(), entry)
+	logger := logging.New(logging.NewLevelHandler(newJobLogHandler(buf, cyan), logging.LevelInfo))
+	entry := logger.With("job", "j1")
+	ctx := common.WithLogger(t.Context(), entry)
 
 	sr := &stepRun{
 		Step:               &step,
 		RunContext:         &RunContext{},
-		shellCommand:       "pwsh -command . '{0}'",
+		shellCommand:       `pwsh -command ". '{0}'"`,
 		interpolatedScript: "echo one\necho two\n",
 		env: map[string]string{
 			"PATH_PREFIX":  "/custom/bin",
@@ -109,7 +106,7 @@ env:
 		"[j1]   | ::group::Run echo one",
 		"[j1]   | echo one",
 		"[j1]   | echo two",
-		"[j1]   | shell: pwsh -command . '{0}'",
+		`[j1]   | shell: pwsh -command ". '{0}'"`,
 		"[j1]   | env:",
 		"[j1]   |   PATH_PREFIX: /custom/bin",
 		"[j1]   |   GREETING: hello",
@@ -121,10 +118,12 @@ env:
 
 func TestPrintRunActionHeaderGolden(t *testing.T) {
 	raw := `id: s1
+name: Checkout
 uses: actions/checkout@v4
 with:
   fetch-depth: "0"
-  token: secret
+  Token: secret
+  clean: ""
 env:
   CUSTOM: value
   GITHUB_TOKEN: tok
@@ -133,22 +132,23 @@ env:
 	require.NoError(t, yaml.Unmarshal([]byte(raw), &step))
 
 	buf := &bytes.Buffer{}
-	logger := logrus.New()
-	logger.SetOutput(buf)
-	logger.SetLevel(logrus.InfoLevel)
-	logger.SetFormatter(&jobLogFormatter{color: cyan})
-	entry := logger.WithFields(logrus.Fields{"job": "j1"})
-	ctx := common.WithLogger(context.Background(), entry)
+	logger := logging.New(logging.NewLevelHandler(newJobLogHandler(buf, cyan), logging.LevelInfo))
+	entry := logger.With("job", "j1")
+	ctx := common.WithLogger(t.Context(), entry)
 
-	printRunActionHeader(ctx, &step, map[string]string{"CUSTOM": "value", "GITHUB_TOKEN": "tok"}, &RunContext{})
+	action := &model.Action{Inputs: map[string]model.Input{"token": {}, "clean": {}, "path": {}, "lfs": {}}}
+	env := map[string]string{"CUSTOM": "value", "GITHUB_TOKEN": "tok", "INPUT_TOKEN": "secret", "INPUT_CLEAN": "", "INPUT_PATH": "sub"}
+	printRunActionHeader(ctx, &step, action, env, &RunContext{})
 
 	want := strings.Join([]string{
 		"[j1]   | ::group::Run actions/checkout@v4",
 		"[j1]   | with:",
+		"[j1]   |   Token: secret",
 		"[j1]   |   fetch-depth: 0",
-		"[j1]   |   token: secret",
+		"[j1]   |   path: sub",
 		"[j1]   | env:",
 		"[j1]   |   CUSTOM: value",
+		"[j1]   | ::endgroup::",
 		"",
 	}, "\n")
 	assert.Equal(t, want, buf.String())
@@ -166,17 +166,17 @@ func TestIsInternalEnvKey(t *testing.T) {
 }
 
 func TestPrintColoredScriptLineCyan(t *testing.T) {
-	f := &jobLogFormatter{color: cyan}
-	entry := &logrus.Entry{
-		Level:   logrus.InfoLevel,
+	f := textFormatter{w: io.Discard, color: cyan}
+	record := logging.Record{
+		Level:   logging.LevelInfo,
 		Message: "echo one",
-		Data: logrus.Fields{
-			"job":               "j1",
-			rawOutputField:      true,
-			scriptLineCyanField: true,
+		Attrs: []logging.Attr{
+			{Key: "job", Value: "j1"},
+			{Key: rawOutputField, Value: true},
+			{Key: scriptLineCyanField, Value: true},
 		},
 	}
 	buf := &bytes.Buffer{}
-	f.printColored(buf, entry)
+	f.printColored(buf, record)
 	assert.Equal(t, "\x1b[36m|\x1b[0m \x1b[36;1mecho one\x1b[0m", buf.String())
 }

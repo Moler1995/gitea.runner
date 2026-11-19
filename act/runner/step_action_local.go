@@ -33,10 +33,7 @@ type stepActionLocal struct {
 
 func (sal *stepActionLocal) pre() common.Executor {
 	sal.env = map[string]string{}
-
-	return func(ctx context.Context) error {
-		return nil
-	}
+	return common.NewPipelineExecutor()
 }
 
 func (sal *stepActionLocal) main() common.Executor {
@@ -45,44 +42,41 @@ func (sal *stepActionLocal) main() common.Executor {
 			return nil
 		}
 
-		printRunActionHeader(ctx, sal.Step, sal.env, sal.getRunContext())
-		rawLogger := common.Logger(ctx).WithField(rawOutputField, true)
-		defer rawLogger.Infof("::endgroup::")
-
 		actionDir := filepath.Join(sal.getRunContext().Config.Workdir, sal.Step.Uses)
+		_, containerActionPath := getContainerActionPaths(sal)
 
-		localReader := func(ctx context.Context) actionYamlReader {
-			_, cpath := getContainerActionPaths(sal.Step, path.Join(actionDir, ""), sal.RunContext)
-			return func(filename string) (io.Reader, io.Closer, error) {
-				spath := path.Join(cpath, filename)
-				for range maxSymlinkDepth {
-					tars, err := sal.RunContext.JobContainer.GetContainerArchive(ctx, spath)
-					if errors.Is(err, fs.ErrNotExist) {
-						return nil, nil, err
-					} else if err != nil {
-						return nil, nil, fs.ErrNotExist
-					}
-					treader := tar.NewReader(tars)
-					header, err := treader.Next()
-					if errors.Is(err, io.EOF) {
-						return nil, nil, os.ErrNotExist
-					} else if err != nil {
-						return nil, nil, err
-					}
-					if header.FileInfo().Mode()&os.ModeSymlink == os.ModeSymlink {
-						spath, err = symlinkJoin(spath, header.Linkname, cpath)
-						if err != nil {
-							return nil, nil, err
-						}
-					} else {
-						return treader, tars, nil
-					}
+		localReader := func(filename string) (io.Reader, io.Closer, error) {
+			spath := path.Join(containerActionPath, filename)
+			for range maxSymlinkDepth {
+				tars, err := sal.RunContext.JobContainer.GetContainerArchive(ctx, spath)
+				if errors.Is(err, fs.ErrNotExist) {
+					return nil, nil, err
+				} else if err != nil {
+					return nil, nil, fs.ErrNotExist
 				}
-				return nil, nil, fmt.Errorf("max depth %d of symlinks exceeded while reading %s", maxSymlinkDepth, spath)
+				treader := tar.NewReader(tars)
+				header, err := treader.Next()
+				if errors.Is(err, io.EOF) {
+					tars.Close()
+					return nil, nil, os.ErrNotExist
+				} else if err != nil {
+					tars.Close()
+					return nil, nil, err
+				}
+				if header.FileInfo().Mode()&os.ModeSymlink == os.ModeSymlink {
+					tars.Close()
+					spath, err = symlinkJoin(spath, header.Linkname, containerActionPath)
+					if err != nil {
+						return nil, nil, err
+					}
+				} else {
+					return treader, tars, nil
+				}
 			}
+			return nil, nil, fmt.Errorf("max depth %d of symlinks exceeded while reading %s", maxSymlinkDepth, spath)
 		}
 
-		actionModel, err := sal.readAction(ctx, sal.Step, actionDir, "", localReader(ctx), os.WriteFile)
+		actionModel, err := sal.readAction(ctx, sal.Step, actionDir, "", localReader, os.WriteFile)
 		if err != nil {
 			return err
 		}
@@ -99,10 +93,6 @@ func (sal *stepActionLocal) post() common.Executor {
 
 func (sal *stepActionLocal) getRunContext() *RunContext {
 	return sal.RunContext
-}
-
-func (sal *stepActionLocal) getGithubContext(ctx context.Context) *model.GithubContext {
-	return sal.getRunContext().getGithubContext(ctx)
 }
 
 func (sal *stepActionLocal) getStepModel() *model.Step {
@@ -127,15 +117,18 @@ func (sal *stepActionLocal) getActionModel() *model.Action {
 	return sal.action
 }
 
-func (sal *stepActionLocal) getCompositeRunContext(ctx context.Context) *RunContext {
+func (sal *stepActionLocal) getCompositeRunContext(ctx context.Context) (*RunContext, error) {
 	if sal.compositeRunContext == nil {
-		actionDir := filepath.Join(sal.RunContext.Config.Workdir, sal.Step.Uses)
-		_, containerActionDir := getContainerActionPaths(sal.getStepModel(), actionDir, sal.RunContext)
+		_, containerActionDir := getContainerActionPaths(sal)
 
-		sal.compositeRunContext = newCompositeRunContext(ctx, sal.RunContext, sal, containerActionDir)
-		sal.compositeSteps = sal.compositeRunContext.compositeExecutor(sal.action)
+		compositeRunContext, err := newCompositeRunContext(ctx, sal.RunContext, sal, containerActionDir)
+		if err != nil {
+			return nil, err
+		}
+		sal.compositeRunContext = compositeRunContext
+		sal.compositeSteps = compositeRunContext.compositeExecutor(sal.action)
 	}
-	return sal.compositeRunContext
+	return sal.compositeRunContext, nil
 }
 
 func (sal *stepActionLocal) getCompositeSteps() *compositeSteps {

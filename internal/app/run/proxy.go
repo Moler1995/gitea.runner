@@ -10,9 +10,9 @@ import (
 	"slices"
 	"strings"
 
+	"gitea.com/gitea/runner/act/common/logging"
 	"gitea.com/gitea/runner/act/container"
 
-	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/http/httpproxy"
 )
 
@@ -55,7 +55,7 @@ func JobProxyEnv(jobEnvs map[string]string, cacheURL string, serviceNames []stri
 	setPair("https_proxy", "HTTPS_PROXY", cfg.HTTPSProxy)
 
 	// no_proxy is merged rather than replaced: the hosts above are structural, and an
-	// operator cannot list the cache server's startup-assigned address in advance.
+	// operator cannot list the cache server's detected address in advance.
 	noProxy := appendNoProxy(cfg.NoProxy, direct...)
 	for _, name := range []string{"no_proxy", "NO_PROXY"} {
 		if existing, ok := jobEnvs[name]; ok {
@@ -87,10 +87,10 @@ func BypassProxyForDockerHost(dockerHost string) {
 	noProxy := appendNoProxy(cfg.NoProxy, host)
 	for _, name := range []string{"no_proxy", "NO_PROXY"} {
 		if err := os.Setenv(name, noProxy); err != nil {
-			log.Warnf("cannot set %s for the runner process: %v", name, err)
+			logging.Warnf("cannot set %s for the runner process: %v", name, err)
 		}
 	}
-	log.Debugf("docker host %s is reached directly, no_proxy is now %q", host, noProxy)
+	logging.Debugf("docker host %s is reached directly, no_proxy is now %q", host, noProxy)
 }
 
 // WarnIfDaemonHasNoProxy points at the one part the runner cannot set: the docker daemon
@@ -101,26 +101,31 @@ func WarnIfDaemonHasNoProxy(ctx context.Context) {
 	}
 	info, err := container.GetHostInfo(ctx)
 	if err != nil {
-		log.Debugf("cannot read the docker daemon's proxy configuration: %v", err)
+		logging.Debugf("cannot read the docker daemon's proxy configuration: %v", err)
 		return
 	}
 	if info.HTTPProxy == "" && info.HTTPSProxy == "" {
-		log.Warn("the runner has a proxy but the docker daemon reports none, so image pulls will not use it: https://docs.docker.com/engine/daemon/proxy/")
+		logging.Warn("the runner has a proxy but the docker daemon reports none, so image pulls will not use it: https://docs.docker.com/engine/daemon/proxy/")
 	}
 }
 
 // proxyPasswords returns the passwords embedded in the runner's proxy URLs, to mask before
 // a job echoes its environment.
-func proxyPasswords() []string {
-	cfg := proxyFromEnv()
-	if cfg == nil {
-		return nil
+func proxyPasswords(envs map[string]string) []string {
+	cfg := httpproxy.FromEnvironment()
+	raws := []string{cfg.HTTPProxy, cfg.HTTPSProxy}
+	for name, value := range envs {
+		if strings.EqualFold(name, "http_proxy") || strings.EqualFold(name, "https_proxy") { // Windows reads env names in any case
+			raws = append(raws, value)
+		}
 	}
-
 	var passwords []string
-	for _, raw := range []string{cfg.HTTPProxy, cfg.HTTPSProxy} {
+	for _, raw := range raws {
 		parsed, err := url.Parse(raw)
-		if err != nil || parsed.User == nil {
+		if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+			parsed, err = url.Parse("http://" + raw)
+		}
+		if err != nil {
 			continue
 		}
 		if password, ok := parsed.User.Password(); ok && password != "" && !slices.Contains(passwords, password) {
@@ -152,11 +157,8 @@ func appendNoProxy(noProxy string, hosts ...string) string {
 // hostOf returns the host of a URL without its port, the form a no_proxy entry takes. It is
 // empty for anything without a network host, such as a unix socket.
 func hostOf(raw string) string {
-	if raw == "" {
-		return ""
-	}
 	parsed, err := url.Parse(strings.TrimSuffix(raw, "/"))
-	if err != nil || parsed.Hostname() == "" {
+	if err != nil {
 		return ""
 	}
 	return parsed.Hostname()

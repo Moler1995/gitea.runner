@@ -75,6 +75,13 @@ func TestEditValues(t *testing.T) {
 			},
 		},
 		{
+			name: "set map entry starting with a newline before an indented line",
+			edit: func(file string) error { return SetValue(file, "runner.envs.ADDED", "\n  indented\nplain\n") },
+			assert: func(t *testing.T, cfg *Config, _ string) {
+				assert.Equal(t, "\n  indented\nplain\n", cfg.Runner.Envs["ADDED"])
+			},
+		},
+		{
 			name: "set replaces a list",
 			edit: func(file string) error { return SetValue(file, "runner.labels", "one", "two") },
 			assert: func(t *testing.T, cfg *Config, _ string) {
@@ -212,6 +219,11 @@ func TestGetValue(t *testing.T) {
 	_, err = GetValue(file, "metrics.addr")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "is not set")
+
+	require.NoError(t, SetValue(file, "cache.s3.endpoint", "https://cache.example"))
+	value, err = GetValue(file, "cache.s3.endpoint")
+	require.NoError(t, err)
+	assert.Equal(t, "https://cache.example", value)
 }
 
 func TestEditValuesFileHandling(t *testing.T) {
@@ -272,6 +284,12 @@ func TestEditValuesPreservesFileText(t *testing.T) {
 			content: []byte(Minimal),
 			edit:    func(file string) error { return SetValue(file, "runner.capacity", "4") },
 			added:   "runner:\n  capacity: 4\n",
+		},
+		{
+			name:    "folded scalar with a long more-indented line",
+			content: []byte("runner:\n  envs:\n    FOLDED: >\n      begin\n        a more-indented line that is long enough for an encoder wrapping at 80 columns to break\n      end\n"),
+			edit:    func(file string) error { return SetValue(file, "runner.capacity", "4") },
+			added:   "  capacity: 4\n",
 		},
 	}
 

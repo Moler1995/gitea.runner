@@ -5,12 +5,17 @@ package run
 
 import (
 	"bytes"
+	"cmp"
 	"context"
-	"encoding/json"
+	"encoding/base64"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"maps"
+	"net"
 	"net/http"
+	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -23,22 +28,25 @@ import (
 
 	"gitea.com/gitea/runner/act/artifactcache"
 	"gitea.com/gitea/runner/act/common"
+	"gitea.com/gitea/runner/act/common/logging"
 	"gitea.com/gitea/runner/act/container"
 	"gitea.com/gitea/runner/act/container/hooks"
 	"gitea.com/gitea/runner/act/runner"
 	"gitea.com/gitea/runner/internal/pkg/client"
 	"gitea.com/gitea/runner/internal/pkg/config"
 	"gitea.com/gitea/runner/internal/pkg/disk"
+	"gitea.com/gitea/runner/internal/pkg/envcheck"
 	"gitea.com/gitea/runner/internal/pkg/labels"
 	"gitea.com/gitea/runner/internal/pkg/metrics"
 	"gitea.com/gitea/runner/internal/pkg/report"
+	"gitea.com/gitea/runner/internal/pkg/telemetry"
 	"gitea.com/gitea/runner/internal/pkg/ver"
 
-	"connectrpc.com/connect"
+	"connectrpc.com/connect/v2"
 	"gitea.dev/actionslib/pkg/model"
 	runnerv1 "gitea.dev/actionslib/runner/v1"
 	docker_container "github.com/moby/moby/api/types/container"
-	log "github.com/sirupsen/logrus"
+	"go.yaml.in/yaml/v4"
 )
 
 // CapabilityCancelling tells the server this runner understands the
@@ -66,9 +74,13 @@ type Runner struct {
 	cacheHandler *artifactcache.Handler
 	capabilities string
 
+	isolatedCacheContainer func(cacheURL string) string
+	instanceTransport      http.RoundTripper
+
 	runningTasks            sync.Map
 	runningCount            atomic.Int64
 	lastIdleCleanupUnixNano atomic.Int64
+	slots                   slotAllocator
 	now                     func() time.Time
 	healthCheckLast         time.Time
 	healthCheckReady        bool
@@ -88,34 +100,31 @@ func NewRunner(cfg *config.Config, reg *config.Registration, cli client.Client) 
 	}
 	envs := make(map[string]string, len(cfg.Runner.Envs))
 	maps.Copy(envs, cfg.Runner.Envs)
+	instanceTransport := client.NewTransport(cli.Address(), cfg.Runner.TLSConfig())
 	var cacheHandler *artifactcache.Handler
 	if cfg.Cache.Enabled == nil || *cfg.Cache.Enabled {
-		if cfg.Cache.ExternalServer != "" {
-			warnIgnoredCachePolicy(cfg)
-			// The v1 client appends its path to this without a separator, so the slash is required.
-			envs["ACTIONS_CACHE_URL"] = strings.TrimRight(cfg.Cache.ExternalServer, "/") + "/"
+		warnIgnoredCachePolicy(cfg)
+		warnIgnoredCacheSecret(cfg)
+		handler, err := artifactcache.StartHandler(artifactcache.Options{
+			Dir:               cfg.Cache.Dir,
+			OutboundIP:        cfg.Cache.Host,
+			Port:              cfg.Cache.Port,
+			Upstream:          cfg.Cache.ExternalServer,
+			S3:                cacheS3(cfg),
+			Policy:            CachePolicy(cfg),
+			Logger:            logging.Default().With("module", "cache_request"),
+			InstanceTransport: instanceTransport,
+		})
+		if err != nil {
+			logging.Errorf("cannot init cache server, it will be disabled: %v", err)
+			// go on
 		} else {
-			warnIgnoredCacheSecret(cfg)
-			handler, err := artifactcache.StartHandler(artifactcache.Options{
-				Dir:        cfg.Cache.Dir,
-				OutboundIP: cfg.Cache.Host,
-				Port:       cfg.Cache.Port,
-				Policy:     CachePolicy(cfg),
-				Logger:     log.StandardLogger().WithField("module", "cache_request"),
-			})
-			if err != nil {
-				log.Errorf("cannot init cache server, it will be disabled: %v", err)
-				// go on
-			} else {
-				cacheHandler = handler
-				envs["ACTIONS_CACHE_URL"] = handler.ExternalURL() + "/"
-			}
+			cacheHandler = handler
 		}
 	}
 
 	// set artifact gitea api
-	artifactGiteaAPI := strings.TrimSuffix(cli.Address(), "/") + "/api/actions_pipeline/"
-	envs["ACTIONS_RUNTIME_URL"] = artifactGiteaAPI
+	envs["ACTIONS_RUNTIME_URL"] = strings.TrimSuffix(cli.Address(), "/") + "/api/actions_pipeline/"
 	envs["ACTIONS_RESULTS_URL"] = strings.TrimSuffix(cli.Address(), "/")
 
 	// Set specific environments to distinguish between Gitea and GitHub
@@ -133,6 +142,8 @@ func NewRunner(cfg *config.Config, reg *config.Registration, cli client.Client) 
 		now:            time.Now,
 		runHealthCheck: executeHealthCheck,
 	}
+	runner.isolatedCacheContainer = lastResult(runner.detectIsolatedCacheContainer)
+	runner.instanceTransport = instanceTransport
 	return runner
 }
 
@@ -144,6 +155,12 @@ func (r *Runner) Close() error {
 // removeOrphanNetworks is a variable so tests can substitute one that needs no Docker daemon.
 var removeOrphanNetworks = container.RemoveOrphanNetworks
 
+var removeOrphanJobVolumes = container.RemoveOrphanJobVolumes
+
+var removeOrphanKubernetesResources = container.RemoveOrphanKubernetesResources
+
+const orphanDockerResourceAge = 10 * time.Minute // spares the network and volumes of a job still starting its first container
+
 // OnIdle performs lightweight maintenance during polling idle windows.
 // It runs synchronously on the poller goroutine; shouldRunIdleCleanup
 // throttles invocations to runner.idle_cleanup_interval so the impact on
@@ -154,9 +171,7 @@ func (r *Runner) OnIdle(ctx context.Context) {
 	}
 	// Bind-workdir mode: reclaim stale per-task workspace dirs (numeric task IDs).
 	if r.cfg.Container.BindWorkdir {
-		workdirParent := strings.TrimLeft(r.cfg.Container.WorkdirParent, "/")
-		workdirRoot := filepath.FromSlash("/" + workdirParent)
-		r.cleanupStaleDirs(ctx, workdirRoot, isTaskIDDir)
+		r.cleanupStaleDirs(ctx, containerWorkdirRoot(r.cfg.Container.WorkdirParent), isTaskIDDir)
 	}
 	// Host mode: reclaim per-job scratch dirs left behind when HostEnvironment
 	// cleanup timed out (e.g. a delete stalled by an AV/EDR filter driver). They
@@ -165,20 +180,28 @@ func (r *Runner) OnIdle(ctx context.Context) {
 	if hostRoot := filepath.FromSlash(r.cfg.Host.WorkdirParent); hostRoot != "" {
 		r.cleanupStaleDirs(ctx, hostRoot, isHostScratchDir)
 	}
-	r.cleanupOrphanNetworks(ctx)
+	r.cleanupOrphanDockerResources(ctx)
+	if r.uuid != "" && r.usesKubernetes() {
+		ctx, cancel := context.WithTimeout(ctx, time.Minute)
+		defer cancel()
+		if err := removeOrphanKubernetesResources(ctx, r.kubernetesOptions(nil), r.now().Add(-r.cfg.Runner.WorkdirCleanupAge)); err != nil {
+			logging.Warnf("failed to clean up job pods left behind by earlier jobs: %v", err)
+		}
+	}
 }
 
-// cleanupOrphanNetworks reclaims the per-job networks of jobs this runner did not live to
-// tear down. A labelled network with no containers on it is finished with, and as for the
-// directories above, a task beginning during the pass is safe because the cutoff keeps a
-// network it has created but not yet attached a container to out of scope.
-func (r *Runner) cleanupOrphanNetworks(ctx context.Context) {
-	if r.uuid == "" || !r.labels.RequireDocker() && !r.cfg.Container.RequireDocker {
+func (r *Runner) cleanupOrphanDockerResources(ctx context.Context) {
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	if r.uuid == "" || (!r.requiresDocker() && !dockerReachable(ctx)) {
 		return
 	}
-	cutoff := r.now().Add(-r.cfg.Runner.WorkdirCleanupAge)
-	if err := removeOrphanNetworks(ctx, r.uuid, cutoff); err != nil {
-		log.Warnf("failed to clean up networks left behind by earlier jobs: %v", err)
+	cutoff := r.now().Add(-orphanDockerResourceAge)
+	if err := removeOrphanNetworks(ctx, r.uuid, r.isolatedCacheContainer(r.cacheHandler.ExternalURL()), cutoff); err != nil {
+		logging.Warnf("failed to clean up networks left behind by earlier jobs: %v", err)
+	}
+	if err := removeOrphanJobVolumes(ctx, r.uuid, cutoff); err != nil {
+		logging.Warnf("failed to clean up volumes left behind by earlier jobs: %v", err)
 	}
 }
 
@@ -200,13 +223,6 @@ func (r *Runner) shouldRunIdleCleanup() bool {
 			return true
 		}
 	}
-}
-
-// cleanupStaleTaskDirs reclaims stale bind-workdir per-task directories under
-// workdirRoot. Retained as a thin wrapper so existing callers and tests keep a
-// stable entry point.
-func (r *Runner) cleanupStaleTaskDirs(ctx context.Context, workdirRoot string) {
-	r.cleanupStaleDirs(ctx, workdirRoot, isTaskIDDir)
 }
 
 // isTaskIDDir reports whether name is a per-task workspace dir (numeric task
@@ -242,7 +258,7 @@ func (r *Runner) cleanupStaleDirs(ctx context.Context, root string, match func(n
 		if errors.Is(err, os.ErrNotExist) {
 			return
 		}
-		log.Warnf("failed to list directory %s for stale cleanup: %v", root, err)
+		logging.Warnf("failed to list directory %s for stale cleanup: %v", root, err)
 		return
 	}
 
@@ -254,15 +270,12 @@ func (r *Runner) cleanupStaleDirs(ctx context.Context, root string, match func(n
 		if err := ctx.Err(); err != nil {
 			return
 		}
-		if !entry.IsDir() {
-			continue
-		}
-		if !match(entry.Name()) {
+		if !entry.IsDir() || !match(entry.Name()) {
 			continue
 		}
 		info, err := entry.Info()
 		if err != nil {
-			log.Warnf("failed to stat %s: %v", filepath.Join(root, entry.Name()), err)
+			logging.Warnf("failed to stat %s: %v", filepath.Join(root, entry.Name()), err)
 			continue
 		}
 		if info.ModTime().After(cutoff) {
@@ -270,53 +283,67 @@ func (r *Runner) cleanupStaleDirs(ctx context.Context, root string, match func(n
 		}
 		dir := filepath.Join(root, entry.Name())
 		if err := os.RemoveAll(dir); err != nil {
-			log.Warnf("failed to clean stale directory %s: %v", dir, err)
+			logging.Warnf("failed to clean stale directory %s: %v", dir, err)
 			continue
 		}
-		log.Infof("cleaned stale directory %s", dir)
+		logging.Infof("cleaned stale directory %s", dir)
 	}
 }
 
-func (r *Runner) SetCapabilitiesFromDeclare(resp *connect.Response[runnerv1.DeclareResponse]) {
-	if resp == nil {
-		return
-	}
-	// Capability negotiation is done via response headers to avoid a hard proto bump.
-	r.capabilities = strings.TrimSpace(resp.Header().Get("X-Gitea-Actions-Capabilities"))
-}
-
-func (r *Runner) Run(ctx context.Context, task *runnerv1.Task) error {
-	if _, ok := r.runningTasks.Load(task.Id); ok {
+func (r *Runner) Run(ctx context.Context, task *runnerv1.Task) (err error) {
+	if _, ok := r.runningTasks.LoadOrStore(task.Id, struct{}{}); ok {
 		return fmt.Errorf("task %d is already running", task.Id)
 	}
-	r.runningTasks.Store(task.Id, struct{}{})
 	defer r.runningTasks.Delete(task.Id)
 
 	r.runningCount.Add(1)
+	defer r.runningCount.Add(-1)
 
 	start := time.Now()
 
 	ctx, cancel := context.WithTimeout(ctx, r.cfg.Runner.Timeout)
 	defer cancel()
+	ctx, endJob := telemetry.StartJob(ctx, task)
 	// A proxy URL may carry credentials, and every job is given it; keep them out of the log.
-	reporter := report.NewReporter(ctx, cancel, r.client, task, r.cfg, proxyPasswords()...)
+	reporter := report.NewReporter(ctx, cancel, r.client, task, r.cfg, proxyPasswords(r.envs)...)
+	var volumeCleanup []common.Executor
+	var volumeCleanupMu sync.Mutex
+	if r.cfg.Runner.PostTaskScript == "" {
+		ctx = runner.WithJobVolumeCleanup(ctx, func(cleanup common.Executor) {
+			volumeCleanupMu.Lock()
+			defer volumeCleanupMu.Unlock()
+			volumeCleanup = append(volumeCleanup, cleanup)
+		})
+	}
 	var runErr error
 	defer func() {
-		r.runningCount.Add(-1)
-
 		lastWords := ""
 		if runErr != nil {
 			lastWords = runErr.Error()
 		}
-		_ = reporter.Close(lastWords)
+		err = reporter.Close(lastWords)
+		if err := cleanupJobVolumes(ctx, volumeCleanup); err != nil {
+			logging.Warnf("task %d volume cleanup after reporting: %v", task.Id, err)
+		}
 
 		metrics.JobDuration.Observe(time.Since(start).Seconds())
-		metrics.JobsTotal.WithLabelValues(metrics.ResultToStatusLabel(reporter.Result())).Inc()
+		metrics.JobsTotal.WithLabelValues(metrics.JobStatus(ctx, reporter.Result())).Inc()
+		endJob(reporter.Result())
 	}()
 	reporter.RunDaemon()
 	runErr = r.run(ctx, task, reporter)
 
 	return nil
+}
+
+func cleanupJobVolumes(ctx context.Context, cleanups []common.Executor) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+	defer cancel()
+	var errs []error
+	for _, cleanup := range cleanups {
+		errs = append(errs, cleanup(ctx))
+	}
+	return errors.Join(errs...)
 }
 
 func (r *Runner) cloneEnvs() map[string]string {
@@ -326,6 +353,25 @@ func (r *Runner) cloneEnvs() map[string]string {
 	envs := make(map[string]string, len(r.envs)+5)
 	maps.Copy(envs, r.envs)
 	return envs
+}
+
+// restoreCalledWorkflowContext undoes Gitea's rewrite of `event_name` and `event.inputs` for older runners,
+// and returns the job's `inputs` from `gitea_workflow_call`, nil if it is not a called workflow's job.
+// See https://github.com/go-gitea/gitea/pull/39452
+func restoreCalledWorkflowContext(task *runnerv1.Task) map[string]any {
+	workflowCall := task.GetContext().GetFields()["gitea_workflow_call"].GetStructValue().GetFields()
+	if workflowCall == nil {
+		return nil
+	}
+	task.Context.Fields["event_name"] = workflowCall["original_event_name"]
+	if event := task.Context.Fields["event"].GetStructValue(); event != nil {
+		if inputs, ok := workflowCall["original_event_inputs"]; ok {
+			event.Fields["inputs"] = inputs
+		} else {
+			delete(event.Fields, "inputs")
+		}
+	}
+	return workflowCall["inputs"].GetStructValue().AsMap()
 }
 
 // getDefaultActionsURL
@@ -348,6 +394,58 @@ func (r *Runner) isSelfHostedActionsURL(task *runnerv1.Task) bool {
 	return giteaDefaultActionsURL != "" && giteaDefaultActionsURL != "https://github.com"
 }
 
+// dockerReachable is a variable so tests can substitute one that needs no Docker daemon. It
+// probes the environment act connects through, not container.docker_host, which act ignores.
+var dockerReachable = func(ctx context.Context) bool {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	return envcheck.CheckIfDockerRunning(ctx, "") == nil
+}
+
+func (r *Runner) requiresDocker() bool {
+	return r.labels.RequireDocker() || r.cfg.Container.RequireDocker
+}
+
+func (r *Runner) usesKubernetes() bool {
+	return slices.ContainsFunc(r.labels, func(label *labels.Label) bool { return label.Schema == labels.SchemeKubernetes })
+}
+
+// kubernetesOptions layers the pod templates of the runner labels a job runs on, in runs-on order, over the shared one.
+func (r *Runner) kubernetesOptions(runsOn []string) container.KubernetesOptions {
+	options := container.KubernetesOptions{
+		Kubeconfig:   r.cfg.Kubernetes.Kubeconfig,
+		Namespace:    r.cfg.Kubernetes.Namespace,
+		PodTemplates: []map[string]any{r.cfg.Kubernetes.PodTemplate},
+		RunnerUUID:   r.uuid,
+	}
+	if transfer := r.cfg.Kubernetes.Transfer; transfer.Mode == config.KubernetesTransferModeAuto || transfer.Mode == config.KubernetesTransferModeDirect {
+		options.Transfer = &container.KubernetesTransfer{
+			Host: transfer.Host, Port: transfer.Port, Image: transfer.Image, Fallback: transfer.Mode == config.KubernetesTransferModeAuto,
+		}
+	}
+	names := r.labels.Names()
+	for index, name := range runsOn {
+		if template, ok := r.cfg.Kubernetes.PodTemplates[name]; ok && slices.Contains(names, name) && !slices.Contains(runsOn[:index], name) {
+			options.PodTemplates = append(options.PodTemplates, template)
+		}
+	}
+	return options
+}
+
+// fallbackPlatform is where a job runs whose runs-on matches no label, as any job without a
+// runs-on does, since Gitea sends those to every runner.
+func (r *Runner) fallbackPlatform(ctx context.Context) string {
+	switch {
+	case r.requiresDocker():
+		return r.cfg.Runner.DefaultImage
+	case r.usesKubernetes():
+		return labels.SchemeKubernetes + "://" + r.cfg.Runner.DefaultImage
+	case dockerReachable(ctx):
+		return r.cfg.Runner.DefaultImage
+	}
+	return labels.SelfHostedPlatform
+}
+
 func (r *Runner) run(ctx context.Context, task *runnerv1.Task, reporter *report.Reporter) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -355,26 +453,60 @@ func (r *Runner) run(ctx context.Context, task *runnerv1.Task, reporter *report.
 		}
 	}()
 
-	r.reportSetup(reporter, task)
+	slot := r.slots.acquire()
+	defer r.slots.release(slot)
+
+	workflowCallInputs := restoreCalledWorkflowContext(task)
+	for _, line := range r.setupLines(task) {
+		reporter.Logf("%s", line)
+	}
 
 	workflow, jobID, err := generateWorkflow(task)
 	if err != nil {
 		return err
 	}
+	logging.With(taskLogFields(task, jobID)...).
+		With("actions_url", r.getDefaultActionsURL(task), "address", r.client.Address()).
+		Info("task started")
 
 	plan, err := model.CombineWorkflowPlanner(workflow).PlanJob(jobID)
 	if err != nil {
 		return err
 	}
 	job := workflow.GetJob(jobID)
-	reporter.ResetSteps(len(job.Steps))
+	reporter.ResetSteps(job.Steps)
+	telemetry.SetJobName(ctx, cmp.Or(job.Name, jobID))
 
 	taskContext := task.Context.Fields
 	envs := r.cloneEnvs()
 
+	// act asks for the platform once per step, so resolve the fallback at most once per task.
+	fallbackPlatform := sync.OnceValue(func() string { return r.fallbackPlatform(ctx) })
+	platformPicker := func(runsOn []string) string {
+		if platform := r.labels.PickPlatform(runsOn); platform != "" {
+			return platform
+		}
+		return fallbackPlatform()
+	}
+	platform := platformPicker(job.RunsOn())
+	cacheURL, cacheContainer := r.cacheForJob(job, platform, reporter.Logf)
+	if cacheURL != "" {
+		envs["ACTIONS_CACHE_URL"] = cacheURL + "/"
+	}
+
 	// Added per task because this job's service containers must be reached directly, and
 	// act reaches them by their workflow key.
-	proxyEnv := JobProxyEnv(envs, envs["ACTIONS_CACHE_URL"], slices.Sorted(maps.Keys(job.Services)))
+	var services map[string]yaml.Node
+	_ = job.RawServices.Decode(&services) // a whole-value expression names no service before evaluation
+	serviceNames := slices.Sorted(maps.Keys(services))
+	if strings.HasPrefix(platform, labels.SchemeKubernetes+"://") {
+		var hostnames []string
+		for _, name := range serviceNames {
+			hostnames = append(hostnames, container.KubernetesServiceHostnames(name)...)
+		}
+		serviceNames = hostnames
+	}
+	proxyEnv := JobProxyEnv(envs, cacheURL, serviceNames)
 	maps.Copy(envs, proxyEnv)
 
 	if r.capabilities != "" {
@@ -383,34 +515,10 @@ func (r *Runner) run(ctx context.Context, task *runnerv1.Task, reporter *report.
 	if v := taskContext["run_id"].GetStringValue(); v != "" {
 		envs["GITEA_RUN_ID"] = v
 	}
+	telemetry.AddJobEnv(ctx, envs)
 
-	log.Infof("task %v repo is %v %v %v", task.Id, taskContext["repository"].GetStringValue(),
-		r.getDefaultActionsURL(task),
-		r.client.Address())
-
-	preset := &model.GithubContext{
-		Event:           taskContext["event"].GetStructValue().AsMap(),
-		RunID:           taskContext["run_id"].GetStringValue(),
-		RunNumber:       taskContext["run_number"].GetStringValue(),
-		RunAttempt:      taskContext["run_attempt"].GetStringValue(),
-		Actor:           taskContext["actor"].GetStringValue(),
-		Repository:      taskContext["repository"].GetStringValue(),
-		EventName:       taskContext["event_name"].GetStringValue(),
-		Sha:             taskContext["sha"].GetStringValue(),
-		Ref:             taskContext["ref"].GetStringValue(),
-		RefName:         taskContext["ref_name"].GetStringValue(),
-		RefType:         taskContext["ref_type"].GetStringValue(),
-		HeadRef:         taskContext["head_ref"].GetStringValue(),
-		BaseRef:         taskContext["base_ref"].GetStringValue(),
-		Token:           taskContext["token"].GetStringValue(),
-		RepositoryOwner: taskContext["repository_owner"].GetStringValue(),
-		RetentionDays:   taskContext["retention_days"].GetStringValue(),
-	}
-	if t := task.Secrets["GITEA_TOKEN"]; t != "" {
-		preset.Token = t
-	} else if t := task.Secrets["GITHUB_TOKEN"]; t != "" {
-		preset.Token = t
-	}
+	preset := model.GithubContextFromMap(task.Context.AsMap())
+	preset.Token = cmp.Or(task.Secrets["GITEA_TOKEN"], task.Secrets["GITHUB_TOKEN"], preset.Token)
 
 	if actionsIDTokenRequestURL := taskContext["actions_id_token_request_url"].GetStringValue(); actionsIDTokenRequestURL != "" {
 		envs["ACTIONS_ID_TOKEN_REQUEST_URL"] = actionsIDTokenRequestURL
@@ -435,16 +543,16 @@ func (r *Runner) run(ctx context.Context, task *runnerv1.Task, reporter *report.
 	// cache requests from the job container can authenticate. The credential
 	// is removed when the task finishes, so a leaked token stops working as
 	// soon as the job ends rather than remaining valid for the runner's
-	// lifetime. Only applies to the embedded cache server; when the operator
-	// points the runner at an external cache via cfg.Cache.ExternalServer, it
-	// is that server's responsibility to authenticate requests.
-	revokeCache, resultsURL := r.registerCacheForTask(giteaRuntimeToken, preset.Repository, reporter)
-	defer revokeCache()
-	// A cache server that agreed to forward the artifact half is the whole results service, so
-	// the job is pointed at it and the v2 variable is finally true.
-	if resultsURL != "" {
-		envs["ACTIONS_RESULTS_URL"], envs[runner.CacheServiceV2Env] = resultsURL, "true"
+	// lifetime.
+	cred := cacheCredential(preset, cacheURL, cmp.Or(job.CacheMode, workflow.CacheMode))
+	if cacheURL != "" {
+		envs["ACTIONS_CACHE_MODE"] = cred.CacheMode // @actions/cache skips what the mode forbids
+		if cred.CacheMode != "write" {
+			reporter.Logf("Cache mode: %s", cred.CacheMode)
+		}
 	}
+	revokeCache, resultsURL := r.registerCacheForTask(giteaRuntimeToken, cred, reporter)
+	defer revokeCache()
 
 	eventJSON, err := json.Marshal(preset.Event)
 	if err != nil {
@@ -462,12 +570,12 @@ func (r *Runner) run(ctx context.Context, task *runnerv1.Task, reporter *report.
 		actionCloneDepth = 0
 	}
 
-	workdirParent := strings.TrimLeft(r.cfg.Container.WorkdirParent, "/")
+	workdirParent := containerWorkdirRoot(r.cfg.Container.WorkdirParent)
 	if r.cfg.Container.BindWorkdir {
 		// Append the task ID to isolate concurrent jobs from the same repo.
-		workdirParent = fmt.Sprintf("%s/%d", workdirParent, task.Id)
+		workdirParent = filepath.Join(workdirParent, strconv.FormatInt(task.Id, 10))
 	}
-	workdir := filepath.FromSlash(fmt.Sprintf("/%s/%s", workdirParent, preset.Repository))
+	workdir := filepath.Join(workdirParent, filepath.FromSlash(preset.Repository))
 	if runtime.GOOS == "windows" {
 		if abs, err := filepath.Abs(workdir); err == nil {
 			workdir = abs
@@ -475,6 +583,8 @@ func (r *Runner) run(ctx context.Context, task *runnerv1.Task, reporter *report.
 	}
 	// Without bind_workdir, the workspace path omits the task id; concurrent host-mode jobs
 	// for the same repository would share this directory and can race with per-job cleanup.
+
+	r.setResultsService(envs, resultsURL)
 
 	runnerConfig := &runner.Config{
 		// On Linux, Workdir will be like "/<parent_directory>/<owner>/<repo>"
@@ -485,26 +595,24 @@ func (r *Runner) run(ctx context.Context, task *runnerv1.Task, reporter *report.
 		AllocatePTY:       r.cfg.Runner.AllocatePTY,
 		ActionOfflineMode: r.cfg.Cache.OfflineMode,
 		ActionCloneDepth:  actionCloneDepth,
-		PatchToolkit:      r.patchToolkit(),
+		NoActionPatch:     r.cfg.Runner.PatchActions != nil && !*r.cfg.Runner.PatchActions,
 
-		ReuseContainers:      false,
 		ForcePull:            r.cfg.Container.ForcePull,
 		ForceRebuild:         r.cfg.Container.ForceRebuild,
-		LogOutput:            true,
-		JSONLogger:           false,
 		Env:                  envs,
 		ProxyEnv:             proxyEnv,
 		Secrets:              task.Secrets,
+		ExtraMasks:           append(proxyPasswords(r.envs), preset.Token),
 		GitHubInstance:       strings.TrimSuffix(r.client.Address(), "/"),
-		AutoRemove:           true,
 		NoSkipCheckout:       true,
 		DisableActEnv:        r.cfg.Runner.SetActEnv != nil && !*r.cfg.Runner.SetActEnv,
 		PresetGitHubContext:  preset,
+		WorkflowCallInputs:   workflowCallInputs,
 		EventJSON:            string(eventJSON),
 		ContainerNamePrefix:  fmt.Sprintf("GITEA-ACTIONS-TASK-%d", task.Id),
 		ContainerMaxLifetime: maxLifetime,
-		CleanWorkdir:         true,
 		ContainerNetworkMode: docker_container.NetworkMode(r.cfg.Container.Network),
+		CacheContainer:       cacheContainer,
 		ContainerNetworkCreateOptions: container.NewDockerNetworkCreateExecutorInput{
 			EnableIPv4: r.cfg.Container.NetworkCreateOptions.EnableIPv4,
 			EnableIPv6: r.cfg.Container.NetworkCreateOptions.EnableIPv6,
@@ -519,18 +627,26 @@ func (r *Runner) run(ctx context.Context, task *runnerv1.Task, reporter *report.
 		},
 		ContainerOptions:                  r.cfg.Container.Options,
 		ServiceReadyTimeout:               r.cfg.Container.ServiceReadyTimeout,
+		Sweep:                             r.cfg.Container.Sweep,
 		ContainerDaemonSocket:             r.cfg.Container.DockerHost,
 		Privileged:                        r.cfg.Container.Privileged,
 		DefaultActionInstance:             r.getDefaultActionsURL(task),
 		DefaultActionInstanceIsSelfHosted: r.isSelfHostedActionsURL(task),
-		PlatformPicker:                    r.labels.PickPlatform,
+		PlatformPicker:                    platformPicker,
 		JobStartedHook:                    r.cfg.Runner.Hooks.JobStarted,
 		JobCompletedHook:                  r.cfg.Runner.Hooks.JobCompleted,
 		Vars:                              task.Vars,
 		ValidVolumes:                      r.cfg.Container.ValidVolumes,
+		ContainerVolumes:                  r.cfg.Container.Volumes,
 		SharedToolCache:                   r.cfg.Runner.ToolCacheMode == config.ToolCacheModeShared,
+		ToolCacheSlot:                     toolCacheSlot(r.cfg.Runner.ToolCacheMode, slot),
 		InsecureSkipTLS:                   r.cfg.Runner.Insecure,
+		ClientCertFile:                    r.cfg.Runner.ClientCertFile,
+		ClientKeyFile:                     r.cfg.Runner.ClientKeyFile,
+		CAFile:                            r.cfg.Runner.CAFile,
+		InstanceTransport:                 r.instanceTransport,
 		RunnerName:                        r.name,
+		KubernetesPicker:                  r.kubernetesOptions,
 	}
 
 	rr, err := runner.New(runnerConfig)
@@ -542,9 +658,9 @@ func (r *Runner) run(ctx context.Context, task *runnerv1.Task, reporter *report.
 	reporter.Logf("workflow prepared")
 
 	// add logger recorders
-	ctx = common.WithLoggerHook(ctx, reporter)
+	ctx = common.WithLoggerHandler(ctx, reporter)
 
-	if !log.IsLevelEnabled(log.DebugLevel) {
+	if !logging.Enabled(logging.LevelDebug) {
 		ctx = runner.WithJobLoggerFactory(ctx, NullLogger{})
 	}
 
@@ -552,10 +668,8 @@ func (r *Runner) run(ctx context.Context, task *runnerv1.Task, reporter *report.
 	reporter.SetOutputs(job.Outputs)
 
 	if r.cfg.Container.BindWorkdir {
-		// Remove the entire task-specific directory (e.g. /workspace/<task_id>).
-		taskDir := filepath.FromSlash("/" + workdirParent)
-		if err := os.RemoveAll(taskDir); err != nil {
-			log.Warnf("failed to clean up workspace %s: %v", taskDir, err)
+		if err := os.RemoveAll(workdirParent); err != nil {
+			logging.Warnf("failed to clean up workspace %s: %v", workdirParent, err)
 		}
 	}
 
@@ -565,10 +679,44 @@ func (r *Runner) run(ctx context.Context, task *runnerv1.Task, reporter *report.
 	return execErr
 }
 
-// patchToolkit reports whether act should edit the toolkit bundled into an action. It follows the
-// cache URL, because that is what the edits point the client at; see act/runner/toolkit_patch.go.
-func (r *Runner) patchToolkit() bool {
-	return r.envs["ACTIONS_CACHE_URL"] != "" && (r.cfg.Cache.V2 == nil || *r.cfg.Cache.V2)
+func lastResult(compute func(key string) (string, bool)) func(key string) string {
+	var (
+		mu      sync.Mutex
+		lastKey string
+		result  string
+	)
+	return func(key string) string {
+		mu.Lock()
+		defer mu.Unlock()
+		if key == lastKey {
+			return result
+		}
+		value, ok := compute(key)
+		if ok {
+			lastKey, result = key, value
+		}
+		return value
+	}
+}
+
+func (r *Runner) setResultsService(envs map[string]string, resultsURL string) {
+	v2 := resultsURL != "" && (r.cfg.Cache.V2 == nil || *r.cfg.Cache.V2) // all cache.v2 turns off, the bundle edit reaching it is what the artifact actions need too
+	if v2 {
+		envs[runner.CacheServiceV2Env] = "true"
+	} else {
+		delete(envs, runner.CacheServiceV2Env)
+	}
+	// Cache v2 clients read no other variable for it, and some cannot use the instance address.
+	if v2 || (resultsURL != "" && r.instanceOutOfReach(envs["ACTIONS_RESULTS_URL"])) {
+		envs["ACTIONS_RESULTS_URL"] = resultsURL
+	}
+}
+
+// These clients keep only the origin they are handed, and reach it on the job's own trust.
+func (r *Runner) instanceOutOfReach(instance string) bool {
+	parsed, err := url.Parse(instance)
+	return err != nil || strings.Trim(parsed.Path, "/") != "" ||
+		(r.cfg.Runner.Insecure && parsed.Scheme == "https")
 }
 
 // registerCacheForTask tells the cache server to accept requests authenticated
@@ -576,32 +724,50 @@ func (r *Runner) patchToolkit() bool {
 // function the caller must invoke (typically via defer) to revoke the
 // credential when the task finishes.
 //
-// Two modes:
-//   - Embedded handler: register in-process via RegisterJob.
-//   - external_server: POST to the remote server's /_internal/register, defer a
-//     POST to /_internal/revoke. This is what enables full per-job auth and
-//     repo scoping over the network.
-//
 // Safe with an empty token (older Gitea did not issue one).
-// It also returns the URL to advertise as ACTIONS_RESULTS_URL, which is the cache server itself
-// when it agreed to forward this instance's artifact service, and "" when it did not.
-func (r *Runner) registerCacheForTask(token, repo string, reporter *report.Reporter) (func(), string) {
-	if token == "" {
+// It also returns the URL to advertise as ACTIONS_RESULTS_URL.
+func (r *Runner) registerCacheForTask(token string, cred artifactcache.JobCredential, reporter *report.Reporter) (func(), string) {
+	if token == "" || cred.PublicURL == "" {
 		return func() {}, ""
 	}
-	cred := artifactcache.JobCredential{
-		Repo:        repo,
-		Results:     r.envs["ACTIONS_RESULTS_URL"], // the instance as the job would reach it
-		InsecureTLS: r.cfg.Runner.Insecure,
+	cred.Results = r.envs["ACTIONS_RESULTS_URL"] // the instance as the job would reach it
+	cred.InsecureTLS = r.cfg.Runner.Insecure
+	revoke := r.cacheHandler.RegisterJob(token, cred)
+	if r.cfg.Cache.ExternalServer != "" {
+		revokeLocal, revokeExternal := revoke, r.registerExternalCacheJob(token, cred, reporter)
+		revoke = func() { revokeLocal(); revokeExternal() }
 	}
-	if r.cacheHandler != nil {
-		return r.cacheHandler.RegisterJob(token, cred), r.cacheHandler.ResultsURL(cred)
+	return revoke, r.cacheHandler.ResultsURL(cred)
+}
+
+// cacheCredential scopes the job's cache entries by ref, as GitHub does.
+func cacheCredential(preset *model.GithubContext, publicURL, cacheMode string) artifactcache.JobCredential {
+	ref := preset.Ref
+	if number, ok := preset.Event["number"].(float64); ok && strings.HasPrefix(preset.EventName, "pull_request") && preset.EventName != "pull_request_target" {
+		ref = fmt.Sprintf("refs/pull/%d/head", int64(number)) // review events take github.ref from the reviewer's commit_id
 	}
-	if r.cfg.Cache.ExternalServer != "" && r.cfg.Cache.ExternalSecret != "" {
-		return r.registerExternalCacheJob(token, cred, reporter)
+	defaultRef := branchRef(model.AsString(model.NestedMapLookup(preset.Event, "repository", "default_branch")))
+	if cacheMode == "" { // only trusted events save caches for the default branch
+		cacheMode = "write"
+		if ref == defaultRef && !slices.Contains([]string{"push", "workflow_dispatch", "schedule", "delete", "registry_package"}, preset.EventName) {
+			cacheMode = "read"
+		}
 	}
-	// No cache server to register against: caching is disabled, or the built-in server failed to start.
-	return func() {}, ""
+	return artifactcache.JobCredential{
+		Repo:       preset.Repository,
+		Ref:        ref,
+		BaseRef:    branchRef(preset.BaseRef),
+		DefaultRef: defaultRef,
+		CacheMode:  cacheMode,
+		PublicURL:  publicURL,
+	}
+}
+
+func branchRef(branch string) string {
+	if branch == "" {
+		return ""
+	}
+	return "refs/heads/" + branch
 }
 
 // registerExternalCacheJob POSTs to the remote cache-server's control-plane.
@@ -609,57 +775,51 @@ func (r *Runner) registerCacheForTask(token, repo string, reporter *report.Repor
 // 401 the job's requests — better than failing the whole task for a cache
 // outage. The warning is mirrored to the job log so users can see why their
 // cache calls 401, instead of having to read the runner daemon's stderr.
-func (r *Runner) registerExternalCacheJob(token string, cred artifactcache.JobCredential, reporter *report.Reporter) (func(), string) {
+func (r *Runner) registerExternalCacheJob(token string, cred artifactcache.JobCredential, reporter *report.Reporter) func() {
 	base := strings.TrimRight(r.cfg.Cache.ExternalServer, "/")
-	resultsURL := ""
-	if body, err := postInternalCache(base+"/_internal/register", r.cfg.Cache.ExternalSecret, map[string]any{
-		"token": token, "repo": cred.Repo, "results": cred.Results, "insecure_tls": cred.InsecureTLS,
-		"public_url": base,
-	}); err != nil {
-		log.Warnf("cache external_server register failed (%s): %v", base, err)
+	if err := postInternalCache(base+"/_internal/register", r.cfg.Cache.ExternalSecret, struct {
+		Token string `json:"token"`
+		artifactcache.JobCredential
+	}{token, cred}); err != nil {
+		logging.Warnf("cache external_server register failed (%s): %v", base, err)
 		if reporter != nil {
 			reporter.Logf("::warning::%s", runner.EscapeCommandData(fmt.Sprintf(
 				"cache external_server register failed (%s): %v — cache requests from this job will be unauthenticated and likely return 401", base, err)))
 		}
-	} else if forwarded, _ := body["results_url"].(string); forwarded != "" {
-		resultsURL = base // the answer only says it forwards, its own address need not be the job's
 	}
 	return func() {
-		if _, err := postInternalCache(base+"/_internal/revoke", r.cfg.Cache.ExternalSecret,
+		if err := postInternalCache(base+"/_internal/revoke", r.cfg.Cache.ExternalSecret,
 			map[string]any{"token": token}); err != nil {
-			log.Warnf("cache external_server revoke failed (%s): %v", base, err)
+			logging.Warnf("cache external_server revoke failed (%s): %v", base, err)
 			if reporter != nil {
 				reporter.Logf("::warning::%s", runner.EscapeCommandData(fmt.Sprintf(
 					"cache external_server revoke failed (%s): %v", base, err)))
 			}
 		}
-	}, resultsURL
+	}
 }
 
-func postInternalCache(url, secret string, body map[string]any) (map[string]any, error) {
+func postInternalCache(url, secret string, body any) error {
 	buf, err := json.Marshal(body)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(buf))
 	if err != nil {
-		return nil, err
+		return err
 	}
 	req.Header.Set("Authorization", "Bearer "+secret)
 	req.Header.Set("Content-Type", "application/json")
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
-		return nil, fmt.Errorf("status %d", resp.StatusCode)
+		return fmt.Errorf("status %d", resp.StatusCode)
 	}
-	answer := map[string]any{}
-	// A server too old to answer with a body is not an error, it simply tells us nothing.
-	_ = json.NewDecoder(resp.Body).Decode(&answer)
-	return answer, nil
+	return nil
 }
 
 func (r *Runner) RunningCount() int64 {
@@ -699,7 +859,7 @@ func (r *Runner) setHealthStatus(ready bool, reason string) {
 func checkFreeDisk(cfg *config.Config) (bool, string) {
 	root := cfg.Host.WorkdirParent
 	if cfg.Container.BindWorkdir {
-		root = filepath.FromSlash("/" + strings.TrimLeft(cfg.Container.WorkdirParent, "/"))
+		root = containerWorkdirRoot(cfg.Container.WorkdirParent)
 	}
 	root = nearestExistingPath(root)
 	available, err := disk.FreeBytes(root)
@@ -711,6 +871,13 @@ func checkFreeDisk(cfg *config.Config) (bool, string) {
 		return false, fmt.Sprintf("low disk space on %s: %d MiB available, %d MiB required", root, availableMB, cfg.HealthCheck.MinFreeDiskSpaceMB)
 	}
 	return true, "ok"
+}
+
+func containerWorkdirRoot(parent string) string {
+	if filepath.IsAbs(parent) {
+		return filepath.Clean(parent)
+	}
+	return filepath.Join(string(filepath.Separator), parent)
 }
 
 func nearestExistingPath(path string) string {
@@ -727,12 +894,17 @@ func nearestExistingPath(path string) string {
 	return "."
 }
 
-func (r *Runner) Declare(ctx context.Context, labels []string) (*connect.Response[runnerv1.DeclareResponse], error) {
-	return r.client.Declare(ctx, connect.NewRequest(&runnerv1.DeclareRequest{
+func (r *Runner) Declare(ctx context.Context, labels []string) (*runnerv1.DeclareResponse, error) {
+	ctx, info := connect.NewClientContext(ctx)
+	resp, err := r.client.Declare(ctx, &runnerv1.DeclareRequest{
 		Version:      ver.Version(),
 		Labels:       labels,
 		Capabilities: RunnerCapabilities(),
-	}))
+	})
+	if err == nil {
+		r.capabilities = strings.TrimSpace(info.ResponseHeader().Get("X-Gitea-Actions-Capabilities"))
+	}
+	return resp, err
 }
 
 // minFreeDisk keeps the cache from growing past the point where the runner stops taking
@@ -755,22 +927,33 @@ func CachePolicy(cfg *config.Config) artifactcache.Policy {
 	}
 }
 
-// warnIgnoredCachePolicy flags eviction settings configured on a runner that points at an external cache server.
+func cacheS3(cfg *config.Config) *artifactcache.S3Options {
+	s3 := cfg.Cache.S3
+	if s3 == nil {
+		return nil
+	}
+	return &artifactcache.S3Options{
+		Endpoint: s3.Endpoint, Region: s3.Region, Bucket: s3.Bucket, Prefix: s3.Prefix,
+		PathStyle: s3.PathStyle, AccessKey: s3.AccessKey, SecretKey: s3.SecretKey,
+	}
+}
+
+// warnIgnoredCachePolicy flags eviction settings configured on a runner that does not apply them.
 func warnIgnoredCachePolicy(cfg *config.Config) {
 	defaults := config.DefaultCache()
-	if cfg.Cache.Retention != defaults.Retention || cfg.Cache.RepoSizeLimit != defaults.RepoSizeLimit ||
-		cfg.Cache.SizeLimit != defaults.SizeLimit || cfg.Cache.SweepInterval != defaults.SweepInterval {
-		log.Warn("cache eviction settings are ignored when cache.external_server is set; configure them on that server instead")
+	limits := cfg.Cache.Retention != defaults.Retention || cfg.Cache.RepoSizeLimit != defaults.RepoSizeLimit ||
+		cfg.Cache.SizeLimit != defaults.SizeLimit
+	switch {
+	case cfg.Cache.ExternalServer != "" && (limits || cfg.Cache.SweepInterval != defaults.SweepInterval):
+		logging.Warn("cache eviction settings are ignored when cache.external_server is set; configure them on that server instead")
+	case cfg.Cache.S3 != nil && limits:
+		logging.Warn("cache eviction settings are ignored when cache.s3 is set; use lifecycle rules on the bucket instead")
 	}
 }
 
 // warnIgnoredCacheSecret flags an external cache server secret configured on a runner that uses the built-in cache server.
 func warnIgnoredCacheSecret(cfg *config.Config) {
-	if cfg.Cache.ExternalServer != "" {
-		return
-	}
-	// Not using an external cache server, so any configured secret is ignored.
-	if cfg.Cache.ExternalSecret == "" {
+	if cfg.Cache.ExternalServer != "" || cfg.Cache.ExternalSecret == "" {
 		return
 	}
 	// LoadDefault resolves external_secret_file into ExternalSecret, so report whichever key the operator actually wrote.
@@ -778,5 +961,61 @@ func warnIgnoredCacheSecret(cfg *config.Config) {
 	if cfg.Cache.ExternalSecretFile != "" {
 		key = "cache.external_secret_file"
 	}
-	log.Warnf("%s is set but cache.external_server is not; the built-in cache server does not use a shared secret, so the value is ignored", key)
+	logging.Warnf("%s is set but cache.external_server is not; the built-in cache server does not use a shared secret, so the value is ignored", key)
+}
+
+// cacheForJob returns the cache address for the job, and the container to attach to its network to reach it there.
+func (r *Runner) cacheForJob(job *model.Job, platform string, logf func(string, ...any)) (string, string) {
+	cacheURL := r.cacheHandler.RefreshExternalURL()
+	jobContainer := job.Container()
+	if cacheURL == "" || strings.HasPrefix(platform, labels.SchemeKubernetes+"://") || (jobContainer == nil || jobContainer.Image == "") && platform == labels.SelfHostedPlatform {
+		return cacheURL, ""
+	}
+	if cacheContainer := r.isolatedCacheContainer(cacheURL); cacheContainer != "" {
+		isolatedURL, _ := url.Parse(cacheURL)
+		isolatedURL.Host = net.JoinHostPort(cacheContainer, isolatedURL.Port())
+		return isolatedURL.String(), cacheContainer
+	}
+	network, enableIPv6 := r.cfg.Container.Network, r.cfg.Container.NetworkCreateOptions.EnableIPv6
+	if addr, err := netip.ParseAddr(hostOf(cacheURL)); err == nil && addr.Is6() && r.cfg.Cache.Host == "" &&
+		network != "host" && (network != "" || enableIPv6 == nil || !*enableIPv6) {
+		logf("::warning::%s", runner.EscapeCommandData("The runner's cache server is at the IPv6 address "+addr.String()+
+			", so cache and artifact steps fail if this job's network has no IPv6. Set cache.host to an address the job reaches, or enable IPv6 on the job network."))
+	}
+	return cacheURL, ""
+}
+
+func (r *Runner) detectIsolatedCacheContainer(cacheURL string) (string, bool) {
+	addr, err := netip.ParseAddr(hostOf(cacheURL))
+	if err != nil {
+		return "", true
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cacheContainer, err := container.IsolatedCacheContainer(ctx, addr, r.cfg.Container.Network)
+	if err != nil {
+		logging.Warnf("cannot check whether jobs reach the cache server: %v", err)
+		return "", false
+	}
+	return cacheContainer, true
+}
+
+// taskLogFields returns key/value pairs for logging.With.
+func taskLogFields(task *runnerv1.Task, job string) []any {
+	taskContext := task.GetContext().GetFields()
+	fields := []any{
+		"task_id", task.Id,
+		"job", job,
+		"repository", taskContext["repository"].GetStringValue(),
+		"run_id", taskContext["run_id"].GetStringValue(),
+		"run_number", taskContext["run_number"].GetStringValue(),
+	}
+	if parts := strings.Split(taskContext["gitea_runtime_token"].GetStringValue(), "."); len(parts) == 3 {
+		var claims struct{ JobID int64 } // Gitea's actionsClaims fields are untagged, so the claim key is "JobID"
+		payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+		if err == nil && json.Unmarshal(payload, &claims) == nil && claims.JobID > 0 {
+			fields = append(fields, "job_id", claims.JobID)
+		}
+	}
+	return fields
 }

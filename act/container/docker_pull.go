@@ -2,7 +2,7 @@
 // Copyright 2020 The nektos/act Authors. All rights reserved.
 // SPDX-License-Identifier: MIT
 
-//go:build !(WITHOUT_DOCKER || !(linux || darwin || windows || netbsd))
+//go:build !(WITHOUT_DOCKER || !(linux || darwin || windows || netbsd || freebsd))
 
 package container
 
@@ -22,7 +22,7 @@ import (
 
 // NewDockerPullExecutor function to create a run executor for the container
 func NewDockerPullExecutor(input NewDockerPullExecutorInput) common.Executor {
-	return func(ctx context.Context) error {
+	return common.Executor(func(ctx context.Context) error {
 		logger := common.Logger(ctx)
 		logger.Debugf("docker pull %v", input.Image)
 
@@ -61,11 +61,10 @@ func NewDockerPullExecutor(input NewDockerPullExecutorInput) common.Executor {
 		// stream rather than on the call itself, so both have to be checked
 		pullOnce := func(opts client.ImagePullOptions) error {
 			reader, err := cli.ImagePull(ctx, imageRef, opts)
-			streamErr := logDockerResponse(logger, reader, err != nil)
 			if err != nil {
 				return err
 			}
-			return streamErr
+			return logDockerResponse(logger, reader, logger.Debugf)
 		}
 
 		err = pullOnce(imagePullOptions)
@@ -83,7 +82,7 @@ func NewDockerPullExecutor(input NewDockerPullExecutorInput) common.Executor {
 			return nil
 		}
 		return fmt.Errorf("failed to pull image '%s' (%s): %w", imageRef, input.Platform, err)
-	}
+	}).Retry(3)
 }
 
 func getImagePullOptions(ctx context.Context, input NewDockerPullExecutorInput) (client.ImagePullOptions, error) {
@@ -114,7 +113,7 @@ func getImagePullOptions(ctx context.Context, input NewDockerPullExecutorInput) 
 		if err != nil {
 			return imagePullOptions, err
 		}
-		if authConfig.Username == "" && authConfig.Password == "" {
+		if authConfig.Username == "" && authConfig.Password == "" && authConfig.IdentityToken == "" && authConfig.RegistryToken == "" {
 			return imagePullOptions, nil
 		}
 		logger.Info("using DockerAuthConfig authentication for docker pull")

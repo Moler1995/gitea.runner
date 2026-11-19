@@ -5,16 +5,31 @@ package run
 
 import (
 	"context"
+	"encoding/base64"
+	"errors"
+	"io"
 	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"gitea.com/gitea/runner/act/artifactcache"
+	"gitea.com/gitea/runner/act/common"
+	"gitea.com/gitea/runner/act/common/logging"
+	"gitea.com/gitea/runner/act/container"
 	"gitea.com/gitea/runner/act/runner"
 	clientmocks "gitea.com/gitea/runner/internal/pkg/client/mocks"
 	"gitea.com/gitea/runner/internal/pkg/config"
+	"gitea.com/gitea/runner/internal/pkg/labels"
 	"gitea.com/gitea/runner/internal/pkg/ver"
 
-	"connectrpc.com/connect"
+	"connectrpc.com/connect/v2"
+	"gitea.dev/actionslib/pkg/model"
 	runnerv1 "gitea.dev/actionslib/runner/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -26,27 +41,21 @@ func TestRunnerCapabilitiesAndDeclare(t *testing.T) {
 	require.Equal(t, []string{CapabilityCancelling}, RunnerCapabilities())
 
 	cli := clientmocks.NewClient(t)
-	cli.On("Declare", mock.Anything, mock.MatchedBy(func(req *connect.Request[runnerv1.DeclareRequest]) bool {
-		return req.Msg.Version == ver.Version() &&
-			len(req.Msg.Labels) == 1 &&
-			req.Msg.Labels[0] == "ubuntu" &&
-			len(req.Msg.Capabilities) == 1 &&
-			req.Msg.Capabilities[0] == CapabilityCancelling
-	})).Return(connect.NewResponse(&runnerv1.DeclareResponse{}), nil)
+	cli.On("Declare", mock.Anything, mock.MatchedBy(func(req *runnerv1.DeclareRequest) bool {
+		return req.Version == ver.Version() &&
+			len(req.Labels) == 1 &&
+			req.Labels[0] == "ubuntu" &&
+			len(req.Capabilities) == 1 &&
+			req.Capabilities[0] == CapabilityCancelling
+	})).Return(&runnerv1.DeclareResponse{}, nil).Run(func(args mock.Arguments) {
+		info, ok := connect.CallInfoForClientContext(args.Get(0).(context.Context))
+		require.True(t, ok)
+		info.ResponseHeader().Set("X-Gitea-Actions-Capabilities", " cancelling,cache-v2 ")
+	})
 
 	r := &Runner{client: cli}
-	_, err := r.Declare(context.Background(), []string{"ubuntu"})
+	_, err := r.Declare(t.Context(), []string{"ubuntu"})
 	require.NoError(t, err)
-}
-
-func TestRunnerSetCapabilitiesFromDeclare(t *testing.T) {
-	r := &Runner{}
-	r.SetCapabilitiesFromDeclare(nil)
-	require.Empty(t, r.capabilities)
-
-	resp := connect.NewResponse(&runnerv1.DeclareResponse{})
-	resp.Header().Set("X-Gitea-Actions-Capabilities", " cancelling,cache-v2 ")
-	r.SetCapabilitiesFromDeclare(resp)
 	require.Equal(t, "cancelling,cache-v2", r.capabilities)
 }
 
@@ -67,9 +76,141 @@ func TestRunnerRunningCountAndNullLogger(t *testing.T) {
 	r.runningCount.Add(2)
 	require.Equal(t, int64(2), r.RunningCount())
 
-	logger := NullLogger{}.WithJobLogger()
-	require.NotNil(t, logger)
-	require.NotNil(t, logger.Out)
+	handler := NullLogger{}.WithJobLogger()
+	require.NotNil(t, handler)
+	require.False(t, handler.Enabled(t.Context(), logging.LevelError))
+}
+
+func TestRunnerReclaimsVolumesAfterReporting(t *testing.T) {
+	for _, mode := range []string{"deferred", "post-task script"} {
+		t.Run(mode, func(t *testing.T) {
+			cfg := &config.Config{
+				Cache:     config.Cache{Enabled: new(false)},
+				Runner:    config.Runner{Timeout: time.Minute, LogReportInterval: time.Minute, StateReportInterval: time.Minute},
+				Container: config.Container{Network: "host", DockerHost: "-"},
+			}
+			if mode == "post-task script" {
+				if runtime.GOOS == "windows" {
+					t.Skip("uses a POSIX script")
+				}
+				cfg.Runner.PostTaskScript = filepath.Join(t.TempDir(), "post-task.sh")
+				require.NoError(t, os.WriteFile(cfg.Runner.PostTaskScript, []byte("#!/bin/sh\n: > \"$0.done\"\n"), 0o700))
+			}
+			cli := clientmocks.NewClient(t)
+			cli.AddressValue = "https://gitea.example/"
+			r := NewRunner(cfg, &config.Registration{UUID: "runner-1", Labels: []string{"ubuntu:docker://node:20"}}, cli)
+			var reported atomic.Bool
+			var removed atomic.Int64
+			cli.On("UpdateLog", mock.Anything, mock.Anything).Return(func(_ context.Context, req *runnerv1.UpdateLogRequest) (*runnerv1.UpdateLogResponse, error) {
+				assert.False(t, reported.Load())
+				return &runnerv1.UpdateLogResponse{AckIndex: req.Index + int64(len(req.Rows))}, nil
+			})
+			cli.On("UpdateTask", mock.Anything, mock.Anything).Return(func(_ context.Context, req *runnerv1.UpdateTaskRequest) (*runnerv1.UpdateTaskResponse, error) {
+				if req.State.Result != runnerv1.Result_RESULT_UNSPECIFIED {
+					assert.Equal(t, runnerv1.Result_RESULT_SUCCESS, req.State.Result)
+					assert.Equal(t, int64(1), r.RunningCount())
+					if mode == "post-task script" {
+						assert.FileExists(t, cfg.Runner.PostTaskScript+".done")
+					}
+					reported.Store(true)
+				}
+				return &runnerv1.UpdateTaskResponse{State: req.State}, nil
+			})
+			var volumesCreated atomic.Bool
+			daemon := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				writer.Header().Set("Content-Type", "application/json")
+				writer.Header().Set("API-Version", "1.47")
+				path := strings.TrimPrefix(request.URL.Path, "/v1.47")
+				if response, ok := map[string]string{
+					"/_ping":                  "OK",
+					"/info":                   `{"Architecture":"amd64","OSType":"linux"}`,
+					"/containers/json":        "[]",
+					"/networks":               "[]",
+					"/volumes":                `{"Volumes":[]}`,
+					"/containers/create":      `{"Id":"job-id"}`,
+					"/containers/job-id/json": `{"Id":"job-id","Config":{},"State":{"Status":"running"}}`,
+				}[path]; ok {
+					_, _ = io.WriteString(writer, response)
+					return
+				}
+				switch {
+				case strings.HasPrefix(path, "/images/"):
+					_, _ = io.WriteString(writer, `{"Id":"image-id","Config":{},"Os":"linux","Architecture":"amd64"}`)
+				case path == "/volumes/create":
+					volumesCreated.Store(true)
+					_, _ = io.WriteString(writer, "{}")
+				case strings.HasSuffix(path, "/exec"):
+					_, _ = io.WriteString(writer, `{"Id":"exec-id"}`)
+				case strings.HasPrefix(path, "/exec/"):
+					_, _ = io.WriteString(writer, `{"Running":false,"ExitCode":0}`)
+				case request.Method == http.MethodDelete || strings.HasSuffix(path, "/start") || strings.HasSuffix(path, "/kill") || strings.HasSuffix(path, "/archive"):
+					if request.Method == http.MethodDelete && strings.HasPrefix(path, "/volumes/") && volumesCreated.Load() {
+						assert.Equal(t, mode != "post-task script", reported.Load())
+						if mode == "post-task script" {
+							assert.NoFileExists(t, cfg.Runner.PostTaskScript+".done")
+						}
+						assert.Equal(t, int64(1), r.RunningCount())
+						removed.Add(1)
+					}
+					writer.WriteHeader(http.StatusNoContent)
+				case strings.HasPrefix(path, "/containers/") && strings.HasSuffix(path, "/json"):
+					http.NotFound(writer, request)
+				default:
+					t.Errorf("unexpected Docker request: %s %s", request.Method, request.URL)
+					http.NotFound(writer, request)
+				}
+			}))
+			t.Cleanup(daemon.Close)
+			t.Setenv("DOCKER_HOST", daemon.URL)
+			require.NoError(t, r.Run(t.Context(), &runnerv1.Task{
+				Context:         &structpb.Struct{},
+				WorkflowPayload: []byte("jobs:\n  job:\n    runs-on: ubuntu\n    steps:\n      - run: exit 0\n        if: false\n"),
+			}))
+			assert.True(t, reported.Load())
+			assert.Equal(t, int64(2), removed.Load())
+			assert.Zero(t, r.RunningCount())
+		})
+	}
+}
+
+func TestCleanupJobVolumesJoinsErrorsAfterCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	err := cleanupJobVolumes(ctx, []common.Executor{
+		func(ctx context.Context) error {
+			require.NoError(t, ctx.Err())
+			deadline, ok := ctx.Deadline()
+			assert.True(t, ok)
+			assert.InDelta(t, time.Minute.Seconds(), time.Until(deadline).Seconds(), 1)
+			return io.EOF
+		},
+		func(context.Context) error { return io.ErrClosedPipe },
+	})
+	require.ErrorIs(t, err, io.EOF)
+	require.ErrorIs(t, err, io.ErrClosedPipe)
+}
+
+func TestRunnerReturnsMaskedFinalReportingError(t *testing.T) {
+	cfg, err := config.LoadDefault("")
+	require.NoError(t, err)
+	cfg.Cache.Enabled = new(false)
+	cfg.Runner.ReportCloseTimeout = time.Millisecond
+	cli := clientmocks.NewClient(t)
+	cli.AddressValue = "https://gitea.example/"
+	reportErr := errors.New("reporting unavailable for hunter2")
+	cli.On("UpdateLog", mock.Anything, mock.Anything).Return(nil, reportErr)
+	cli.On("UpdateTask", mock.Anything, mock.Anything).Return(nil, reportErr)
+	r := NewRunner(cfg, &config.Registration{}, cli)
+
+	err = r.Run(t.Context(), &runnerv1.Task{
+		Context:         &structpb.Struct{},
+		WorkflowPayload: []byte("["),
+		Secrets:         map[string]string{"PASSWORD": "hunter2"},
+	})
+
+	require.ErrorContains(t, err, "reporting unavailable for ***")
+	assert.NotContains(t, err.Error(), "hunter2")
+	assert.Zero(t, r.RunningCount())
 }
 
 func TestNewRunnerInitializesLabelsAndEnvironment(t *testing.T) {
@@ -82,7 +223,7 @@ func TestNewRunnerInitializesLabelsAndEnvironment(t *testing.T) {
 		Labels: []string{"ubuntu:host", "", "pool:e57e18d4"},
 	}
 	cli := clientmocks.NewClient(t)
-	cli.On("Address").Return("https://gitea.example/").Maybe()
+	cli.AddressValue = "https://gitea.example/"
 
 	r := NewRunner(cfg, reg, cli)
 
@@ -98,6 +239,55 @@ func TestNewRunnerInitializesLabelsAndEnvironment(t *testing.T) {
 	require.Empty(t, r.envs[runner.CacheServiceV2Env], "no cache server, nothing to serve v2 from")
 }
 
+func TestRunnerFallbackPlatform(t *testing.T) {
+	tests := []struct {
+		name          string
+		label         string
+		dockerRunning bool
+		want          string
+	}{
+		{"a docker label needs no daemon probe", "ubuntu:docker://node:18", false, "mirror.example/ci:noble"},
+		{"host labels keep the image where docker runs", "ubuntu:host", true, "mirror.example/ci:noble"},
+		{"host labels without docker run on the host", "ubuntu:host", false, labels.SelfHostedPlatform},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reachable := dockerReachable
+			dockerReachable = func(context.Context) bool { return tt.dockerRunning }
+			t.Cleanup(func() { dockerReachable = reachable })
+
+			label, err := labels.Parse(tt.label)
+			require.NoError(t, err)
+			cfg := &config.Config{}
+			cfg.Runner.DefaultImage = "mirror.example/ci:noble"
+			r := &Runner{cfg: cfg, labels: labels.Labels{label}}
+
+			require.Equal(t, tt.want, r.fallbackPlatform(t.Context()))
+		})
+	}
+}
+
+func TestRunnerKubernetesOptionsLayerTheLabelPodTemplatesInRunsOnOrder(t *testing.T) {
+	cfg := &config.Config{Kubernetes: config.Kubernetes{
+		PodTemplate:  map[string]any{"base": true},
+		PodTemplates: map[string]map[string]any{"gpu": {"gpu": true}, "large": {"large": true}, "other": {"other": true}},
+	}}
+	r := &Runner{cfg: cfg, labels: labels.Labels{{Name: "linux"}, {Name: "gpu"}, {Name: "large"}}}
+
+	require.Equal(t, []map[string]any{{"base": true}, {"large": true}, {"gpu": true}}, r.kubernetesOptions([]string{"linux", "large", "other", "gpu", "large"}).PodTemplates)
+}
+
+func TestRunnerKubernetesOptionsTransfer(t *testing.T) {
+	kubernetesRunner := &Runner{cfg: &config.Config{}}
+	kubernetesRunner.cfg.Kubernetes.Transfer = config.KubernetesTransfer{Mode: config.KubernetesTransferModeAPI, Host: "10.0.0.5", Port: 4000, Image: "gitea/runner:latest"}
+	require.Nil(t, kubernetesRunner.kubernetesOptions(nil).Transfer)
+
+	kubernetesRunner.cfg.Kubernetes.Transfer.Mode = config.KubernetesTransferModeAuto
+	require.Equal(t, &container.KubernetesTransfer{Host: "10.0.0.5", Port: 4000, Image: "gitea/runner:latest", Fallback: true}, kubernetesRunner.kubernetesOptions(nil).Transfer)
+	kubernetesRunner.cfg.Kubernetes.Transfer.Mode = config.KubernetesTransferModeDirect
+	require.Equal(t, &container.KubernetesTransfer{Host: "10.0.0.5", Port: 4000, Image: "gitea/runner:latest"}, kubernetesRunner.kubernetesOptions(nil).Transfer)
+}
+
 // Proxy variables are assembled per task, because a job's service containers have to be
 // reached directly and they are only known once the workflow is parsed.
 func TestNewRunnerLeavesProxyToTheTask(t *testing.T) {
@@ -106,14 +296,19 @@ func TestNewRunnerLeavesProxyToTheTask(t *testing.T) {
 
 	cfg := &config.Config{}
 	cfg.Cache.ExternalServer = "http://cache.local:8088/"
+	cfg.Cache.Host = "runner.local"
 	reg := &config.Registration{Name: "runner"}
 	cli := clientmocks.NewClient(t)
-	cli.On("Address").Return("https://gitea.example/").Maybe()
+	cli.AddressValue = "https://gitea.example/"
 
 	r := NewRunner(cfg, reg, cli)
+	t.Cleanup(func() { _ = r.Close() })
 
 	require.NotContains(t, r.envs, "http_proxy")
 	require.NotContains(t, r.envs, "no_proxy")
+	proxyEnv := JobProxyEnv(r.envs, r.cacheHandler.ExternalURL(), nil)
+	assert.Contains(t, proxyEnv["no_proxy"], "runner.local")
+	assert.NotContains(t, proxyEnv["no_proxy"], "cache.local")
 }
 
 func taskWithDefaultActionsURL(url string) *runnerv1.Task {
@@ -132,7 +327,7 @@ func TestNewRunnerCacheServiceV2(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Cache.Dir, cfg.Cache.Host = t.TempDir(), "127.0.0.1"
 	cli := clientmocks.NewClient(t)
-	cli.On("Address").Return("https://gitea.example/").Maybe()
+	cli.AddressValue = "https://gitea.example/"
 
 	r := NewRunner(cfg, &config.Registration{Name: "runner"}, cli)
 	t.Cleanup(func() { _ = r.Close() })
@@ -140,11 +335,10 @@ func TestNewRunnerCacheServiceV2(t *testing.T) {
 
 	assert.Equal(t, "https://gitea.example", r.envs["ACTIONS_RESULTS_URL"])
 	assert.Empty(t, r.envs[runner.CacheServiceV2Env], "a promise the runner has not made yet")
-	assert.True(t, r.patchToolkit())
 
 	// The registration is what makes it true: the cache server takes the results service over,
 	// having been told which instance to forward the artifact half to.
-	revoke, resultsURL := r.registerCacheForTask(token, "owner/repo", nil)
+	revoke, resultsURL := r.registerCacheForTask(token, artifactcache.JobCredential{Repo: "owner/repo", PublicURL: r.cacheHandler.ExternalURL()}, nil)
 	defer revoke()
 	require.Equal(t, r.cacheHandler.ExternalURL(), resultsURL)
 
@@ -161,22 +355,142 @@ func TestNewRunnerCacheServiceV2(t *testing.T) {
 	defer resp.Body.Close()
 
 	assert.Equal(t, http.StatusOK, resp.StatusCode, "the advertised results service serves no cache service")
+	assert.NotContains(t, r.envs, "ACTIONS_CACHE_URL")
+
+	envs := r.cloneEnvs()
+	r.setResultsService(envs, resultsURL)
+	assert.Equal(t, resultsURL, envs["ACTIONS_RESULTS_URL"])
+	assert.Equal(t, "true", envs[runner.CacheServiceV2Env])
+
+	cfg.Cache.V2 = new(bool)
+	envs = r.cloneEnvs()
+	envs[runner.CacheServiceV2Env] = "true"
+	r.setResultsService(envs, resultsURL)
+	assert.Equal(t, "https://gitea.example", envs["ACTIONS_RESULTS_URL"])
+	assert.Empty(t, envs[runner.CacheServiceV2Env], "a runner.envs entry would promise v2 at an origin not serving it")
+
+	envs = r.cloneEnvs()
+	envs[runner.CacheServiceV2Env] = "true"
+	envs["ACTIONS_RESULTS_URL"] = "https://gitea.example/sub"
+	r.setResultsService(envs, "")
+	assert.Equal(t, "https://gitea.example/sub", envs["ACTIONS_RESULTS_URL"], "with no cache server there is nothing to front with")
+	assert.Empty(t, envs[runner.CacheServiceV2Env])
+
+	for instance, insecure := range map[string]bool{
+		"https://gitea.example/sub":   false,
+		"https://self-signed.example": true,
+	} {
+		cfg.Runner.Insecure = insecure
+		envs = r.cloneEnvs()
+		envs["ACTIONS_RESULTS_URL"] = instance
+		r.setResultsService(envs, resultsURL)
+		assert.Equal(t, resultsURL, envs["ACTIONS_RESULTS_URL"], instance)
+		assert.Empty(t, envs[runner.CacheServiceV2Env])
+	}
+
+	workflow, err := model.ReadWorkflow(strings.NewReader(`jobs: {native: {runs-on: native}, linux: {runs-on: linux}, containerized: {runs-on: native, container: alpine}, empty: {runs-on: native, container: ""}}`))
+	require.NoError(t, err)
+	r.isolatedCacheContainer = func(_cacheURL string) string { return "a1b2c3d4e5f6" }
+	pickPlatform := func(runsOn []string) string { return map[string]string{"native": labels.SelfHostedPlatform}[runsOn[0]] }
+	for job, isolated := range map[string]bool{"native": false, "linux": true, "containerized": true, "empty": false} {
+		cacheURL, cacheContainer := r.cacheForJob(workflow.GetJob(job), pickPlatform(workflow.GetJob(job).RunsOn()), t.Logf)
+		if isolated {
+			assert.Equal(t, "a1b2c3d4e5f6", cacheContainer, job)
+			assert.Equal(t, strings.Replace(r.cacheHandler.ExternalURL(), "127.0.0.1", cacheContainer, 1), cacheURL, job)
+		} else {
+			assert.Empty(t, cacheContainer, job)
+			assert.Equal(t, r.cacheHandler.ExternalURL(), cacheURL, job)
+		}
+	}
 }
 
-// The v1 cache client appends its path to ACTIONS_CACHE_URL without a separator, so a configured
-// server that is missing the slash would send it to a URL whose port swallows the path.
-func TestNewRunnerNormalizesTheExternalCacheServer(t *testing.T) {
-	cfg := &config.Config{}
-	cfg.Cache.ExternalServer = "http://cache.local:8088//"
-	cli := clientmocks.NewClient(t)
-	cli.On("Address").Return("https://gitea.example/").Maybe()
+func TestCacheForJobIPv6WarningAndIsolationRecheck(t *testing.T) {
+	handler, err := artifactcache.StartHandler(artifactcache.Options{OutboundIP: "2001:db8::1", Upstream: "http://cache.invalid"})
+	require.NoError(t, err)
+	defer handler.Close()
+	var checked []string
+	r := &Runner{cfg: &config.Config{}, cacheHandler: handler, isolatedCacheContainer: lastResult(func(cacheURL string) (string, bool) {
+		checked = append(checked, cacheURL)
+		return "", cacheURL != "http://unreachable"
+	})}
+	warnings := 0
+	logf := func(_format string, _args ...any) { warnings++ }
+	workflow, err := model.ReadWorkflow(strings.NewReader(`jobs: {native: {runs-on: native}, containerized: {runs-on: native, container: alpine}}`))
+	require.NoError(t, err)
+	for _, job := range []string{"native", "containerized", "containerized"} {
+		cacheURL, _ := r.cacheForJob(workflow.GetJob(job), labels.SelfHostedPlatform, logf)
+		assert.Equal(t, handler.ExternalURL(), cacheURL)
+	}
+	assert.Equal(t, 2, warnings)
+	assert.Equal(t, []string{handler.ExternalURL()}, checked)
 
-	r := NewRunner(cfg, &config.Registration{Name: "runner"}, cli)
+	r.cfg.Container.NetworkCreateOptions.EnableIPv6 = new(true)
+	r.cacheForJob(workflow.GetJob("containerized"), labels.SelfHostedPlatform, logf)
+	assert.Equal(t, 2, warnings)
+	r.cfg.Container.Network = "bridge"
+	r.cacheForJob(workflow.GetJob("containerized"), labels.SelfHostedPlatform, logf)
+	assert.Equal(t, 3, warnings)
+	r.cfg.Cache.Host = "2001:db8::1"
+	r.cacheForJob(workflow.GetJob("containerized"), labels.SelfHostedPlatform, logf)
+	assert.Equal(t, 3, warnings)
 
-	assert.Equal(t, "http://cache.local:8088/", r.envs["ACTIONS_CACHE_URL"])
-	// Nothing to front the results service with, so the variable stays unset, but the bundles are
-	// still patched: artifacts v4 need that, and the patch keeps the cache client on the cache URL.
-	assert.Equal(t, "https://gitea.example", r.envs["ACTIONS_RESULTS_URL"])
-	assert.Empty(t, r.envs[runner.CacheServiceV2Env])
-	assert.True(t, r.patchToolkit())
+	r.isolatedCacheContainer("http://unreachable")
+	r.isolatedCacheContainer("http://unreachable")
+	assert.Len(t, checked, 3)
+}
+
+func TestRestoreCalledWorkflowContext(t *testing.T) {
+	newTask := func(workflowCall map[string]any) *runnerv1.Task {
+		values := map[string]any{
+			"event_name": "workflow_call",
+			"event":      map[string]any{"ref": "refs/heads/main", "inputs": map[string]any{"env": "leaf"}},
+		}
+		if workflowCall != nil {
+			values["gitea_workflow_call"] = workflowCall
+		}
+		taskCtx, err := structpb.NewStruct(values)
+		require.NoError(t, err)
+		return &runnerv1.Task{Context: taskCtx}
+	}
+
+	t.Run("dispatched run", func(t *testing.T) {
+		task := newTask(map[string]any{
+			"original_event_name":   "workflow_dispatch",
+			"original_event_inputs": map[string]any{"target": "prod"},
+			"inputs":                map[string]any{"target": "prod", "env": "leaf"},
+		})
+		assert.Equal(t, map[string]any{"target": "prod", "env": "leaf"}, restoreCalledWorkflowContext(task))
+		taskCtx := task.Context.AsMap()
+		assert.Equal(t, "workflow_dispatch", taskCtx["event_name"])
+		assert.Equal(t, map[string]any{"ref": "refs/heads/main", "inputs": map[string]any{"target": "prod"}}, taskCtx["event"])
+		assert.Equal(t, []string{"::group::Inputs", "env: leaf", "target: prod", "::endgroup::"}, inputLines(task.Context.Fields))
+	})
+
+	t.Run("event without inputs", func(t *testing.T) {
+		task := newTask(map[string]any{
+			"original_event_name": "push",
+			"inputs":              map[string]any{"env": "leaf"},
+		})
+		assert.Equal(t, map[string]any{"env": "leaf"}, restoreCalledWorkflowContext(task))
+		taskCtx := task.Context.AsMap()
+		assert.Equal(t, "push", taskCtx["event_name"])
+		assert.Equal(t, map[string]any{"ref": "refs/heads/main"}, taskCtx["event"])
+	})
+
+	t.Run("not a called workflow's job", func(t *testing.T) {
+		task := newTask(nil)
+		assert.Nil(t, restoreCalledWorkflowContext(task))
+		assert.Equal(t, "workflow_call", task.Context.AsMap()["event_name"])
+	})
+}
+
+func TestTaskLogFields(t *testing.T) {
+	fields := func(token string) []any {
+		taskContext, err := structpb.NewStruct(map[string]any{"repository": "owner/repo", "run_id": "159", "run_number": "14", "gitea_runtime_token": token})
+		require.NoError(t, err)
+		return taskLogFields(&runnerv1.Task{Id: 72, Context: taskContext}, "build")
+	}
+	want := []any{"task_id", int64(72), "job", "build", "repository", "owner/repo", "run_id", "159", "run_number", "14"}
+	assert.Equal(t, want, fields("malformed"))
+	assert.Equal(t, append(want, "job_id", int64(221)), fields("header."+base64.RawURLEncoding.EncodeToString([]byte(`{"TaskID":72,"JobID":221}`))+".signature"))
 }

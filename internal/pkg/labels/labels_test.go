@@ -7,82 +7,33 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
-	"gotest.tools/v3/assert"
 )
 
 func TestParse(t *testing.T) {
 	tests := []struct {
-		args    string
-		want    *Label
-		wantErr bool
+		args string
+		want *Label
 	}{
-		{
-			args: "ubuntu:docker://node:18",
-			want: &Label{
-				Name:   "ubuntu",
-				Schema: "docker",
-				Arg:    "//node:18",
-			},
-			wantErr: false,
-		},
-		{
-			args: "ubuntu:host",
-			want: &Label{
-				Name:   "ubuntu",
-				Schema: "host",
-				Arg:    "",
-			},
-			wantErr: false,
-		},
-		{
-			args: "ubuntu",
-			want: &Label{
-				Name:   "ubuntu",
-				Schema: "host",
-				Arg:    "",
-			},
-			wantErr: false,
-		},
-		{
-			args: "pool:e57e18d4-10d4-406f-93bf-60f127221bdd",
-			want: &Label{
-				Name:   "pool:e57e18d4-10d4-406f-93bf-60f127221bdd",
-				Schema: "host",
-				Arg:    "",
-				Opaque: true,
-			},
-			wantErr: false,
-		},
-		{
-			args: "ubuntu:vm:ubuntu-18.04",
-			want: &Label{
-				Name:   "ubuntu:vm:ubuntu-18.04",
-				Schema: "host",
-				Arg:    "",
-				Opaque: true,
-			},
-			wantErr: false,
-		},
-		{
-			args:    "",
-			want:    nil,
-			wantErr: true,
-		},
+		{"ubuntu:docker://node:18", &Label{Name: "ubuntu", Schema: "docker", Arg: "//node:18"}},
+		{"ubuntu:host", &Label{Name: "ubuntu", Schema: "host"}},
+		{"ubuntu", &Label{Name: "ubuntu", Schema: "host"}},
+		{"pool:e57e18d4-10d4-406f-93bf-60f127221bdd", &Label{Name: "pool:e57e18d4-10d4-406f-93bf-60f127221bdd", Schema: "host", Opaque: true}},
+		{"ubuntu:vm:ubuntu-18.04", &Label{Name: "ubuntu:vm:ubuntu-18.04", Schema: "host", Opaque: true}},
+		{"", nil},
 	}
 	for _, tt := range tests {
 		t.Run(tt.args, func(t *testing.T) {
 			got, err := Parse(tt.args)
-			if tt.wantErr {
+			if tt.want == nil {
 				require.Error(t, err)
 				return
 			}
 			require.NoError(t, err)
-			assert.DeepEqual(t, got, tt.want)
+			require.Equal(t, tt.want, got)
 		})
 	}
 }
 
-// mustParse parses the given label strings, failing the test on any error.
 func mustParse(t *testing.T, strs ...string) Labels {
 	t.Helper()
 	ls := make(Labels, 0, len(strs))
@@ -115,6 +66,7 @@ func TestPickPlatform(t *testing.T) {
 	ls := mustParse(t,
 		"ubuntu:docker://node:18",
 		"self-hosted:host",
+		"k8s:kubernetes://node:24",
 	)
 
 	tests := []struct {
@@ -123,10 +75,11 @@ func TestPickPlatform(t *testing.T) {
 		want   string
 	}{
 		{"docker strips leading slashes", []string{"ubuntu"}, "node:18"},
-		{"host maps to self-hosted marker", []string{"self-hosted"}, "-self-hosted"},
-		{"first match wins", []string{"self-hosted", "ubuntu"}, "-self-hosted"},
-		{"unknown falls back to default", []string{"windows"}, "docker.gitea.com/runner-images:ubuntu-latest"},
-		{"no runsOn falls back to default", nil, "docker.gitea.com/runner-images:ubuntu-latest"},
+		{"kubernetes keeps its scheme", []string{"k8s"}, "kubernetes://node:24"},
+		{"host maps to self-hosted marker", []string{"self-hosted"}, SelfHostedPlatform},
+		{"first match wins", []string{"self-hosted", "ubuntu"}, SelfHostedPlatform},
+		{"unknown label picks nothing", []string{"windows"}, ""},
+		{"no runsOn picks nothing", nil, ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -156,7 +109,6 @@ func TestToStrings(t *testing.T) {
 	}, ls.ToStrings())
 }
 
-// a colon-containing name must survive a write to and read back from the .runner file
 func TestOpaqueLabelRoundTrip(t *testing.T) {
 	const raw = "pool:e57e18d4-10d4-406f-93bf-60f127221bdd"
 
@@ -167,5 +119,5 @@ func TestOpaqueLabelRoundTrip(t *testing.T) {
 	require.Equal(t, ls, again)
 	require.Equal(t, []string{raw}, again.Names())
 	require.False(t, again.RequireDocker())
-	require.Equal(t, "-self-hosted", again.PickPlatform([]string{raw}))
+	require.Equal(t, SelfHostedPlatform, again.PickPlatform([]string{raw}))
 }

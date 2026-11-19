@@ -4,13 +4,19 @@
 package runner
 
 import (
+	"bytes"
 	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"io"
 	"net/url"
 	"strings"
 	"testing"
 
-	"github.com/sirupsen/logrus"
+	"gitea.com/gitea/runner/act/common"
+	"gitea.com/gitea/runner/act/common/logging"
+	"gitea.com/gitea/runner/act/common/logging/logtest"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -22,6 +28,7 @@ func TestValueMasker(t *testing.T) {
 		secrets    map[string]string
 		masks      []string
 		disallowed []string
+		want       string
 	}{
 		{
 			name:  "Multiline Private Key",
@@ -43,16 +50,70 @@ func TestValueMasker(t *testing.T) {
 			secrets:    map[string]string{"TOKEN": "pass%word"},
 			disallowed: []string{"pass%25word"},
 		},
+		{
+			name:  "one-character mask",
+			lines: "%",
+			masks: []string{"%"},
+			want:  "***",
+		},
+		{
+			name:    "fully escaped legacy secret",
+			lines:   "##[group]alpha beta%3Bgamma%5Ddelta",
+			secrets: map[string]string{"TOKEN": "alpha beta;gamma]delta"},
+			want:    "##[group]***",
+		},
+		{
+			name:  "partially escaped legacy mask",
+			lines: "##[group]alpha beta%3Bgamma]delta",
+			masks: []string{"alpha beta;gamma]delta"},
+			want:  "##[group]***",
+		},
+		{
+			name:  "partially escaped modern mask preserves unrelated escapes",
+			lines: "::group::alpha%25beta%gamma tail%250A%0A",
+			masks: []string{"alpha%beta%gamma"},
+			want:  "::group::*** tail%250A%0A",
+		},
+		{
+			name:  "command escapes are decoded once",
+			lines: "##[group]alpha%253Bbeta%5Dgamma",
+			masks: []string{"alpha;beta]gamma"},
+			want:  "##[group]alpha%253Bbeta%5Dgamma",
+		},
+		{
+			name:  "plain output preserves escapes",
+			lines: "alpha beta%3Bgamma%5Ddelta",
+			masks: []string{"alpha beta;gamma]delta"},
+			want:  "alpha beta%3Bgamma%5Ddelta",
+		},
+		{
+			name:  "command display preserves literal escapes around a mask",
+			lines: "##[command]alpha tail%3Bvalue%5D",
+			masks: []string{"alpha"},
+			want:  "##[command]*** tail%3Bvalue%5D",
+		},
+		{
+			name:  "unknown modern commands preserve literal escapes",
+			lines: "::unknown::alpha tail%25value",
+			masks: []string{"alpha"},
+			want:  "::unknown::*** tail%25value",
+		},
+		{
+			name:  "masks can span command headers and data",
+			lines: "::group::hidden other",
+			masks: []string{"group::hidden", "other"},
+			want:  "::*** ***",
+		},
 	}
 	for _, entry := range table {
 		t.Run(entry.name, func(t *testing.T) {
 			ctx := WithMasks(t.Context(), &entry.masks)
-			masker := valueMasker(false, entry.secrets)
+			masker := valueMasker(false, AppendSecretMaskers(nil, entry.secrets))
 			for line := range strings.SplitSeq(entry.lines, "\n") {
-				lentry := masker(&logrus.Entry{
-					Context: ctx,
-					Message: line,
-				})
+				lentry := masker(ctx, logging.Record{Message: line})
+				if entry.want != "" {
+					assert.Equal(t, entry.want, lentry.Message)
+				}
 				for _, line := range entry.disallowed {
 					assert.NotContains(t, lentry.Message, line)
 				}
@@ -64,26 +125,27 @@ func TestValueMasker(t *testing.T) {
 // A secret that reaches the log through an encoding — a base64 payload, a JSON body, a
 // URL — must be masked as well: masking only the verbatim value leaks it.
 func TestValueMaskerEncodedSecrets(t *testing.T) {
-	secret := `p@ss w"rd/1`
-	masker := valueMasker(false, map[string]string{"TOKEN": secret})
-
 	for _, tc := range []struct {
-		name string
-		line string
+		name, secret string
+		encoded      []string
 	}{
-		{"verbatim", "the token is " + secret},
-		{"base64", "Authorization: Basic " + base64.StdEncoding.EncodeToString([]byte(secret))},
-		{"json", `{"token":"` + jsonStringEscape(secret) + `"}`},
-		{"query escaped", "https://example.com/?token=" + url.QueryEscape(secret)},
-		{"path escaped", "https://example.com/" + url.PathEscape(secret) + "/x"},
+		{"common encodings", `p@ss w"rd/1`, []string{
+			`p@ss w"rd/1`, base64.StdEncoding.EncodeToString([]byte(`p@ss w"rd/1`)),
+			jsonStringEscape(`p@ss w"rd/1`), url.PathEscape(`p@ss w"rd/1`),
+		}},
+		{"XML expression and quotes", `"a'b&c<d>"`, []string{
+			`&quot;a&apos;b&amp;c&lt;d&gt;&quot;`, `"a''b&c<d>"`, `a'b&c<d>`,
+		}},
+		{"URI spaces", "a b", []string{"a%20b", "a+b"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			entry := masker(&logrus.Entry{Context: t.Context(), Message: tc.line})
+			masker := valueMasker(false, AppendSecretMaskers(nil, map[string]string{"TOKEN": tc.secret}))
+			entry := masker(t.Context(), logging.Record{Message: strings.Join(tc.encoded, " ")})
 
 			assert.Contains(t, entry.Message, "***")
-			assert.NotContains(t, entry.Message, secret)
-			assert.NotContains(t, entry.Message, base64.StdEncoding.EncodeToString([]byte(secret)))
-			assert.NotContains(t, entry.Message, url.QueryEscape(secret))
+			for _, disallowed := range tc.encoded {
+				assert.NotContains(t, entry.Message, disallowed)
+			}
 		})
 	}
 }
@@ -94,7 +156,7 @@ func TestValueMaskerEncodedSecrets(t *testing.T) {
 // form, so a JS-serialized JSON body does not leak it.
 func TestValueMaskerJSONEscapesBothWays(t *testing.T) {
 	secret := `a"<b>&c`
-	masker := valueMasker(false, map[string]string{"TOKEN": secret})
+	masker := valueMasker(false, AppendSecretMaskers(nil, map[string]string{"TOKEN": secret}))
 
 	for _, tc := range []struct {
 		name string
@@ -104,7 +166,7 @@ func TestValueMaskerJSONEscapesBothWays(t *testing.T) {
 		{"literal (JS JSON.stringify / .NET)", jsonStringEscapeNoHTML(secret)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			entry := masker(&logrus.Entry{Context: t.Context(), Message: `{"t":"` + tc.form + `"}`})
+			entry := masker(t.Context(), logging.Record{Message: `{"t":"` + tc.form + `"}`})
 
 			assert.Contains(t, entry.Message, "***")
 			assert.NotContains(t, entry.Message, tc.form)
@@ -112,17 +174,34 @@ func TestValueMaskerJSONEscapesBothWays(t *testing.T) {
 	}
 }
 
+// With debug logging on, the job logger writes to stdout, which no reporter masks, so it has
+// to hide the values that are not job secrets too.
+func TestValueMaskerHidesExtraMasks(t *testing.T) {
+	masker := valueMasker(false, (&Config{ExtraMasks: []string{"pr0xypw"}}).maskers())
+
+	entry := masker(t.Context(), logging.Record{Message: "proxy is http://user:pr0xypw@proxy:3128"})
+
+	assert.Equal(t, "proxy is http://user:***@proxy:3128", entry.Message)
+}
+
 // ::add-mask:: values go through the same masker, so they get the same treatment.
 func TestValueMaskerEncodedMasks(t *testing.T) {
-	masks := []string{"s3cr3t value"}
-	masker := valueMasker(false, nil)
+	masks := []string{"s3cr3t value", "first\rsecond", " s3cr3t "}
+	masker := valueMasker(false, AppendSecretMaskers(nil, nil))
 
-	entry := masker(&logrus.Entry{
-		Context: WithMasks(t.Context(), &masks),
-		Message: "encoded: " + base64.StdEncoding.EncodeToString([]byte("s3cr3t value")),
-	})
-
-	assert.Equal(t, "encoded: ***", entry.Message)
+	for _, tc := range []struct {
+		line, want string
+	}{
+		{"encoded: " + base64.StdEncoding.EncodeToString([]byte("s3cr3t value")), "encoded: ***"},
+		{"first and second", "*** and ***"},
+		{"encoded: " + base64.StdEncoding.EncodeToString([]byte(" s3cr3t ")), "encoded: ***"},
+		{"encoded: " + base64.StdEncoding.EncodeToString([]byte("s3cr3t")), "encoded: ***"},
+		{"encoded: " + base64.StdEncoding.EncodeToString([]byte("first")), "encoded: ***"},
+		{"##[group]s3cr3t value\r\n", "##[group]***\r\n"},
+	} {
+		entry := masker(WithMasks(t.Context(), &masks), logging.Record{Message: tc.line})
+		assert.Equal(t, tc.want, entry.Message, tc.line)
+	}
 }
 
 // A token in a Basic auth header is base64'd together with the user name, so the token's
@@ -130,18 +209,16 @@ func TestValueMaskerEncodedMasks(t *testing.T) {
 // alignments must be masked as well, or `Authorization: Basic base64("user:token")` leaks
 // the token to anyone who can decode the log.
 func TestValueMaskerBase64Alignments(t *testing.T) {
-	secret := "s3cr3t-token-value"
-	masker := valueMasker(false, map[string]string{"TOKEN": secret})
+	secret := "s3cr3t"
+	masker := valueMasker(false, AppendSecretMaskers(nil, map[string]string{"TOKEN": secret}))
 
 	// One prefix per alignment: len%3 of 0, 1 and 2.
 	for _, prefix := range []string{"x-access-token:", "user:", "ab:"} {
 		t.Run(prefix, func(t *testing.T) {
 			encoded := base64.StdEncoding.EncodeToString([]byte(prefix + secret))
-			entry := masker(&logrus.Entry{Context: t.Context(), Message: "Authorization: Basic " + encoded})
+			entry := masker(t.Context(), logging.Record{Message: "Authorization: Basic " + encoded})
 
 			assert.Contains(t, entry.Message, "***")
-			// The aligned middle of the secret must be gone, so the payload can no longer be
-			// decoded back into the token.
 			assert.NotEqual(t, "Authorization: Basic "+encoded, entry.Message)
 			decodable := strings.TrimPrefix(entry.Message, "Authorization: Basic ")
 			decoded, err := base64.StdEncoding.DecodeString(decodable)
@@ -155,9 +232,9 @@ func TestValueMaskerBase64Alignments(t *testing.T) {
 // The masker caches its replacer, so it has to notice both a mask appended to the same
 // slice and a composite action logging with a slice of its own.
 func TestValueMaskerCachedReplacerSeesNewMasks(t *testing.T) {
-	masker := valueMasker(false, map[string]string{"TOKEN": "secret-token"})
+	masker := valueMasker(false, AppendSecretMaskers(nil, map[string]string{"TOKEN": "secret-token"}))
 	mask := func(masks *[]string, message string) string {
-		return masker(&logrus.Entry{Context: WithMasks(t.Context(), masks), Message: message}).Message
+		return masker(WithMasks(t.Context(), masks), logging.Record{Message: message}).Message
 	}
 
 	job := []string{"first mask"}
@@ -176,31 +253,86 @@ func TestValueMaskerCachedReplacerSeesNewMasks(t *testing.T) {
 }
 
 func TestAppendSecretMaskerSkipsUselessEncodings(t *testing.T) {
-	// A token with no character an escape would touch only gains its base64 forms:
-	// JSON, query and path escaping all leave it unchanged.
 	pairs := AppendSecretMasker(nil, "plaintoken")
 	assert.Equal(t, []string{
-		"plaintoken", "***",
-		base64.StdEncoding.EncodeToString([]byte("plaintoken")), "***",
-		// The two shifted alignments, each without its leading and trailing group.
-		"YWludG9r", "***",
-		"bGFpbnRv", "***",
+		"plaintoken", "***", "cGxhaW50b2tlbg==", "***", "bGFpbnRva2Vu", "***", "YWludG9rZW4=", "***",
+		"aW50b2tl", "***", "YWludG9r", "***", "bGFpbnRv", "***",
 	}, pairs)
 
-	// Too short to mask.
-	assert.Empty(t, AppendSecretMasker(nil, "x"))
+	assert.Contains(t, AppendSecretMasker(nil, "x"), "x")
+	assert.Empty(t, AppendSecretMasker(nil, " \t"))
+	assert.NotContains(t, AppendSecretMasker(nil, "{\nvalue\n}"), "{")
+	assert.NotContains(t, AppendSecretMasker(nil, `"123456"`), "123456")
 }
 
 func TestJobLogFormatterDecodesCommandData(t *testing.T) {
-	logger := logrus.New()
-	logger.Out = io.Discard
 	format := func(message string) string {
-		out, err := (&jobLogFormatter{}).Format(&logrus.Entry{Logger: logger, Message: message, Data: logrus.Fields{rawOutputField: true}})
+		line, err := textFormatter{w: io.Discard}.format(logging.Record{Message: message, Attrs: []logging.Attr{{Key: rawOutputField, Value: true}}})
 		require.NoError(t, err)
-		return string(out)
+		return string(line)
 	}
 
 	assert.Contains(t, format("##[error]deploy 50%25 traffic"), "##[error]deploy 50% traffic")
 	// a plain line is not command data and keeps its literal escapes
 	assert.Contains(t, format("progress 50%25 done"), "progress 50%25 done")
+}
+
+type factoryFunc func() logging.Handler
+
+func (f factoryFunc) WithJobLogger() logging.Handler { return f() }
+
+func TestWithJobLoggerFansOutAndMasksOnlyOutput(t *testing.T) {
+	output, hook := logtest.NewWithLevel(logging.LevelTrace), logtest.NewWithLevel(logging.LevelTrace)
+	ctx := WithJobLoggerFactory(t.Context(), factoryFunc(func() logging.Handler { return output }))
+	ctx = common.WithLoggerHandler(ctx, hook)
+	level := logging.LevelInfo
+	cfg := &Config{Secrets: map[string]string{"TOKEN": "s3cr3t-value"}, JobLoggerLevel: &level}
+
+	ctx = WithJobLogger(ctx, "j1", "build", cfg, &[]string{}, nil)
+	ctx = withStepLogger(ctx, 2, "s2", "step two", "Main")
+	ctx = WithCompositeStepLogger(ctx, "inner")
+	common.Logger(ctx).Infof("token is %s", "s3cr3t-value")
+	common.Logger(ctx).Debugf("below the job logger level")
+
+	// the reporter masks for itself, so its record keeps the original
+	require.Len(t, hook.AllRecords(), 1)
+	assert.Equal(t, "token is s3cr3t-value", hook.LastRecord().Message)
+	require.Len(t, output.AllRecords(), 1)
+	assert.Equal(t, "token is ***", output.LastRecord().Message)
+
+	for _, want := range []struct {
+		key string
+		val any
+	}{{"job", "build"}, {"jobID", "j1"}, {"stepNumber", 2}, {"stage", "Main"}, {"stepID", []string{"s2", "inner"}}} {
+		got, ok := hook.LastRecord().Attr(want.key)
+		assert.True(t, ok, want.key)
+		assert.Equal(t, want.val, got, want.key)
+	}
+}
+
+func TestJobLogJSONHandler(t *testing.T) {
+	buf := &bytes.Buffer{}
+	rc := &RunContext{Config: &Config{Secrets: map[string]string{"TOKEN": "s3cr3t-value"}}}
+	ctx := WithJobLoggerFactory(t.Context(), factoryFunc(func() logging.Handler { return newJobLogJSONHandler(buf) }))
+	ctx = WithJobLogger(ctx, "j1", "build", rc.Config, &rc.Masks, nil)
+	logger := common.Logger(withStepLogger(ctx, 1, "s1", "deploy s3cr3t-value", StageMain)).
+		With("msg", "clash").WithError(errors.New("boom"))
+	logger.Warnf("careful %d", 1)
+
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &got))
+	assert.Equal(t, "careful 1", got["msg"])
+	assert.Equal(t, "warning", got["level"])
+	assert.Equal(t, "build", got["job"])
+	assert.Equal(t, "deploy ***", got["step"])
+	assert.Equal(t, "boom", got["error"])
+	assert.Equal(t, "clash", got["fields.msg"])
+	assert.NotEmpty(t, got["time"])
+
+	rc.AddMask(ctx, "runtime-value")
+	buf.Reset()
+	common.Logger(withStepLogger(ctx, 2, "s2", "deploy s3cr3t-value runtime-value", StageMain)).Info("done")
+
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &got))
+	assert.Equal(t, "deploy *** ***", got["step"])
 }

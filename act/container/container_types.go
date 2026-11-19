@@ -9,12 +9,23 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path"
+	"runtime"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"gitea.com/gitea/runner/act/common"
 
 	"github.com/docker/go-connections/nat"
 	"github.com/moby/moby/api/types/container"
 )
+
+var hostOS = runtime.GOOS // replaced in tests
+
+// DrainGracePeriod caps the wait for container output to drain so the log tail is not truncated
+const DrainGracePeriod = 2 * time.Second
 
 // ExitCodeError reports a non-zero process exit code from a container command.
 type ExitCodeError int
@@ -25,26 +36,27 @@ func (e ExitCodeError) Error() string {
 
 // NewContainerInput the input for the New function
 type NewContainerInput struct {
-	Image          string
-	Username       string
-	Password       string
-	Entrypoint     []string
-	Cmd            []string
-	WorkingDir     string
-	Env            []string
-	Binds          []string
-	Mounts         map[string]string
-	Name           string
-	Stdout         io.Writer
-	Stderr         io.Writer
-	NetworkMode    string
-	Privileged     bool
-	UsernsMode     string
-	Platform       string
-	Options        string
-	NetworkAliases []string
-	ExposedPorts   nat.PortSet
-	PortBindings   nat.PortMap
+	Image           string
+	Username        string
+	Password        string
+	Entrypoint      []string
+	Cmd             []string
+	WorkingDir      string
+	Env             []string
+	Binds           []string
+	Mounts          map[string]string
+	Name            string
+	Stdout          io.Writer
+	Stderr          io.Writer
+	NetworkMode     string
+	Privileged      bool
+	UsernsMode      string
+	Platform        string
+	RunnerOptions   string // container options the runner was configured with, trusted
+	WorkflowOptions string // container options the workflow asked for, untrusted
+	NetworkAliases  []string
+	ExposedPorts    nat.PortSet
+	PortBindings    nat.PortMap
 
 	// Gitea specific
 	AutoRemove   bool
@@ -70,9 +82,30 @@ const (
 	HealthUnhealthy = string(container.Unhealthy)
 )
 
+// marks what a runner creates for its jobs, telling its leftovers from another runner's
+const runnerUUIDLabel = "com.gitea.runner.uuid"
+
 // ErrContainerNotFound reports a container the daemon no longer knows. Its text is a
 // fragment, missingContainerError composes it into the message every operation shares.
 var ErrContainerNotFound = errors.New("does not exist")
+
+// DockerProxy is a job's docker socket, fronting the daemon's for the job's lifetime.
+type DockerProxy struct {
+	Socket    string
+	close     func(context.Context) error
+	closeOnce sync.Once
+	closeErr  error
+	mounts    atomic.Value
+}
+
+func (p *DockerProxy) SetMounts(mounts map[string]string) {
+	p.mounts.Store(mounts)
+}
+
+func (p *DockerProxy) Close(ctx context.Context) error {
+	p.closeOnce.Do(func() { p.closeErr = p.close(ctx) })
+	return p.closeErr
+}
 
 // Info is a snapshot of a container, as of one inspect.
 type Info struct {
@@ -83,15 +116,24 @@ type Info struct {
 	// HealthOutput is the last healthcheck probe's output.
 	HealthOutput string
 	Ports        map[string]string // container port ("5432") to the host port it is published on
+	Mounts       map[string]string // container path to its source on the daemon
+}
+
+// DaemonPath maps target to its daemon path through the nearest mount with a source, empty without one.
+func (info *Info) DaemonPath(target string) string {
+	for dir := target; dir != "/" && dir != "."; dir = path.Dir(dir) {
+		if source := info.Mounts[dir]; source != "" {
+			return path.Join(source, strings.TrimPrefix(target, dir))
+		}
+	}
+	return ""
 }
 
 // Container for managing docker run containers
 type Container interface {
 	Create(capAdd, capDrop []string) common.Executor
-	ConnectToNetwork(name string) common.Executor
 	Copy(destPath string, files ...*FileEntry) common.Executor
-	CopyTarStream(ctx context.Context, destPath string, tarStream io.Reader) error
-	CopyDir(destPath, srcPath string, useGitIgnore bool) common.Executor
+	CopyDir(destPath, srcPath string, useGitIgnore, skipGitDir bool) common.Executor
 	GetContainerArchive(ctx context.Context, srcPath string) (io.ReadCloser, error)
 	Inspect(ctx context.Context) (*Info, error)
 	DumpLogs(ctx context.Context) error
@@ -110,6 +152,8 @@ type NewDockerBuildExecutorInput struct {
 	ContextDir   string
 	Dockerfile   string
 	BuildContext io.Reader
+	Dockerignore []byte // applied to BuildContext as the docker CLI applies it
+	Stdout       io.Writer
 	ImageTag     string
 	Platform     string
 	BuildArgs    map[string]*string

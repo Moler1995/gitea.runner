@@ -8,6 +8,11 @@ import (
 	"context"
 	"io"
 	"io/fs"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -15,6 +20,8 @@ import (
 
 	"gitea.com/gitea/runner/act/common"
 	"gitea.com/gitea/runner/act/common/git"
+	"gitea.com/gitea/runner/act/common/logging"
+	"gitea.com/gitea/runner/act/common/logging/logtest"
 	"gitea.com/gitea/runner/act/container"
 
 	"gitea.dev/actionslib/pkg/model"
@@ -23,12 +30,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-type closerMock struct {
-	mock.Mock
-}
+type closerFunc func()
 
-func (m *closerMock) Close() error {
-	m.Called()
+func (close closerFunc) Close() error {
+	close()
 	return nil
 }
 
@@ -39,6 +44,15 @@ runs:
 	using: 'node16'
 	main: 'main.js'
 `, "\t", "  ")
+	yamlAction := &model.Action{
+		Name: "name",
+		Runs: model.ActionRuns{
+			Using:  "node16",
+			Main:   "main.js",
+			PreIf:  "always()",
+			PostIf: "always()",
+		},
+	}
 
 	table := []struct {
 		name        string
@@ -52,30 +66,14 @@ runs:
 			step:        &model.Step{},
 			filename:    "action.yml",
 			fileContent: yaml,
-			expected: &model.Action{
-				Name: "name",
-				Runs: model.ActionRuns{
-					Using:  "node16",
-					Main:   "main.js",
-					PreIf:  "always()",
-					PostIf: "always()",
-				},
-			},
+			expected:    yamlAction,
 		},
 		{
 			name:        "readActionYaml",
 			step:        &model.Step{},
 			filename:    "action.yaml",
 			fileContent: yaml,
-			expected: &model.Action{
-				Name: "name",
-				Runs: model.ActionRuns{
-					Using:  "node16",
-					Main:   "main.js",
-					PreIf:  "always()",
-					PostIf: "always()",
-				},
-			},
+			expected:    yamlAction,
 		},
 		{
 			name:        "readDockerfile",
@@ -91,6 +89,19 @@ runs:
 			},
 		},
 		{
+			name:        "readLowercaseDockerfile",
+			step:        &model.Step{},
+			filename:    "dockerfile",
+			fileContent: "FROM ubuntu:20.04",
+			expected: &model.Action{
+				Name: "(Synthetic)",
+				Runs: model.ActionRuns{
+					Using: "docker",
+					Image: "dockerfile",
+				},
+			},
+		},
+		{
 			name: "readWithArgs",
 			step: &model.Step{
 				With: map[string]string{
@@ -100,10 +111,11 @@ runs:
 			expected: &model.Action{
 				Name: "(Synthetic)",
 				Inputs: map[string]model.Input{
+					"args": {},
 					"cwd": {
 						Description: "(Actual working directory)",
 						Required:    false,
-						Default:     "actionDir/actionPath",
+						Default:     filepath.Join("actionDir", "actionPath"),
 					},
 					"command": {
 						Description: "(Actual program)",
@@ -121,160 +133,76 @@ runs:
 
 	for _, tt := range table {
 		t.Run(tt.name, func(t *testing.T) {
-			closerMock := &closerMock{}
+			closed := false
 
 			readFile := func(filename string) (io.Reader, io.Closer, error) {
 				if tt.filename != filename {
 					return nil, nil, fs.ErrNotExist
 				}
 
-				return strings.NewReader(tt.fileContent), closerMock, nil
+				return strings.NewReader(tt.fileContent), closerFunc(func() { closed = true }), nil
 			}
 
-			writeFile := func(filename string, data []byte, perm fs.FileMode) error {
-				assert.Equal(t, "actionDir/actionPath/trampoline.js", filename)
-				assert.Equal(t, fs.FileMode(0o400), perm)
+			writeFile := func(filename string, _data []byte, perm fs.FileMode) error {
+				assert.Equal(t, filepath.Join("actionDir", "actionPath", "trampoline.js"), filename)
+				assert.Equal(t, fs.FileMode(0o644), perm)
 				return nil
 			}
 
-			if tt.filename != "" {
-				closerMock.On("Close")
-			}
+			action, err := readActionImpl(t.Context(), tt.step, "actionDir", "actionPath", readFile, writeFile)
 
-			action, err := readActionImpl(context.Background(), tt.step, "actionDir", "actionPath", readFile, writeFile)
-
-			assert.NoError(t, err) //nolint:testifylint // pre-existing issue from nektos/act
+			require.NoError(t, err)
 			assert.Equal(t, tt.expected, action)
 
-			closerMock.AssertExpectations(t)
+			assert.Equal(t, tt.filename != "", closed)
 		})
 	}
 }
 
-// With AutoRemove the daemon reaps the container on exit, so act must not remove it afterwards.
-func TestExecAsDockerAutoRemove(t *testing.T) {
-	orig := ContainerNewContainer
-	defer func() { ContainerNewContainer = orig }()
-
-	for _, tc := range []struct {
-		autoRemove bool
-		removes    int
-	}{
-		{false, 2}, // stale + post-run
-		{true, 1},  // post-run skipped
-	} {
-		cm := &containerMock{}
-		ContainerNewContainer = func(*container.NewContainerInput) container.ExecutionsEnvironment { return cm }
-
-		step := &stepActionRemote{
-			Step: &model.Step{ID: "1", Uses: "org/action@v1"},
-			RunContext: &RunContext{
-				Config:       &Config{AutoRemove: tc.autoRemove},
-				Run:          &model.Run{JobID: "1", Workflow: &model.Workflow{Jobs: map[string]*model.Job{"1": {}}}},
-				JobContainer: cm,
-			},
-			action: &model.Action{Runs: model.ActionRuns{Using: "docker", Image: "docker://node:14"}},
-		}
-
-		removes := 0
-		cm.On("Pull", false).Return(func(context.Context) error { return nil })
-		cm.On("Remove").Return(func(context.Context) error { removes++; return nil })
-		cm.On("Create", []string(nil), []string(nil)).Return(func(context.Context) error { return nil })
-		cm.On("Start", true).Return(func(context.Context) error { return nil })
-		cm.On("Close").Return(func(context.Context) error { return nil })
-
-		require.NoError(t, execAsDocker(context.Background(), step, "action", t.TempDir(), t.TempDir(), false, stepStageMain))
-		cm.AssertExpectations(t)
-		assert.Equal(t, tc.removes, removes)
-	}
-}
-
 func TestActionRunner(t *testing.T) {
-	table := []struct {
+	t.Chdir(t.TempDir())
+	for _, tt := range []struct {
 		name        string
-		step        actionStep
+		inputs      map[string]model.Input
+		with        map[string]string
+		state       map[string]string
 		expectedEnv map[string]string
+		warning     string
 	}{
 		{
-			name: "with-input",
-			step: &stepActionRemote{
-				Step: &model.Step{
-					Uses: "org/repo/path@ref",
-				},
-				RunContext: &RunContext{
-					Config: &Config{},
-					Run: &model.Run{
-						JobID: "job",
-						Workflow: &model.Workflow{
-							Jobs: map[string]*model.Job{
-								"job": {
-									Name: "job",
-								},
-							},
-						},
-					},
-				},
-				action: &model.Action{
-					Inputs: map[string]model.Input{
-						"key": {
-							Default: "default value",
-						},
-					},
-					Runs: model.ActionRuns{
-						Using: "node16",
-					},
-				},
-				env: map[string]string{},
-			},
+			name:        "with-input",
+			inputs:      map[string]model.Input{"key": {Default: "default value"}},
 			expectedEnv: map[string]string{"INPUT_KEY": "default value"},
 		},
 		{
-			name: "restore-saved-state",
-			step: &stepActionRemote{
-				Step: &model.Step{
-					ID:   "step",
-					Uses: "org/repo/path@ref",
-				},
-				RunContext: &RunContext{
-					ActionPath: "path",
-					Config:     &Config{},
-					Run: &model.Run{
-						JobID: "job",
-						Workflow: &model.Workflow{
-							Jobs: map[string]*model.Job{
-								"job": {
-									Name: "job",
-								},
-							},
-						},
-					},
-					CurrentStep: "post-step",
-					StepResults: map[string]*model.StepResult{
-						"step": {},
-					},
-					IntraActionState: map[string]map[string]string{
-						"step": {
-							"name": "state value",
-						},
-					},
-				},
-				action: &model.Action{
-					Runs: model.ActionRuns{
-						Using: "node16",
-					},
-				},
-				env: map[string]string{},
-			},
+			name:        "declared input ignores case",
+			inputs:      map[string]model.Input{"key": {Default: "default value"}},
+			with:        map[string]string{"KEY": "provided value"},
+			expectedEnv: map[string]string{"INPUT_KEY": "provided value"},
+		},
+		{
+			name:    "unexpected inputs warn once across stages",
+			inputs:  map[string]model.Input{"key": {}},
+			with:    map[string]string{"KEY": "provided value", "UNKNOWN": "value", "other%0A\r\n": "value"},
+			warning: "##[warning]Unexpected input(s) 'UNKNOWN', 'other%250A%0D%0A', valid inputs are ['key']",
+		},
+		{
+			name:    "no declared inputs",
+			with:    map[string]string{"unknown": "value"},
+			warning: "##[warning]Unexpected input(s) 'unknown', valid inputs are ['']",
+		},
+		{
+			name:        "restore-saved-state",
+			state:       map[string]string{"name": "state value"},
 			expectedEnv: map[string]string{"STATE_name": "state value"},
 		},
-	}
-
-	for _, tt := range table {
+	} {
 		t.Run(tt.name, func(t *testing.T) {
-			ctx := context.Background()
-
+			hook := logtest.NewWithLevel(logging.LevelWarn)
+			ctx := common.WithLogger(t.Context(), logging.New(hook))
 			cm := &containerMock{}
-			cm.On("CopyDir", "/var/run/act/actions/dir/", "dir/", false).Return(func(ctx context.Context) error { return nil })
+			containerActionDir := "/var/run/act/actions/" + model.UsesHash("/org/repo/path@ref") + "/"
+			cm.On("CopyDir", containerActionDir, "dir/", false, true).Return(func(_ctx context.Context) error { return nil })
 
 			envMatcher := mock.MatchedBy(func(env map[string]string) bool {
 				for k, v := range tt.expectedEnv {
@@ -284,17 +212,100 @@ func TestActionRunner(t *testing.T) {
 				}
 				return true
 			})
+			cm.On("Exec", []string{"node", "--preserve-symlinks-main", containerActionDir + "path"}, envMatcher, "", "").Return(func(_ctx context.Context) error { return nil })
+			cm.On("Exec", nodeActionCommand(containerActionDir+"path/pre.js"), mock.Anything, "", "").Return(func(_ctx context.Context) error { return nil })
+			cm.On("Exec", nodeActionCommand(containerActionDir+"path/post.js"), envMatcher, "", "").Return(func(_ctx context.Context) error { return nil })
 
-			cm.On("Exec", []string{"node", "/var/run/act/actions/dir/path"}, envMatcher, "", "").Return(func(ctx context.Context) error { return nil })
-
-			tt.step.getRunContext().JobContainer = cm
-
-			err := runActionImpl(tt.step, "dir", newRemoteAction("org/repo/path@ref"))(ctx)
-
-			assert.NoError(t, err) //nolint:testifylint // pre-existing issue from nektos/act
+			remoteAction := mustNewRemoteAction(t, "org/repo/path@ref")
+			step := &stepActionRemote{
+				Step: &model.Step{ID: "step", Uses: "org/repo/path@ref", With: tt.with},
+				RunContext: &RunContext{
+					Config:           &Config{PresetGitHubContext: &model.GithubContext{}},
+					Run:              &model.Run{JobID: "job", Workflow: &model.Workflow{Jobs: map[string]*model.Job{"job": {}}}},
+					IntraActionState: map[string]map[string]string{"step": tt.state},
+					JobContainer:     cm,
+				},
+				action:       &model.Action{Inputs: tt.inputs, Runs: model.ActionRuns{Using: "node16", Pre: "pre.js", Post: "post.js"}},
+				actionDir:    "dir",
+				env:          (&model.Step{With: tt.with}).GetEnv(),
+				remoteAction: remoteAction,
+			}
+			require.NoError(t, runPreStep(step)(ctx))
+			assert.Empty(t, hook.AllRecords())
+			require.NoError(t, runActionImpl(step, "dir", remoteAction)(ctx))
+			require.NoError(t, runPostStep(step)(ctx))
+			if tt.warning == "" {
+				assert.Empty(t, hook.AllRecords())
+			} else {
+				require.Len(t, hook.AllRecords(), 1)
+				assert.Equal(t, tt.warning, hook.LastRecord().Message)
+				rawOutput, ok := hook.LastRecord().Attr(rawOutputField)
+				require.True(t, ok)
+				assert.Equal(t, true, rawOutput)
+			}
 			cm.AssertExpectations(t)
 		})
 	}
+}
+
+func TestGoActionUsesLinuxExecutablePaths(t *testing.T) {
+	actionRoot := t.TempDir()
+	for _, stage := range []string{"main", "pre", "post"} {
+		t.Run(stage, func(t *testing.T) {
+			cm := &containerMock{}
+			containerActionDir := "/var/run/act/actions/" + model.UsesHash("/org/repo@ref")
+			cm.On("CopyDir", containerActionDir+"/", mock.Anything, false, true).Return(noopExecutor).Maybe()
+			cm.On("Exec", []string{"go", "build", "-o", stage + ".go.out", stage + ".go"}, mock.Anything, "", containerActionDir).Return(noopExecutor).Once()
+			cm.On("Exec", []string{containerActionDir + "/" + stage + ".go.out"}, mock.Anything, "", "").Return(noopExecutor).Once()
+			step := &stepActionRemote{
+				Step: &model.Step{ID: "step", Uses: "org/repo@ref"},
+				RunContext: &RunContext{
+					Config:       &Config{NoActionPatch: true, PresetGitHubContext: &model.GithubContext{}},
+					Run:          &model.Run{JobID: "job", Workflow: &model.Workflow{Jobs: map[string]*model.Job{"job": {}}}},
+					JobContainer: cm,
+				},
+				action:       &model.Action{Runs: model.ActionRuns{Using: model.ActionRunsUsingGo, Main: "main.go", Pre: "pre.go", Post: "post.go"}},
+				actionDir:    filepath.Join(actionRoot, stage),
+				env:          map[string]string{},
+				remoteAction: mustNewRemoteAction(t, "org/repo@ref"),
+			}
+			switch stage {
+			case "main":
+				require.NoError(t, runActionImpl(step, step.actionDir, step.remoteAction)(t.Context()))
+			case "pre":
+				require.NoError(t, runPreStep(step)(t.Context()))
+			case "post":
+				require.NoError(t, runPostStep(step)(t.Context()))
+			}
+			cm.AssertExpectations(t)
+		})
+	}
+}
+
+func TestNodeActionCommandPreservesSymlinkedEntrypoint(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation requires privileges on Windows")
+	}
+	requireHostTools(t, "node")
+
+	actionDir := t.TempDir()
+	entrypoint := filepath.Join(actionDir, "index.mjs")
+	require.NoError(t, os.WriteFile(entrypoint, []byte(`
+import {fileURLToPath} from "node:url";
+const self = fileURLToPath(import.meta.url);
+if (process.argv[1] !== self) {
+	console.log("argv[1]:", process.argv[1], "import.meta.url:", self);
+	process.exitCode = 1;
+}
+`), 0o600))
+
+	symlinkedActionDir := filepath.Join(t.TempDir(), "action")
+	require.NoError(t, os.Symlink(actionDir, symlinkedActionDir))
+	symlinkedEntrypoint := filepath.Join(symlinkedActionDir, "index.mjs")
+
+	args := nodeActionCommand(symlinkedEntrypoint)
+	output, err := exec.CommandContext(t.Context(), args[0], args[1:]...).CombinedOutput()
+	require.NoError(t, err, "%s", output)
 }
 
 func TestNewStepContainerDoesNotUseDockerSecrets(t *testing.T) {
@@ -310,7 +321,7 @@ func TestNewStepContainerDoesNotUseDockerSecrets(t *testing.T) {
 		ContainerNewContainer = origContainerNewContainer
 	}()
 
-	ctx := context.Background()
+	ctx := t.Context()
 	rc := &RunContext{
 		Name: "job",
 		Config: &Config{
@@ -337,16 +348,16 @@ func TestNewStepContainerDoesNotUseDockerSecrets(t *testing.T) {
 	step.On("getStepModel").Return(&model.Step{ID: "action"})
 	step.On("getEnv").Return(&env)
 
-	_ = newStepContainer(ctx, step, "registry.example.com/action:tag", nil, nil)
+	newStepContainer(ctx, step, "registry.example.com/action:tag", nil, nil, "")
 
-	// DOCKER_USERNAME/DOCKER_PASSWORD should not be injected as pull credentials for docker action containers.
 	assert.Empty(t, captured.Username)
 	assert.Empty(t, captured.Password)
+	assert.True(t, captured.AutoRemove)
 	step.AssertExpectations(t)
 }
 
 func TestMaybeCopyToActionDirHoldsCloneLock(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	actionDir := t.TempDir()
 
@@ -357,7 +368,7 @@ func TestMaybeCopyToActionDirHoldsCloneLock(t *testing.T) {
 	copyEntered := make(chan struct{})
 
 	cm := &containerMock{}
-	cm.On("CopyDir", "/var/run/act/actions/", actionDir+"/", false).Return(func(ctx context.Context) error {
+	cm.On("CopyDir", "/var/run/act/actions/", actionDir+"/", false, true).Return(func(ctx context.Context) error {
 		close(copyEntered)
 		<-releaseCopy
 		return nil
@@ -386,7 +397,10 @@ func TestMaybeCopyToActionDirHoldsCloneLock(t *testing.T) {
 
 	peerAcquired := make(chan struct{})
 	go func() {
-		unlock := git.AcquireCloneLock(actionDir)
+		unlock, err := git.AcquireCloneLock(t.Context(), actionDir)
+		if !assert.NoError(t, err) {
+			return
+		}
 		close(peerAcquired)
 		unlock()
 	}()
@@ -420,7 +434,9 @@ func TestMaybeCopyToActionDirHoldsCloneLock(t *testing.T) {
 func TestExecAsDockerHoldsCloneLockForRemoteUncached(t *testing.T) {
 	actionDir := t.TempDir()
 
-	unlockOnce := sync.OnceFunc(git.AcquireCloneLock(actionDir))
+	unlock, err := git.AcquireCloneLock(t.Context(), actionDir)
+	require.NoError(t, err)
+	unlockOnce := sync.OnceFunc(unlock)
 	defer unlockOnce()
 
 	innerEntered := make(chan struct{})
@@ -447,7 +463,7 @@ func TestExecAsDockerHoldsCloneLockForRemoteUncached(t *testing.T) {
 	step := &stepActionRemote{
 		Step: &model.Step{ID: "1", Uses: "remote/action@v1", With: map[string]string{}},
 		RunContext: &RunContext{
-			Config: &Config{},
+			Config: &Config{Env: testCheckoutEnv()},
 			Run: &model.Run{
 				JobID: "1",
 				Workflow: &model.Workflow{
@@ -461,7 +477,7 @@ func TestExecAsDockerHoldsCloneLockForRemoteUncached(t *testing.T) {
 		env:    map[string]string{},
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
 	done := make(chan error, 1)
@@ -481,30 +497,83 @@ func TestExecAsDockerHoldsCloneLockForRemoteUncached(t *testing.T) {
 	case <-innerEntered:
 	case err := <-done:
 		t.Fatalf("execAsDocker returned without entering inner: %v", err)
-	case <-time.After(time.Second):
-		t.Fatal("inner build executor not entered after lock released")
 	}
 
 	cancel()
 	releaseOnce()
+	assert.ErrorIs(t, <-done, context.Canceled)
+}
 
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("execAsDocker did not return after inner was released and ctx was canceled")
+func TestExecAsDockerImageChecks(t *testing.T) {
+	actionRoot := t.TempDir()
+	originalExists, originalBuild, originalContainer := ContainerImageExistsLocally, ContainerNewDockerBuildExecutor, ContainerNewContainer
+	t.Cleanup(func() {
+		ContainerImageExistsLocally, ContainerNewDockerBuildExecutor, ContainerNewContainer = originalExists, originalBuild, originalContainer
+	})
+	ContainerNewContainer = func(*container.NewContainerInput) container.ExecutionsEnvironment { return fakeContainer{} }
+	var removed bool
+	fakeDockerDaemon(t, func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method == http.MethodDelete {
+			removed = true
+			_, _ = io.WriteString(writer, `[]`)
+		} else {
+			_, _ = io.WriteString(writer, `{"Architecture":"aarch64"}`)
+		}
+	})
+
+	for _, testcase := range []struct {
+		name, platform           string
+		exists, matches, rebuild bool
+		wantBuild, wantRemove    bool
+		wantChecks               []string
+	}{
+		{name: "missing image", platform: "linux/arm64", wantBuild: true, wantChecks: []string{"any"}},
+		{name: "unspecified platform", exists: true, matches: true, wantChecks: []string{"any"}},
+		{name: "any platform", platform: "any", exists: true, matches: true, wantChecks: []string{"any"}},
+		{name: "matching platform", platform: "linux/arm64", exists: true, matches: true, wantChecks: []string{"any", "linux/arm64"}},
+		{name: "different platform", platform: "linux/arm64", exists: true, wantBuild: true, wantRemove: true, wantChecks: []string{"any", "linux/arm64"}},
+		{name: "forced rebuild", exists: true, matches: true, rebuild: true, wantBuild: true, wantChecks: []string{"any"}},
+	} {
+		t.Run(testcase.name, func(t *testing.T) {
+			var checks []string
+			ContainerImageExistsLocally = func(_ctx context.Context, _image, platform string) (bool, error) {
+				checks = append(checks, platform)
+				return testcase.exists && (platform == "any" || testcase.matches), nil
+			}
+			var built bool
+			removed = false
+			ContainerNewDockerBuildExecutor = func(container.NewDockerBuildExecutorInput) common.Executor {
+				return func(context.Context) error { built = true; return nil }
+			}
+			step := &stepActionRemote{
+				Step: &model.Step{ID: "action"},
+				RunContext: &RunContext{
+					Config: &Config{
+						PresetGitHubContext:   &model.GithubContext{},
+						ContainerArchitecture: testcase.platform,
+						ForceRebuild:          testcase.rebuild,
+					},
+					Run:          &model.Run{JobID: "job", Workflow: &model.Workflow{Jobs: map[string]*model.Job{"job": {}}}},
+					JobContainer: &jobContainerMock{},
+				},
+				action: &model.Action{Runs: model.ActionRuns{Using: "docker", Image: "Dockerfile"}},
+				env:    map[string]string{},
+			}
+			dir := filepath.Join(actionRoot, testcase.name)
+			require.NoError(t, execAsDocker(t.Context(), step, "action", dir, dir, false, stepStageMain))
+			assert.Equal(t, testcase.wantChecks, checks)
+			assert.Equal(t, testcase.wantBuild, built)
+			assert.Equal(t, testcase.wantRemove, removed)
+		})
 	}
 }
 
 func TestDockerActionImageTag(t *testing.T) {
-	// Remote actions already carry a unique, ref-scoped actionName (the uses
-	// hash), so the tag must be left untouched for backwards compatibility.
 	assert.Equal(t,
 		"act-abc123-dockeraction:latest",
 		dockerActionImageTag("owner/repo", "abc123", false),
 	)
 
-	// Local actions keep a human-readable, repository-namespaced prefix and gain a short hash suffix that makes the tag unique per (repository, actionName).
-	// See https://gitea.com/gitea/runner/issues/1039.
 	assert.Equal(t,
 		"act-owner-repo-baca2daaa2fe-dockeraction:latest",
 		dockerActionImageTag("owner/repo", "./", true),
@@ -514,16 +583,11 @@ func TestDockerActionImageTag(t *testing.T) {
 		dockerActionImageTag("owner/repo", "./sub", true),
 	)
 
-	// Sanitizing every non-alphanumeric character to "-" is lossy, so distinct inputs can collapse to the same readable prefix.
-	// The hash suffix must keep such cases apart, otherwise an image built for one repository is reused for another.
 	collisions := [][2]struct {
 		repoName   string
 		actionName string
 	}{
-		// Two different repositories, both `uses: ./`: "a/b-c" and "a-b/c" both sanitize to "a-b-c".
 		{{"a/b-c", "./"}, {"a-b/c", "./"}},
-		// A repository's root action vs another repository's sub-path action:
-		// "owner/repo-a" + "./" and "owner/repo" + "./a" both sanitize to "owner-repo-a".
 		{{"owner/repo-a", "./"}, {"owner/repo", "./a"}},
 	}
 	for _, c := range collisions {
@@ -535,41 +599,112 @@ func TestDockerActionImageTag(t *testing.T) {
 		)
 	}
 
-	// Distinct local actions within the same repository keep distinct tags.
 	assert.NotEqual(t,
 		dockerActionImageTag("owner/repo", "./", true),
 		dockerActionImageTag("owner/repo", "./sub", true),
 	)
+
+	workflow := &model.Workflow{Jobs: map[string]*model.Job{"job1": {}}}
+	job := newTestRC(workflow, nil)
+	step := &stepActionRemote{Step: &model.Step{}, RunContext: job}
+	image := job.dockerActionImage(t.Context(), step, "abc123", false)
+	assert.True(t, strings.HasPrefix(image, "act-abc123-dockeraction:latest-"))
+	assert.Equal(t, image, (&RunContext{Parent: job}).dockerActionImage(t.Context(), step, "abc123", false))
+	assert.NotEqual(t, image, job.dockerActionImage(t.Context(), &stepActionRemote{Step: &model.Step{}, RunContext: job}, "abc123", false))
+	assert.NotEqual(t, image, newTestRC(workflow, nil).dockerActionImage(t.Context(), step, "abc123", false))
+	job.dockerActionImage(common.WithDryrun(t.Context(), true), &stepActionRemote{Step: &model.Step{}, RunContext: job}, "abc123", false)
+	assert.Len(t, job.dockerActionImages, 2)
 }
 
-// Only the entrypoint is stage specific: every stage of a docker action receives runs.args
-// and runs.env, and the `entrypoint` input applies to the main stage alone.
 func TestExecAsDockerStageEntrypoint(t *testing.T) {
 	orig := ContainerNewContainer
 	defer func() { ContainerNewContainer = orig }()
+	fakeDockerDaemon(t, func(writer http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(writer, `{"Architecture":"x86_64"}`)
+	})
 
 	for _, tc := range []struct {
 		name           string
 		stage          stepStage
+		with           map[string]string
+		inputs         map[string]model.Input
+		runs           model.ActionRuns
+		env            map[string]string
+		wantCmd        []string
 		wantEntrypoint []string
+		warning        string
 	}{
 		{
-			name:           "main stage prefers the entrypoint input",
-			stage:          stepStageMain,
-			wantEntrypoint: []string{"input.sh"},
+			name:  "main stage prefers manifest values",
+			stage: stepStageMain,
+			with:  map[string]string{"args": "caller", "entrypoint": "input.sh"},
+			runs: model.ActionRuns{
+				Entrypoint: "main.sh",
+				Args:       []string{"manifest"},
+				Env:        map[string]string{"ACTION_ONLY": "manifest"},
+			},
+			wantCmd:        []string{"manifest"},
+			wantEntrypoint: []string{"main.sh"},
 		},
 		{
-			name:           "pre stage uses runs.pre-entrypoint",
-			stage:          stepStagePre,
+			name:           "main stage uses caller fallbacks in any case and warns about undeclared inputs",
+			stage:          stepStageMain,
+			with:           map[string]string{"ARGS": "caller --flag", "entryPoint": "input.sh --verbose", "unknown": "value"},
+			inputs:         map[string]model.Input{"message": {}},
+			runs:           model.ActionRuns{Env: map[string]string{"ACTION_ONLY": "manifest"}},
+			wantCmd:        []string{"caller", "--flag"},
+			wantEntrypoint: []string{"input.sh", "--verbose"},
+			warning:        "##[warning]Unexpected input(s) 'unknown', valid inputs are ['entryPoint', 'args', 'message']",
+		},
+		{
+			name:    "manifest args keep caller input quotes literal",
+			stage:   stepStageMain,
+			with:    map[string]string{"args": "it's literal"},
+			runs:    model.ActionRuns{Args: []string{"${{ inputs.args }}"}},
+			env:     map[string]string{"INPUT_ARGS": "it's literal"},
+			wantCmd: []string{"it's literal"},
+		},
+		{
+			name:    "caller input skips its default expression",
+			stage:   stepStageMain,
+			with:    map[string]string{"MESSAGE": "provided"},
+			inputs:  map[string]model.Input{"message": {Default: "${{ fromJSON('') }}"}},
+			runs:    model.ActionRuns{Args: []string{"${{ inputs.message }}"}},
+			env:     map[string]string{"INPUT_MESSAGE": "provided"},
+			wantCmd: []string{"provided"},
+		},
+		{
+			name:    "explicit empty manifest args suppress caller args",
+			stage:   stepStageMain,
+			with:    map[string]string{"args": "it's ignored"},
+			runs:    model.ActionRuns{Args: []string{}},
+			wantCmd: []string{},
+		},
+		{
+			name:  "pre stage keeps step environment",
+			stage: stepStagePre,
+			with:  map[string]string{"entrypoint": "input.sh"},
+			runs: model.ActionRuns{
+				PreEntrypoint: "pre.sh --verbose",
+				Args:          []string{"hello"},
+				Env:           map[string]string{"SHARED": "manifest"},
+			},
+			env:            map[string]string{"SHARED": "step"},
+			wantCmd:        []string{"hello"},
 			wantEntrypoint: []string{"pre.sh", "--verbose"},
 		},
 		{
-			name:           "post stage uses runs.post-entrypoint",
+			name:           "post stage uses manifest entrypoint",
 			stage:          stepStagePost,
+			runs:           model.ActionRuns{PostEntrypoint: "post.sh", Args: []string{"hello"}},
+			wantCmd:        []string{"hello"},
 			wantEntrypoint: []string{"post.sh"},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			hook := logtest.NewWithLevel(logging.LevelWarn)
+			ctx := common.WithLogger(t.Context(), logging.New(hook))
+			tc.runs.Using, tc.runs.Image = "docker", "docker://node:14"
 			cm := &containerMock{}
 			var input *container.NewContainerInput
 			ContainerNewContainer = func(in *container.NewContainerInput) container.ExecutionsEnvironment {
@@ -578,22 +713,15 @@ func TestExecAsDockerStageEntrypoint(t *testing.T) {
 			}
 
 			step := &stepActionRemote{
-				Step: &model.Step{ID: "1", Uses: "org/action@v1", With: map[string]string{"entrypoint": "input.sh"}},
+				Step: &model.Step{ID: "1", Uses: "org/action@v1", With: tc.with},
 				RunContext: &RunContext{
-					Config:       &Config{},
+					Config:       &Config{PresetGitHubContext: &model.GithubContext{}},
 					Run:          &model.Run{JobID: "1", Workflow: &model.Workflow{Jobs: map[string]*model.Job{"1": {}}}},
 					JobContainer: cm,
 				},
-				action: &model.Action{Runs: model.ActionRuns{
-					Using:          "docker",
-					Image:          "docker://node:14",
-					PreEntrypoint:  "pre.sh --verbose",
-					Entrypoint:     "main.sh",
-					PostEntrypoint: "post.sh",
-					Args:           []string{"hello"},
-					Env:            map[string]string{"MY_VAR": "world"},
-				}},
-				env: map[string]string{},
+				action:       &model.Action{Inputs: tc.inputs, Runs: tc.runs},
+				env:          mergeMaps(tc.env),
+				remoteAction: mustNewRemoteAction(t, "org/action@v1"),
 			}
 
 			cm.On("Pull", false).Return(func(context.Context) error { return nil })
@@ -602,20 +730,35 @@ func TestExecAsDockerStageEntrypoint(t *testing.T) {
 			cm.On("Start", true).Return(func(context.Context) error { return nil })
 			cm.On("Close").Return(func(context.Context) error { return nil })
 
-			require.NoError(t, execAsDocker(context.Background(), step, "action", t.TempDir(), t.TempDir(), false, tc.stage))
+			if tc.stage == stepStageMain {
+				require.NoError(t, runActionImpl(step, "", step.remoteAction)(ctx))
+			} else {
+				require.NoError(t, execAsDocker(ctx, step, "action", "", "", false, tc.stage))
+			}
+			if tc.warning == "" {
+				assert.Empty(t, hook.AllRecords())
+			} else {
+				require.Len(t, hook.AllRecords(), 1)
+				assert.Equal(t, tc.warning, hook.LastRecord().Message)
+			}
 			require.NotNil(t, input)
+			assert.Equal(t, tc.wantCmd, input.Cmd)
 			assert.Equal(t, tc.wantEntrypoint, input.Entrypoint)
-			assert.Equal(t, []string{"hello"}, input.Cmd)
-			assert.Contains(t, input.Env, "MY_VAR=world")
+			for key, value := range mergeMaps(tc.runs.Env, tc.env) {
+				assert.Contains(t, input.Env, key+"="+value)
+			}
 		})
 	}
 }
 
-func TestDockerActionHasPreAndPostStep(t *testing.T) {
+func TestActionHasPreAndPostStep(t *testing.T) {
 	newStep := func(runs model.ActionRuns) actionStep {
 		return &stepActionRemote{action: &model.Action{Runs: runs}}
 	}
-	ctx := context.Background()
+	ctx := t.Context()
+
+	assert.False(t, hasPreStep(newStep(model.ActionRuns{Using: "composite", Steps: []model.Step{{Run: "true"}}}))(ctx))
+	assert.True(t, hasPreStep(newStep(model.ActionRuns{Using: "composite", Steps: []model.Step{{Run: "true"}, {Uses: "actions/cache@v4"}}}))(ctx))
 
 	assert.False(t, hasPreStep(newStep(model.ActionRuns{Using: "docker", Image: "Dockerfile"}))(ctx))
 	assert.False(t, hasPostStep(newStep(model.ActionRuns{Using: "docker", Image: "Dockerfile"}))(ctx))

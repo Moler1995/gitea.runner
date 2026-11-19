@@ -1,7 +1,7 @@
 ### BUILDER STAGE
 #
 #
-FROM golang:1.26-alpine3.23 AS builder
+FROM golang:1.27-alpine AS builder
 
 # Do not remove `git` here, it is required for getting runner version when executing `make build`
 RUN apk add --no-cache make git
@@ -12,19 +12,22 @@ ENV GOPROXY=${GOPROXY:-}
 COPY . /opt/src/runner
 WORKDIR /opt/src/runner
 
-RUN make clean && make build
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    make clean && make build
 
 ### DIND VARIANT
 #
 #
-FROM docker:29.7.1-dind AS dind
+FROM docker:29.9.3-dind AS dind
 
 ARG VERSION=dev
 
 LABEL org.opencontainers.image.source="https://gitea.com/gitea/runner"
 LABEL org.opencontainers.image.version="${VERSION}"
 
-RUN apk add --no-cache s6 bash git tzdata nftables
+# upgrade first: the docker base image can lag behind Alpine security fixes
+RUN apk upgrade --no-cache && apk add --no-cache s6 bash git tzdata nftables
 
 COPY --from=builder /opt/src/runner/gitea-runner /usr/local/bin/gitea-runner
 COPY scripts/run.sh /usr/local/bin/run.sh
@@ -32,12 +35,14 @@ COPY scripts/s6 /etc/s6
 
 VOLUME /data
 
+ENV TINI_SUBREAPER=1
+
 ENTRYPOINT ["s6-svscan","/etc/s6"]
 
 ### DIND-ROOTLESS VARIANT
 #
 #
-FROM docker:29.7.1-dind-rootless AS dind-rootless
+FROM docker:29.9.3-dind-rootless AS dind-rootless
 
 ARG VERSION=dev
 
@@ -45,7 +50,8 @@ LABEL org.opencontainers.image.source="https://gitea.com/gitea/runner"
 LABEL org.opencontainers.image.version="${VERSION}"
 
 USER root
-RUN apk add --no-cache s6 bash git tzdata nftables
+# upgrade first: the docker base image can lag behind Alpine security fixes
+RUN apk upgrade --no-cache && apk add --no-cache s6 bash git tzdata nftables
 
 COPY --from=builder /opt/src/runner/gitea-runner /usr/local/bin/gitea-runner
 COPY scripts/run.sh /usr/local/bin/run.sh
@@ -56,6 +62,7 @@ VOLUME /data
 RUN mkdir -p /data && chown -R rootless:rootless /etc/s6 /data
 
 ENV DOCKER_HOST=unix:///run/user/1000/docker.sock
+ENV TINI_SUBREAPER=1
 
 USER rootless
 ENTRYPOINT ["s6-svscan","/etc/s6"]
@@ -70,7 +77,7 @@ ARG VERSION=dev
 LABEL org.opencontainers.image.source="https://gitea.com/gitea/runner"
 LABEL org.opencontainers.image.version="${VERSION}"
 
-RUN apk add --no-cache tini bash git tzdata
+RUN apk upgrade --no-cache && apk add --no-cache tini bash git tzdata
 
 COPY --from=builder /opt/src/runner/gitea-runner /usr/local/bin/gitea-runner
 COPY scripts/run.sh /usr/local/bin/run.sh

@@ -4,16 +4,25 @@
 package client
 
 import (
-	"gitea.dev/actionslib/ping/v1/pingv1connect"
-	"gitea.dev/actionslib/runner/v1/runnerv1connect"
+	"context"
+	"errors"
+	"strings"
+
+	"connectrpc.com/connect/v2"
+	runnerv1 "gitea.dev/actionslib/runner/v1"
 )
 
 // A Client manages communication with the runner.
-//
-//go:generate mockery --name Client
 type Client interface {
-	pingv1connect.PingServiceClient
-	runnerv1connect.RunnerServiceClient
 	Address() string
-	Insecure() bool
+	Declare(context.Context, *runnerv1.DeclareRequest) (*runnerv1.DeclareResponse, error)
+	FetchTask(context.Context, *runnerv1.FetchTaskRequest) (*runnerv1.FetchTaskResponse, error)
+	UpdateLog(context.Context, *runnerv1.UpdateLogRequest) (*runnerv1.UpdateLogResponse, error)
+	UpdateTask(context.Context, *runnerv1.UpdateTaskRequest) (*runnerv1.UpdateTaskResponse, error)
+}
+
+// IsRegistrationRejected reports whether Gitea itself answered "unregistered runner", unlike a proxy's 401.
+func IsRegistrationRejected(err error) bool {
+	var connectErr *connect.Error
+	return errors.As(err, &connectErr) && strings.HasSuffix(connectErr.Message(), "unregistered runner")
 }

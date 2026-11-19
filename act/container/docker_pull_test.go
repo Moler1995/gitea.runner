@@ -2,23 +2,29 @@
 // Copyright 2020 The nektos/act Authors. All rights reserved.
 // SPDX-License-Identifier: MIT
 
+//go:build !(WITHOUT_DOCKER || !(linux || darwin || windows || netbsd || freebsd))
+
 package container
 
 import (
-	"context"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"testing/iotest"
 
-	"github.com/docker/cli/cli/config"
-	log "github.com/sirupsen/logrus"
-	"github.com/sirupsen/logrus/hooks/test"
+	"gitea.com/gitea/runner/act/common/logging"
+	"gitea.com/gitea/runner/act/common/logging/logtest"
+
+	"github.com/moby/moby/api/pkg/authconfig"
+	"github.com/moby/moby/api/types/registry"
 	assert "github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func init() {
-	log.SetLevel(log.DebugLevel)
+	logging.SetLevel(logging.LevelDebug)
 }
 
 func TestCleanImage(t *testing.T) {
@@ -36,18 +42,15 @@ func TestCleanImage(t *testing.T) {
 	}
 
 	for _, table := range tables {
-		imageOut := cleanImage(context.Background(), table.imageIn)
+		imageOut := cleanImage(t.Context(), table.imageIn)
 		assert.Equal(t, table.imageOut, imageOut)
 	}
 }
 
 func TestGetImagePullOptions(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 
-	orig := config.Dir()
-	t.Cleanup(func() { config.SetDir(orig) })
-
-	config.SetDir("/non-existent/docker")
+	t.Setenv("DOCKER_CONFIG", "/non-existent/docker")
 
 	options, err := getImagePullOptions(ctx, NewDockerPullExecutorInput{})
 	assert.NoError(t, err, "Failed to create ImagePullOptions")                                                 //nolint:testifylint // pre-existing issue from nektos/act
@@ -61,13 +64,28 @@ func TestGetImagePullOptions(t *testing.T) {
 	assert.NoError(t, err, "Failed to create ImagePullOptions") //nolint:testifylint // pre-existing issue from nektos/act
 	assert.Equal(t, "eyJ1c2VybmFtZSI6InVzZXJuYW1lIiwicGFzc3dvcmQiOiJwYXNzd29yZCJ9", options.RegistryAuth, "Username and Password should be provided")
 
-	config.SetDir("testdata/docker-pull-options")
+	t.Setenv("DOCKER_CONFIG", "testdata/docker-pull-options")
 
 	options, err = getImagePullOptions(ctx, NewDockerPullExecutorInput{
 		Image: "nektos/act",
 	})
 	assert.NoError(t, err, "Failed to create ImagePullOptions") //nolint:testifylint // pre-existing issue from nektos/act
 	assert.Equal(t, "eyJ1c2VybmFtZSI6InVzZXJuYW1lIiwicGFzc3dvcmQiOiJwYXNzd29yZFxuIiwic2VydmVyYWRkcmVzcyI6Imh0dHBzOi8vaW5kZXguZG9ja2VyLmlvL3YxLyJ9", options.RegistryAuth, "RegistryAuth should be taken from local docker config")
+
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{"auths":{"identity.example.com":{"identitytoken":"identity-token"},"registry.example.com":{"registrytoken":"registry-token"}}}`), 0o600))
+	t.Setenv("DOCKER_CONFIG", dir)
+	for host, want := range map[string]registry.AuthConfig{
+		"identity.example.com": {IdentityToken: "identity-token", ServerAddress: "identity.example.com"},
+		"registry.example.com": {RegistryToken: "registry-token", ServerAddress: "registry.example.com"},
+	} {
+		options, err := getImagePullOptions(ctx, NewDockerPullExecutorInput{Image: host + "/app"})
+		require.NoError(t, err)
+		require.NotEmpty(t, options.RegistryAuth, host)
+		got, err := authconfig.Decode(options.RegistryAuth)
+		require.NoError(t, err)
+		assert.Equal(t, want, *got)
+	}
 }
 
 // A digest-pinned image is immutable, so its local copy is always current.
@@ -79,11 +97,16 @@ func TestIsPinnedImage(t *testing.T) {
 // The pull path reports a failure the daemon sent mid-stream, so it must carry the reason
 // whichever of the two shapes the daemon used.
 func TestLogDockerResponseError(t *testing.T) {
-	logger, _ := test.NewNullLogger()
+	logger, hook := logtest.NewLogger()
 	streamErr := func(line string) error {
-		return logDockerResponse(logger, io.NopCloser(strings.NewReader(line)), false)
+		return logDockerResponse(logger, io.NopCloser(strings.NewReader(line)), logger.Infof)
 	}
 	require.EqualError(t, streamErr(`{"error":"toomanyrequests: rate limit exceeded"}`), "toomanyrequests: rate limit exceeded")
 	require.EqualError(t, streamErr(`{"errorDetail":{"message":"unexpected EOF"}}`), "unexpected EOF")
 	require.NoError(t, streamErr(`{"status":"Downloading"}`))
+	require.NoError(t, streamErr(`{"stream":"`+strings.Repeat("x", 70000)+`"}`))
+	assert.Equal(t, logging.LevelInfo, hook.LastRecord().Level)
+	require.ErrorIs(t, logDockerResponse(logger, io.NopCloser(io.MultiReader(
+		strings.NewReader(`{"status":"Downloading"}`+"\n"), iotest.ErrReader(io.ErrUnexpectedEOF),
+	)), logger.Infof), io.ErrUnexpectedEOF)
 }

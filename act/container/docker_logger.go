@@ -2,17 +2,18 @@
 // Copyright 2020 The nektos/act Authors. All rights reserved.
 // SPDX-License-Identifier: MIT
 
-//go:build !(WITHOUT_DOCKER || !(linux || darwin || windows || netbsd))
+//go:build !(WITHOUT_DOCKER || !(linux || darwin || windows || netbsd || freebsd))
 
 package container
 
 import (
 	"bufio"
-	"encoding/json"
+	"cmp"
+	"encoding/json/v2"
 	"errors"
 	"io"
 
-	"github.com/sirupsen/logrus"
+	"gitea.com/gitea/runner/act/common/logging"
 )
 
 type dockerMessage struct {
@@ -20,66 +21,43 @@ type dockerMessage struct {
 	Stream      string `json:"stream"`
 	Error       string `json:"error"`
 	ErrorDetail struct {
-		Message string
-	}
+		Message string `json:"message"`
+	} `json:"errorDetail"`
 	Status   string `json:"status"`
 	Progress string `json:"progress"`
 }
 
-func logDockerResponse(logger logrus.FieldLogger, dockerResponse io.ReadCloser, isError bool) error {
-	if dockerResponse == nil {
-		return nil
-	}
+func logDockerResponse(logger *logging.Logger, dockerResponse io.ReadCloser, log func(string, ...any)) error {
 	defer dockerResponse.Close()
 
 	scanner := bufio.NewScanner(dockerResponse)
-	msg := dockerMessage{}
-
+	scanner.Buffer(nil, 64*1024*1024) // a build echoes long instructions in one record
 	for scanner.Scan() {
 		line := scanner.Bytes()
-
-		msg.ID = ""
-		msg.Stream = ""
-		msg.Error = ""
-		msg.ErrorDetail.Message = ""
-		msg.Status = ""
-		msg.Progress = ""
-
+		var msg dockerMessage
 		if err := json.Unmarshal(line, &msg); err != nil {
-			writeLog(logger, false, "Unable to unmarshal line [%s] ==> %v", string(line), err)
+			logger.Debugf("Unable to unmarshal line [%s] ==> %v", string(line), err)
 			continue
 		}
 
-		if msg.Error != "" {
-			writeLog(logger, isError, "%s", msg.Error)
-			return errors.New(msg.Error)
+		if message := cmp.Or(msg.Error, msg.ErrorDetail.Message); message != "" {
+			log("%s", message)
+			return errors.New(message)
 		}
 
-		if msg.ErrorDetail.Message != "" {
-			writeLog(logger, isError, "%s", msg.ErrorDetail.Message)
-			return errors.New(msg.ErrorDetail.Message)
-		}
-
-		if msg.Status != "" {
+		switch {
+		case msg.Status != "":
 			if msg.Progress != "" {
-				writeLog(logger, isError, "%s :: %s :: %s\n", msg.Status, msg.ID, msg.Progress)
+				log("%s :: %s :: %s\n", msg.Status, msg.ID, msg.Progress)
 			} else {
-				writeLog(logger, isError, "%s :: %s\n", msg.Status, msg.ID)
+				log("%s :: %s\n", msg.Status, msg.ID)
 			}
-		} else if msg.Stream != "" {
-			writeLog(logger, isError, "%s", msg.Stream)
-		} else {
-			writeLog(logger, false, "Unable to handle line: %s", string(line))
+		case msg.Stream != "":
+			log("%s", msg.Stream)
+		default:
+			logger.Debugf("Unable to handle line: %s", string(line))
 		}
 	}
 
-	return nil
-}
-
-func writeLog(logger logrus.FieldLogger, isError bool, format string, args ...any) {
-	if isError {
-		logger.Errorf(format, args...)
-	} else {
-		logger.Debugf(format, args...)
-	}
+	return scanner.Err()
 }

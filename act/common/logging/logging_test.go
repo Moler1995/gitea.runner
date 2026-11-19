@@ -1,0 +1,145 @@
+// Copyright 2026 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package logging_test
+
+import (
+	"errors"
+	"log/slog"
+	"runtime"
+	"strings"
+	"testing"
+
+	"gitea.com/gitea/runner/act/common/logging"
+	"gitea.com/gitea/runner/act/common/logging/logtest"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestParseLevel(t *testing.T) {
+	for in, want := range map[string]logging.Level{
+		"trace": logging.LevelTrace, "DEBUG": logging.LevelDebug, "info": logging.LevelInfo,
+		"warn": logging.LevelWarn, "warning": logging.LevelWarn,
+		"error": logging.LevelError, "fatal": logging.LevelError, "panic": logging.LevelError,
+	} {
+		got, err := logging.ParseLevel(in)
+		require.NoError(t, err, in)
+		assert.Equal(t, want, got, in)
+	}
+	_, err := logging.ParseLevel("loud")
+	require.Error(t, err)
+	assert.Equal(t, "warn", logging.LevelWarn.String())
+}
+
+type countingStringer struct{ n *int }
+
+func (c countingStringer) String() string { *c.n++; return "x" }
+
+func TestLogger(t *testing.T) {
+	h := logtest.NewWithLevel(logging.LevelTrace)
+	assert.Nil(t, h.LastRecord())
+	l := logging.New(h)
+
+	l.With("job", "j1").WithError(errors.New("boom")).Warnf("step %d", 2)
+	l.Info("a", 1, 2, "b")
+	l.With("k").With(7).Debug("x")
+
+	recs := h.AllRecords()
+	require.Len(t, recs, 3)
+	assert.Equal(t, "step 2", recs[0].Message)
+	assert.Equal(t, logging.LevelWarn, recs[0].Level)
+	assert.False(t, recs[0].Time.IsZero())
+	job, _ := recs[0].Attr("job")
+	assert.Equal(t, "j1", job)
+	errv, _ := recs[0].Attr("error")
+	require.EqualError(t, errv.(error), "boom")
+	assert.Equal(t, "a1 2b", recs[1].Message)
+	bad, _ := recs[2].Attr("!BADKEY")
+	assert.Equal(t, 7, bad)
+}
+
+func TestLoggerSkipsFormattingWhenDisabled(t *testing.T) {
+	n := 0
+	l := logging.New(logging.NewLevelHandler(logtest.NewWithLevel(logging.LevelTrace), logging.LevelWarn))
+	l.Debugf("%v", countingStringer{&n})
+	assert.Zero(t, n)
+	assert.False(t, l.Enabled(logging.LevelInfo))
+}
+
+func TestMultiHandler(t *testing.T) {
+	assert.False(t, logging.DiscardHandler.Enabled(t.Context(), logging.LevelError))
+	all, warnOnly := logtest.New(), logtest.NewWithLevel(logging.LevelTrace)
+	l := logging.New(logging.NewMultiHandler(all, logging.NewLevelHandler(warnOnly, logging.LevelWarn), logging.DiscardHandler)).With("a", 1)
+	l.Info("i")
+	l.Error("e")
+	assert.Len(t, all.AllRecords(), 2)
+	require.Len(t, warnOnly.AllRecords(), 1)
+	v, _ := warnOnly.LastRecord().Attr("a")
+	assert.Equal(t, 1, v)
+}
+
+func frameOf(t *testing.T, pc uintptr) runtime.Frame {
+	t.Helper()
+	require.NotZero(t, pc)
+	f, _ := runtime.CallersFrames([]uintptr{pc}).Next()
+	return f
+}
+
+func TestCallerPC(t *testing.T) {
+	l, h := logtest.NewLogger()
+	l.Infof("method")
+	l.Info("method")
+
+	prev := logging.Default()
+	t.Cleanup(func() { logging.SetDefault(prev) })
+	logging.SetDefault(l)
+	logging.Infof("global")
+	logging.Error("global")
+
+	require.Len(t, h.AllRecords(), 4)
+	for _, r := range h.AllRecords() {
+		assert.True(t, strings.HasSuffix(frameOf(t, r.PC).Function, "TestCallerPC"), r.Message)
+	}
+}
+
+func TestDefaultLevel(t *testing.T) {
+	prev := logging.GetLevel()
+	t.Cleanup(func() { logging.SetLevel(prev) })
+
+	logging.SetLevel(logging.LevelWarn)
+	assert.Equal(t, logging.LevelWarn, logging.GetLevel())
+	assert.True(t, logging.Enabled(logging.LevelError))
+	assert.False(t, logging.Enabled(logging.LevelInfo))
+}
+
+func TestSlogHandler(t *testing.T) {
+	var buf strings.Builder
+	l := logging.New(logging.NewSlogHandler(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))).With("job", "j1")
+
+	assert.False(t, l.Enabled(logging.LevelTrace))
+	l.WithError(errors.New("boom")).Errorf("fail %s", "x")
+
+	out := buf.String()
+	assert.Contains(t, out, "level=ERROR")
+	assert.Contains(t, out, `msg="fail x"`)
+	assert.Contains(t, out, "job=j1")
+	assert.Contains(t, out, "error=boom")
+}
+
+func TestSlogBridge(t *testing.T) {
+	h := logtest.SetDefault(t)
+	slog.With("lib", "actionslib").Warn("from a library", "n", 1)
+	_, _, line, _ := runtime.Caller(0)
+	slog.Debug("dropped")
+
+	recs := h.AllRecords()
+	require.Len(t, recs, 1)
+	assert.Equal(t, "from a library", recs[0].Message)
+	assert.Equal(t, logging.LevelWarn, recs[0].Level)
+	lib, _ := recs[0].Attr("lib")
+	assert.Equal(t, "actionslib", lib)
+	n, _ := recs[0].Attr("n")
+	assert.EqualValues(t, 1, n)
+	assert.Equal(t, line-1, frameOf(t, recs[0].PC).Line)
+}

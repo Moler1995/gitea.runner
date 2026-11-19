@@ -277,7 +277,7 @@ func mappingValue(mapping *yaml.Node, key string) *yaml.Node {
 }
 
 func renderNode(node *yaml.Node) (string, error) {
-	if !allScalars(node.Content) {
+	if slices.ContainsFunc(node.Content, func(child *yaml.Node) bool { return child.Kind != yaml.ScalarNode }) {
 		encoded, err := encodeYAML(node)
 		if err != nil {
 			return "", err
@@ -303,26 +303,9 @@ func renderNode(node *yaml.Node) (string, error) {
 	}
 }
 
-func allScalars(nodes []*yaml.Node) bool {
-	for _, node := range nodes {
-		if node.Kind != yaml.ScalarNode {
-			return false
-		}
-	}
-	return true
-}
-
+// encodeYAML never wraps lines, re-encoding must not reflow long values.
 func encodeYAML(node *yaml.Node) ([]byte, error) {
-	var buf bytes.Buffer
-	encoder := yaml.NewEncoder(&buf)
-	encoder.SetIndent(2)
-	if err := encoder.Encode(node); err != nil {
-		return nil, err
-	}
-	if err := encoder.Close(); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
+	return yaml.Dump(node, yaml.WithV3Defaults(), yaml.WithIndent(2), yaml.WithLineWidth(-1))
 }
 
 // restoreLayout re-applies the spacing the encoder drops: the blank lines between
@@ -477,6 +460,9 @@ func resolvePath(segments []string) (*fieldInfo, error) {
 					strings.Join(segments[:i+1], "."), strings.Join(yamlNames(typ), ", "))
 			}
 			typ = field.Type
+			if typ.Kind() == reflect.Pointer {
+				typ = typ.Elem()
+			}
 		case reflect.Map:
 			// The segment names a user-defined entry, so the walk ends here.
 			if i != len(segments)-1 {

@@ -2,38 +2,36 @@
 // Copyright 2020 The nektos/act Authors. All rights reserved.
 // SPDX-License-Identifier: MIT
 
-//go:build !(WITHOUT_DOCKER || !(linux || darwin || windows || netbsd))
+//go:build !(WITHOUT_DOCKER || !(linux || darwin || windows || netbsd || freebsd))
 
 package container
 
 import (
-	"archive/tar"
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
+	"path"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"runtime"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"gitea.com/gitea/runner/act/common"
-	"gitea.com/gitea/runner/act/filecollector"
+	"gitea.com/gitea/runner/act/common/logging"
 
-	"dario.cat/mergo"
+	"github.com/bmatcuk/doublestar/v4"
 	cerrdefs "github.com/containerd/errdefs"
-	"github.com/docker/cli/cli/compose/loader"
-	"github.com/docker/cli/cli/connhelper"
-	"github.com/go-git/go-billy/v5/helper/polyfill"
-	"github.com/go-git/go-billy/v5/osfs"
-	"github.com/go-git/go-git/v5/plumbing/format/gitignore"
-	"github.com/gobwas/glob"
-	"github.com/joho/godotenv"
+	"github.com/docker/cli/opts"
 	"github.com/moby/moby/api/pkg/stdcopy"
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/mount"
@@ -42,50 +40,16 @@ import (
 	"github.com/moby/moby/client"
 	"github.com/moby/moby/client/pkg/versions"
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
-	"github.com/sirupsen/logrus"
 )
-
-// drainGracePeriod bounds how long we wait for an output-copy goroutine to
-// finish draining a container's output before returning, so that neither a
-// cancellation (waitForCommand) nor a normal container exit (wait) truncates
-// the tail of the log. It is a safety bound: in the common case the stream
-// reaches EOF and the goroutine returns well before this elapses.
-const drainGracePeriod = 2 * time.Second
 
 // NewContainer creates a reference to a container
 func NewContainer(input *NewContainerInput) ExecutionsEnvironment {
-	cr := new(containerReference)
-	cr.input = input
 	// Resolved up front because the image pull runs before the container is created.
-	cf := createFlagsFromOptions(input.Options)
+	cf := createFlagsFromOptions(input.allOptions())
 	if cf.platform != "" {
-		cr.input.Platform = cf.platform
+		input.Platform = cf.platform
 	}
-	cr.pullPolicy = cf.pull
-	return cr
-}
-
-func (cr *containerReference) ConnectToNetwork(name string) common.Executor {
-	return common.
-		NewDebugExecutor("docker network connect %s %s", name, cr.input.Name).
-		Then(
-			common.NewPipelineExecutor(
-				cr.connect(),
-				cr.connectToNetwork(name, cr.input.NetworkAliases),
-			).IfNot(common.Dryrun),
-		)
-}
-
-func (cr *containerReference) connectToNetwork(name string, aliases []string) common.Executor {
-	return func(ctx context.Context) error {
-		_, err := cr.cli.NetworkConnect(ctx, name, client.NetworkConnectOptions{
-			Container: cr.input.Name,
-			EndpointConfig: &network.EndpointSettings{
-				Aliases: aliases,
-			},
-		})
-		return err
-	}
+	return &containerReference{input: input, pullPolicy: cf.pull}
 }
 
 // supportsContainerImagePlatform reports whether the Docker server API version
@@ -120,8 +84,13 @@ func (cr *containerReference) Start(attach bool) common.Executor {
 				cr.attach().IfBool(attach),
 				cr.start(),
 				cr.wait().IfBool(attach),
-				cr.tryReadUID(),
-				cr.tryReadGID(),
+				func(ctx context.Context) error {
+					var wg sync.WaitGroup
+					wg.Go(func() { _ = cr.tryReadID("-u", func(id int) { cr.UID = id })(ctx) })
+					_ = cr.tryReadID("-g", func(id int) { cr.GID = id })(ctx)
+					wg.Wait()
+					return nil
+				},
 				func(ctx context.Context) error {
 					// If this fails, then folders have wrong permissions on non root container
 					if cr.UID != 0 || cr.GID != 0 {
@@ -160,12 +129,12 @@ func (cr *containerReference) Copy(destPath string, files ...*FileEntry) common.
 	).IfNot(common.Dryrun)
 }
 
-func (cr *containerReference) CopyDir(destPath, srcPath string, useGitIgnore bool) common.Executor {
+func (cr *containerReference) CopyDir(destPath, srcPath string, useGitIgnore, skipGitDir bool) common.Executor {
 	return common.NewPipelineExecutor(
 		common.NewInfoExecutor("docker cp src=%s dst=%s", srcPath, destPath),
 		cr.connect(),
 		cr.find(),
-		cr.copyDir(destPath, srcPath, useGitIgnore),
+		cr.copyDir(destPath, srcPath, useGitIgnore, skipGitDir),
 		func(ctx context.Context) error {
 			// If this fails, then folders have wrong permissions on non root container
 			if cr.UID != 0 || cr.GID != 0 {
@@ -221,6 +190,9 @@ func (cr *containerReference) Inspect(ctx context.Context) (*Info, error) {
 	} else if err != nil {
 		return nil, err
 	}
+	if cr.containerEnvID != cr.id && result.Container.Config != nil {
+		cr.containerEnv, cr.containerEnvID = opts.ConvertKVStringsToMap(result.Container.Config.Env), cr.id
+	}
 	return containerInfoFromInspect(result.Container), nil
 }
 
@@ -235,18 +207,30 @@ func (cr *containerReference) DumpLogs(ctx context.Context) error {
 	if cr.id == "" {
 		return cr.missingContainerError("read its logs")
 	}
+	tty, err := cr.containerTTY(ctx)
+	if err != nil {
+		return err
+	}
 
 	logs, err := cr.cli.ContainerLogs(ctx, cr.id, client.ContainerLogsOptions{ShowStdout: true, ShowStderr: true})
 	if err != nil {
 		return err
 	}
 	defer logs.Close()
-	return cr.copyOutput(logs)
+	return cr.copyOutput(logs, tty)
+}
+
+func (cr *containerReference) containerTTY(ctx context.Context) (bool, error) {
+	inspect, err := cr.cli.ContainerInspect(ctx, cr.id, client.ContainerInspectOptions{})
+	if err != nil {
+		return false, fmt.Errorf("failed to inspect container: %w", err)
+	}
+	return inspect.Container.Config != nil && inspect.Container.Config.Tty, nil
 }
 
 // copyOutput writes a container stream to the writers the container was created with,
 // demultiplexing it unless the container has a TTY, which sends a single raw stream.
-func (cr *containerReference) copyOutput(stream io.Reader) error {
+func (cr *containerReference) copyOutput(stream io.Reader, tty bool) error {
 	outWriter := cr.input.Stdout
 	if outWriter == nil {
 		outWriter = os.Stdout
@@ -257,7 +241,7 @@ func (cr *containerReference) copyOutput(stream io.Reader) error {
 	}
 
 	var err error
-	if !cr.input.AllocatePTY || os.Getenv("NORAW") != "" {
+	if !tty || os.Getenv("NORAW") != "" {
 		_, err = stdcopy.StdCopy(outWriter, errWriter, stream)
 	} else {
 		_, err = io.Copy(outWriter, stream)
@@ -274,6 +258,31 @@ func containerInfoFromInspect(inspect container.InspectResponse) *Info {
 		ID:     inspect.ID,
 		Health: HealthNone,
 		Ports:  map[string]string{}, // an empty map, never null, in the expression context
+		Mounts: make(map[string]string, len(inspect.Mounts)),
+	}
+	for _, mountPoint := range inspect.Mounts {
+		info.Mounts[mountPoint.Destination] = mountPoint.Source
+	}
+	if hostConfig := inspect.HostConfig; hostConfig != nil { // Mounts omits --tmpfs targets and subpaths
+		for target := range hostConfig.Tmpfs {
+			info.Mounts[path.Clean(target)] = ""
+		}
+		for _, spec := range hostConfig.Mounts {
+			subpath := ""
+			if spec.VolumeOptions != nil {
+				subpath = spec.VolumeOptions.Subpath
+			} else if spec.ImageOptions != nil {
+				subpath = spec.ImageOptions.Subpath
+			}
+			if target := path.Clean(spec.Target); subpath != "" && info.Mounts[target] != "" {
+				info.Mounts[target] = path.Join(info.Mounts[target], subpath)
+			}
+		}
+	}
+	for _, target := range []string{"/etc/hosts", "/etc/hostname", "/etc/resolv.conf"} { // specific to the job's network namespace
+		if _, mounted := info.Mounts[target]; !mounted {
+			info.Mounts[target] = ""
+		}
 	}
 
 	if state := inspect.State; state != nil {
@@ -301,11 +310,27 @@ func containerInfoFromInspect(inspect container.InspectResponse) *Info {
 }
 
 func (cr *containerReference) UpdateFromEnv(srcPath string, env *map[string]string) common.Executor {
-	return parseEnvFile(cr, srcPath, env).IfNot(common.Dryrun)
+	return parseEnvFile(cr, srcPath, env, false).IfNot(common.Dryrun)
 }
 
 func (cr *containerReference) UpdateFromImageEnv(env *map[string]string) common.Executor {
-	return cr.extractFromImageEnv(env).IfNot(common.Dryrun)
+	envMap := *env
+	return common.Executor(func(ctx context.Context) error {
+		if cr.containerEnvID != cr.id {
+			if _, err := cr.Inspect(ctx); err != nil {
+				common.Logger(ctx).Error(err)
+				return fmt.Errorf("inspect container: %w", err)
+			}
+		}
+		for key, value := range cr.containerEnv {
+			if envMap[key] == "" {
+				envMap[key] = value
+			} else if key == "PATH" {
+				envMap[key] += ":" + value
+			}
+		}
+		return nil
+	}).IfNot(common.Dryrun)
 }
 
 func (cr *containerReference) Exec(command []string, env map[string]string, user, workdir string) common.Executor {
@@ -341,56 +366,62 @@ type containerReference struct {
 	id         string
 	input      *NewContainerInput
 	pullPolicy string
+	daemonOS   string
 	UID        int
 	GID        int
 	// attachDone is closed by the attach() streaming goroutine once it has
 	// drained and flushed the container's output. wait() blocks on it so the
 	// tail of the log lands before the step proceeds.
-	attachDone chan struct{}
+	attachDone     chan struct{}
+	containerEnv   map[string]string // fixed at creation, cached by inspect for containerEnvID
+	containerEnvID string
 	LinuxContainerEnvironmentExtensions
 }
 
-func GetDockerClient(ctx context.Context) (cli client.APIClient, err error) {
+func GetDockerClient(ctx context.Context) (client.APIClient, error) {
+	cli, _, err := newDockerClient(ctx)
+	return cli, err
+}
+
+func newDockerClient(ctx context.Context) (cli client.APIClient, daemonOS string, err error) {
 	dockerHost := os.Getenv("DOCKER_HOST")
 
 	if strings.HasPrefix(dockerHost, "ssh://") {
-		var helper *connhelper.ConnectionHelper
-
-		helper, err = connhelper.GetConnectionHelper(dockerHost)
-		if err != nil {
-			return nil, err
+		var args []string
+		if args, err = sshArgs(dockerHost); err != nil {
+			return nil, "", err
 		}
 		cli, err = client.New(
-			client.WithHost(helper.Host),
-			client.WithDialContext(helper.Dialer),
+			client.WithHost("http://docker.example.com"), // the dialer below ignores the address
+			client.WithDialContext(func(context.Context, string, string) (net.Conn, error) { return dialCommand("ssh", args...) }),
 		)
 	} else {
 		cli, err = client.New(client.FromEnv)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to docker daemon: %w", err)
+		return nil, "", fmt.Errorf("failed to connect to docker daemon: %w", err)
 	}
 	// Best-effort API version negotiation, matching the old client.NegotiateAPIVersion
 	// behaviour. Ping failures here are non-fatal: the connection is exercised again on
 	// the first real call, and the client falls back to the daemon's default API version.
-	if _, err := cli.Ping(ctx, client.PingOptions{NegotiateAPIVersion: true}); err != nil {
+	ping, err := cli.Ping(ctx, client.PingOptions{NegotiateAPIVersion: true})
+	if err != nil {
 		common.Logger(ctx).Warnf("docker daemon ping during version negotiation failed, continuing: %v", err)
 	}
 
-	return cli, nil
+	return cli, ping.OSType, nil
 }
 
-func GetHostInfo(ctx context.Context) (info system.Info, err error) {
-	var cli client.APIClient
-	cli, err = GetDockerClient(ctx)
+func GetHostInfo(ctx context.Context) (system.Info, error) {
+	cli, err := GetDockerClient(ctx)
 	if err != nil {
-		return info, err
+		return system.Info{}, err
 	}
 	defer cli.Close()
 
 	result, err := cli.Info(ctx, client.InfoOptions{})
 	if err != nil {
-		return info, err
+		return system.Info{}, err
 	}
 
 	return result.Info, nil
@@ -418,16 +449,32 @@ func RunnerArch(ctx context.Context) string {
 	return info.Architecture
 }
 
+func (cr *containerReference) targetOS(ctx context.Context) string {
+	if cr.daemonOS == "" {
+		cr.daemonOS = "linux"
+		if cr.cli != nil {
+			if result, err := cr.cli.Info(ctx, client.InfoOptions{}); err == nil && result.Info.OSType != "" {
+				cr.daemonOS = result.Info.OSType
+			}
+		}
+	}
+	return cr.daemonOS
+}
+
+func (cr *containerReference) markExecutable(ctx context.Context) bool {
+	return hostOS == "windows" && cr.targetOS(ctx) == "linux"
+}
+
 func (cr *containerReference) connect() common.Executor {
 	return func(ctx context.Context) error {
 		if cr.cli != nil {
 			return nil
 		}
-		cli, err := GetDockerClient(ctx)
+		cli, daemonOS, err := newDockerClient(ctx)
 		if err != nil {
 			return err
 		}
-		cr.cli = cli
+		cr.cli, cr.daemonOS = cli, daemonOS
 		return nil
 	}
 }
@@ -437,6 +484,7 @@ func (cr *containerReference) Close() common.Executor {
 		if cr.cli != nil {
 			err := cr.cli.Close()
 			cr.cli = nil
+			cr.daemonOS = ""
 			if err != nil {
 				return fmt.Errorf("failed to close client: %w", err)
 			}
@@ -462,22 +510,23 @@ func (cr *containerReference) find() common.Executor {
 			}
 			cr.id = ""
 		}
-		containers, err := cr.cli.ContainerList(ctx, client.ContainerListOptions{
-			All: true,
-		})
+		result, err := cr.cli.ContainerInspect(ctx, cr.input.Name, client.ContainerInspectOptions{})
+		if err == nil && result.Container.Name == "/"+cr.input.Name {
+			cr.id = result.Container.ID
+			return nil
+		} else if cerrdefs.IsNotFound(err) {
+			return nil
+		}
+		containers, err := cr.cli.ContainerList(ctx, client.ContainerListOptions{All: true}) // inspect also matches ids, and podman fails it with a 500 for a container removed mid-request
 		if err != nil {
 			return fmt.Errorf("failed to list containers: %w", err)
 		}
-
-		for _, c := range containers.Items {
-			for _, name := range c.Names {
-				if name[1:] == cr.input.Name {
-					cr.id = c.ID
-					return nil
-				}
+		for _, candidate := range containers.Items {
+			if slices.Contains(candidate.Names, "/"+cr.input.Name) {
+				cr.id = candidate.ID
+				break
 			}
 		}
-
 		return nil
 	}
 }
@@ -488,7 +537,7 @@ func (cr *containerReference) remove() common.Executor {
 		if idOrName == "" && cr.input != nil {
 			idOrName = cr.input.Name
 		}
-		if idOrName == "" {
+		if idOrName == "" || cr.cli == nil {
 			return nil
 		}
 
@@ -506,14 +555,11 @@ func (cr *containerReference) remove() common.Executor {
 			RemoveVolumes: true,
 			Force:         true,
 		})
-		switch {
-		case cerrdefs.IsConflict(err):
-			// the daemon's own AutoRemove teardown is running, and it releases the volume
-			// references and the network endpoint only once it finishes
-			cr.waitForRemoval(ctx, idOrName)
-		case err != nil && !cerrdefs.IsNotFound(err):
-			logger.Error(fmt.Errorf("failed to remove container %s: %w", idOrName, err))
-			return nil // keep the id, the container is still there for a later Remove()
+		if cerrdefs.IsConflict(err) {
+			err = cr.waitForRemoval(ctx, idOrName)
+		}
+		if err != nil && !cerrdefs.IsNotFound(err) {
+			return fmt.Errorf("failed to remove container %s: %w", idOrName, err)
 		}
 
 		logger.Debugf("Removed container: %v", idOrName)
@@ -522,7 +568,7 @@ func (cr *containerReference) remove() common.Executor {
 	}
 }
 
-func (cr *containerReference) waitForRemoval(ctx context.Context, idOrName string) {
+func (cr *containerReference) waitForRemoval(ctx context.Context, idOrName string) error {
 	// per container, against the one minute the post-job executor allows for the whole
 	// cleanup, so a job with several services can spend most of that budget here
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
@@ -532,110 +578,109 @@ func (cr *containerReference) waitForRemoval(ctx context.Context, idOrName strin
 		Condition: container.WaitConditionRemoved,
 	})
 	select {
-	case <-waitResult.Result:
-	case <-waitResult.Error:
-	case <-ctx.Done():
-		// the client delivers the result over an unbuffered channel, so leave a receiver
-		// behind or its goroutine parks on the send for the lifetime of the process
-		go func() {
-			select {
-			case <-waitResult.Result:
-			case <-waitResult.Error:
-			}
-		}()
-		common.Logger(ctx).Warnf("Timed out waiting for the daemon to remove container %s, its volumes and network may be left behind", idOrName)
+	case result := <-waitResult.Result:
+		if result.Error != nil {
+			return errors.New(result.Error.Message)
+		}
+		return nil
+	case err := <-waitResult.Error:
+		return err
 	}
 }
 
-func (cr *containerReference) mergeContainerConfigs(ctx context.Context, config *container.Config, hostConfig *container.HostConfig) (*container.Config, *container.HostConfig, error) {
-	logger := common.Logger(ctx)
-	input := cr.input
+// allOptions puts the runner's options first, so a flag both sources set ends up the workflow's.
+func (input *NewContainerInput) allOptions() string {
+	return strings.TrimSpace(input.RunnerOptions + " " + input.WorkflowOptions)
+}
 
-	if input.Options == "" {
-		return config, hostConfig, nil
+func (cr *containerReference) mergeContainerConfigs(ctx context.Context, config *container.Config, hostConfig *container.HostConfig) error {
+	logger := common.Logger(ctx)
+	options := cr.input.allOptions()
+
+	if options == "" {
+		return nil
+	}
+
+	// For Gitea, checked here because the parse below is what would read those files
+	if err := rejectHostReadingOptions(cr.input.WorkflowOptions); err != nil {
+		return err
 	}
 
 	// parse configuration from CLI container.options
-	flags, copts, cf, err := parseContainerOptions(input.Options)
+	flags, copts, cf, err := parseContainerOptions(options)
 	if err != nil {
-		return nil, nil, err
+		return err
 	}
 
 	if err := cf.validate(); err != nil {
-		return nil, nil, fmt.Errorf("Cannot process container options: '%s': '%w'", input.Options, err)
+		return fmt.Errorf("cannot process container options: '%s': '%w'", options, err)
 	}
-
-	// FIXME: If everything is fine after gitea/act v0.260.0, remove the following comment.
-	// In the old fork version, the code is
-	// if len(copts.netMode.Value()) == 0 {
-	// 	if err = copts.netMode.Set("host"); err != nil {
-	// 		return nil, nil, fmt.Errorf("Cannot parse networkmode=host. This is an internal error and should not happen: '%w'", err)
-	// 	}
-	// }
-	// And it has been commented with:
-	//   If a service container's network is set to `host`, the container will not be able to
-	//   connect to the specified network created for the job container and the service containers.
-	//   So comment out the following code.
-	// Not the if it's necessary to comment it in the new version,
-	// since it's cr.input.NetworkMode now.
 
 	if len(copts.netMode.Value()) == 0 {
 		if err = copts.netMode.Set(cr.input.NetworkMode); err != nil {
-			return nil, nil, fmt.Errorf("Cannot parse networkmode=%s. This is an internal error and should not happen: '%w'", cr.input.NetworkMode, err)
+			return fmt.Errorf("cannot parse networkmode=%s. This is an internal error and should not happen: '%w'", cr.input.NetworkMode, err)
 		}
 	}
 
 	// If the `privileged` config has been disabled, `copts.privileged` need to be forced to false,
 	// even if the user specifies `--privileged` in the options string.
-	if !hostConfig.Privileged {
+	if !hostConfig.Privileged && copts.privileged {
+		logger.Warnf("container option %q is not allowed when privileged mode is disabled and will be ignored", "--privileged")
 		copts.privileged = false
 	}
 
-	containerConfig, err := parse(flags, copts, runtime.GOOS)
+	serverOS := cr.targetOS(ctx)
+	containerConfig, err := parse(flags, copts, serverOS)
 	if err != nil {
-		return nil, nil, fmt.Errorf("Cannot process container options: '%s': '%w'", input.Options, err)
+		return fmt.Errorf("cannot process container options: '%s': '%w'", options, err)
+	}
+	// workflow aliases join the runner's own, deduped so a re-create cannot grow the input
+	for _, endpoint := range containerConfig.NetworkingConfig.EndpointsConfig {
+		for _, alias := range endpoint.Aliases {
+			if !slices.Contains(cr.input.NetworkAliases, alias) {
+				cr.input.NetworkAliases = append(cr.input.NetworkAliases, alias)
+			}
+		}
 	}
 
-	// For Gitea
-	// When privileged mode is disabled, container.options is workflow-controlled
-	// untrusted input. Strip the HostConfig fields that would let a workflow break
-	// out of the container (host namespaces, capability expansion, security profile
-	// overrides, device and runtime access). Otherwise these survive into the final
-	// HostConfig even though --privileged is forced off.
+	// For Gitea, forcing --privileged off is not enough, other options reach the host too
 	if !hostConfig.Privileged {
-		sanitizeOptionsHostConfig(logger, containerConfig.HostConfig)
+		trusted, err := parseOptionsHostConfig(cr.input.RunnerOptions, serverOS)
+		if err != nil {
+			return err
+		}
+		sanitizeOptionsHostConfig(logger, containerConfig.HostConfig, trusted)
 	}
 
 	logger.Debugf("Custom container.Config from options ==> %+v", containerConfig.Config)
 
-	err = mergo.Merge(config, containerConfig.Config, mergo.WithOverride, mergo.WithAppendSlice)
-	if err != nil {
-		return nil, nil, fmt.Errorf("Cannot merge container.Config options: '%s': '%w'", input.Options, err)
-	}
+	overlay(reflect.ValueOf(config).Elem(), reflect.ValueOf(containerConfig.Config).Elem(), true)
 	logger.Debugf("Merged container.Config ==> %+v", config)
 
 	logger.Debugf("Custom container.HostConfig from options ==> %+v", containerConfig.HostConfig)
 
+	cr.sanitizeConfig(ctx, containerConfig.HostConfig) // a dropped volume must not displace the runner's own
 	overlayVolumes(hostConfig, containerConfig.HostConfig)
 	binds := hostConfig.Binds
 	mounts := hostConfig.Mounts
 	networkMode := hostConfig.NetworkMode
-	err = mergo.Merge(hostConfig, containerConfig.HostConfig, mergo.WithOverride)
-	if err != nil {
-		return nil, nil, fmt.Errorf("Cannot merge container.HostConfig options: '%s': '%w'", input.Options, err)
-	}
+	overlay(reflect.ValueOf(hostConfig).Elem(), reflect.ValueOf(containerConfig.HostConfig).Elem(), false)
 	hostConfig.Binds = binds
 	hostConfig.Mounts = mounts
 	if cf.name != "" {
 		logger.Warn("--name in the options will be ignored.")
 	}
-	if len(copts.netMode.Value()) > 0 {
+	// the runner's own network mode was put into copts above, so ask the flags instead
+	if flags.Changed("network") || flags.Changed("net") {
 		logger.Warn("--network and --net in the options will be ignored.")
+	}
+	if len(cr.input.Entrypoint) != 0 && flags.Changed("entrypoint") {
+		logger.Warn("--entrypoint in the options will be ignored.")
 	}
 	hostConfig.NetworkMode = networkMode
 	logger.Debugf("Merged container.HostConfig ==> %+v", hostConfig)
 
-	return config, hostConfig, nil
+	return nil
 }
 
 func (cr *containerReference) create(capAdd, capDrop []string) common.Executor {
@@ -661,15 +706,9 @@ func (cr *containerReference) create(capAdd, capDrop []string) common.Executor {
 			ExposedPorts: exposedPorts,
 			Tty:          input.AllocatePTY,
 		}
-		// For Gitea, reduce log noise
-		// logger.Debugf("Common container.Config ==> %+v", config)
 
 		if len(input.Cmd) != 0 {
 			config.Cmd = input.Cmd
-		}
-
-		if len(input.Entrypoint) != 0 {
-			config.Entrypoint = input.Entrypoint
 		}
 
 		mounts := make([]mount.Mount, 0)
@@ -706,29 +745,23 @@ func (cr *containerReference) create(capAdd, capDrop []string) common.Executor {
 			PortBindings: portBindings,
 			AutoRemove:   input.AutoRemove,
 		}
-		// For Gitea, reduce log noise
-		// logger.Debugf("Common container.HostConfig ==> %+v", hostConfig)
 
-		config, hostConfig, err = cr.mergeContainerConfigs(ctx, config, hostConfig)
-		if err != nil {
+		if err := cr.mergeContainerConfigs(ctx, config, hostConfig); err != nil {
 			return err
 		}
 
+		if len(input.Entrypoint) != 0 {
+			config.Entrypoint = input.Entrypoint
+		}
+
 		// For Gitea
-		config, hostConfig = cr.sanitizeConfig(ctx, config, hostConfig)
+		cr.sanitizeConfig(ctx, hostConfig)
 
 		var networkingConfig *network.NetworkingConfig
-		// For Gitea, reduce log noise
-		// logger.Debugf("input.NetworkAliases ==> %v", input.NetworkAliases)
-		n := hostConfig.NetworkMode
-		// IsUserDefined and IsHost are broken on windows
-		if n.IsUserDefined() && n != "host" && len(input.NetworkAliases) > 0 {
-			endpointConfig := &network.EndpointSettings{
-				Aliases: input.NetworkAliases,
-			}
+		if isUserDefinedNetwork(hostConfig.NetworkMode) && len(input.NetworkAliases) > 0 {
 			networkingConfig = &network.NetworkingConfig{
 				EndpointsConfig: map[string]*network.EndpointSettings{
-					input.NetworkMode: endpointConfig,
+					input.NetworkMode: {Aliases: input.NetworkAliases},
 				},
 			}
 		}
@@ -752,44 +785,6 @@ func (cr *containerReference) create(capAdd, capDrop []string) common.Executor {
 	}
 }
 
-func (cr *containerReference) extractFromImageEnv(env *map[string]string) common.Executor {
-	envMap := *env
-	return func(ctx context.Context) error {
-		logger := common.Logger(ctx)
-
-		inspect, err := cr.cli.ImageInspect(ctx, cr.input.Image)
-		if err != nil {
-			logger.Error(err)
-			return fmt.Errorf("inspect image: %w", err)
-		}
-
-		if inspect.Config == nil {
-			return nil
-		}
-
-		imageEnv, err := godotenv.Unmarshal(strings.Join(inspect.Config.Env, "\n"))
-		if err != nil {
-			logger.Error(err)
-			return fmt.Errorf("unmarshal image env: %w", err)
-		}
-
-		for k, v := range imageEnv {
-			if k == "PATH" {
-				if envMap[k] == "" {
-					envMap[k] = v
-				} else {
-					envMap[k] += `:` + v
-				}
-			} else if envMap[k] == "" {
-				envMap[k] = v
-			}
-		}
-
-		env = &envMap
-		return nil
-	}
-}
-
 func (cr *containerReference) exec(cmd []string, env map[string]string, user, workdir string) common.Executor {
 	return func(ctx context.Context) error {
 		if cr.id == "" {
@@ -807,20 +802,11 @@ func (cr *containerReference) exec(cmd []string, env map[string]string, user, wo
 
 		logger.Debugf("Exec command '%s'", cmd)
 		isTerminal := cr.input.AllocatePTY
-		envList := make([]string, 0)
-		for k, v := range env {
-			envList = append(envList, fmt.Sprintf("%s=%s", k, v))
-		}
-
-		var wd string
-		if workdir != "" {
-			if strings.HasPrefix(workdir, "/") {
-				wd = workdir
-			} else {
-				wd = fmt.Sprintf("%s/%s", cr.input.WorkingDir, workdir)
-			}
-		} else {
-			wd = cr.input.WorkingDir
+		wd := cr.input.WorkingDir
+		if strings.HasPrefix(workdir, "/") {
+			wd = workdir
+		} else if workdir != "" {
+			wd = fmt.Sprintf("%s/%s", cr.input.WorkingDir, workdir)
 		}
 		logger.Debugf("Working directory '%s'", wd)
 
@@ -828,7 +814,7 @@ func (cr *containerReference) exec(cmd []string, env map[string]string, user, wo
 			User:         user,
 			Cmd:          cmd,
 			WorkingDir:   wd,
-			Env:          envList,
+			Env:          getEnvListFromMap(env),
 			TTY:          isTerminal,
 			AttachStderr: true,
 			AttachStdout: true,
@@ -845,8 +831,7 @@ func (cr *containerReference) exec(cmd []string, env map[string]string, user, wo
 		}
 		defer resp.Close()
 
-		err = cr.waitForCommand(ctx, resp.HijackedResponse, idResp, user, workdir)
-		if err != nil {
+		if err := cr.waitForCommand(ctx, resp.HijackedResponse); err != nil {
 			return err
 		}
 
@@ -878,6 +863,7 @@ func (cr *containerReference) tryReadID(opt string, cbk func(id int)) common.Exe
 			return nil
 		}
 		defer resp.Close()
+		defer context.AfterFunc(ctx, resp.Close)()
 
 		sid, err := resp.Reader.ReadString('\n')
 		if err != nil {
@@ -895,15 +881,7 @@ func (cr *containerReference) tryReadID(opt string, cbk func(id int)) common.Exe
 	}
 }
 
-func (cr *containerReference) tryReadUID() common.Executor {
-	return cr.tryReadID("-u", func(id int) { cr.UID = id })
-}
-
-func (cr *containerReference) tryReadGID() common.Executor {
-	return cr.tryReadID("-g", func(id int) { cr.GID = id })
-}
-
-func (cr *containerReference) waitForCommand(ctx context.Context, resp client.HijackedResponse, _ client.ExecCreateResult, _, _ string) error {
+func (cr *containerReference) waitForCommand(ctx context.Context, resp client.HijackedResponse) error {
 	logger := common.Logger(ctx)
 
 	// Buffered so the copy goroutine never blocks on send if the grace-period
@@ -911,7 +889,7 @@ func (cr *containerReference) waitForCommand(ctx context.Context, resp client.Hi
 	cmdResponse := make(chan error, 1)
 
 	go func() {
-		cmdResponse <- cr.copyOutput(resp.Reader)
+		cmdResponse <- cr.copyOutput(resp.Reader, cr.input.AllocatePTY)
 	}()
 
 	select {
@@ -927,8 +905,11 @@ func (cr *containerReference) waitForCommand(ctx context.Context, resp client.Hi
 		// truncate the tail of the log. The goroutine exits once the hijacked
 		// stream is closed by resp.Close() in the caller's defer.
 		select {
-		case <-cmdResponse:
-		case <-time.After(drainGracePeriod):
+		case err := <-cmdResponse:
+			if err != nil {
+				logger.Debugf("Failed to drain command output after cancellation: %v", err)
+			}
+		case <-time.After(DrainGracePeriod):
 			logger.Warn("Timed out draining command output after cancellation")
 		}
 
@@ -936,51 +917,12 @@ func (cr *containerReference) waitForCommand(ctx context.Context, resp client.Hi
 		// from executing
 		return ctx.Err()
 	case err := <-cmdResponse:
-		if err != nil {
-			logger.Error(err)
-		}
-
-		return nil
+		return err
 	}
 }
 
-func (cr *containerReference) CopyTarStream(ctx context.Context, destPath string, tarStream io.Reader) error {
-	if cr.id == "" {
-		return cr.missingContainerError("copy to %s", destPath)
-	}
-	// Mkdir, with a path relative to the DestinationPath ("/") below. Docker 29.5+
-	// rejects absolute tar entry names with "path escapes from parent".
-	buf := &bytes.Buffer{}
-	tw := tar.NewWriter(buf)
-	_ = tw.WriteHeader(&tar.Header{
-		Name:     strings.TrimPrefix(destPath, "/"),
-		Mode:     0o777,
-		Typeflag: tar.TypeDir,
-	})
-	tw.Close()
-	_, err := cr.cli.CopyToContainer(ctx, cr.id, client.CopyToContainerOptions{
-		DestinationPath: "/",
-		Content:         buf,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to mkdir to copy content to container: %w", err)
-	}
-	// Copy Content
-	_, err = cr.cli.CopyToContainer(ctx, cr.id, client.CopyToContainerOptions{
-		DestinationPath: destPath,
-		Content:         tarStream,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to copy content to container: %w", err)
-	}
-	// If this fails, then folders have wrong permissions on non root container
-	if cr.UID != 0 || cr.GID != 0 {
-		_ = cr.Exec([]string{"chown", "-R", fmt.Sprintf("%d:%d", cr.UID, cr.GID), destPath}, nil, "0", "")(ctx)
-	}
-	return nil
-}
-
-func (cr *containerReference) copyDir(dstPath, srcPath string, useGitIgnore bool) common.Executor {
+func (cr *containerReference) copyDir(dstPath, srcPath string, useGitIgnore, skipGitDir bool) common.Executor {
+	dstPath = path.Clean(dstPath)
 	return func(ctx context.Context) error {
 		if cr.id == "" {
 			return cr.missingContainerError("copy directory to %s", dstPath)
@@ -991,70 +933,32 @@ func (cr *containerReference) copyDir(dstPath, srcPath string, useGitIgnore bool
 			return err
 		}
 		logger.Debugf("Writing tarball %s from %s", tarFile.Name(), srcPath)
-		defer func(tarFile *os.File) {
-			name := tarFile.Name()
-			err := tarFile.Close()
-			if !errors.Is(err, os.ErrClosed) {
+		defer func() {
+			if err := tarFile.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
 				logger.Error(err)
 			}
-			err = os.Remove(name)
-			if err != nil {
+			if err := os.Remove(tarFile.Name()); err != nil {
 				logger.Error(err)
 			}
-		}(tarFile)
-		tw := tar.NewWriter(tarFile)
-
-		srcPrefix := filepath.Dir(srcPath)
-		if !strings.HasSuffix(srcPrefix, string(filepath.Separator)) {
-			srcPrefix += string(filepath.Separator)
-		}
-		logger.Debugf("Stripping prefix:%s src:%s", srcPrefix, srcPath)
-
-		var ignorer gitignore.Matcher
-		if useGitIgnore {
-			ps, err := gitignore.ReadPatterns(polyfill.New(osfs.New(srcPath)), nil)
-			if err != nil {
-				logger.Debugf("Error loading .gitignore: %v", err)
-			}
-
-			ignorer = gitignore.NewMatcher(ps)
-		}
-
-		fc := &filecollector.FileCollector{
-			Fs:        &filecollector.DefaultFs{},
-			Ignorer:   ignorer,
-			SrcPath:   srcPath,
-			SrcPrefix: srcPrefix,
-			Handler: &filecollector.TarCollector{
-				TarWriter: tw,
-				UID:       cr.UID,
-				GID:       cr.GID,
-				DstDir:    dstPath[1:],
-			},
-		}
-
-		err = filepath.Walk(srcPath, fc.CollectFiles(ctx, []string{}))
-		if err != nil {
-			return err
-		}
-		if err := tw.Close(); err != nil {
+		}()
+		extractionRoot := cr.extractionRoot(dstPath)
+		if err := writeDirTar(ctx, tarFile, path.Join("/", strings.TrimPrefix(dstPath, extractionRoot)), srcPath, useGitIgnore, skipGitDir, cr.UID, cr.GID, cr.markExecutable(ctx)); err != nil {
 			return err
 		}
 
 		logger.Debugf("Extracting content from '%s' to '%s'", tarFile.Name(), dstPath)
-		_, err = tarFile.Seek(0, 0)
-		if err != nil {
+		if _, err := tarFile.Seek(0, 0); err != nil {
 			return fmt.Errorf("failed to seek tar archive: %w", err)
 		}
-		_, err = cr.cli.CopyToContainer(ctx, cr.id, client.CopyToContainerOptions{
-			DestinationPath: "/",
-			Content:         tarFile,
-		})
-		if err != nil {
-			return fmt.Errorf("failed to copy content to container: %w", err)
-		}
-		return nil
+		return cr.upload(ctx, extractionRoot, tarFile)
 	}
+}
+
+func (cr *containerReference) extractionRoot(dstPath string) string {
+	if actPath := cr.GetActPath(); strings.HasPrefix(dstPath+"/", actPath+"/") {
+		return actPath // keeps tar entries from crossing the image's /var/run symlink
+	}
+	return "/"
 }
 
 func (cr *containerReference) copyContent(dstPath string, files ...*FileEntry) common.Executor {
@@ -1062,43 +966,29 @@ func (cr *containerReference) copyContent(dstPath string, files ...*FileEntry) c
 		if cr.id == "" {
 			return cr.missingContainerError("copy to %s", dstPath)
 		}
-		logger := common.Logger(ctx)
 		var buf bytes.Buffer
-		tw := tar.NewWriter(&buf)
-		for _, file := range files {
-			logger.Debugf("Writing entry to tarball %s len:%d", file.Name, len(file.Body))
-			hdr := &tar.Header{
-				Name: file.Name,
-				Mode: file.Mode,
-				Size: int64(len(file.Body)),
-				Uid:  cr.UID,
-				Gid:  cr.GID,
-			}
-			if err := tw.WriteHeader(hdr); err != nil {
-				return err
-			}
-			if _, err := tw.Write([]byte(file.Body)); err != nil {
-				return err
-			}
-		}
-		if err := tw.Close(); err != nil {
+		if err := writeFilesTar(ctx, &buf, cr.UID, cr.GID, files...); err != nil {
 			return err
 		}
 
-		logger.Debugf("Extracting content to '%s'", dstPath)
-		_, err := cr.cli.CopyToContainer(ctx, cr.id, client.CopyToContainerOptions{
-			DestinationPath: dstPath,
-			Content:         &buf,
-		})
-		if err != nil {
-			return fmt.Errorf("failed to copy content to container: %w", err)
-		}
-		return nil
+		common.Logger(ctx).Debugf("Extracting content to '%s'", dstPath)
+		return cr.upload(ctx, dstPath, &buf)
 	}
+}
+
+func (cr *containerReference) upload(ctx context.Context, dstPath string, content io.Reader) error {
+	if _, err := cr.cli.CopyToContainer(ctx, cr.id, client.CopyToContainerOptions{DestinationPath: dstPath, Content: content}); err != nil {
+		return fmt.Errorf("failed to copy content to container: %w", err)
+	}
+	return nil
 }
 
 func (cr *containerReference) attach() common.Executor {
 	return func(ctx context.Context) error {
+		tty, err := cr.containerTTY(ctx)
+		if err != nil {
+			return err
+		}
 		out, err := cr.cli.ContainerAttach(ctx, cr.id, client.ContainerAttachOptions{
 			Stream: true,
 			Stdout: true,
@@ -1109,9 +999,12 @@ func (cr *containerReference) attach() common.Executor {
 		}
 		done := make(chan struct{})
 		cr.attachDone = done
+		stopClose := context.AfterFunc(ctx, out.Close)
 		go func() {
 			defer close(done)
-			if copyErr := cr.copyOutput(out.Reader); copyErr != nil {
+			defer out.Close()
+			defer stopClose()
+			if copyErr := cr.copyOutput(out.Reader, tty); copyErr != nil && ctx.Err() == nil {
 				common.Logger(ctx).Error(copyErr)
 			}
 		}()
@@ -1146,6 +1039,9 @@ func (cr *containerReference) wait() common.Executor {
 				return fmt.Errorf("failed to wait for container: %w", err)
 			}
 		case status := <-waitResult.Result:
+			if status.Error != nil {
+				return fmt.Errorf("failed to wait for container: %s", status.Error.Message)
+			}
 			statusCode = status.StatusCode
 		}
 
@@ -1157,7 +1053,7 @@ func (cr *containerReference) wait() common.Executor {
 		if cr.attachDone != nil {
 			select {
 			case <-cr.attachDone:
-			case <-time.After(drainGracePeriod):
+			case <-time.After(DrainGracePeriod):
 				logger.Warn("Timed out draining container output")
 			}
 			cr.attachDone = nil
@@ -1172,87 +1068,79 @@ func (cr *containerReference) wait() common.Executor {
 }
 
 // For Gitea
-// sanitizeOptionsHostConfig clears the HostConfig fields parsed from a
-// workflow-controlled container.options string that could be used to escape the
-// container when privileged mode is disabled. It must only be called when the
-// runner has privileged mode turned off; with privileged mode enabled the
-// administrator has already opted into host access.
-func sanitizeOptionsHostConfig(logger logrus.FieldLogger, hostConfig *container.HostConfig) {
-	warn := func(option string) {
-		logger.Warnf("container option %q is not allowed when privileged mode is disabled and will be ignored", option)
-	}
+// sanitizeOptionsHostConfig takes back everything a workflow could escape the container with,
+// setting each field to trusted, which is what the runner's own options parse to on their own.
+// Only for unprivileged mode, since privileged mode grants host access anyway.
+func sanitizeOptionsHostConfig(logger *logging.Logger, hostConfig, trusted *container.HostConfig) {
+	resetOption(logger, "--pid", &hostConfig.PidMode, trusted.PidMode)
+	resetOption(logger, "--ipc", &hostConfig.IpcMode, trusted.IpcMode)
+	resetOption(logger, "--uts", &hostConfig.UTSMode, trusted.UTSMode)
+	resetOption(logger, "--cgroupns", &hostConfig.CgroupnsMode, trusted.CgroupnsMode)
+	resetOption(logger, "--userns", &hostConfig.UsernsMode, trusted.UsernsMode) // --userns=host would undo the remapping the runner asked for
+	resetOption(logger, "--cap-add", &hostConfig.CapAdd, trusted.CapAdd)
+	resetOption(logger, "--security-opt", &hostConfig.SecurityOpt, trusted.SecurityOpt)
+	resetOption(logger, "--device", &hostConfig.Devices, trusted.Devices)
+	resetOption(logger, "--device-cgroup-rule", &hostConfig.DeviceCgroupRules, trusted.DeviceCgroupRules)
+	resetOption(logger, "--gpus", &hostConfig.DeviceRequests, trusted.DeviceRequests)
+	resetOption(logger, "--volumes-from", &hostConfig.VolumesFrom, trusted.VolumesFrom)
+	resetOption(logger, "--runtime", &hostConfig.Runtime, trusted.Runtime)
+	resetOption(logger, "--cgroup-parent", &hostConfig.CgroupParent, trusted.CgroupParent)
+	resetOption(logger, "--sysctl", &hostConfig.Sysctls, trusted.Sysctls)
+	resetOption(logger, "--isolation", &hostConfig.Isolation, trusted.Isolation) // windows: process isolation drops the hyper-v boundary
+	resetOption(logger, "--volume-driver", &hostConfig.VolumeDriver, trusted.VolumeDriver)
+	// systempaths=unconfined lands in these two rather than in SecurityOpt
+	resetOption(logger, "--security-opt", &hostConfig.MaskedPaths, trusted.MaskedPaths)
+	resetOption(logger, "--security-opt", &hostConfig.ReadonlyPaths, trusted.ReadonlyPaths)
+	resetOption(logger, "--log-driver", &hostConfig.LogConfig.Type, trusted.LogConfig.Type) // drivers run in the daemon, egressing from its network
+	resetOption(logger, "--log-opt", &hostConfig.LogConfig.Config, trusted.LogConfig.Config)
+	resetOption(logger, "--oom-score-adj", &hostConfig.OomScoreAdj, trusted.OomScoreAdj) // -1000 exempts it from the host OOM killer
+	resetOption(logger, "--oom-kill-disable", &hostConfig.OomKillDisable, trusted.OomKillDisable)
 
-	if hostConfig.PidMode != "" {
-		warn("--pid")
-		hostConfig.PidMode = ""
-	}
-	if hostConfig.IpcMode != "" {
-		warn("--ipc")
-		hostConfig.IpcMode = ""
-	}
-	if hostConfig.UTSMode != "" {
-		warn("--uts")
-		hostConfig.UTSMode = ""
-	}
-	if hostConfig.CgroupnsMode != "" {
-		warn("--cgroupns")
-		hostConfig.CgroupnsMode = ""
-	}
-	// UsernsMode is set from the runner-controlled input; never let options
-	// override it (e.g. --userns=host disables user namespace remapping).
-	if hostConfig.UsernsMode != "" {
-		warn("--userns")
-		hostConfig.UsernsMode = ""
-	}
-	if len(hostConfig.CapAdd) > 0 {
-		warn("--cap-add")
-		hostConfig.CapAdd = nil
-	}
-	if len(hostConfig.SecurityOpt) > 0 {
-		warn("--security-opt")
-		hostConfig.SecurityOpt = nil
-	}
-	if len(hostConfig.Devices) > 0 {
-		warn("--device")
-		hostConfig.Devices = nil
-	}
-	if len(hostConfig.DeviceCgroupRules) > 0 {
-		warn("--device-cgroup-rule")
-		hostConfig.DeviceCgroupRules = nil
-	}
-	if len(hostConfig.DeviceRequests) > 0 {
-		warn("--gpus")
-		hostConfig.DeviceRequests = nil
-	}
-	if len(hostConfig.VolumesFrom) > 0 {
-		warn("--volumes-from")
-		hostConfig.VolumesFrom = nil
-	}
-	if hostConfig.Runtime != "" {
-		warn("--runtime")
-		hostConfig.Runtime = ""
-	}
-	if hostConfig.CgroupParent != "" {
-		warn("--cgroup-parent")
-		hostConfig.CgroupParent = ""
-	}
-	if len(hostConfig.Sysctls) > 0 {
-		warn("--sysctl")
-		hostConfig.Sysctls = nil
-	}
+	// a driver mounts what it likes, e.g. local with device= binds any host path, which
+	// valid_volumes never gets to see
+	hostConfig.Mounts = slices.DeleteFunc(hostConfig.Mounts, func(mt mount.Mount) bool {
+		if mt.VolumeOptions == nil || mt.VolumeOptions.DriverConfig == nil ||
+			slices.ContainsFunc(trusted.Mounts, func(t mount.Mount) bool { return reflect.DeepEqual(t, mt) }) {
+			return false
+		}
+		logger.Warnf("volume driver of %q in the workflow is not allowed when privileged mode is disabled and will be ignored", mt.Source)
+		return true
+	})
 }
 
-// For Gitea
-// sanitizeConfig remove the invalid configurations from `config` and `hostConfig`
-func (cr *containerReference) sanitizeConfig(ctx context.Context, config *container.Config, hostConfig *container.HostConfig) (*container.Config, *container.HostConfig) {
+// resetOption puts a field back to the runner's own value. It compares the values rather than
+// the flags, so a field that more than one option feeds cannot slip through.
+func resetOption[T any](logger *logging.Logger, option string, field *T, trusted T) {
+	if reflect.DeepEqual(*field, trusted) {
+		return
+	}
+	logger.Warnf("container option %q in the workflow is not allowed when privileged mode is disabled and will be ignored", option)
+	*field = trusted
+}
+
+// parseOptionsHostConfig parses one options string on its own, to see what it alone asks for.
+// Even "" goes through the parser, or its empty slices and maps would differ from a real parse.
+func parseOptionsHostConfig(options, serverOS string) (*container.HostConfig, error) {
+	flags, copts, _, err := parseContainerOptions(options)
+	if err != nil {
+		return nil, err
+	}
+	containerConfig, err := parse(flags, copts, serverOS)
+	if err != nil {
+		return nil, fmt.Errorf("cannot process container options: '%s': '%w'", options, err)
+	}
+	return containerConfig.HostConfig, nil
+}
+
+func (cr *containerReference) sanitizeConfig(ctx context.Context, hostConfig *container.HostConfig) {
 	logger := common.Logger(ctx)
+	matcher := newValidVolumeMatcher(ctx, cr.input.ValidVolumes)
 
 	if len(cr.input.ValidVolumes) > 0 {
-		matcher := newValidVolumeMatcher(ctx, cr.input.ValidVolumes)
 		// sanitize binds
 		sanitizedBinds := make([]string, 0, len(hostConfig.Binds))
 		for _, bind := range hostConfig.Binds {
-			parsed, err := loader.ParseVolume(bind)
+			parsed, err := ParseVolume(bind)
 			if err != nil {
 				logger.Warnf("parse volume [%s] error: %v", bind, err)
 				continue
@@ -1262,34 +1150,96 @@ func (cr *containerReference) sanitizeConfig(ctx context.Context, config *contai
 				sanitizedBinds = append(sanitizedBinds, bind)
 				continue
 			}
-			if matcher.isValid(parsed.Source, mount.Type(parsed.Type)) {
+			if matcher.isValid(parsed.Source, parsed.Type, parsed.ReadOnly) {
+				if matcher.needsNoCopy(parsed.Source, parsed.Type) && !parsed.NoCopy {
+					bind += ",nocopy"
+				}
 				sanitizedBinds = append(sanitizedBinds, bind)
 			} else {
 				logger.Warnf("[%s] is not a valid volume, will be ignored", parsed.Source)
 			}
 		}
 		hostConfig.Binds = sanitizedBinds
-		// sanitize mounts
-		sanitizedMounts := make([]mount.Mount, 0, len(hostConfig.Mounts))
-		for _, mt := range hostConfig.Mounts {
-			if matcher.isValid(mt.Source, mt.Type) {
-				sanitizedMounts = append(sanitizedMounts, mt)
-			} else {
-				logger.Warnf("[%s] is not a valid volume, will be ignored", mt.Source)
+	} else {
+		for _, bind := range hostConfig.Binds {
+			logger.Warnf("[%s] is not a valid volume, will be ignored", bind)
+		}
+		hostConfig.Binds = []string{}
+	}
+	// sanitize mounts
+	sanitizedMounts := make([]mount.Mount, 0, len(hostConfig.Mounts))
+	for _, mt := range hostConfig.Mounts {
+		readOnly := mt.ReadOnly && (mt.BindOptions == nil || !mt.BindOptions.ReadOnlyNonRecursive) // bind-recursive=writable leaves submounts writable
+		if matcher.isValid(mt.Source, mt.Type, readOnly) {
+			if matcher.needsNoCopy(mt.Source, mt.Type) {
+				mt.VolumeOptions = cmp.Or(mt.VolumeOptions, &mount.VolumeOptions{})
+				mt.VolumeOptions.NoCopy = true
+			}
+			sanitizedMounts = append(sanitizedMounts, mt)
+		} else {
+			logger.Warnf("[%s] is not a valid volume, will be ignored", mt.Source)
+		}
+	}
+	hostConfig.Mounts = sanitizedMounts
+}
+
+func SanitizeBinds(ctx context.Context, validVolumes, binds []string) []string {
+	cr := &containerReference{input: &NewContainerInput{ValidVolumes: validVolumes}}
+	hostConfig := &container.HostConfig{Binds: binds}
+	cr.sanitizeConfig(ctx, hostConfig)
+	return hostConfig.Binds
+}
+
+func overlay(dst, src reflect.Value, appendSlices bool) {
+	switch dst.Kind() {
+	case reflect.Struct:
+		opaque := true
+		for i := range dst.NumField() {
+			if dst.Type().Field(i).IsExported() {
+				opaque = false
+				overlay(dst.Field(i), src.Field(i), appendSlices)
 			}
 		}
-		hostConfig.Mounts = sanitizedMounts
-	} else {
-		hostConfig.Binds = []string{}
-		hostConfig.Mounts = []mount.Mount{}
+		if opaque {
+			dst.Set(src)
+		}
+	case reflect.Map:
+		if src.IsNil() {
+			return
+		}
+		if dst.IsNil() {
+			dst.Set(reflect.MakeMap(dst.Type()))
+		}
+		for key, value := range src.Seq2() {
+			dst.SetMapIndex(key, value)
+		}
+	case reflect.Slice:
+		if appendSlices {
+			dst.Set(reflect.AppendSlice(dst, src))
+		} else if src.Len() > 0 {
+			dst.Set(src)
+		}
+	case reflect.Pointer:
+		if src.IsNil() {
+			return
+		}
+		if dst.IsNil() {
+			dst.Set(src)
+			return
+		}
+		overlay(dst.Elem(), src.Elem(), appendSlices)
+	case reflect.Array:
+		dst.Set(src)
+	default:
+		if !src.IsZero() {
+			dst.Set(src)
+		}
 	}
-
-	return config, hostConfig
 }
 
 // bindTarget returns the container path a bind mounts onto, empty if it cannot be parsed.
 func bindTarget(bind string) string {
-	parsed, err := loader.ParseVolume(bind)
+	parsed, err := ParseVolume(bind)
 	if err != nil {
 		return ""
 	}
@@ -1316,28 +1266,39 @@ func overlayVolumes(dst, src *container.HostConfig) {
 }
 
 type validVolumeMatcher struct {
-	allowAll bool
-	named    []glob.Glob
-	host     []glob.Glob
+	allowAll         bool
+	allowAllReadOnly bool
+	named            []validVolumeRule
+	host             []validVolumeRule
+}
+
+type validVolumeRule struct {
+	pattern  string
+	readOnly bool
 }
 
 func newValidVolumeMatcher(ctx context.Context, validVolumes []string) validVolumeMatcher {
 	logger := common.Logger(ctx)
 	ret := validVolumeMatcher{
-		named: make([]glob.Glob, 0, len(validVolumes)),
-		host:  make([]glob.Glob, 0, len(validVolumes)),
+		named: make([]validVolumeRule, 0, len(validVolumes)),
+		host:  make([]validVolumeRule, 0, len(validVolumes)),
 	}
 
 	for _, v := range validVolumes {
+		v, readOnly := strings.CutSuffix(v, ":ro")
 		if v == "**" {
-			ret.allowAll = true
+			if readOnly {
+				ret.allowAllReadOnly = true
+			} else {
+				ret.allowAll = true
+			}
 			continue
 		}
 		if !isHostVolumePattern(v) {
-			if g, err := glob.Compile(v); err != nil {
-				logger.Errorf("create glob from %s error: %v", v, err)
+			if doublestar.ValidatePattern(v) {
+				ret.named = append(ret.named, validVolumeRule{pattern: v, readOnly: readOnly})
 			} else {
-				ret.named = append(ret.named, g)
+				logger.Errorf("invalid volume pattern %s", v)
 			}
 			continue
 		}
@@ -1346,38 +1307,42 @@ func newValidVolumeMatcher(ctx context.Context, validVolumes []string) validVolu
 			logger.Errorf("normalize volume pattern %s error: %v", v, err)
 			continue
 		}
-		if g, err := glob.Compile(normalized); err != nil {
-			logger.Errorf("create glob from %s error: %v", normalized, err)
+		if doublestar.ValidatePathPattern(normalized) {
+			ret.host = append(ret.host, validVolumeRule{pattern: normalized, readOnly: readOnly})
 		} else {
-			ret.host = append(ret.host, g)
+			logger.Errorf("invalid volume pattern %s", normalized)
 		}
 	}
 
 	return ret
 }
 
-func (m validVolumeMatcher) isValid(source string, sourceType mount.Type) bool {
-	if m.allowAll {
+func (m validVolumeMatcher) isValid(source string, sourceType mount.Type, readOnly bool) bool {
+	if m.allowAll || (m.allowAllReadOnly && readOnly) {
 		return true
 	}
+	if sourceType == mount.TypeTmpfs && source == "" { // backed by memory, exposes nothing from the host, same as --tmpfs
+		return true
+	}
+	rules, match := m.named, doublestar.MatchUnvalidated
 	if isHostVolumeSource(source, sourceType) {
 		normalized, err := normalizeHostVolumePath(source)
 		if err != nil {
 			return false
 		}
-		for _, g := range m.host {
-			if g.Match(normalized) {
-				return true
-			}
-		}
-		return false
+		rules, match, source = m.host, doublestar.PathMatchUnvalidated, normalized
 	}
-	for _, g := range m.named {
-		if g.Match(source) {
+	for _, rule := range rules {
+		if (readOnly || !rule.readOnly) && match(rule.pattern, source) {
 			return true
 		}
 	}
 	return false
+}
+
+// needsNoCopy reports a volume only `:ro` rules allow, as dockerd fills an empty volume from the image even when mounted read-only.
+func (m validVolumeMatcher) needsNoCopy(source string, sourceType mount.Type) bool {
+	return sourceType == mount.TypeVolume && !m.isValid(source, sourceType, false)
 }
 
 func isHostVolumePattern(pattern string) bool {

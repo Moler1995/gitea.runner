@@ -4,26 +4,34 @@
 package config
 
 import (
-	"bytes"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"maps"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
 
+	"gitea.com/gitea/runner/act/common/logging"
+	"gitea.com/gitea/runner/act/container"
 	"gitea.com/gitea/runner/act/container/hooks"
 
+	"github.com/docker/go-connections/tlsconfig"
 	"github.com/docker/go-units"
 	"github.com/joho/godotenv"
-	log "github.com/sirupsen/logrus"
 	"go.yaml.in/yaml/v4"
+	"golang.org/x/net/http/httpguts"
 )
 
 // RequestTimeout bounds every RPC to Gitea, and with it runner.fetch_timeout.
 const RequestTimeout = 60 * time.Second
+
+// DefaultImage is the image jobs run in unless a label or runner.default_image names another.
+const DefaultImage = "docker.gitea.com/runner-images:ubuntu-latest"
 
 // DefaultPostTaskScriptTimeout is the fallback cap on how long the post-task
 // script may run when post_task_script is set without an explicit timeout. It is
@@ -31,15 +39,25 @@ const RequestTimeout = 60 * time.Second
 // (so a programmatically built config still gets a sane bound).
 const DefaultPostTaskScriptTimeout = 5 * time.Minute
 
+var environmentReference = regexp.MustCompile(`\$?\$\{[A-Za-z_][A-Za-z0-9_]*\}`)
+
 // Minimal is the smallest config file that runs the runner: options it does not
 // name keep their default, and it names none.
 const Minimal = `# Minimal config file. Every option it does not set keeps its default.
 # "gitea-runner config generate" prints all options, "config set <key> <value>" sets one here.
 `
 
-// Log represents the configuration for logging.
+// Log represents the runner process's own logging, plus the copy of each task's log it keeps.
 type Log struct {
 	Level string `yaml:"level"` // Level indicates the logging level.
+	Job   LogJob `yaml:"job"`   // Job configures the copy of each task's log kept on the runner host.
+}
+
+// LogJob represents the configuration for the copy of each task's log kept on the runner host.
+type LogJob struct {
+	Dir       string        `yaml:"dir"`       // Dir is the directory the runner writes each task's log to. Empty, the default, writes none.
+	Retention time.Duration `yaml:"retention"` // Retention deletes a task's log directory once it is older than this. Default 168h, 0s keeps them regardless of age.
+	MaxSize   Size          `yaml:"max_size"`  // MaxSize caps one task's log file. Default 1GB, 0 is no limit.
 }
 
 // Runner represents the configuration for the runner.
@@ -51,25 +69,34 @@ type Runner struct {
 	Timeout               time.Duration     `yaml:"timeout"`                  // Timeout specifies the duration for runner timeout.
 	ShutdownTimeout       time.Duration     `yaml:"shutdown_timeout"`         // ShutdownTimeout specifies the duration to wait for running jobs to complete during a shutdown of the runner.
 	Insecure              bool              `yaml:"insecure"`                 // Insecure indicates whether the runner operates in an insecure mode.
+	ClientCertFile        string            `yaml:"client_cert_file"`         // ClientCertFile is the PEM certificate presented to a Gitea instance that requires mutual TLS.
+	ClientKeyFile         string            `yaml:"client_key_file"`          // ClientKeyFile is the PEM private key paired with ClientCertFile.
+	CAFile                string            `yaml:"ca_file"`                  // CAFile holds PEM CA certificates trusted for the Gitea instance besides the system's.
+	ExtraHeaders          map[string]string `yaml:"extra_headers"`            // ExtraHeaders adds HTTP headers to runner API requests to Gitea.
 	FetchTimeout          time.Duration     `yaml:"fetch_timeout"`            // FetchTimeout specifies the timeout duration for fetching resources.
 	FetchInterval         time.Duration     `yaml:"fetch_interval"`           // FetchInterval specifies the interval duration for fetching resources.
 	FetchIntervalMax      time.Duration     `yaml:"fetch_interval_max"`       // FetchIntervalMax specifies the maximum backoff interval when idle.
-	WorkdirCleanupAge     time.Duration     `yaml:"workdir_cleanup_age"`      // WorkdirCleanupAge removes stale bind-workdir task directories and orphaned host-mode scratch dirs older than this duration during idle cleanup.
-	IdleCleanupInterval   time.Duration     `yaml:"idle_cleanup_interval"`    // IdleCleanupInterval runs the idle cleanup (stale directories and orphaned docker networks) periodically while the runner is idle. Set to 0 to disable cleanup cadence.
+	WorkdirCleanupAge     time.Duration     `yaml:"workdir_cleanup_age"`      // WorkdirCleanupAge removes stale bind-workdir task directories, orphaned host-mode scratch dirs and orphaned Kubernetes job resources older than this duration during idle cleanup.
+	IdleCleanupInterval   time.Duration     `yaml:"idle_cleanup_interval"`    // IdleCleanupInterval runs the idle cleanup (stale directories, orphaned docker networks and volumes, orphaned job pods) periodically while the runner is idle. Set to 0 to disable cleanup cadence.
 	LogReportInterval     time.Duration     `yaml:"log_report_interval"`      // LogReportInterval specifies the base interval for periodic log flush.
 	LogReportMaxLatency   time.Duration     `yaml:"log_report_max_latency"`   // LogReportMaxLatency specifies the max time a log row can wait before being sent.
 	LogReportBatchSize    int               `yaml:"log_report_batch_size"`    // LogReportBatchSize triggers immediate log flush when buffer reaches this size.
+	LogReportLevel        string            `yaml:"log_report_level"`         // LogReportLevel is the lowest level of the runner's own messages sent to the job log between steps. Empty, the default, follows log.level.
 	StateReportInterval   time.Duration     `yaml:"state_report_interval"`    // StateReportInterval specifies the interval for state reporting.
 	ReportCloseTimeout    time.Duration     `yaml:"report_close_timeout"`     // ReportCloseTimeout caps each RPC attempt when flushing the final logs and task state at job completion, on a detached context so a server cancel can't block the acknowledgement.
 	Labels                []string          `yaml:"labels"`                   // Labels specify the labels of the runner. Labels are declared on each startup
 	GithubMirror          string            `yaml:"github_mirror"`            // GithubMirror defines what mirrors should be used when using github
-	ActionShallowClone    *bool             `yaml:"action_shallow_clone"`     // ActionShallowClone fetches only the requested ref of an action repository at depth 1 instead of cloning every branch's full history. It is a pointer to distinguish between false and not set; if not set, it defaults to true.
+	ActionShallowClone    *bool             `yaml:"action_shallow_clone"`     // ActionShallowClone clones only the requested ref at depth 1 instead of every branch's full history, for reusable workflows and actions without an archive. It is a pointer to distinguish between false and not set; if not set, it defaults to true.
 	SetActEnv             *bool             `yaml:"set_act_env"`              // SetActEnv controls whether the ACT=true environment variable is injected into jobs. It is a pointer to distinguish between false and not set; if not set, it defaults to true. Set it to false so workflows gated on `if: ${{ !env.ACT }}` behave like on GitHub.
+	PatchActions          *bool             `yaml:"patch_actions"`            // PatchActions applies compatibility patches to the actions a job runs, so actions written for GitHub work against Gitea, see act/runner/patch_actions.go. It is a pointer to distinguish between false and not set; if not set, it defaults to true. Set it to false to run every action exactly as published, at the price of the artifact actions refusing.
 	AllocatePTY           bool              `yaml:"allocate_pty"`             // AllocatePTY allocates a pseudo-TTY for each step's process. Default is false, matching GitHub's actions/runner. Enable only for jobs that need an interactive terminal; tools like docker build emit redrawing progress frames into the captured log when a TTY is present. Applies to both host and docker backends.
+	DefaultImage          string            `yaml:"default_image"`            // DefaultImage is the image a job runs in when its runs-on matches none of the runner's labels. A runner without docker runs such a job on the host instead.
 	ToolCacheMode         string            `yaml:"tool_cache_mode"`          // ToolCacheMode is what the runner mounts at RUNNER_TOOL_CACHE on both backends: ToolCacheModeNone or ToolCacheModeShared.
 	PostTaskScript        string            `yaml:"post_task_script"`         // PostTaskScript is the path to an executable script run on the host after each task's cleanup completes. Empty disables the hook. On Windows use .exe/.bat/.cmd; PowerShell (.ps1) is not supported yet as the configured path.
 	PostTaskScriptTimeout time.Duration     `yaml:"post_task_script_timeout"` // PostTaskScriptTimeout caps how long the post-task script may run. Default is 5m when post_task_script is set.
 	Hooks                 RunnerHooks       `yaml:"hooks"`                    // Hooks are scripts run inside the job environment around the job's steps.
+
+	rootCAs *x509.CertPool // the system's and CAFile's, nil for the system's alone
 }
 
 // RunnerHooks represents the scripts run inside the job environment around the job's steps.
@@ -88,13 +115,28 @@ type Cache struct {
 	ExternalSecret     string `yaml:"external_secret"`      // ExternalSecret is a shared secret between this runner and an external gitea-runner cache-server, enabling per-job ACTIONS_RUNTIME_TOKEN authentication and repo scoping over the network. Required whenever ExternalServer is set; ExternalSecretFile is the alternative way to provide it.
 	ExternalSecretFile string `yaml:"external_secret_file"` // ExternalSecretFile is the path to a file holding the ExternalSecret value, so the secret can be mounted instead of stored in the config file. LoadDefault reads it into ExternalSecret; setting both is an error.
 	OfflineMode        bool   `yaml:"offline_mode"`         // OfflineMode reuses a cached action without fetching from the remote; a moved tag or branch stays at the cached commit until the cache entry is removed.
-	V2                 *bool  `yaml:"v2"`                   // V2 serves the actions cache service v2 API to jobs, used by actions/cache@v4.2 and later, and edits the action bundles that would otherwise refuse it. Unset means enabled.
+	V2                 *bool  `yaml:"v2"`                   // V2 advertises the actions cache service v2 API to jobs. The bundle edit that reaches it is made either way, the artifact actions need it too. Unset means enabled.
 
-	// Eviction settings, ignored when ExternalServer is set since that server applies its own.
+	S3 *CacheS3 `yaml:"s3"` // S3 stores the cache in an S3-compatible bucket, so runners with the same settings use the same cache.
+
+	// Eviction settings, ignored when ExternalServer is set since that server applies its own. With S3, bucket lifecycle rules replace all but SweepInterval.
 	Retention     time.Duration `yaml:"retention"`       // Retention removes entries nothing has read or written within this window. Default 168h, 0 keeps them regardless of age.
 	RepoSizeLimit Size          `yaml:"repo_size_limit"` // RepoSizeLimit caps one repository, evicting least recently accessed first. Default 10GB, 0 is no limit.
 	SizeLimit     Size          `yaml:"size_limit"`      // SizeLimit caps the whole cache the same way. No limit by default.
 	SweepInterval time.Duration `yaml:"sweep_interval"`  // SweepInterval is the minimum time between two eviction sweeps. Default 1h; a cadence has no "off".
+}
+
+// CacheS3 is an S3-compatible bucket that stores the cache.
+type CacheS3 struct {
+	Endpoint      string `yaml:"endpoint"`
+	Region        string `yaml:"region"`
+	Bucket        string `yaml:"bucket"`
+	Prefix        string `yaml:"prefix"`
+	PathStyle     *bool  `yaml:"path_style"`
+	AccessKey     string `yaml:"access_key"`
+	AccessKeyFile string `yaml:"access_key_file"`
+	SecretKey     string `yaml:"secret_key"`
+	SecretKeyFile string `yaml:"secret_key_file"`
 }
 
 // DefaultCache returns the cache eviction defaults, seeded before the file is read so a
@@ -134,6 +176,7 @@ func parseSize(value string) (Size, error) {
 
 // Container represents the configuration for the container.
 type Container struct {
+	Hooks                hooks.Config                  `yaml:"hooks"`                  // configures the container-hooks mode
 	Network              string                        `yaml:"network"`                // Network specifies the network for the container.
 	NetworkCreateOptions ContainerNetworkCreateOptions `yaml:"network_create_options"` // Add options when the network need to be created by the runner
 	NetworkMode          string                        `yaml:"network_mode"`           // Deprecated: use Network instead. Could be removed after Gitea 1.20
@@ -141,17 +184,18 @@ type Container struct {
 	Options              string                        `yaml:"options"`                // Options specifies additional options for the container.
 	WorkdirParent        string                        `yaml:"workdir_parent"`         // WorkdirParent specifies the parent directory for the container's working directory.
 	ValidVolumes         []string                      `yaml:"valid_volumes"`          // ValidVolumes specifies the volumes (including bind mounts) can be mounted to containers.
+	Volumes              []string                      `yaml:"volumes"`                // Volumes are mounted into every job, service and docker action container.
 	DockerHost           string                        `yaml:"docker_host"`            // DockerHost specifies the Docker host. It overrides the value specified in environment variable DOCKER_HOST.
 	ForcePull            bool                          `yaml:"force_pull"`             // Pull docker image(s) even if already present, except digest-pinned ones. A pull that fails while a local copy exists is a warning, not a job failure.
 	ForceRebuild         bool                          `yaml:"force_rebuild"`          // Rebuild docker image(s) even if already present
 	RequireDocker        bool                          `yaml:"require_docker"`         // Always require a reachable docker daemon, even if not required by runner
 	DockerTimeout        time.Duration                 `yaml:"docker_timeout"`         // Timeout to wait for the docker daemon to be reachable, if docker is required by require_docker or runner
-	BindWorkdir          bool                          `yaml:"bind_workdir"`           // BindWorkdir binds the workspace to the host filesystem instead of using Docker volumes. Required for DinD when jobs use docker compose with bind mounts.
+	BindWorkdir          bool                          `yaml:"bind_workdir"`           // BindWorkdir mounts the workspace from a host directory instead of a Docker volume.
 	ServiceReadyTimeout  time.Duration                 `yaml:"service_ready_timeout"`  // ServiceReadyTimeout bounds how long a job waits for a service container that declares a healthcheck to report healthy. Negative disables waiting.
-	Hooks                hooks.Config                  `yaml:"hooks"`                  // Hooks configures the container-hooks mode, which delegates container lifecycle management (prepare/execute/cleanup) to an external entrypoint instead of using the Docker API.
+	Sweep                bool                          `yaml:"sweep"`                  // Sweep removes the containers, networks and volumes a job creates through its Docker proxy when the job ends.
 }
 
-// Values of Runner.ToolCacheMode: the runner mounts no tool cache, or one that every job reuses.
+// Values of Runner.ToolCacheMode: the runner mounts no tool cache, or one per capacity slot that its jobs reuse.
 const (
 	ToolCacheModeNone   = "none"
 	ToolCacheModeShared = "shared"
@@ -167,6 +211,33 @@ type ContainerNetworkCreateOptions struct {
 // Host represents the configuration for the host.
 type Host struct {
 	WorkdirParent string `yaml:"workdir_parent"` // WorkdirParent specifies the parent directory for the host's working directory.
+}
+
+// Kubernetes configures the pods jobs run in.
+type Kubernetes struct {
+	Kubeconfig   string                    `yaml:"kubeconfig"`    // Kubeconfig to use instead of the in-cluster service account.
+	Namespace    string                    `yaml:"namespace"`     // Namespace of job pods, empty uses the service account's, else the kubeconfig context's, else default.
+	PodTemplate  map[string]any            `yaml:"pod_template"`  // PodTemplate is a pod manifest the runner merges its own onto.
+	PodTemplates map[string]map[string]any `yaml:"pod_templates"` // PodTemplates are merged over PodTemplate, in runs-on order, for jobs whose runs-on has the label they are keyed by.
+	Transfer     KubernetesTransfer        `yaml:"transfer"`      // Transfer has job pods fetch copied files from the runner over the pod network instead of through the API server.
+}
+
+// Kubernetes transfer modes: how files the runner copies reach job pods.
+const (
+	KubernetesTransferModeAPI    = "api"    // through the API server
+	KubernetesTransferModeAuto   = "auto"   // over the pod network, through the API server for a job pod that cannot reach the runner
+	KubernetesTransferModeDirect = "direct" // over the pod network only, a copy that cannot reach the runner fails
+)
+
+// KubernetesTransferModes are the valid kubernetes.transfer.mode values.
+var KubernetesTransferModes = []string{KubernetesTransferModeAPI, KubernetesTransferModeAuto, KubernetesTransferModeDirect}
+
+// KubernetesTransfer configures copying files into job pods over the pod network.
+type KubernetesTransfer struct {
+	Mode  string `yaml:"mode"`  // Mode is one of KubernetesTransferModes, api when empty.
+	Host  string `yaml:"host"`  // Host is the address the runner listens on and job pods reach it at, empty uses the outbound IP.
+	Port  uint16 `yaml:"port"`  // Port the runner listens on for job pods, 0 picks a free one.
+	Image string `yaml:"image"` // Image has gitea-runner on its PATH, empty uses the image of a single-container runner pod.
 }
 
 // Metrics represents the configuration for the Prometheus metrics endpoint.
@@ -195,26 +266,34 @@ type Config struct {
 	Host        Host        `yaml:"host"`         // Host represents the configuration for the host.
 	Metrics     Metrics     `yaml:"metrics"`      // Metrics represents the configuration for the Prometheus metrics endpoint.
 	HealthCheck HealthCheck `yaml:"health_check"` // HealthCheck controls opt-in local task-admission checks.
+	Kubernetes  Kubernetes  `yaml:"kubernetes"`
 }
 
 // LoadDefault returns the default configuration.
 // If file is not empty, it will be used to load the configuration.
 func LoadDefault(file string) (*Config, error) {
-	cfg := &Config{Cache: DefaultCache()}
-	definedRunnerKeys := map[string]bool{}
+	// Seeded before the file is read, so a written 0 can mean off.
+	cfg := &Config{
+		Runner: Runner{FetchIntervalMax: 5 * time.Second, WorkdirCleanupAge: 24 * time.Hour, IdleCleanupInterval: 10 * time.Minute},
+		Cache:  DefaultCache(),
+		Log:    Log{Job: LogJob{Retention: 7 * 24 * time.Hour, MaxSize: 1024 * 1024 * 1024}},
+	}
 	if file != "" {
 		content, err := os.ReadFile(file)
 		if err != nil {
 			return nil, fmt.Errorf("open config file %q: %w", file, err)
 		}
-		if err := yaml.Unmarshal(content, cfg); err != nil {
+		var document yaml.Node
+		if err := yaml.Unmarshal(content, &document); err != nil {
 			return nil, fmt.Errorf("parse config file %q: %w", file, err)
 		}
-		warnUnknownKeys(file, content)
-		definedRunnerKeys, err = definedRunnerConfigKeys(content)
-		if err != nil {
-			return nil, fmt.Errorf("parse config file %q for defaults metadata: %w", file, err)
+		if err := expandEnvironment(&document); err != nil {
+			return nil, fmt.Errorf("parse config file %q: %w", file, err)
 		}
+		if err := document.Load(cfg, yaml.WithV3Defaults()); err != nil {
+			return nil, fmt.Errorf("parse config file %q: %w", file, err)
+		}
+		warnUnknownKeys(file, &document)
 	}
 
 	if cfg.Runner.EnvFile != "" {
@@ -227,6 +306,32 @@ func LoadDefault(file string) (*Config, error) {
 				cfg.Runner.Envs = map[string]string{}
 			}
 			maps.Copy(cfg.Runner.Envs, envs)
+		}
+	}
+	if (cfg.Runner.ClientCertFile == "") != (cfg.Runner.ClientKeyFile == "") {
+		return nil, errors.New("runner.client_cert_file and runner.client_key_file must be set together")
+	}
+	if cfg.Runner.ClientCertFile != "" {
+		if _, err := tls.LoadX509KeyPair(cfg.Runner.ClientCertFile, cfg.Runner.ClientKeyFile); err != nil {
+			return nil, fmt.Errorf("load runner client certificate: %w", err)
+		}
+		for _, file := range []*string{&cfg.Runner.ClientCertFile, &cfg.Runner.ClientKeyFile} {
+			abs, err := filepath.Abs(*file) // git resolves a relative path against the repository it runs in
+			if err != nil {
+				return nil, err
+			}
+			*file = abs
+		}
+	}
+
+	if cfg.Runner.CAFile != "" {
+		if err := cfg.Runner.loadCAFile(); err != nil {
+			return nil, err
+		}
+	}
+	for _, spec := range cfg.Container.Volumes {
+		if parsed, err := container.ParseVolume(spec); err != nil || parsed.Source == "" {
+			return nil, fmt.Errorf("container.volumes entry %q is not source:target[:options]", spec)
 		}
 	}
 
@@ -243,19 +348,16 @@ func LoadDefault(file string) (*Config, error) {
 		cfg.Runner.Timeout = 3 * time.Hour
 	}
 	if cfg.Runner.ActionShallowClone == nil {
-		b := true
-		cfg.Runner.ActionShallowClone = &b
+		cfg.Runner.ActionShallowClone = new(true)
 	}
 	if cfg.Runner.SetActEnv == nil {
-		b := true
-		cfg.Runner.SetActEnv = &b
+		cfg.Runner.SetActEnv = new(true)
 	}
 	if cfg.Cache.Enabled == nil {
-		b := true
-		cfg.Cache.Enabled = &b
+		cfg.Cache.Enabled = new(true)
 	}
 	// Resolved regardless of cache.enabled, because the `cache-server` command reads the secret from the same key without checking cache.enabled.
-	if err := resolveCacheExternalSecret(cfg); err != nil {
+	if err := resolveSecretFile("cache.external_secret", &cfg.Cache.ExternalSecret, cfg.Cache.ExternalSecretFile); err != nil {
 		return nil, err
 	}
 	if *cfg.Cache.Enabled {
@@ -269,15 +371,35 @@ func LoadDefault(file string) (*Config, error) {
 		if cfg.Cache.ExternalServer != "" && cfg.Cache.ExternalSecret == "" {
 			return nil, errors.New("cache.external_server is set but no shared secret is configured; set cache.external_secret (or cache.external_secret_file) to the same value used by the gitea-runner cache-server")
 		}
+		if err := resolveCacheS3(&cfg.Cache); err != nil {
+			return nil, err
+		}
 	}
 	if cfg.Container.WorkdirParent == "" {
 		cfg.Container.WorkdirParent = "workspace"
+	}
+	if cfg.Runner.DefaultImage == "" {
+		cfg.Runner.DefaultImage = DefaultImage
 	}
 	if cfg.Runner.ToolCacheMode == "" {
 		cfg.Runner.ToolCacheMode = ToolCacheModeNone
 	}
 	if !slices.Contains(ToolCacheModes, cfg.Runner.ToolCacheMode) {
 		return nil, fmt.Errorf("invalid runner.tool_cache_mode %q: must be one of %q", cfg.Runner.ToolCacheMode, ToolCacheModes)
+	}
+	if cfg.Kubernetes.Transfer.Mode == "" {
+		cfg.Kubernetes.Transfer.Mode = KubernetesTransferModeAPI
+	}
+	if !slices.Contains(KubernetesTransferModes, cfg.Kubernetes.Transfer.Mode) {
+		return nil, fmt.Errorf("invalid kubernetes.transfer.mode %q: must be one of %q", cfg.Kubernetes.Transfer.Mode, KubernetesTransferModes)
+	}
+	if cfg.Runner.LogReportLevel != "" {
+		if _, err := logging.ParseLevel(cfg.Runner.LogReportLevel); err != nil {
+			return nil, fmt.Errorf("invalid runner.log_report_level: %w", err)
+		}
+	}
+	if err := validateExtraHeaders(cfg.Runner.ExtraHeaders); err != nil {
+		return nil, err
 	}
 	if cfg.Host.WorkdirParent == "" {
 		home, err := os.UserHomeDir()
@@ -291,15 +413,6 @@ func LoadDefault(file string) (*Config, error) {
 	}
 	if cfg.Runner.FetchInterval <= 0 {
 		cfg.Runner.FetchInterval = 2 * time.Second
-	}
-	if cfg.Runner.FetchIntervalMax <= 0 {
-		cfg.Runner.FetchIntervalMax = 5 * time.Second
-	}
-	if cfg.Runner.WorkdirCleanupAge == 0 && !definedRunnerKeys["workdir_cleanup_age"] {
-		cfg.Runner.WorkdirCleanupAge = 24 * time.Hour
-	}
-	if cfg.Runner.IdleCleanupInterval == 0 && !definedRunnerKeys["idle_cleanup_interval"] {
-		cfg.Runner.IdleCleanupInterval = 10 * time.Minute
 	}
 	if cfg.Runner.LogReportInterval <= 0 {
 		cfg.Runner.LogReportInterval = 5 * time.Second
@@ -336,33 +449,26 @@ func LoadDefault(file string) (*Config, error) {
 	}
 
 	// Validate and fix invalid config combinations to prevent confusing behavior.
-	if cfg.Runner.ToolCacheMode == ToolCacheModeShared && cfg.Runner.Capacity > 1 {
-		log.Warnf("runner.tool_cache_mode %q with capacity %d: two jobs writing the same tool version at once corrupt it",
-			ToolCacheModeShared, cfg.Runner.Capacity)
-	}
 	if cfg.Runner.FetchTimeout > RequestTimeout {
-		log.Warnf("fetch_timeout (%v) exceeds the RPC timeout (%v), capping it", cfg.Runner.FetchTimeout, RequestTimeout)
+		logging.Warnf("fetch_timeout (%v) exceeds the RPC timeout (%v), capping it", cfg.Runner.FetchTimeout, RequestTimeout)
 		cfg.Runner.FetchTimeout = RequestTimeout
 	}
 	if cfg.Runner.FetchIntervalMax < cfg.Runner.FetchInterval {
-		log.Warnf("fetch_interval_max (%v) is less than fetch_interval (%v), setting fetch_interval_max to fetch_interval",
-			cfg.Runner.FetchIntervalMax, cfg.Runner.FetchInterval)
+		if cfg.Runner.FetchIntervalMax != 0 {
+			logging.Warnf("fetch_interval_max (%v) is less than fetch_interval (%v), setting fetch_interval_max to fetch_interval",
+				cfg.Runner.FetchIntervalMax, cfg.Runner.FetchInterval)
+		}
 		cfg.Runner.FetchIntervalMax = cfg.Runner.FetchInterval
 	}
 	if cfg.Runner.LogReportMaxLatency >= cfg.Runner.LogReportInterval {
-		log.Warnf("log_report_max_latency (%v) >= log_report_interval (%v), the max-latency timer will never fire before the periodic ticker; consider lowering log_report_max_latency",
+		logging.Warnf("log_report_max_latency (%v) >= log_report_interval (%v), the max-latency timer will never fire before the periodic ticker; consider lowering log_report_max_latency",
 			cfg.Runner.LogReportMaxLatency, cfg.Runner.LogReportInterval)
 	}
 
 	// although `container.network_mode` will be deprecated, but we have to be compatible with it for now.
 	if cfg.Container.NetworkMode != "" && cfg.Container.Network == "" {
-		log.Warn("You are trying to use deprecated configuration item of `container.network_mode`, please use `container.network` instead.")
-		if cfg.Container.NetworkMode == "bridge" {
-			// Previously, if the value of `container.network_mode` is `bridge`, we will create a new network for job.
-			// But “bridge” is easily confused with the bridge network created by Docker by default.
-			// So we set the value of `container.network` to empty string to make `runner` automatically create a new network for job.
-			cfg.Container.Network = ""
-		} else {
+		logging.Warn("You are trying to use deprecated configuration item of `container.network_mode`, please use `container.network` instead.")
+		if cfg.Container.NetworkMode != "bridge" { // "bridge" meant a per-job network, which an empty container.network creates
 			cfg.Container.Network = cfg.Container.NetworkMode
 		}
 	}
@@ -370,65 +476,130 @@ func LoadDefault(file string) (*Config, error) {
 	return cfg, nil
 }
 
+func (r *Runner) loadCAFile() error {
+	abs, err := filepath.Abs(r.CAFile) // git resolves a relative path against the repository it runs in
+	if err != nil {
+		return err
+	}
+	r.CAFile = abs
+	tlsConfig, err := tlsconfig.Client(tlsconfig.Options{CAFile: r.CAFile})
+	if err != nil {
+		return fmt.Errorf("load runner CA file: %w", err)
+	}
+	r.rootCAs = tlsConfig.RootCAs
+	return nil
+}
+
+func (r *Runner) TLSConfig() *tls.Config {
+	tlsConfig := &tls.Config{InsecureSkipVerify: r.Insecure, RootCAs: r.rootCAs}
+	if r.ClientCertFile != "" {
+		tlsConfig.GetClientCertificate = func(info *tls.CertificateRequestInfo) (*tls.Certificate, error) {
+			pair, err := tls.LoadX509KeyPair(r.ClientCertFile, r.ClientKeyFile) // per handshake, so renewed files apply
+			if err != nil || info.SupportsCertificate(&pair) != nil {
+				return &tls.Certificate{}, err
+			}
+			return &pair, nil
+		}
+	}
+	return tlsConfig
+}
+
+// expandEnvironment replaces ${NAME} in values and retypes them, so ${CAPACITY} can be an int and an empty value is unset.
+func expandEnvironment(node *yaml.Node) error {
+	var errs []error
+	if node.Kind == yaml.ScalarNode {
+		expanded := environmentReference.ReplaceAllStringFunc(node.Value, func(match string) string {
+			if strings.HasPrefix(match, "$$") {
+				return match[1:]
+			}
+			value, ok := os.LookupEnv(strings.Trim(match, "${}"))
+			if !ok {
+				errs = append(errs, fmt.Errorf("line %d: %s is not set", node.Line, match))
+			}
+			return value
+		})
+		if expanded != node.Value && node.Style&yaml.TaggedStyle == 0 {
+			node.Tag = ""
+			if expanded == "" && node.Style == 0 {
+				node.Tag = "!!null"
+			}
+		}
+		node.Value = expanded
+		return errors.Join(errs...)
+	}
+	for index, child := range node.Content {
+		if node.Kind != yaml.MappingNode || index%2 == 1 {
+			errs = append(errs, expandEnvironment(child))
+		}
+	}
+	return errors.Join(errs...)
+}
+
 // warnUnknownKeys reports keys the config does not define, which are otherwise ignored
 // without a trace. It only warns, so a config carrying keys from another runner version
 // still loads.
-func warnUnknownKeys(file string, content []byte) {
-	decoder := yaml.NewDecoder(bytes.NewReader(content))
-	decoder.KnownFields(true)
-
-	var typeErr *yaml.TypeError
-	if err := decoder.Decode(&Config{}); errors.As(err, &typeErr) {
-		for _, message := range typeErr.Errors {
-			log.Warnf("config file %q: %s, it will be ignored", file, message)
+func warnUnknownKeys(file string, document *yaml.Node) {
+	var loadErrs *yaml.LoadErrors
+	if err := document.Load(&Config{}, yaml.WithV3Defaults(), yaml.WithKnownFields()); errors.As(err, &loadErrs) {
+		for _, loadErr := range loadErrs.Errors {
+			logging.Warnf("config file %q: %s, it will be ignored", file, loadErr)
 		}
 	}
 }
 
-func definedRunnerConfigKeys(content []byte) (map[string]bool, error) {
-	var root yaml.Node
-	if err := yaml.Unmarshal(content, &root); err != nil {
-		return nil, err
-	}
-
-	defined := map[string]bool{}
-	if len(root.Content) == 0 {
-		return defined, nil
-	}
-
-	doc := root.Content[0]
-	for i := 0; i+1 < len(doc.Content); i += 2 {
-		key := doc.Content[i]
-		value := doc.Content[i+1]
-		if key.Value != "runner" || value.Kind != yaml.MappingNode {
-			continue
+func validateExtraHeaders(headers map[string]string) error {
+	seen := make(map[string]string, len(headers))
+	for name, value := range headers {
+		if !httpguts.ValidHeaderFieldName(name) || !httpguts.ValidHeaderFieldValue(value) {
+			return fmt.Errorf("invalid runner.extra_headers entry %q", name)
 		}
-		for j := 0; j+1 < len(value.Content); j += 2 {
-			defined[value.Content[j].Value] = true
+		key := strings.ToLower(name)
+		if other, ok := seen[key]; ok {
+			return fmt.Errorf("runner.extra_headers sets %q and %q, which name the same header", other, name)
 		}
-		break
+		seen[key] = name
 	}
-
-	return defined, nil
+	return nil
 }
 
-// resolveCacheExternalSecret loads cache.external_secret from the file named by cache.external_secret_file,
-// so deployments can mount the secret instead of committing it to the config file.
-func resolveCacheExternalSecret(cfg *Config) error {
-	if cfg.Cache.ExternalSecretFile == "" {
+// resolveSecretFile reads key from key_file, so deployments can mount a secret instead of committing it.
+func resolveSecretFile(key string, secret *string, file string) error {
+	if file == "" {
 		return nil
 	}
-	if cfg.Cache.ExternalSecret != "" {
-		return errors.New("cache.external_secret and cache.external_secret_file are both set; configure only one of them")
+	if *secret != "" {
+		return fmt.Errorf("%s and %s_file are both set; configure only one of them", key, key)
 	}
-	content, err := os.ReadFile(cfg.Cache.ExternalSecretFile)
+	content, err := os.ReadFile(file)
 	if err != nil {
-		return fmt.Errorf("read cache.external_secret_file %q: %w", cfg.Cache.ExternalSecretFile, err)
+		return fmt.Errorf("read %s_file %q: %w", key, file, err)
 	}
-	secret := strings.TrimSpace(string(content))
-	if secret == "" {
-		return fmt.Errorf("cache.external_secret_file %q contains no secret", cfg.Cache.ExternalSecretFile)
+	*secret = strings.TrimSpace(string(content))
+	if *secret == "" {
+		return fmt.Errorf("%s_file %q contains no secret", key, file)
 	}
-	cfg.Cache.ExternalSecret = secret
+	return nil
+}
+
+func resolveCacheS3(cache *Cache) error {
+	s3 := cache.S3
+	switch {
+	case s3 == nil:
+		return nil
+	case cache.ExternalServer != "":
+		return errors.New("cache.s3 and cache.external_server cannot both be set")
+	case s3.Endpoint == "" || s3.Bucket == "":
+		return errors.New("cache.s3.endpoint and cache.s3.bucket must be set")
+	}
+	if err := resolveSecretFile("cache.s3.access_key", &s3.AccessKey, s3.AccessKeyFile); err != nil {
+		return err
+	}
+	if err := resolveSecretFile("cache.s3.secret_key", &s3.SecretKey, s3.SecretKeyFile); err != nil {
+		return err
+	}
+	if s3.AccessKey == "" || s3.SecretKey == "" {
+		return errors.New("cache.s3.access_key (or cache.s3.access_key_file) and cache.s3.secret_key (or cache.s3.secret_key_file) must be set")
+	}
+	s3.Prefix = strings.Trim(s3.Prefix, "/")
 	return nil
 }

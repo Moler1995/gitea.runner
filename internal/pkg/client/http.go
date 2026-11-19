@@ -6,74 +6,90 @@ package client
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"net/http"
 	"strings"
 	"time"
 
 	"gitea.com/gitea/runner/internal/pkg/ver"
 
-	"connectrpc.com/connect"
+	"connectrpc.com/connect/v2"
+	"connectrpc.com/connect/v2/connecthttp"
 	"gitea.dev/actionslib/ping/v1/pingv1connect"
+	"gitea.dev/actionslib/pkg/protocol"
 	"gitea.dev/actionslib/runner/v1/runnerv1connect"
 )
 
-func getHTTPClient(endpoint string, insecure bool, timeout time.Duration) *http.Client {
+func NewTransport(endpoint string, tlsConfig *tls.Config) *http.Transport {
 	transport := &http.Transport{
 		Proxy:               http.ProxyFromEnvironment,
 		MaxIdleConns:        10,
 		MaxIdleConnsPerHost: 10, // All requests go to one host; default is 2 which causes frequent reconnects.
 		IdleConnTimeout:     90 * time.Second,
+		ForceAttemptHTTP2:   true,
 	}
-	if strings.HasPrefix(endpoint, "https://") && insecure {
-		transport.TLSClientConfig = &tls.Config{
-			InsecureSkipVerify: true,
-		}
+	if strings.HasPrefix(endpoint, "https://") {
+		transport.TLSClientConfig = tlsConfig
 	}
-	return &http.Client{Transport: transport, Timeout: timeout}
+	return transport
+}
+
+func getHTTPClient(endpoint string, tlsConfig *tls.Config, timeout time.Duration, extraHeaders map[string]string) *http.Client {
+	return &http.Client{
+		Transport: NewTransport(endpoint, tlsConfig),
+		Timeout:   timeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 { // a custom CheckRedirect replaces net/http's own limit
+				return errors.New("stopped after 10 redirects")
+			}
+			from, to := via[0].URL, req.URL
+			if from.Hostname() != to.Hostname() || from.Scheme == "https" && to.Scheme != "https" {
+				for name, value := range extraHeaders {
+					if req.Header.Get(name) == value {
+						req.Header.Del(name)
+					}
+				}
+			}
+			return nil
+		},
+	}
 }
 
 // New returns a new runner client. timeout bounds every RPC: without it a
 // stalled connection parks the reporter for the whole job context, so logs and
 // heartbeats stop together and the task is reaped as a zombie.
-func New(endpoint string, insecure bool, uuid, token string, timeout time.Duration, opts ...connect.ClientOption) *HTTPClient {
+func New(endpoint string, tlsConfig *tls.Config, uuid, token string, timeout time.Duration, extraHeaders map[string]string, opts ...connecthttp.Option) *HTTPClient {
 	baseURL := strings.TrimRight(endpoint, "/") + "/api/actions"
 
-	opts = append(opts, connect.WithInterceptors(connect.UnaryInterceptorFunc(func(next connect.UnaryFunc) connect.UnaryFunc {
-		return func(ctx context.Context, req connect.AnyRequest) (connect.AnyResponse, error) {
-			req.Header().Set("User-Agent", "gitea-runner/"+ver.Version())
+	opts = append([]connecthttp.Option{connecthttp.WithReadMaxBytes(0)}, opts...)
+	rpcClient := connect.NewClient(connecthttp.NewTransport(getHTTPClient(endpoint, tlsConfig, timeout, extraHeaders), baseURL, opts...), func(next connect.ClientFunc) connect.ClientFunc {
+		return func(ctx context.Context, spec connect.Spec) (connect.ClientStream, error) {
+			info, _ := connect.CallInfoForClientContext(ctx)
+			for name, value := range extraHeaders {
+				if info.RequestHeader().Get(name) == "" {
+					info.RequestHeader().Set(name, value)
+				}
+			}
+			info.RequestHeader().Set("User-Agent", "gitea-runner/"+ver.Version())
 			if uuid != "" {
-				req.Header().Set(UUIDHeader, uuid)
+				info.RequestHeader().Set(protocol.UUIDHeader, uuid)
 			}
 			if token != "" {
-				req.Header().Set(TokenHeader, token)
+				info.RequestHeader().Set(protocol.TokenHeader, token)
 			}
-			return next(ctx, req)
+			return next(ctx, spec)
 		}
-	})))
+	})
 
-	httpClient := getHTTPClient(endpoint, insecure, timeout)
 	return &HTTPClient{
-		PingServiceClient: pingv1connect.NewPingServiceClient(
-			httpClient,
-			baseURL,
-			opts...,
-		),
-		RunnerServiceClient: runnerv1connect.NewRunnerServiceClient(
-			httpClient,
-			baseURL,
-			opts...,
-		),
-		endpoint: endpoint,
-		insecure: insecure,
+		PingServiceClient:   pingv1connect.NewPingServiceClient(rpcClient),
+		RunnerServiceClient: runnerv1connect.NewRunnerServiceClient(rpcClient),
+		endpoint:            endpoint,
 	}
 }
 
 func (c *HTTPClient) Address() string {
 	return c.endpoint
-}
-
-func (c *HTTPClient) Insecure() bool {
-	return c.insecure
 }
 
 var _ Client = (*HTTPClient)(nil)
@@ -83,5 +99,4 @@ type HTTPClient struct {
 	pingv1connect.PingServiceClient
 	runnerv1connect.RunnerServiceClient
 	endpoint string
-	insecure bool
 }

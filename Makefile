@@ -1,27 +1,27 @@
 DIST := dist
-EXECUTABLE := gitea-runner
-DIST_DIRS := $(DIST)/binaries $(DIST)/release
 GO ?= go
-SHASUM ?= shasum -a 256
+EXECUTABLE := gitea-runner$(shell $(GO) env GOEXE)
 HAS_GO = $(shell hash $(GO) > /dev/null 2>&1 && echo "GO" || echo "NOGO" )
-XGO_PACKAGE ?= src.techknowlogick.com/xgo@v1.9.0 # renovate: datasource=go
-XGO_VERSION := go-1.26.x
-GXZ_PACKAGE ?= github.com/ulikunitz/xz/cmd/gxz@v0.5.16 # renovate: datasource=go
 
-LINUX_ARCHS ?= linux/amd64,linux/arm64
-DARWIN_ARCHS ?= darwin-12/amd64,darwin-12/arm64
-WINDOWS_ARCHS ?= windows/amd64
+PODMAN_TEST_IMAGE ?= quay.io/containers/podman:v6.1.3-immutable@sha256:1d844fd1fc6ce68c1e72ae19550cc3caef039306219ee007d88f7e67c5df4dd1 # renovate: datasource=docker
+E2E_JOB_IMAGE ?= docker.gitea.com/runner-images:ubuntu-latest@sha256:139605d4a6ab61e48dfd7687b11184881c2d7fcf06bf739e9cadb34f73deb51d # renovate: datasource=docker
+SERVICE_IMAGE ?= nginx:1.31.7-alpine@sha256:892bb2152464f0c5d8972593a5f5afaf8054552580b699d95f8ff4af08c2d33d # renovate: datasource=docker
+E2E_GITEA_IMAGE ?= gitea/gitea:main-nightly
+E2E_K3S_IMAGE ?= rancher/k3s:v1.37.2-k3s1@sha256:21ea6e0fac4e3930c2ce8aa40ddd41a8b18cb3e9a0222c030dc005e7e88c4332 # renovate: datasource=docker
+WINDOWS_TEST_IMAGE ?= dockurr/windows:6.06@sha256:16fd7c39a3e48bb946d29c59dc6015942e5b900a1fa5d7e5552053bfc48ee2ea # renovate: datasource=docker
+
 GOFILES := $(shell find . -type f -name "*.go" -o -name "go.mod" ! -name "generated.*")
 
 DOCKER_IMAGE ?= gitea/runner
 DOCKER_TAG ?= nightly
 DOCKER_REF := $(DOCKER_IMAGE):$(DOCKER_TAG)
-DOCKER_ROOTLESS_REF := $(DOCKER_IMAGE):$(DOCKER_TAG)-dind-rootless
 
-GOLANGCI_LINT_PACKAGE ?= github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 # renovate: datasource=go
-GOVULNCHECK_PACKAGE ?= golang.org/x/vuln/cmd/govulncheck@v1.6.0 # renovate: datasource=go
+GOLANGCI_LINT_PACKAGE ?= github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0 # renovate: datasource=go
+GOVULNCHECK_PACKAGE ?= golang.org/x/vuln/cmd/govulncheck@v1.9.0 # renovate: datasource=go
 
 GOTEST_FLAGS ?= -race -timeout 20m -parallel 8
+
+CROSS_TARGETS ?= darwin/arm64 freebsd/amd64 linux/arm netbsd/amd64 openbsd/amd64 solaris/amd64 # one per platform file set, linux/arm for 32-bit syscall fields
 
 STATIC ?=
 EXTLDFLAGS ?=
@@ -32,22 +32,16 @@ endif
 ifeq ($(HAS_GO), GO)
 	GOPATH ?= $(shell $(GO) env GOPATH)
 	export PATH := $(GOPATH)/bin:$(PATH)
-
-	CGO_EXTRA_CFLAGS := -DSQLITE_MAX_VARIABLE_NUMBER=32766
-	CGO_CFLAGS ?= $(shell $(GO) env CGO_CFLAGS) $(CGO_EXTRA_CFLAGS)
 endif
 
 ifeq ($(OS), Windows_NT)
 	GOFLAGS := -v -buildmode=exe
-	EXECUTABLE ?= $(EXECUTABLE).exe
 	GO_ENV_WINDOWS := set GOOS=windows&&
 else ifeq ($(OS), Windows)
 	GOFLAGS := -v -buildmode=exe
-	EXECUTABLE ?= $(EXECUTABLE).exe
 	GO_ENV_WINDOWS := set GOOS=windows&&
 else
 	GOFLAGS := -v
-	EXECUTABLE ?= $(EXECUTABLE)
 	GO_ENV_WINDOWS := GOOS=windows
 endif
 
@@ -96,24 +90,23 @@ go-check:
 	fi
 
 .PHONY: fmt-check
-fmt-check: fmt
-	@diff=$$(git diff --color=always -- '*.go'); \
-	if [ -n "$$diff" ]; then \
-		echo "Please run 'make fmt' and commit the result:"; \
-		printf "%s" "$${diff}"; \
-		exit 1; \
-	fi
+fmt-check: ## check the Go code formatting
+	$(GO) run $(GOLANGCI_LINT_PACKAGE) fmt --diff-colored
 
 .PHONY: deps-tools
 deps-tools: ## install tool dependencies
 	$(GO) install $(GOLANGCI_LINT_PACKAGE) & \
-	$(GO) install $(GXZ_PACKAGE) & \
-	$(GO) install $(XGO_PACKAGE) & \
 	$(GO) install $(GOVULNCHECK_PACKAGE) & \
 	wait
 
 .PHONY: checks
 checks: tidy-check fmt-check security-check ## run the non-lint source checks
+
+.PHONY: cross-check
+cross-check: $(addprefix cross-check/,$(CROSS_TARGETS)) ## check that code and tests compile on every supported platform
+
+cross-check/%:
+	GOOS=$(word 1,$(subst /, ,$*)) GOARCH=$(word 2,$(subst /, ,$*)) CGO_ENABLED=0 $(GO) vet -gcflags='all=-N -l' ./...
 
 .PHONY: lint
 lint: lint-go lint-go-windows ## lint everything
@@ -137,7 +130,7 @@ lint-pr-title: ## lint PR title against Conventional Commits (set PR_TITLE=...)
 
 .PHONY: security-check
 security-check:
-	GOEXPERIMENT= $(GO) run $(GOVULNCHECK_PACKAGE) -show color ./... || true
+	$(GO) run $(GOVULNCHECK_PACKAGE) -show color ./... || true
 
 .PHONY: tidy
 tidy: ## run go mod tidy
@@ -149,13 +142,8 @@ tidy: ## run go mod tidy
 	fi
 
 .PHONY: tidy-check
-tidy-check: tidy
-	@diff=$$(git diff --color=always -- go.mod go.sum); \
-	if [ -n "$$diff" ]; then \
-		echo "Please run 'make tidy' and commit the result:"; \
-		printf "%s" "$${diff}"; \
-		exit 1; \
-	fi
+tidy-check: ## check that go.mod and go.sum are tidy
+	$(GO) mod tidy -diff
 
 .PHONY: test
 test: ## test everything (integration tests self-skip without docker/network)
@@ -168,8 +156,18 @@ coverage-report: ## turn coverage.txt from `make test` into .tmp/coverage.md
 	@echo "Wrote .tmp/coverage.md"
 
 .PHONY: test-dind
-test-dind: ## run the daemon-facing tests against the built dind image (TARGET=dind|dind-rootless)
-	@./scripts/test-dind.sh $(TARGET)
+test-dind: ## run the daemon-facing tests against the built dind image or podman (TARGET=dind|dind-rootless|podman)
+	@PODMAN_TEST_IMAGE=$(PODMAN_TEST_IMAGE) ./scripts/test-dind.sh $(TARGET)
+
+.PHONY: test-windows
+test-windows: ## run the tests on Windows Server Core in a QEMU VM on the docker host
+	@GO=$(GO) WINDOWS_TEST_IMAGE=$(WINDOWS_TEST_IMAGE) ./scripts/test-windows.sh
+
+E2E_CONCURRENCY ?= 8
+
+.PHONY: test-e2e
+test-e2e: ## run Gitea compatibility tests against E2E_GITEA_IMAGE
+	@E2E_CONCURRENCY=$(E2E_CONCURRENCY) E2E_GITEA_IMAGE=$(E2E_GITEA_IMAGE) E2E_K3S_IMAGE=$(E2E_K3S_IMAGE) E2E_JOB_IMAGE=$(E2E_JOB_IMAGE) GO=$(GO) SERVICE_IMAGE=$(SERVICE_IMAGE) ./tools/test-e2e.sh $(E2E_ARGS)
 
 .PHONY: install
 install: $(GOFILES) ## install the runner binary via `go install`
@@ -184,45 +182,6 @@ $(EXECUTABLE): $(GOFILES)
 .PHONY: deps-backend
 deps-backend: ## install backend dependencies
 	$(GO) mod download
-
-.PHONY: release
-release: release-windows release-linux release-darwin release-copy release-compress release-check ## build release artifacts
-
-$(DIST_DIRS):
-	mkdir -p $(DIST_DIRS)
-
-.PHONY: release-windows
-release-windows: | $(DIST_DIRS)
-	CGO_CFLAGS="$(CGO_CFLAGS)" $(GO) run $(XGO_PACKAGE) -go $(XGO_VERSION) -buildmode exe -dest $(DIST)/binaries -tags 'netgo osusergo $(TAGS)' -ldflags '-s -w -linkmode external -extldflags "-static" $(LDFLAGS)' -targets '$(WINDOWS_ARCHS)' -out $(EXECUTABLE)-$(VERSION) .
-ifeq ($(CI),true)
-	cp -r /build/* $(DIST)/binaries/
-endif
-
-.PHONY: release-linux
-release-linux: | $(DIST_DIRS)
-	CGO_CFLAGS="$(CGO_CFLAGS)" $(GO) run $(XGO_PACKAGE) -go $(XGO_VERSION) -dest $(DIST)/binaries -tags 'netgo osusergo $(TAGS)' -ldflags '-s -w -linkmode external -extldflags "-static" $(LDFLAGS)' -targets '$(LINUX_ARCHS)' -out $(EXECUTABLE)-$(VERSION) .
-ifeq ($(CI),true)
-	cp -r /build/* $(DIST)/binaries/
-endif
-
-.PHONY: release-darwin
-release-darwin: | $(DIST_DIRS)
-	CGO_CFLAGS="$(CGO_CFLAGS)" $(GO) run $(XGO_PACKAGE) -go $(XGO_VERSION) -dest $(DIST)/binaries -tags 'netgo osusergo $(TAGS)' -ldflags '-s -w $(LDFLAGS)' -targets '$(DARWIN_ARCHS)' -out $(EXECUTABLE)-$(VERSION) .
-ifeq ($(CI),true)
-	cp -r /build/* $(DIST)/binaries/
-endif
-
-.PHONY: release-copy
-release-copy: | $(DIST_DIRS)
-	cd $(DIST); for file in `find . -type f -name "*"`; do cp $${file} ./release/; done;
-
-.PHONY: release-check
-release-check: | $(DIST_DIRS)
-	cd $(DIST)/release/; for file in `find . -type f -name "*"`; do echo "checksumming $${file}" && $(SHASUM) `echo $${file} | sed 's/^..//'` > $${file}.sha256; done;
-
-.PHONY: release-compress
-release-compress: | $(DIST_DIRS)
-	cd $(DIST)/release/; for file in `find . -type f -name "*"`; do echo "compressing $${file}" && $(GO) run $(GXZ_PACKAGE) -k -9 $${file}; done;
 
 .PHONY: docker
 docker: ## build the docker image

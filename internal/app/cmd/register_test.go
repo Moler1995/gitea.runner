@@ -4,14 +4,51 @@
 package cmd
 
 import (
+	"bytes"
+	"context"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"path/filepath"
+	"sync/atomic"
 	"testing"
 
+	"gitea.com/gitea/runner/act/common/logging"
 	"gitea.com/gitea/runner/internal/pkg/config"
 
 	"github.com/stretchr/testify/require"
-	"gotest.tools/v3/assert"
 )
+
+type cancelRegistrationPrompt struct {
+	cancel context.CancelFunc
+}
+
+func (w cancelRegistrationPrompt) Write(data []byte) (int, error) {
+	if bytes.Contains(data, []byte("Enter the Gitea instance URL")) {
+		w.cancel()
+	}
+	return len(data), nil
+}
+
+func TestRunRegisterCancelsWhilePrompting(t *testing.T) {
+	t.Setenv(registerTokenEnvVar, "")
+	t.Chdir(t.TempDir())
+	stdin, input, err := os.Pipe()
+	require.NoError(t, err)
+	previousStdin := os.Stdin
+	os.Stdin = stdin
+	t.Cleanup(func() {
+		_ = input.Close()
+		_ = stdin.Close()
+		os.Stdin = previousStdin
+	})
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	previousOutput := logging.Output()
+	logging.SetOutput(cancelRegistrationPrompt{cancel})
+	t.Cleanup(func() { logging.SetOutput(previousOutput) })
+	require.NoError(t, runRegister(ctx, &registerArgs{}, new(string))(nil, nil))
+}
 
 func TestRegisterNonInteractiveReturnsLabelValidationError(t *testing.T) {
 	err := registerNoInteractive(t.Context(), "", &registerArgs{
@@ -19,7 +56,7 @@ func TestRegisterNonInteractiveReturnsLabelValidationError(t *testing.T) {
 		Token:        "token",
 		InstanceAddr: "http://localhost:3000",
 	})
-	assert.ErrorContains(t, err, "empty label")
+	require.ErrorContains(t, err, "empty label")
 }
 
 func TestRegisterInputsValidate(t *testing.T) {
@@ -62,7 +99,6 @@ func TestRegisterInputsValidate(t *testing.T) {
 
 func TestValidateLabels(t *testing.T) {
 	require.NoError(t, validateLabels([]string{"ubuntu:host", "ubuntu:docker://node:18"}))
-	// a colon that is not a supported schema is part of the label name
 	require.NoError(t, validateLabels([]string{"pool:e57e18d4-10d4-406f-93bf-60f127221bdd"}))
 	require.Error(t, validateLabels([]string{"ubuntu:host", ""}))
 }
@@ -146,97 +182,72 @@ func TestRegisterInputsAssignToNext(t *testing.T) {
 }
 
 func TestInitInputs(t *testing.T) {
-	t.Run("missing token", func(t *testing.T) {
-		_, err := initInputs(&registerArgs{
-			InstanceAddr: "http://localhost:3000",
-			RunnerName:   "runner",
-			Ephemeral:    true,
-			Labels:       " ubuntu:host , ubuntu:docker://node:18 ",
+	t.Setenv(registerTokenEnvVar, "")
+	missingTokenFile := filepath.Join(t.TempDir(), "missing-token")
+	_, readErr := os.ReadFile(missingTokenFile)
+	require.ErrorIs(t, readErr, os.ErrNotExist)
+	for _, tc := range []struct {
+		name, tokenFile, wantErr string
+		env                      *string
+	}{
+		{name: "missing token", wantErr: "missing token, token-file argument, or GITEA_RUNNER_REGISTRATION_TOKEN environment variable"},
+		{name: "empty token", env: new(""), wantErr: "missing token, token-file argument, or GITEA_RUNNER_REGISTRATION_TOKEN environment variable"},
+		{
+			name: "invalid token file", tokenFile: missingTokenFile, env: new("from-env"),
+			wantErr: "cannot read the token file: " + missingTokenFile + ", " + readErr.Error(),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.env != nil {
+				t.Setenv(registerTokenEnvVar, *tc.env)
+			}
+			_, err := initInputs(&registerArgs{
+				NoInteractive: true,
+				InstanceAddr:  "http://localhost:3000",
+				TokenFile:     tc.tokenFile,
+				RunnerName:    "runner",
+				Ephemeral:     true,
+				Labels:        " ubuntu:host , ubuntu:docker://node:18 ",
+			})
+			require.EqualError(t, err, tc.wantErr)
 		})
-		require.EqualError(t, err, "missing token, token-file argument, or GITEA_RUNNER_REGISTRATION_TOKEN environment variable")
-	})
+	}
 
-	t.Run("empty token", func(t *testing.T) {
-		t.Setenv(registerTokenEnvVar, "")
-		_, err := initInputs(&registerArgs{
-			InstanceAddr: "http://localhost:3000",
-			Token:        "",
-			TokenFile:    "",
-			RunnerName:   "runner",
-			Ephemeral:    true,
-			Labels:       " ubuntu:host , ubuntu:docker://node:18 ",
+	for _, tc := range []struct {
+		name, address, token, runnerName, wantToken string
+		file                                        bool
+	}{
+		{name: "interactive token prompt", address: "http://localhost:3000", runnerName: "runner"},
+		{name: "valid token", address: " http://localhost:3000 ", token: "from-plain-arg\n", runnerName: "runner\n", wantToken: "from-plain-arg"},
+		{name: "valid token file", address: "http://localhost:3000", runnerName: "runner", file: true, wantToken: "from-file"},
+		{name: "token from environment variable", address: "http://localhost:3000", runnerName: "runner", wantToken: "from-env"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(registerTokenEnvVar, "from-env")
+			if tc.wantToken == "" {
+				t.Setenv(registerTokenEnvVar, "")
+			}
+			var tokenFile string
+			if tc.file {
+				tokenFile = filepath.Join(t.TempDir(), "from-file")
+				require.NoError(t, os.WriteFile(tokenFile, []byte("from-file\n"), 0o600))
+			}
+			inputs, err := initInputs(&registerArgs{
+				InstanceAddr: tc.address,
+				Token:        tc.token,
+				TokenFile:    tokenFile,
+				RunnerName:   tc.runnerName,
+				Ephemeral:    true,
+				Labels:       " ubuntu:host , ubuntu:docker://node:18 ",
+			})
+			require.NoError(t, err)
+			require.Equal(t, "http://localhost:3000", inputs.InstanceAddr)
+			require.Equal(t, tc.wantToken, inputs.Token)
+			require.Equal(t, "runner", inputs.RunnerName)
+			require.True(t, inputs.Ephemeral)
+			require.Equal(t, []string{"ubuntu:host ", " ubuntu:docker://node:18"}, inputs.Labels)
 		})
-		require.EqualError(t, err, "missing token, token-file argument, or GITEA_RUNNER_REGISTRATION_TOKEN environment variable")
-	})
-
-	t.Run("invalid token file", func(t *testing.T) {
-		t.Setenv(registerTokenEnvVar, "from-env")
-		_, err := initInputs(&registerArgs{
-			InstanceAddr: "http://localhost:3000",
-			TokenFile:    "/tmp/nonexistent",
-			RunnerName:   "runner",
-			Ephemeral:    true,
-			Labels:       " ubuntu:host , ubuntu:docker://node:18 ",
-		})
-		require.EqualError(t, err, "cannot read the token file: /tmp/nonexistent, open /tmp/nonexistent: no such file or directory")
-	})
-
-	t.Run("valid token", func(t *testing.T) {
-		t.Setenv(registerTokenEnvVar, "from-env")
-		inputs, err := initInputs(&registerArgs{
-			InstanceAddr: " http://localhost:3000 ",
-			Token:        "from-plain-arg\n",
-			RunnerName:   "runner\n",
-			Ephemeral:    true,
-			Labels:       " ubuntu:host , ubuntu:docker://node:18 ",
-		})
-		require.NoError(t, err)
-		require.Equal(t, "http://localhost:3000", inputs.InstanceAddr)
-		require.Equal(t, "from-plain-arg", inputs.Token)
-		require.Equal(t, "runner", inputs.RunnerName)
-		require.True(t, inputs.Ephemeral)
-		require.Equal(t, []string{"ubuntu:host ", " ubuntu:docker://node:18"}, inputs.Labels)
-	})
-
-	t.Run("valid token file", func(t *testing.T) {
-		t.Setenv(registerTokenEnvVar, "from-env")
-		tokenFile, createErr := os.CreateTemp(t.TempDir(), "from-file")
-		require.NoError(t, createErr)
-		defer tokenFile.Close()
-		_, writeErr := tokenFile.WriteString("from-file\n")
-		require.NoError(t, writeErr)
-		_ = tokenFile.Sync()
-
-		inputs, err := initInputs(&registerArgs{
-			InstanceAddr: "http://localhost:3000",
-			TokenFile:    tokenFile.Name(),
-			RunnerName:   "runner",
-			Ephemeral:    true,
-			Labels:       " ubuntu:host , ubuntu:docker://node:18 ",
-		})
-		require.NoError(t, err)
-		require.Equal(t, "http://localhost:3000", inputs.InstanceAddr)
-		require.Equal(t, "from-file", inputs.Token)
-		require.Equal(t, "runner", inputs.RunnerName)
-		require.True(t, inputs.Ephemeral)
-		require.Equal(t, []string{"ubuntu:host ", " ubuntu:docker://node:18"}, inputs.Labels)
-	})
-
-	t.Run("token from environment variable", func(t *testing.T) {
-		t.Setenv(registerTokenEnvVar, "from-env")
-		inputs, err := initInputs(&registerArgs{
-			InstanceAddr: "http://localhost:3000",
-			RunnerName:   "runner",
-			Ephemeral:    true,
-			Labels:       " ubuntu:host , ubuntu:docker://node:18 ",
-		})
-		require.NoError(t, err)
-		require.Equal(t, "http://localhost:3000", inputs.InstanceAddr)
-		require.Equal(t, "from-env", inputs.Token)
-		require.Equal(t, "runner", inputs.RunnerName)
-		require.True(t, inputs.Ephemeral)
-		require.Equal(t, []string{"ubuntu:host ", " ubuntu:docker://node:18"}, inputs.Labels)
-	})
+	}
 
 	t.Run("empty labels", func(t *testing.T) {
 		inputs, _ := initInputs(&registerArgs{
@@ -245,4 +256,19 @@ func TestInitInputs(t *testing.T) {
 		})
 		require.Nil(t, inputs.Labels)
 	})
+}
+
+func TestDoRegisterReturnsPingErrorWithoutRetrying(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{}
+	cfg.Runner.File = filepath.Join(t.TempDir(), ".runner")
+	err := doRegister(t.Context(), cfg, &registerInputs{InstanceAddr: server.URL, RunnerName: "runner"})
+	require.ErrorContains(t, err, "cannot ping the Gitea instance server")
+	require.Equal(t, int32(1), requests.Load())
 }

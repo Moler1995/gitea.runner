@@ -1,0 +1,805 @@
+// Copyright 2026 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+//go:build !(WITHOUT_DOCKER || !(linux || darwin || windows || netbsd || freebsd))
+
+package container
+
+import (
+	"archive/tar"
+	"bufio"
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"testing/synctest"
+	"time"
+
+	cerrdefs "github.com/containerd/errdefs"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/image"
+	"github.com/moby/moby/api/types/mount"
+	"github.com/moby/moby/api/types/network"
+	"github.com/moby/moby/api/types/volume"
+	mobyclient "github.com/moby/moby/client"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
+)
+
+func (m *mockDockerClient) VolumeList(ctx context.Context, opts mobyclient.VolumeListOptions) (mobyclient.VolumeListResult, error) {
+	args := m.Called(ctx, opts)
+	return args.Get(0).(mobyclient.VolumeListResult), args.Error(1)
+}
+
+func (m *mockDockerClient) VolumeRemove(ctx context.Context, id string, opts mobyclient.VolumeRemoveOptions) (mobyclient.VolumeRemoveResult, error) {
+	args := m.Called(ctx, id, opts)
+	return args.Get(0).(mobyclient.VolumeRemoveResult), args.Error(1)
+}
+
+// unix socket paths are limited to about a hundred bytes, which the default macOS TMPDIR exceeds
+func shortTempDir(t testing.TB) string {
+	t.Helper()
+	t.Setenv("TMPDIR", "/tmp")
+	return t.TempDir()
+}
+
+func daemonSocketPath(t testing.TB, cli mobyclient.APIClient) string {
+	t.Helper()
+	host := cli.DaemonHost()
+	if !strings.HasPrefix(host, "unix://") {
+		t.Skipf("skipping: daemon at %s is not a unix socket", host)
+	}
+	return strings.TrimPrefix(host, "unix://")
+}
+
+func TestDockerProxy(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix socket ownership is unavailable on Windows")
+	}
+	bodies := make(chan []byte, 8)
+	createStarted, releaseCreate := make(chan struct{}), make(chan struct{})
+	streamsDone := make(chan struct{}, 2)
+	var probes atomic.Int32
+	daemonSocket := filepath.Join(shortTempDir(t), "d.sock")
+	listener, err := net.Listen("unix", daemonSocket)
+	require.NoError(t, err)
+	daemon := &http.Server{ReadHeaderTimeout: time.Second, Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/create"):
+			body, _ := io.ReadAll(r.Body)
+			if bytes.Contains(body, []byte(`"Image":"probe-image"`)) {
+				_, _ = w.Write([]byte(`{"Id":"probe"}`))
+				return
+			}
+			if r.URL.RawQuery == "wait" {
+				close(createStarted)
+				<-releaseCreate
+			}
+			bodies <- body
+			w.WriteHeader(http.StatusCreated)
+		case strings.HasSuffix(r.URL.Path, "/images/json"):
+			if probes.Add(1) == 1 {
+				http.Error(w, "probe unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			_, _ = w.Write([]byte(`[{"Id":"probe-image"}]`))
+		case strings.HasSuffix(r.URL.Path, "/containers/json"):
+			_, _ = w.Write([]byte(`[]`))
+		case strings.HasSuffix(r.URL.Path, "/json"):
+			http.NotFound(w, r)
+		case strings.HasSuffix(r.URL.Path, "/archive"):
+			w.Header().Set("X-Docker-Container-Path-Stat", "e30=")
+		case r.Method == http.MethodDelete:
+			w.WriteHeader(http.StatusNoContent)
+		case r.URL.Path == "/exec/detached/start" || r.URL.Path == "/exec/error/start":
+			if r.URL.Path == "/exec/error/start" {
+				w.Header().Set("Content-Type", "application/vnd.docker.raw-stream")
+				w.WriteHeader(http.StatusBadRequest)
+			}
+			_, _ = w.Write([]byte("ordinary"))
+		case rawStreamPath.MatchString(r.URL.Path) || r.URL.Path == "/session":
+			_, _ = io.Copy(io.Discard, r.Body)
+			conn, buffered, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+			if r.Header.Get("Upgrade") != "" {
+				_, _ = conn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\nready\n"))
+			} else {
+				_, _ = conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Type: application/vnd.docker.raw-stream\r\n\r\nready\n"))
+			}
+			input, _ := io.ReadAll(buffered)
+			_, _ = conn.Write(append([]byte("final:"), input...))
+			streamsDone <- struct{}{}
+		default:
+			w.Header().Set("Api-Version", "1.47")
+			_, _ = w.Write([]byte("OK " + r.Method + " " + r.URL.Path))
+		}
+	})}
+	go func() { _ = daemon.Serve(listener) }()
+	t.Cleanup(func() { _ = daemon.Close() })
+	proxy, err := StartDockerProxy(daemonSocket, shortTempDir(t), "job-1")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = proxy.Close(context.Background()) })
+	proxy.SetMounts(map[string]string{"/workspace/o/r": "/volumes/job/_data", "/workspace/o/r/tmp": "", "/var/run/docker.sock": "/tmp/p/docker.sock", "/volumes": "/daemon/volumes"})
+	client := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "unix", proxy.Socket)
+	}}}
+	t.Cleanup(client.CloseIdleConnections)
+	dialProxy := func(t *testing.T) *net.UnixConn {
+		t.Helper()
+		conn, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: proxy.Socket, Net: "unix"})
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = conn.Close() })
+		require.NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second)))
+		return conn
+	}
+	startStream := func(t *testing.T, path, upgrade string) (*net.UnixConn, *bufio.Reader) {
+		t.Helper()
+		conn := dialProxy(t)
+		_, err := fmt.Fprintf(conn, "POST %s HTTP/1.1\r\nHost: docker\r\n%sContent-Length: 2\r\n\r\n{}input", path, upgrade)
+		require.NoError(t, err)
+		reader := bufio.NewReader(conn)
+		resp, err := http.ReadResponse(reader, nil)
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			_ = conn.Close()
+			_ = resp.Body.Close()
+		})
+		prefix, err := reader.ReadString('\n')
+		require.NoError(t, err)
+		require.Equal(t, "ready\n", prefix)
+		return conn, reader
+	}
+
+	t.Run("labels creates", func(t *testing.T) {
+		for _, testCase := range []struct{ path, body, want string }{
+			{
+				"/v1.47/containers/create", `{"Image":"alpine","Unknown":{"enabled":true},"Labels":{"own":"1","com.gitea.runner.job.job-0":""}}`,
+				`{"Image":"alpine","Unknown":{"enabled":true},"Labels":{"own":"1","com.gitea.runner.job.job-0":"","com.gitea.runner.job.job-1":""}}`,
+			},
+			{
+				"/containers/create", `{"HostConfig":{"Binds":["/workspace/o/r:/src:ro","/workspace/o/r/../r/sub/:/sub","workspace/o/r:/relative","/workspace/o/rest:/rest","/workspace/o/r/tmp/x:/tmp","named:/named","/anonymous","/workspace/o/r:ro","/volumes/job/_data/x:/daemon-path"]},"DriverOpts":{"o":"bind","device":"/workspace/o/r"},"Labels":{"Foo":"1","foo":"2"}}`,
+				`{"HostConfig":{"Binds":["/volumes/job/_data:/src:ro","/volumes/job/_data/sub:/sub","workspace/o/r:/relative","/workspace/o/rest:/rest","/workspace/o/r/tmp/x:/tmp","named:/named","/anonymous","/workspace/o/r:ro","/volumes/job/_data/x:/daemon-path"]},"DriverOpts":{"o":"bind","device":"/workspace/o/r"},"Labels":{"Foo":"1","foo":"2","com.gitea.runner.job.job-1":""}}`,
+			},
+			{
+				"/containers/create", `{"HostConfig":{"Mounts":[{"Type":"bind","Source":"/var/run/docker.sock","Target":"/var/run/docker.sock"},{"type":"bind","source":"/workspace/o/r/sub/","target":"/m"},{"Type":"bind","Source":"/workspace/o/r/sub/../data","Target":"/dotted"},{"Type":"bind","Source":"/workspace/o/r/../r","Target":"/escaping"},{"Type":"BIND","Source":"/workspace/o/r"},{"Type":"volume","Source":"/workspace/o/r"}]}}`,
+				`{"HostConfig":{"Mounts":[{"Type":"bind","Source":"/tmp/p/docker.sock","Target":"/var/run/docker.sock"},{"Type":"bind","Source":"/volumes/job/_data/sub/","target":"/m"},{"Type":"bind","Source":"/volumes/job/_data/sub/../data","Target":"/dotted"},{"Type":"bind","Source":"/volumes/job/_data","Target":"/escaping"},{"Type":"BIND","Source":"/workspace/o/r"},{"Type":"volume","Source":"/workspace/o/r"}]},"Labels":{"com.gitea.runner.job.job-1":""}}`,
+			},
+			{
+				"/containers/create", `{"HostConfig":{"Mounts":[{"Type":"volume","VolumeOptions":{"DriverConfig":{"Options":{"o":"bind","device":"/workspace/o/r/data"}}}},{"Type":"volume","VolumeOptions":{"DriverConfig":{"Options":{"o":"unbindable","device":"/workspace/o/r"}}}},{"Type":"volume","VolumeOptions":{"DriverConfig":{"Options":{"o":"bind,remount","device":"/workspace/o/r"}}}},{"Type":"volume","VolumeOptions":{"DriverConfig":{"Name":"plugin","Options":{"o":"bind","device":"/workspace/o/r"}}}}]}}`,
+				`{"HostConfig":{"Mounts":[{"Type":"volume","VolumeOptions":{"DriverConfig":{"Options":{"o":"bind","device":"/volumes/job/_data/data"}}}},{"Type":"volume","VolumeOptions":{"DriverConfig":{"Options":{"o":"unbindable","device":"/workspace/o/r"}}}},{"Type":"volume","VolumeOptions":{"DriverConfig":{"Options":{"o":"bind,remount","device":"/workspace/o/r"}}}},{"Type":"volume","VolumeOptions":{"DriverConfig":{"Name":"plugin","Options":{"o":"bind","device":"/workspace/o/r"}}}}]},"Labels":{"com.gitea.runner.job.job-1":""}}`,
+			},
+			{
+				"/containers/create", `{"HostConfig":{"privileged":true,"Privileged":false,"Binds":["/workspace/o/r:/src"]},"hoſtconfig":null}`,
+				`{"HostConfig":{"privileged":true,"Privileged":false,"Binds":["/workspace/o/r:/src"]},"hoſtconfig":null,"Labels":{"com.gitea.runner.job.job-1":""}}`,
+			},
+			{
+				"/networks/create", `{"Name":"n"}`,
+				`{"Name":"n","Labels":{"com.gitea.runner.job.job-1":""}}`,
+			},
+			{
+				"/volumes/create", `{"Name":"v","labels":null,"DriverOpts":{"type":"none","o":"rbind,ro","device":"/workspace/o/r/"},"HostConfig":{"Binds":["/workspace/o/r:/src"]}}`,
+				`{"Name":"v","Labels":{"com.gitea.runner.job.job-1":""},"DriverOpts":{"type":"none","o":"rbind,ro","device":"/volumes/job/_data/"},"HostConfig":{"Binds":["/workspace/o/r:/src"]}}`,
+			},
+			{
+				"/volumes/create", `{"Name":"d","DriverOpts":{"o":"bind","device":1,"device":"/workspace/o/r"}}`,
+				`{"Name":"d","DriverOpts":{"o":"bind","device":1,"device":"/workspace/o/r"},"Labels":{"com.gitea.runner.job.job-1":""}}`,
+			},
+			{
+				"/volumes/create", `{"Name":"p","Driver":"plugin","DriverOpts":{"o":"bind","device":"/workspace/o/r"}}`,
+				`{"Name":"p","Driver":"plugin","DriverOpts":{"o":"bind","device":"/workspace/o/r"},"Labels":{"com.gitea.runner.job.job-1":""}}`,
+			},
+			{
+				"/volumes/create", "",
+				`{"Labels":{"com.gitea.runner.job.job-1":""}}`,
+			},
+			{
+				"/volumes/create", "null",
+				`{"Labels":{"com.gitea.runner.job.job-1":""}}`,
+			},
+			{
+				"/volumes/create", `{"Labels":{"discard":"1"},"labels":null,"LABELS":{"own":"1"},"LABELS":{"extra":"2"}}`,
+				`{"Labels":{"own":"1","extra":"2","com.gitea.runner.job.job-1":""}}`,
+			},
+		} {
+			resp, err := client.Post("http://docker"+testCase.path, "application/json", strings.NewReader(testCase.body))
+			require.NoError(t, err)
+			resp.Body.Close()
+			require.Equal(t, http.StatusCreated, resp.StatusCode)
+			assert.JSONEq(t, testCase.want, string(<-bodies), testCase.body)
+		}
+	})
+
+	t.Run("passes other requests through", func(t *testing.T) {
+		resp, err := client.Get("http://docker/v1.47/_ping")
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		assert.Equal(t, "1.47", resp.Header.Get("Api-Version"))
+		assert.Equal(t, "OK GET /v1.47/_ping", string(body))
+	})
+
+	t.Run("discovery caches only successes", func(t *testing.T) {
+		if runtime.GOOS != "linux" {
+			t.Skip("automatic proxy discovery requires Linux")
+		}
+		t.Setenv("DOCKER_HOST", "unix://"+daemonSocket)
+		tempDir := shortTempDir(t)
+		t.Setenv("TMPDIR", tempDir)
+		require.Nil(t, NewDockerProxy(t.Context(), "failed"))
+		for _, job := range []string{"first", "second"} {
+			proxy := NewDockerProxy(t.Context(), job)
+			require.NotNil(t, proxy)
+			require.NoError(t, proxy.Close(context.Background()))
+		}
+		assert.EqualValues(t, 2, probes.Load())
+		workdir, err := os.Getwd()
+		require.NoError(t, err)
+		cached, _ := dockerProxyProbes.Load([3]string{"unix://" + daemonSocket, workdir, tempDir})
+		cached.(*dockerProxyProbe).directory.socket, _ = os.Stat(t.TempDir())
+		proxy := NewDockerProxy(t.Context(), "replaced daemon")
+		require.NotNil(t, proxy)
+		require.NoError(t, proxy.Close(context.Background()))
+		assert.EqualValues(t, 3, probes.Load())
+	})
+
+	t.Run("tunnels raw streams through stdin EOF", func(t *testing.T) {
+		for _, stream := range []struct{ path, upgrade string }{
+			{path: "/v1.47/exec/abc/start"},
+			{path: "/containers/abc/attach", upgrade: "Connection: Upgrade\r\nUpgrade: tcp\r\n"},
+		} {
+			conn, reader := startStream(t, stream.path, stream.upgrade)
+			require.NoError(t, conn.CloseWrite())
+			output, err := io.ReadAll(reader)
+			require.NoError(t, err)
+			assert.Equal(t, "final:input", string(output))
+			<-streamsDone
+		}
+	})
+
+	t.Run("detached and error responses retain keepalive label injection", func(t *testing.T) {
+		conn := dialProxy(t)
+		reader := bufio.NewReader(conn)
+		for endpoint, status := range map[string]int{"detached": http.StatusOK, "error": http.StatusBadRequest} {
+			_, err := fmt.Fprintf(conn, "POST /exec/%s/start HTTP/1.1\r\nHost: docker\r\nContent-Length: 2\r\n\r\n{}", endpoint)
+			require.NoError(t, err)
+			resp, err := http.ReadResponse(reader, nil)
+			require.NoError(t, err)
+			body, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+			require.NoError(t, resp.Body.Close())
+			assert.Equal(t, status, resp.StatusCode)
+			assert.Equal(t, "ordinary", string(body))
+			_, err = io.WriteString(conn, "POST /volumes/create HTTP/1.1\r\nHost: docker\r\nContent-Length: 0\r\n\r\n")
+			require.NoError(t, err)
+			resp, err = http.ReadResponse(reader, nil)
+			require.NoError(t, err)
+			require.NoError(t, resp.Body.Close())
+			require.Equal(t, http.StatusCreated, resp.StatusCode)
+			assert.JSONEq(t, `{"Labels":{"com.gitea.runner.job.job-1":""}}`, string(<-bodies))
+		}
+	})
+
+	t.Run("close joins streams and admitted create", func(t *testing.T) {
+		t.Cleanup(func() { close(releaseCreate) })
+		_, raw := startStream(t, "/exec/live/start", "")
+		_, upgraded := startStream(t, "/session", "Connection: Upgrade\r\nUpgrade: tcp\r\n")
+		creator := dialProxy(t)
+		_, err := io.WriteString(creator, "POST /volumes/create?wait HTTP/1.1\r\nHost: docker\r\nContent-Length: 2\r\n\r\n{}")
+		require.NoError(t, err)
+		<-createStarted
+		require.NoError(t, creator.CloseWrite())
+		closed := make(chan error, 1)
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+		go func() { closed <- proxy.Close(ctx) }()
+		for _, reader := range []*bufio.Reader{raw, upgraded} {
+			_, err := reader.ReadByte()
+			require.ErrorIs(t, err, io.EOF)
+			<-streamsDone
+		}
+		select {
+		case err := <-closed:
+			t.Fatalf("Close returned before admitted create settled: %v", err)
+		default:
+		}
+		releaseCreate <- struct{}{}
+		resp, err := http.ReadResponse(bufio.NewReader(creator), nil)
+		require.NoError(t, err)
+		require.NoError(t, resp.Body.Close())
+		require.Equal(t, http.StatusCreated, resp.StatusCode)
+		assert.JSONEq(t, `{"Labels":{"com.gitea.runner.job.job-1":""}}`, string(<-bodies))
+		require.NoError(t, <-closed)
+	})
+}
+
+func TestRemoveLabelledRemovesContainersNetworksAndVolumes(t *testing.T) {
+	containerFailure := errors.New("container removal failed")
+	listFailure := errors.New("listing failed")
+	volumeFailure := errors.New("volume removal failed")
+	ctx := t.Context()
+	filters := make(mobyclient.Filters).Add("label", jobLabel+"job-1")
+	cli := &mockDockerClient{}
+	cli.On("ContainerList", ctx, mobyclient.ContainerListOptions{All: true, Filters: filters}).
+		Return(mobyclient.ContainerListResult{Items: []container.Summary{{ID: "c1", Names: []string{"/app"}}}}, nil).Once()
+	cli.On("ContainerKill", ctx, "c1", mock.Anything).Return(mobyclient.ContainerKillResult{}, nil).Once()
+	cli.On("ContainerRemove", ctx, "c1", mobyclient.ContainerRemoveOptions{RemoveVolumes: true, Force: true}).
+		Return(mobyclient.ContainerRemoveResult{}, containerFailure).Once()
+	cli.On("NetworkList", ctx, mobyclient.NetworkListOptions{Filters: filters}).
+		Return(mobyclient.NetworkListResult{Items: []network.Summary{{ID: "n1", Name: "stack_default", Scope: "swarm"}}}, listFailure).Once()
+	cli.On("NetworkRemove", ctx, "n1", mobyclient.NetworkRemoveOptions{}).Return(mobyclient.NetworkRemoveResult{}, cerrdefs.ErrInvalidArgument).Once()
+	cli.On("VolumeList", ctx, mobyclient.VolumeListOptions{Filters: filters}).
+		Return(mobyclient.VolumeListResult{Items: []volume.Volume{{Name: "app_data"}}}, nil).Once()
+	cli.On("VolumeRemove", ctx, "app_data", mobyclient.VolumeRemoveOptions{}).Return(mobyclient.VolumeRemoveResult{}, volumeFailure).Once()
+
+	err := removeLabelled(ctx, cli, "job-1")
+	require.ErrorIs(t, err, containerFailure)
+	require.ErrorIs(t, err, listFailure)
+	require.ErrorIs(t, err, volumeFailure)
+	require.NotErrorIs(t, err, cerrdefs.ErrInvalidArgument)
+	require.ErrorContains(t, err, "failed to remove container c1")
+	require.ErrorContains(t, err, "failed to remove volume app_data")
+	cli.AssertExpectations(t)
+}
+
+func TestDockerProxyWithDaemon(t *testing.T) {
+	requireDocker(t)
+	ctx := t.Context()
+	cleanupCtx := context.WithoutCancel(ctx)
+	require.NoError(t, NewDockerPullExecutor(NewDockerPullExecutorInput{Image: "alpine"})(ctx))
+	direct, err := GetDockerClient(ctx)
+	require.NoError(t, err)
+	defer direct.Close()
+	dir := shortTempDir(t)
+	seen, err := daemonSeesDir(ctx, direct, dir, dir)
+	require.NoError(t, err)
+	t.Logf("daemon sees the runner's filesystem: %v", seen)
+	seen, err = daemonSeesDir(ctx, direct, dir, shortTempDir(t))
+	require.NoError(t, err)
+	assert.False(t, seen)
+
+	job := "proxy-test-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	proxy, err := StartDockerProxy(daemonSocketPath(t, direct), dir, job)
+	if os.Geteuid() != 0 && errors.Is(err, os.ErrPermission) {
+		t.Skipf("non-root runners that cannot take the daemon socket's ownership get it directly: %v", err)
+	}
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = proxy.Close(context.Background()) })
+	viaProxy, err := mobyclient.New(mobyclient.WithHost("unix://" + proxy.Socket))
+	require.NoError(t, err)
+	defer viaProxy.Close()
+
+	created, err := viaProxy.ContainerCreate(ctx, mobyclient.ContainerCreateOptions{
+		Config: &container.Config{Image: "alpine", Cmd: []string{"sleep", "300"}, Labels: map[string]string{"own": "1"}},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = direct.ContainerRemove(cleanupCtx, created.ID, mobyclient.ContainerRemoveOptions{Force: true})
+	})
+	_, err = viaProxy.ContainerStart(ctx, created.ID, mobyclient.ContainerStartOptions{})
+	require.NoError(t, err)
+	net, err := viaProxy.NetworkCreate(ctx, job, mobyclient.NetworkCreateOptions{})
+	require.NoError(t, err)
+	t.Cleanup(func() { _, _ = direct.NetworkRemove(cleanupCtx, net.ID, mobyclient.NetworkRemoveOptions{}) })
+	_, err = viaProxy.VolumeCreate(ctx, mobyclient.VolumeCreateOptions{Name: job})
+	require.NoError(t, err)
+	t.Cleanup(func() { _, _ = direct.VolumeRemove(cleanupCtx, job, mobyclient.VolumeRemoveOptions{Force: true}) })
+
+	inspected, err := direct.ContainerInspect(ctx, created.ID, mobyclient.ContainerInspectOptions{})
+	require.NoError(t, err)
+	assert.Subset(t, inspected.Container.Config.Labels, map[string]string{"own": "1", jobLabel + job: ""})
+	vol, err := direct.VolumeInspect(ctx, job, mobyclient.VolumeInspectOptions{})
+	require.NoError(t, err)
+	assert.Contains(t, vol.Volume.Labels, jobLabel+job)
+
+	exec, err := viaProxy.ExecCreate(ctx, created.ID, mobyclient.ExecCreateOptions{Cmd: []string{"cat"}, AttachStdin: true, AttachStdout: true, TTY: true})
+	require.NoError(t, err)
+	attached, err := viaProxy.ExecAttach(ctx, exec.ID, mobyclient.ExecAttachOptions{TTY: true})
+	require.NoError(t, err)
+	_, err = attached.Conn.Write([]byte("hello\n"))
+	require.NoError(t, err)
+	echoed, err := attached.Reader.ReadString('\n')
+	require.NoError(t, err)
+	assert.Equal(t, "hello\r\n", echoed)
+	attached.Close()
+
+	require.NoError(t, proxy.Close(ctx))
+	require.NoError(t, RemoveDockerJobResources(ctx, job))
+	_, err = direct.ContainerInspect(ctx, created.ID, mobyclient.ContainerInspectOptions{})
+	assert.True(t, cerrdefs.IsNotFound(err))
+	_, err = direct.NetworkInspect(ctx, net.ID, mobyclient.NetworkInspectOptions{})
+	assert.True(t, cerrdefs.IsNotFound(err))
+	_, err = direct.VolumeInspect(ctx, job, mobyclient.VolumeInspectOptions{})
+	assert.True(t, cerrdefs.IsNotFound(err))
+}
+
+func BenchmarkDockerProxy(b *testing.B) {
+	ctx := context.Background()
+	direct, err := GetDockerClient(ctx)
+	require.NoError(b, err)
+	defer direct.Close()
+	if _, err := direct.Ping(ctx, mobyclient.PingOptions{}); err != nil {
+		b.Skipf("docker daemon unreachable: %v", err)
+	}
+	proxy, err := StartDockerProxy(daemonSocketPath(b, direct), shortTempDir(b), "bench")
+	require.NoError(b, err)
+	defer func() { _ = proxy.Close(ctx) }()
+	viaProxy, err := mobyclient.New(mobyclient.WithHost("unix://" + proxy.Socket))
+	require.NoError(b, err)
+	defer viaProxy.Close()
+
+	require.NoError(b, NewDockerPullExecutor(NewDockerPullExecutorInput{Image: "alpine"})(ctx))
+	created, err := direct.ContainerCreate(ctx, mobyclient.ContainerCreateOptions{Config: &container.Config{Image: "alpine", Cmd: []string{"sleep", "600"}}})
+	require.NoError(b, err)
+	defer func() { _, _ = direct.ContainerRemove(ctx, created.ID, mobyclient.ContainerRemoveOptions{Force: true}) }()
+	_, err = direct.ContainerStart(ctx, created.ID, mobyclient.ContainerStartOptions{})
+	require.NoError(b, err)
+
+	var archive bytes.Buffer
+	writer := tar.NewWriter(&archive)
+	payload := make([]byte, 64<<20)
+	require.NoError(b, writer.WriteHeader(&tar.Header{Name: "blob", Mode: 0o600, Size: int64(len(payload))}))
+	_, _ = writer.Write(payload)
+	require.NoError(b, writer.Close())
+
+	for name, cli := range map[string]mobyclient.APIClient{"direct": direct, "proxy": viaProxy} {
+		b.Run("ping/"+name, func(b *testing.B) {
+			for b.Loop() {
+				if _, err := cli.Ping(ctx, mobyclient.PingOptions{}); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+		b.Run("copy64MiB/"+name, func(b *testing.B) {
+			b.SetBytes(int64(archive.Len()))
+			for b.Loop() {
+				_, err := cli.CopyToContainer(ctx, created.ID, mobyclient.CopyToContainerOptions{DestinationPath: "/tmp", Content: bytes.NewReader(archive.Bytes())})
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+type probeClient struct {
+	mobyclient.APIClient
+	create     func(context.Context, mobyclient.ContainerCreateOptions) (mobyclient.ContainerCreateResult, error)
+	remove     func(context.Context, string, mobyclient.ContainerRemoveOptions) (mobyclient.ContainerRemoveResult, error)
+	stat       func(string) error
+	mounts     []container.MountPoint
+	containers []container.Summary
+}
+
+func (c *probeClient) Info(_ctx context.Context, _opts mobyclient.InfoOptions) (mobyclient.SystemInfoResult, error) {
+	return mobyclient.SystemInfoResult{}, nil
+}
+
+func (c *probeClient) Close() error {
+	return nil
+}
+
+func (c *probeClient) ContainerList(context.Context, mobyclient.ContainerListOptions) (mobyclient.ContainerListResult, error) {
+	return mobyclient.ContainerListResult{Items: c.containers}, nil
+}
+
+func (c *probeClient) ContainerKill(context.Context, string, mobyclient.ContainerKillOptions) (mobyclient.ContainerKillResult, error) {
+	return mobyclient.ContainerKillResult{}, cerrdefs.ErrConflict
+}
+
+func (c *probeClient) ContainerInspect(context.Context, string, mobyclient.ContainerInspectOptions) (mobyclient.ContainerInspectResult, error) {
+	return mobyclient.ContainerInspectResult{Container: container.InspectResponse{Mounts: c.mounts}}, nil
+}
+
+func (c *probeClient) ImageList(context.Context, mobyclient.ImageListOptions) (mobyclient.ImageListResult, error) {
+	return mobyclient.ImageListResult{Items: []image.Summary{{ID: "removed-image"}, {ID: "probe-image"}}}, nil
+}
+
+func (c *probeClient) ContainerCreate(ctx context.Context, opts mobyclient.ContainerCreateOptions) (mobyclient.ContainerCreateResult, error) {
+	return c.create(ctx, opts)
+}
+
+func (c *probeClient) ContainerRemove(ctx context.Context, id string, opts mobyclient.ContainerRemoveOptions) (mobyclient.ContainerRemoveResult, error) {
+	return c.remove(ctx, id, opts)
+}
+
+func (c *probeClient) ContainerStatPath(_ context.Context, _ string, opts mobyclient.ContainerStatPathOptions) (mobyclient.ContainerStatPathResult, error) {
+	return mobyclient.ContainerStatPathResult{}, c.stat(opts.Path)
+}
+
+func TestDockerProxyDirectoryProbes(t *testing.T) {
+	type result struct {
+		seen bool
+		err  error
+	}
+	for name, createErr := range map[string]error{"unavailable directory": nil, "daemon error": errors.New("probe failed")} {
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				dir := t.TempDir()
+				socket, err := os.Stat(t.TempDir())
+				require.NoError(t, err)
+				key := [3]string{"daemon", dir, dir}
+				release := make(chan struct{})
+				var calls, removals atomic.Int32
+				visible := false
+				cli := &probeClient{
+					create: func(_ctx context.Context, _opts mobyclient.ContainerCreateOptions) (mobyclient.ContainerCreateResult, error) {
+						calls.Add(1)
+						<-release
+						return mobyclient.ContainerCreateResult{ID: "probe"}, createErr
+					},
+					stat: func(_path string) error {
+						if visible {
+							return nil
+						} else {
+							return cerrdefs.ErrNotFound
+						}
+					},
+					remove: func(_ctx context.Context, _id string, _opts mobyclient.ContainerRemoveOptions) (mobyclient.ContainerRemoveResult, error) {
+						removals.Add(1)
+						return mobyclient.ContainerRemoveResult{}, nil
+					},
+				}
+				results := make(chan result, 8)
+				for range cap(results) {
+					go func() {
+						probe, err := probeDockerProxyDirectory(t.Context(), cli, key, socket)
+						results <- result{probe.seen, err}
+					}()
+				}
+				synctest.Wait()
+				assert.EqualValues(t, 1, calls.Load())
+				replacement, err := os.Stat(t.TempDir())
+				require.NoError(t, err)
+				replaced := make(chan result, 1)
+				go func() {
+					probe, err := probeDockerProxyDirectory(t.Context(), cli, key, replacement)
+					replaced <- result{probe.seen, err}
+				}()
+				synctest.Wait()
+				assert.EqualValues(t, 2, calls.Load())
+				close(release)
+				for range cap(results) {
+					result := <-results
+					require.ErrorIs(t, result.err, createErr)
+					assert.False(t, result.seen)
+				}
+				replacementResult := <-replaced
+				require.ErrorIs(t, replacementResult.err, createErr)
+				assert.False(t, replacementResult.seen)
+				assert.EqualValues(t, 2, calls.Load())
+				if createErr == nil {
+					assert.EqualValues(t, 2, removals.Load())
+				} else {
+					assert.Zero(t, removals.Load())
+				}
+				createErr, visible = nil, true
+				probe, err := probeDockerProxyDirectory(t.Context(), cli, key, socket)
+				require.NoError(t, err)
+				assert.True(t, probe.seen)
+				assert.Equal(t, dir, probe.directory.dir)
+				assert.Equal(t, dir, probe.directory.daemonDir)
+				assert.EqualValues(t, 3, calls.Load())
+				entries, err := os.ReadDir(dir)
+				require.NoError(t, err)
+				assert.Empty(t, entries)
+			})
+		})
+	}
+	t.Run("cancelled caller leaves the probe to finish for the others", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			dir := t.TempDir()
+			socket, err := os.Stat(t.TempDir())
+			require.NoError(t, err)
+			key := [3]string{"daemon", dir, dir}
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			release := make(chan struct{})
+			var calls, removals atomic.Int32
+			cli := &probeClient{
+				create: func(ctx context.Context, _opts mobyclient.ContainerCreateOptions) (mobyclient.ContainerCreateResult, error) {
+					calls.Add(1)
+					<-release
+					return mobyclient.ContainerCreateResult{ID: "probe"}, ctx.Err()
+				},
+				stat: func(_path string) error { return nil },
+				remove: func(_ctx context.Context, _id string, _opts mobyclient.ContainerRemoveOptions) (mobyclient.ContainerRemoveResult, error) {
+					removals.Add(1)
+					return mobyclient.ContainerRemoveResult{}, nil
+				},
+			}
+			leader, follower, late := make(chan result, 1), make(chan result, 1), make(chan result, 1)
+			go func() {
+				probe, err := probeDockerProxyDirectory(ctx, cli, key, socket)
+				leader <- result{probe.seen, err}
+			}()
+			synctest.Wait()
+			go func() {
+				probe, err := probeDockerProxyDirectory(t.Context(), cli, key, socket)
+				follower <- result{probe.seen, err}
+			}()
+			synctest.Wait()
+			cancel()
+			leaderResult := <-leader
+			require.ErrorIs(t, leaderResult.err, context.Canceled)
+			assert.False(t, leaderResult.seen)
+			go func() {
+				probe, err := probeDockerProxyDirectory(t.Context(), cli, key, socket)
+				late <- result{probe.seen, err}
+			}()
+			synctest.Wait()
+			close(release)
+			for _, results := range []chan result{follower, late} {
+				result := <-results
+				require.NoError(t, result.err)
+				assert.True(t, result.seen)
+			}
+			assert.EqualValues(t, 1, calls.Load())
+			assert.EqualValues(t, 1, removals.Load())
+			_, cached := dockerProxyProbes.Load(key)
+			assert.True(t, cached)
+		})
+	})
+	t.Run("caller joining a probe that ran out of time retries", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			dir := t.TempDir()
+			socket, err := os.Stat(t.TempDir())
+			require.NoError(t, err)
+			var calls atomic.Int32
+			cli := &probeClient{
+				create: func(ctx context.Context, _opts mobyclient.ContainerCreateOptions) (mobyclient.ContainerCreateResult, error) {
+					if calls.Add(1) == 1 {
+						<-ctx.Done()
+						return mobyclient.ContainerCreateResult{}, ctx.Err()
+					}
+					return mobyclient.ContainerCreateResult{ID: "probe"}, nil
+				},
+				stat: func(_path string) error { return nil },
+				remove: func(_ctx context.Context, _id string, _opts mobyclient.ContainerRemoveOptions) (mobyclient.ContainerRemoveResult, error) {
+					return mobyclient.ContainerRemoveResult{}, nil
+				},
+			}
+			probe, err := probeDockerProxyDirectory(t.Context(), cli, [3]string{"daemon", dir, dir}, socket)
+			require.NoError(t, err)
+			assert.True(t, probe.seen)
+			assert.EqualValues(t, 2, calls.Load())
+		})
+	})
+}
+
+func TestRemoveStaleProbeContainers(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		probeMount := container.MountPoint{Type: mount.TypeBind, Destination: "/gitea-runner-probe"}
+		writableMount := container.MountPoint{Type: mount.TypeBind, Destination: "/gitea-runner-probe", RW: true}
+		var removed []string
+		cli := &probeClient{
+			containers: []container.Summary{
+				{ID: "abandoned", State: container.StateCreated, Mounts: []container.MountPoint{probeMount}},
+				{ID: "foreign", State: container.StateCreated, Mounts: []container.MountPoint{writableMount}},
+				{ID: "started", State: container.StateExited, Mounts: []container.MountPoint{probeMount}},
+			},
+			remove: func(_ctx context.Context, id string, _opts mobyclient.ContainerRemoveOptions) (mobyclient.ContainerRemoveResult, error) {
+				removed = append(removed, id)
+				return mobyclient.ContainerRemoveResult{}, nil
+			},
+		}
+		start := time.Now()
+		removeStaleProbeContainers(cli)
+		assert.Equal(t, []string{"abandoned"}, removed)
+		assert.GreaterOrEqual(t, time.Since(start), dockerProxyProbeWorkerTimeout+dockerProxyProbeTimeout)
+	})
+}
+
+func TestDaemonSeesDir(t *testing.T) {
+	dir := t.TempDir()
+	markers := make(map[string]bool)
+
+	for _, testCase := range []struct {
+		name      string
+		daemonDir string
+		removeErr error
+		seen      bool
+		removed   bool
+	}{
+		{name: "cleanup after cancellation", daemonDir: dir, seen: true, removed: true},
+		{name: "daemon without the directory", daemonDir: filepath.Join(dir, "missing")},
+		{name: "daemon with a different directory at that path", daemonDir: t.TempDir(), removed: true},
+		{name: "cleanup error after cancellation", daemonDir: dir, removeErr: errors.New("cleanup failed"), removed: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			removed := false
+			var attemptedImages []string
+			cli := &probeClient{
+				create: func(_ctx context.Context, opts mobyclient.ContainerCreateOptions) (mobyclient.ContainerCreateResult, error) {
+					assert.Equal(t, []mount.Mount{{Type: mount.TypeBind, Source: testCase.daemonDir, Target: "/gitea-runner-probe", ReadOnly: true}}, opts.HostConfig.Mounts)
+					attemptedImages = append(attemptedImages, opts.Config.Image)
+					if opts.Config.Image == "removed-image" {
+						return mobyclient.ContainerCreateResult{}, cerrdefs.ErrNotFound
+					}
+					cancel()
+					if _, err := os.Stat(testCase.daemonDir); err != nil {
+						return mobyclient.ContainerCreateResult{}, cerrdefs.ErrInvalidArgument
+					}
+					return mobyclient.ContainerCreateResult{ID: "probe"}, nil
+				},
+				stat: func(path string) error {
+					marker := strings.TrimPrefix(path, "/gitea-runner-probe/")
+					assert.False(t, markers[marker])
+					markers[marker] = true
+					if _, err := os.Stat(filepath.Join(testCase.daemonDir, marker)); err != nil {
+						return cerrdefs.ErrNotFound
+					}
+					return nil
+				},
+				remove: func(ctx context.Context, id string, opts mobyclient.ContainerRemoveOptions) (mobyclient.ContainerRemoveResult, error) {
+					removed = true
+					assert.Equal(t, "probe", id)
+					assert.Equal(t, mobyclient.ContainerRemoveOptions{Force: true, RemoveVolumes: true}, opts)
+					require.NoError(t, ctx.Err())
+					_, bounded := ctx.Deadline()
+					assert.True(t, bounded)
+					return mobyclient.ContainerRemoveResult{}, testCase.removeErr
+				},
+			}
+			seen, err := daemonSeesDir(ctx, cli, dir, testCase.daemonDir)
+			require.ErrorIs(t, err, testCase.removeErr)
+			assert.Equal(t, []string{"removed-image", "probe-image"}, attemptedImages)
+			assert.Equal(t, testCase.seen, seen)
+			assert.Equal(t, testCase.removed, removed)
+
+			entries, err := os.ReadDir(dir)
+			require.NoError(t, err)
+			assert.Empty(t, entries)
+		})
+	}
+}
+
+func TestRunnerContainerWorkdir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("a runner container is Linux")
+	}
+	workdir := t.TempDir()
+	t.Chdir(workdir)
+	volume := container.MountPoint{Type: mount.TypeVolume, Source: "/daemon/_data", Destination: filepath.Dir(workdir)}
+	for _, testCase := range []struct {
+		name      string
+		mount     container.MountPoint
+		foreign   bool
+		daemonDir string
+	}{
+		{name: "volume above the working directory", mount: volume, daemonDir: filepath.Join(volume.Source, filepath.Base(workdir))},
+		{name: "tmpfs", mount: container.MountPoint{Type: mount.TypeTmpfs, Destination: volume.Destination}},
+		{name: "hostname of another container", mount: volume, foreign: true},
+	} {
+		cli := &probeClient{
+			mounts: []container.MountPoint{testCase.mount},
+			stat: func(path string) error {
+				if _, err := os.Stat(path); err != nil || testCase.foreign {
+					return cerrdefs.ErrNotFound
+				}
+				return nil
+			},
+		}
+		dir, daemonDir := runnerContainerWorkdir(t.Context(), cli)
+		assert.Equal(t, testCase.daemonDir, daemonDir, testCase.name)
+		assert.Equal(t, testCase.daemonDir != "", dir == workdir, testCase.name)
+	}
+	entries, err := os.ReadDir(workdir)
+	require.NoError(t, err)
+	assert.Empty(t, entries)
+}

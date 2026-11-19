@@ -1,0 +1,344 @@
+// Copyright 2026 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package runner
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"gitea.com/gitea/runner/act/artifactcache"
+
+	"gitea.dev/actionslib/pkg/model"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+const actionsCacheRef = "v6.1.0"
+
+func bundleFromGitHub(t *testing.T, repo, ref, path string) string {
+	t.Helper()
+
+	cacheDir, err := os.UserCacheDir()
+	require.NoError(t, err)
+	dir := filepath.Join(cacheDir, "gitea-runner-test", strings.ReplaceAll(repo, "/", "-")+"-"+ref)
+	bundle := filepath.Join(dir, strings.ReplaceAll(path, "/", "-"))
+	if _, err := os.Stat(bundle); err == nil {
+		return bundle
+	}
+	require.NoError(t, os.MkdirAll(dir, 0o755))
+
+	url := "https://raw.githubusercontent.com/" + repo + "/" + ref + "/" + path
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	require.NoError(t, err)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Skipf("cannot reach %s: %v", url, err)
+	}
+	defer resp.Body.Close()
+	require.NotEqual(t, http.StatusNotFound, resp.StatusCode, "%s is not in this release", url)
+	if resp.StatusCode != http.StatusOK {
+		t.Skipf("GET %s: %s", url, resp.Status)
+	}
+	file, err := os.Create(bundle)
+	require.NoError(t, err)
+	_, err = io.Copy(file, resp.Body)
+	require.NoError(t, file.Close())
+	require.NoError(t, err)
+	return bundle
+}
+
+type jobEnv struct {
+	workspace, runnerTemp string
+	cacheURL, resultsURL  string
+	token                 string
+}
+
+func newActionJobEnv(t *testing.T, token string, credential artifactcache.JobCredential) jobEnv {
+	t.Helper()
+
+	handler, err := artifactcache.StartHandler(artifactcache.Options{Dir: filepath.Join(t.TempDir(), "cache"), OutboundIP: "127.0.0.1"})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = handler.Close() })
+	t.Cleanup(handler.RegisterJob(token, credential))
+	return jobEnv{
+		workspace:  tempDirPath(t),
+		runnerTemp: tempDirPath(t),
+		cacheURL:   handler.ExternalURL(),
+		resultsURL: handler.ExternalURL(),
+		token:      token,
+	}
+}
+
+func runActionEntrypoint(t *testing.T, script string, env jobEnv, inputs map[string]string) string {
+	t.Helper()
+	state := filepath.Join(env.runnerTemp, "state")
+	output := filepath.Join(env.runnerTemp, "output")
+	for _, name := range []string{state, output} {
+		require.NoError(t, os.WriteFile(name, nil, 0o600))
+	}
+
+	cmd := exec.CommandContext(t.Context(), "node", script)
+	cmd.Dir = env.workspace
+	cmd.Env = append(os.Environ(),
+		"ACTIONS_RUNTIME_TOKEN="+env.token,
+		"ACTIONS_CACHE_URL="+env.cacheURL+"/",
+		"ACTIONS_RESULTS_URL="+env.resultsURL,
+		"ACTIONS_CACHE_SERVICE_V2=true",
+		"GITHUB_SERVER_URL=https://gitea.example.com",
+		"GITHUB_REPOSITORY=testuser/testrepo",
+		"GITHUB_RUN_ID=1",
+		"GITHUB_REF=refs/heads/main",
+		"GITHUB_EVENT_NAME=push",
+		"GITHUB_WORKSPACE="+env.workspace,
+		"RUNNER_TEMP="+env.runnerTemp,
+		"GITHUB_STATE="+state,
+		"GITHUB_OUTPUT="+output,
+	)
+	for name, value := range inputs {
+		cmd.Env = append(cmd.Env, "INPUT_"+strings.ToUpper(name)+"="+value)
+	}
+	out, err := cmd.CombinedOutput()
+	t.Logf("%s:\n%s", filepath.Base(script), out)
+	require.NoError(t, err, "%s failed", script)
+	return string(out)
+}
+
+func patchedAction(t *testing.T, repo, ref, entrypoint string) string {
+	t.Helper()
+
+	body, err := os.ReadFile(bundleFromGitHub(t, repo, ref, entrypoint))
+	require.NoError(t, err)
+	if patched, ok := patchedBundle(body); ok {
+		body = patched
+	}
+	script := filepath.Join(tempDirPath(t), filepath.Base(entrypoint))
+	require.NoError(t, os.WriteFile(script, body, 0o600))
+	return script
+}
+
+func tempDirPath(t *testing.T) string {
+	t.Helper()
+
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	require.NoError(t, err)
+	return dir
+}
+
+func TestCacheServiceV2EndToEnd(t *testing.T) {
+	t.Parallel()
+	requireHostTools(t, "node")
+
+	restore := patchedAction(t, "actions/cache", actionsCacheRef, "dist/restore/index.js")
+	save := patchedAction(t, "actions/cache", actionsCacheRef, "dist/save/index.js")
+
+	env := newActionJobEnv(t, "e2e-runtime-token", artifactcache.JobCredential{Repo: "testuser/testrepo"})
+	require.NoError(t, os.MkdirAll(filepath.Join(env.workspace, "to-cache"), 0o755))
+	content := []byte("cached through the patched gate")
+	require.NoError(t, os.WriteFile(filepath.Join(env.workspace, "to-cache", "data.txt"), content, 0o600))
+
+	const key = "patched-gate-key"
+	inputs := map[string]string{"path": "to-cache", "key": key}
+
+	missed := runActionEntrypoint(t, restore, env, inputs)
+	require.Contains(t, missed, "Cache service version: v2", "the patch did not take, the client stayed on v1")
+	require.Contains(t, missed, "Cache not found for input keys: "+key)
+
+	saved := runActionEntrypoint(t, save, env, inputs)
+	require.Contains(t, saved, "Cache saved with key: "+key)
+
+	env.workspace = tempDirPath(t)
+	hit := runActionEntrypoint(t, restore, env, inputs)
+	require.Contains(t, hit, "Cache restored from key: "+key)
+
+	got, err := os.ReadFile(filepath.Join(env.workspace, "to-cache", "data.txt"))
+	require.NoError(t, err)
+	assert.Equal(t, content, got)
+	env.workspace = tempDirPath(t)
+	v1 := runActionEntrypoint(t, bundleFromGitHub(t, "actions/cache", actionsCacheRef, "dist/restore/index.js"), env, inputs)
+	require.Contains(t, v1, "Cache service version: v1")
+	require.Contains(t, v1, "Cache restored from key: "+key)
+}
+
+func TestPatchedBundleAcrossActions(t *testing.T) {
+	for _, tc := range []struct {
+		repo, ref, path string
+		wantPatched     bool
+	}{
+		{"actions/cache", actionsCacheRef, "dist/restore/index.js", true},
+		{"actions/setup-node", "v7.1.0", "dist/cache-save/index.js", true},
+		{"actions/setup-python", "v7.0.0", "dist/setup/index.js", true},
+		{"actions/setup-go", "v7.0.0", "dist/setup/index.js", true},
+		{"actions/setup-java", "v5.7.0", "dist/setup/index.js", true},
+		{"actions/setup-java", "v6.1.0", "dist/setup/295.index.js", true},
+		{"ruby/setup-ruby", "v1.331.0", "dist/index.js", true},
+		{"pnpm/action-setup", "v6.1.0", "dist/index.js", true},
+		{"oven-sh/setup-bun", "v2.2.0", "dist/setup/index.js", true},
+		{"Swatinem/rust-cache", "v2.9.1", "dist/restore/index.js", true},
+		{"Swatinem/rust-cache", "v2.9.2", "dist/cache-CTfQoCTL.js", true},
+		{"docker/build-push-action", "v7.4.0", "dist/index.cjs", true},
+		{"gradle/actions", "v6.4.0", "dist/setup-gradle/main/index.js", true},
+		{"actions/upload-artifact", "v4.4.0", "dist/upload/index.js", true},
+		{"actions/upload-artifact", "v7.0.2", "dist/upload/index.js", true},
+		{"actions/download-artifact", "v8.0.2", "dist/index.js", true},
+		{"actions/checkout", "v7.0.1", "dist/index.js", false},
+		{"mozilla-actions/sccache-action", "v0.0.11", "dist/setup/index.js", false},
+	} {
+		t.Run(tc.repo+"@"+tc.ref, func(t *testing.T) {
+			t.Parallel()
+
+			data, err := os.ReadFile(bundleFromGitHub(t, tc.repo, tc.ref, tc.path))
+			require.NoError(t, err)
+
+			out, patched := patchedBundle(data)
+			require.Equal(t, tc.wantPatched, patched)
+			if !tc.wantPatched {
+				assert.Equal(t, data, out, "an untouched bundle must come back byte for byte")
+				return
+			}
+			assert.False(t, bytes.Contains(out, []byte(".LOCALHOST")), "a copy of the gate was missed")
+
+			if !bytes.Contains(data, []byte(CacheServiceV2Env)) {
+				return
+			}
+			assert.NotZero(t, bytes.Count(out, []byte("(process.env."+cacheURLEnv+"||process.env")),
+				"the cache service URL was not redirected")
+			assert.Equal(t, bytes.Count(data, []byte(resultsURLEnv)), bytes.Count(out, []byte(resultsURLEnv)),
+				"a read of the results URL was lost, it must stay as the fallback")
+		})
+	}
+}
+
+func TestUploadArtifactThroughTheResultsService(t *testing.T) {
+	t.Parallel()
+	requireHostTools(t, "node")
+
+	var called []string
+	var zipped []byte
+	gitea := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		method := path.Base(r.URL.Path)
+		called = append(called, method)
+		w.Header().Set("x-ms-request-id", "stub")
+		switch method {
+		case "CreateArtifact":
+			_, _ = io.WriteString(w, `{"ok":true,"signed_upload_url":"http://`+r.Host+
+				`/twirp/github.actions.results.api.v1.ArtifactService/UploadArtifact?sig=x"}`)
+		case "FinalizeArtifact":
+			_, _ = io.WriteString(w, `{"ok":true,"artifact_id":"1"}`)
+		case "ListArtifacts":
+			_, _ = io.WriteString(w, `{"artifacts":[{"workflow_run_backend_id":"11",`+
+				`"workflow_job_run_backend_id":"22","database_id":"1","name":"an-artifact","size":"`+
+				strconv.Itoa(len(zipped))+`"}]}`)
+		case "GetSignedArtifactURL":
+			_, _ = io.WriteString(w, `{"signed_url":"http://`+r.Host+`/download"}`)
+		case "download":
+			w.Header().Set("Content-Type", "application/zip")
+			_, _ = w.Write(zipped)
+		default:
+			body, _ := io.ReadAll(r.Body)
+			switch r.URL.Query().Get("comp") {
+			case "block":
+				zipped = append(zipped, body...)
+			case "blocklist":
+			default:
+				zipped = body
+			}
+			w.WriteHeader(http.StatusCreated)
+		}
+	}))
+	defer gitea.Close()
+	env := newActionJobEnv(t, "e30."+base64.RawURLEncoding.EncodeToString([]byte(`{"scp":"Actions.Results:11:22"}`))+".sig",
+		artifactcache.JobCredential{Repo: "testuser/testrepo", Results: gitea.URL})
+
+	upload := patchedAction(t, "actions/upload-artifact", "v7.0.2", "dist/upload/index.js")
+
+	uploaded := []byte("through the results service")
+	require.NoError(t, os.WriteFile(filepath.Join(env.workspace, "artifact.txt"), uploaded, 0o600))
+
+	out := runActionEntrypoint(t, upload, env, map[string]string{
+		"name": "an-artifact", "path": "artifact.txt", "if-no-files-found": "error",
+		"retention-days": "0", "compression-level": "6", "overwrite": "false",
+		"include-hidden-files": "false", "archive": "true",
+	})
+
+	require.Contains(t, out, "has been successfully uploaded")
+	download := patchedAction(t, "actions/download-artifact", "v8.0.2", "dist/index.js")
+	env.workspace = tempDirPath(t)
+	out = runActionEntrypoint(t, download, env, map[string]string{
+		"name": "an-artifact", "path": "downloaded", "merge-multiple": "false",
+		"skip-decompress": "false", "include-hidden-files": "false", "github-token": "",
+	})
+
+	require.Contains(t, out, "Artifact download completed")
+	assert.Subset(t, called,
+		[]string{"CreateArtifact", "UploadArtifact", "FinalizeArtifact", "ListArtifacts", "GetSignedArtifactURL"},
+		"the artifact service was not reached through the cache server")
+	got, err := os.ReadFile(filepath.Join(env.workspace, "downloaded", "artifact.txt"))
+	require.NoError(t, err)
+	assert.Equal(t, uploaded, got)
+}
+
+func TestSetupActionFindsTheCacheService(t *testing.T) {
+	t.Parallel()
+	requireHostTools(t, "node", "npm")
+
+	setup := patchedAction(t, "actions/setup-node", "v7.1.0", "dist/setup/index.js")
+
+	env := newActionJobEnv(t, "setup-runtime-token", artifactcache.JobCredential{Repo: "testuser/testrepo"})
+	require.NoError(t, os.WriteFile(filepath.Join(env.workspace, "package-lock.json"),
+		[]byte(`{"lockfileVersion":3}`), 0o600))
+
+	out := runActionEntrypoint(t, setup, env, map[string]string{"cache": "npm"})
+
+	require.Contains(t, out, "Cache service version: v2")
+	require.Contains(t, out, "npm cache is not found", "the lookup did not reach the cache server")
+}
+
+func TestCodeSplitActionFindsTheCacheService(t *testing.T) {
+	requireHostTools(t, "node", "rustc")
+
+	dir := tempDirPath(t)
+	require.NoError(t, os.Mkdir(filepath.Join(dir, "dist"), 0o755))
+	for _, name := range []string{
+		"action.yml", "dist/restore.js", "dist/save.js", "dist/cleanup-BWEbZ6YT.js",
+		"dist/cache-CTfQoCTL.js", "dist/cache-DC26rUaF.js", "dist/state-cjs-CkvFUaNy.js",
+	} {
+		body, err := os.ReadFile(bundleFromGitHub(t, "Swatinem/rust-cache", "v2.9.2", name))
+		require.NoError(t, err)
+		require.NoError(t, os.WriteFile(filepath.Join(dir, name), body, 0o600))
+	}
+	body, err := os.ReadFile(filepath.Join(dir, "action.yml"))
+	require.NoError(t, err)
+	action, err := model.ReadAction(bytes.NewReader(body))
+	require.NoError(t, err)
+	inputs := map[string]string{"lookup-only": "true", "add-rust-environment-hash-key": "false", "cache-bin": "false"}
+	for name, input := range action.Inputs {
+		if _, ok := inputs[name]; !ok {
+			inputs[name] = input.Default
+		}
+	}
+	t.Setenv("CARGO_HOME", tempDirPath(t))
+
+	for _, entry := range patchedScripts(t.Context(), dir, actionScriptPaths(dir, dir, action)) {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, entry.Name), []byte(entry.Body), 0o600))
+	}
+	out := runActionEntrypoint(t, filepath.Join(dir, action.Runs.Main),
+		newActionJobEnv(t, "split-runtime-token", artifactcache.JobCredential{Repo: "testuser/testrepo"}), inputs)
+
+	require.Contains(t, out, "Cache service version: v2")
+	require.Contains(t, out, "No cache found.", "the lookup did not reach the cache server")
+}

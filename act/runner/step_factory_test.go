@@ -9,77 +9,33 @@ import (
 
 	"gitea.dev/actionslib/pkg/model"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestStepFactoryNewStep(t *testing.T) {
-	table := []struct {
+	for _, test := range []struct {
 		name  string
 		model *model.Step
-		check func(s step) bool
+		want  step
 	}{
-		{
-			name: "StepRemoteAction",
-			model: &model.Step{
-				Uses: "remote/action@v1",
-			},
-			check: func(s step) bool {
-				_, ok := s.(*stepActionRemote)
-				return ok
-			},
-		},
-		{
-			name: "StepLocalAction",
-			model: &model.Step{
-				Uses: "./action@v1",
-			},
-			check: func(s step) bool {
-				_, ok := s.(*stepActionLocal)
-				return ok
-			},
-		},
-		{
-			name: "StepDocker",
-			model: &model.Step{
-				Uses: "docker://image:tag",
-			},
-			check: func(s step) bool {
-				_, ok := s.(*stepDocker)
-				return ok
-			},
-		},
-		{
-			name: "StepRun",
-			model: &model.Step{
-				Run: "cmd",
-			},
-			check: func(s step) bool {
-				_, ok := s.(*stepRun)
-				return ok
-			},
-		},
-	}
-
-	for _, tt := range table {
-		t.Run(tt.name, func(t *testing.T) {
-			sf := &stepFactoryImpl{}
-
-			step, err := sf.newStep(tt.model, &RunContext{})
-
-			assert.True(t, tt.check((step)))
-			assert.NoError(t, err)
+		{"StepRemoteAction", &model.Step{Uses: "remote/action@v1"}, &stepActionRemote{}},
+		{"StepLocalAction", &model.Step{Uses: "./action@v1"}, &stepActionLocal{}},
+		{"StepDocker", &model.Step{Uses: "docker://image:tag"}, &stepDocker{}},
+		{"StepRun", &model.Step{Run: "cmd"}, &stepRun{}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			step, err := (&stepFactoryImpl{}).newStep(test.model, &RunContext{})
+			require.NoError(t, err)
+			assert.IsType(t, test.want, step)
 		})
 	}
 }
 
 func TestStepFactoryInvalidStep(t *testing.T) {
-	model := &model.Step{
-		Uses: "remote/action@v1",
-		Run:  "cmd",
+	for _, stepModel := range []*model.Step{
+		{Uses: "remote/action@v1", Run: "cmd"},
+	} {
+		_, err := (&stepFactoryImpl{}).newStep(stepModel, &RunContext{Name: "build"})
+		assert.ErrorContains(t, err, "job:build ", stepModel.Uses)
 	}
-
-	sf := &stepFactoryImpl{}
-
-	_, err := sf.newStep(model, &RunContext{})
-
-	assert.Error(t, err)
 }

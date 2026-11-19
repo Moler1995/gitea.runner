@@ -5,83 +5,72 @@
 package runner
 
 import (
+	"cmp"
 	"context"
-	"encoding/json"
 	"fmt"
-	"maps"
+	"net/http"
 	"os"
 	"runtime"
+	"slices"
 	"sync"
 	"time"
 
 	"gitea.com/gitea/runner/act/common"
+	"gitea.com/gitea/runner/act/common/logging"
 	"gitea.com/gitea/runner/act/container"
 	"gitea.com/gitea/runner/act/container/hooks"
+	"gitea.com/gitea/runner/act/ghcontext"
 
 	"gitea.dev/actionslib/pkg/model"
 	docker_container "github.com/moby/moby/api/types/container"
-	log "github.com/sirupsen/logrus"
+	"go.yaml.in/yaml/v4"
 )
-
-// Runner provides capabilities to run GitHub actions
-type Runner interface {
-	NewPlanExecutor(plan *model.Plan) common.Executor
-}
 
 // Config contains the config for a new runner
 type Config struct {
-	Actor                              string                                        // the user that triggered the event
-	Workdir                            string                                        // path to working directory
-	ActionCacheDir                     string                                        // path used for caching action contents
-	ActionOfflineMode                  bool                                          // when offline, use cached action contents
-	ActionCloneDepth                   int                                           // limit history when cloning an action repo; 0 clones every branch in full
-	BindWorkdir                        bool                                          // bind the workdir to the job container
-	EventName                          string                                        // name of event to run
-	EventPath                          string                                        // path to JSON file to use for event.json in containers
-	DefaultBranch                      string                                        // name of the main branch for this repository
-	ReuseContainers                    bool                                          // reuse containers to maintain state
-	ForcePull                          bool                                          // force pulling of the image, even if already present
-	ForceRebuild                       bool                                          // force rebuilding local docker image action
-	LogOutput                          bool                                          // log the output from docker run
-	JSONLogger                         bool                                          // use json or text logger
-	LogPrefixJobID                     bool                                          // switches from the full job name to the job id
-	Env                                map[string]string                             // env for containers
-	Inputs                             map[string]string                             // manually passed action inputs
-	Secrets                            map[string]string                             // list of secrets
-	Vars                               map[string]string                             // list of vars
-	Token                              string                                        // GitHub token
-	InsecureSecrets                    bool                                          // switch hiding output when printing to terminal
-	Platforms                          map[string]string                             // list of platforms
-	Privileged                         bool                                          // use privileged mode
-	UsernsMode                         string                                        // user namespace to use
-	ContainerArchitecture              string                                        // Desired OS/architecture platform for running containers
-	ContainerDaemonSocket              string                                        // Path to Docker daemon socket
-	ContainerOptions                   string                                        // Options for the job container
-	UseGitIgnore                       bool                                          // controls if paths in .gitignore should not be copied into container, default true
-	GitHubInstance                     string                                        // GitHub instance to use, default "github.com"
-	ContainerCapAdd                    []string                                      // list of kernel capabilities to add to the containers
-	ContainerCapDrop                   []string                                      // list of kernel capabilities to remove from the containers
-	AutoRemove                         bool                                          // controls if the container is automatically removed upon workflow completion
-	ArtifactServerPath                 string                                        // the path where the artifact server stores uploads
-	ArtifactServerAddr                 string                                        // the address the artifact server binds to
-	ArtifactServerPort                 string                                        // the port the artifact server binds to
-	NoSkipCheckout                     bool                                          // do not skip actions/checkout
-	DisableActEnv                      bool                                          // do not inject the ACT=true environment variable into jobs
-	RemoteName                         string                                        // remote name in local git repo config
-	ReplaceGheActionWithGithubCom      []string                                      // Use actions from GitHub Enterprise instance to GitHub
-	ReplaceGheActionTokenWithGithubCom string                                        // Token of private action repo on GitHub.
-	Matrix                             map[string]map[string]bool                    // Matrix config to run
-	ContainerNetworkMode               docker_container.NetworkMode                  // the network mode of job containers (the value of --network)
-	ContainerNetworkCreateOptions      container.NewDockerNetworkCreateExecutorInput // the default network create options
-	ActionCache                        ActionCache                                   // Use a custom ActionCache Implementation
-	ProxyEnv                           map[string]string                             // the proxy variables the job runs with, also given to service containers and image builds
-	PatchToolkit                       bool                                          // edit the @actions toolkit bundled into an action so it works against Gitea, see toolkit_patch.go
+	Actor                         string                                        // the user that triggered the event
+	Workdir                       string                                        // path to working directory
+	ActionCacheDir                string                                        // path used for caching action contents
+	ActionOfflineMode             bool                                          // when offline, use cached action contents
+	ActionCloneDepth              int                                           // limit history when cloning an action repo, 0 clones every branch in full
+	BindWorkdir                   bool                                          // bind the workdir to the job container
+	EventName                     string                                        // name of event to run
+	EventPath                     string                                        // path to JSON file to use for event.json in containers
+	ForcePull                     bool                                          // force pulling of the image, even if already present
+	ForceRebuild                  bool                                          // force rebuilding local docker image action
+	JSONLogger                    bool                                          // use json or text logger
+	Env                           map[string]string                             // env for containers
+	Secrets                       map[string]string                             // list of secrets
+	ExtraMasks                    []string                                      // values to hide that are not in Secrets, such as the proxy password
+	RuntimeTokens                 map[*model.Workflow]string                    // ACTIONS_RUNTIME_TOKEN per workflow run, as each is its own artifact run
+	Vars                          map[string]string                             // list of vars
+	Token                         string                                        // GitHub token
+	InsecureSecrets               bool                                          // switch hiding output when printing to terminal
+	Privileged                    bool                                          // use privileged mode
+	UsernsMode                    string                                        // user namespace to use
+	ContainerArchitecture         string                                        // Desired OS/architecture platform for running containers
+	ContainerDaemonSocket         string                                        // Path to Docker daemon socket
+	ContainerOptions              string                                        // Options for the job container
+	UseGitIgnore                  bool                                          // controls if paths in .gitignore should not be copied into container, default true
+	GitHubInstance                string                                        // instance hostname or URL, empty when unknown
+	ContainerCapAdd               []string                                      // list of kernel capabilities to add to the containers
+	ContainerCapDrop              []string                                      // list of kernel capabilities to remove from the containers
+	ArtifactServerPath            string                                        // the path where the artifact server stores uploads
+	ArtifactServerAddr            string                                        // the address the artifact server binds to
+	ArtifactServerPort            string                                        // the port the artifact server binds to
+	NoSkipCheckout                bool                                          // do not skip actions/checkout
+	DisableActEnv                 bool                                          // do not inject the ACT=true environment variable into jobs
+	ContainerNetworkMode          docker_container.NetworkMode                  // the network mode of job containers (the value of --network)
+	ContainerNetworkCreateOptions container.NewDockerNetworkCreateExecutorInput // the default network create options
+	CacheContainer                string                                        // let jobs reach an otherwise isolated cache
+	ProxyEnv                      map[string]string                             // the proxy variables the job runs with, also given to service containers and image builds
+	NoActionPatch                 bool                                          // run actions exactly as published, applying no compatibility patches, see patch_actions.go
 
-	PresetGitHubContext   *model.GithubContext // the preset github context, overrides some fields like DefaultBranch, Env, Secrets etc.
+	PresetGitHubContext   *model.GithubContext // overrides actor, ref, repository, token and related context fields
+	WorkflowCallInputs    map[string]any       // the `inputs` Gitea resolved for a called workflow's job, nil for other jobs
 	EventJSON             string               // the content of JSON file to use for event.json in containers, overrides EventPath
 	ContainerNamePrefix   string               // the prefix of container name
 	ContainerMaxLifetime  time.Duration        // the max lifetime of job containers
-	CleanWorkdir          bool                 // remove host executor workdir on teardown
 	DefaultActionInstance string               // the default actions web site
 	// DefaultActionInstanceIsSelfHosted reports whether DefaultActionInstance is this
 	// self-hosted Gitea (DEFAULT_ACTIONS_URL=self). It gates token trust: only then may the
@@ -89,45 +78,44 @@ type Config struct {
 	// differ from GitHubInstance when the runner registered with a different hostname than
 	// AppURL. It is never set for github.com or a GithubMirror, so the token stays on-instance.
 	DefaultActionInstanceIsSelfHosted bool
-	PlatformPicker                    func(labels []string) string // platform picker, it will take precedence over Platforms if isn't nil
-	JobLoggerLevel                    *log.Level                   // the level of job logger
-	ValidVolumes                      []string                     // only volumes (and bind mounts) in this slice can be mounted on the job container or service containers
-	SharedToolCache                   bool                         // one tool cache for all jobs instead of one per job
-	InsecureSkipTLS                   bool                         // whether to skip verifying TLS certificate of the Gitea instance
-	MaxParallel                       int                          // max parallel jobs to run across all workflows (0 = no limit, uses CPU count)
-	AllocatePTY                       bool                         // allocate a pseudo-TTY for each step's process
-	ServiceReadyTimeout               time.Duration                // how long a job waits for its service containers to report healthy (0 uses the default)
-	RunnerName                        string                       // name this runner registered with, reported as `runner.name`, defaults to the hostname
-	JobStartedHook                    string                       // script run inside the job environment before the job's first step; ACTIONS_RUNNER_HOOK_JOB_STARTED is read from Env when empty
-	JobCompletedHook                  string                       // script run inside the job environment after the job's last step; ACTIONS_RUNNER_HOOK_JOB_COMPLETED is read from Env when empty
-	ContainerHooks                    hooks.Config                 // configures the container-hooks mode
+	PlatformPicker                    func(labels []string) string
+	KubernetesPicker                  func(labels []string) container.KubernetesOptions
+	InstanceTransport                 http.RoundTripper
+	JobLoggerLevel                    *logging.Level // the level of job logger
+	ValidVolumes                      []string       // only volumes (and bind mounts) in this slice can be mounted on the job container or service containers
+	ContainerVolumes                  []string       // mounted into every job, service and docker action container
+	SharedToolCache                   bool           // keeps the tool cache across jobs instead of one per job
+	ToolCacheSlot                     string         // keeps concurrent tasks' tool caches apart, empty for slot 0 and in exec
+	InsecureSkipTLS                   bool           // whether to skip verifying TLS certificate of the Gitea instance
+	ClientCertFile, ClientKeyFile     string         // PEM client certificate for the Gitea instance
+	CAFile                            string         // PEM CA certificates the Gitea instance's certificate chains to
+	MaxParallel                       int            // max parallel jobs to run across all workflows (0 = no limit, uses CPU count)
+	AllocatePTY                       bool           // allocate a pseudo-TTY for each step's process
+	ServiceReadyTimeout               time.Duration  // how long a job waits for its service containers to report healthy (0 uses the default)
+	Sweep                             bool           // remove the containers, networks and volumes a job creates through its docker proxy
+	RunnerName                        string         // name this runner registered with, reported as `runner.name`, defaults to the hostname
+	JobStartedHook                    string         // script run inside the job environment before the job's first step; ACTIONS_RUNNER_HOOK_JOB_STARTED is read from Env when empty
+	JobCompletedHook                  string         // script run inside the job environment after the job's last step; ACTIONS_RUNNER_HOOK_JOB_COMPLETED is read from Env when empty
+	ContainerHooks                    hooks.Config   // configures the container-hooks mode
 }
 
-// RunnerDebug reports whether debug logging is on, exposed as `runner.debug` and
-// RUNNER_DEBUG. Only the secret also makes the reporter keep ::debug:: output, the env
-// is accepted for `exec` and for runners configured with it.
+// RunnerDebug reports whether debug logging is on, exposed as `runner.debug` and RUNNER_DEBUG.
 func (c Config) RunnerDebug() bool {
-	return c.Secrets["ACTIONS_STEP_DEBUG"] == "true" || c.Env["ACTIONS_STEP_DEBUG"] == "true"
+	stepDebug, ok := c.Secrets["ACTIONS_STEP_DEBUG"]
+	if !ok {
+		stepDebug = c.Vars["ACTIONS_STEP_DEBUG"]
+	}
+	return stepDebug == "true" || c.Env["ACTIONS_STEP_DEBUG"] == "true"
 }
 
 // GetToken: Adapt to Gitea
 func (c Config) GetToken() string {
-	token := c.Secrets["GITHUB_TOKEN"]
-	if c.Secrets["GITEA_TOKEN"] != "" {
-		token = c.Secrets["GITEA_TOKEN"]
-	}
-	return token
+	return cmp.Or(c.Secrets["GITEA_TOKEN"], c.Secrets["GITHUB_TOKEN"])
 }
 
 // DefaultActionURL returns the host used for implicit remote actions.
 func (c Config) DefaultActionURL() string {
-	if c.DefaultActionInstance != "" {
-		return c.DefaultActionInstance
-	}
-	if c.GitHubInstance != "" {
-		return c.GitHubInstance
-	}
-	return "github.com"
+	return cmp.Or(c.DefaultActionInstance, c.GitHubInstance, "github.com")
 }
 
 type caller struct {
@@ -143,8 +131,10 @@ type runnerImpl struct {
 	caller    *caller // the job calling this runner (caller of a reusable workflow)
 }
 
+type Runner = runnerImpl
+
 // New Creates a new Runner
-func New(runnerConfig *Config) (Runner, error) {
+func New(runnerConfig *Config) (*Runner, error) {
 	runner := &runnerImpl{
 		config: runnerConfig,
 	}
@@ -152,7 +142,7 @@ func New(runnerConfig *Config) (Runner, error) {
 	return runner.configure()
 }
 
-func (runner *runnerImpl) configure() (Runner, error) {
+func (runner *runnerImpl) configure() (*runnerImpl, error) {
 	if runner.config.RunnerName == "" {
 		// Callers that do not register, such as `exec`, still get a `runner.name`.
 		runner.config.RunnerName, _ = os.Hostname()
@@ -162,115 +152,129 @@ func (runner *runnerImpl) configure() (Runner, error) {
 	if runner.config.EventJSON != "" {
 		runner.eventJSON = runner.config.EventJSON
 	} else if runner.config.EventPath != "" {
-		log.Debugf("Reading event.json from %s", runner.config.EventPath)
+		logging.Debugf("Reading event.json from %s", runner.config.EventPath)
 		eventJSONBytes, err := os.ReadFile(runner.config.EventPath)
 		if err != nil {
 			return nil, err
 		}
 		runner.eventJSON = string(eventJSONBytes)
-	} else if len(runner.config.Inputs) != 0 {
-		eventMap := map[string]map[string]string{
-			"inputs": runner.config.Inputs,
-		}
-		eventJSON, err := json.Marshal(eventMap)
-		if err != nil {
-			return nil, err
-		}
-		runner.eventJSON = string(eventJSON)
 	}
 	return runner, nil
 }
 
+func maxParallelFor(strategy *model.Strategy, combinations int) int {
+	maxParallel := 4 // actionslib has no default for an undeclared max-parallel
+	if strategy != nil {
+		if limit, err := strategy.MaxParallel(); err != nil {
+			logging.Errorf("Ignoring invalid max-parallel: %v", err)
+		} else if limit > 0 {
+			maxParallel = limit
+		}
+	}
+	return min(maxParallel, combinations)
+}
+
 // NewPlanExecutor ...
 func (runner *runnerImpl) NewPlanExecutor(plan *model.Plan) common.Executor {
+	for _, stage := range plan.Stages {
+		for _, run := range stage.Runs {
+			job := run.Job()
+			if runsOn := job.RunsOn(); job.Uses == "" && len(job.Steps) > 0 && (len(runsOn) == 0 || slices.Contains(runsOn, "")) { // Gitea's needs placeholders carry no steps
+				return common.NewErrorExecutor(fmt.Errorf("job %q requires a non-empty 'runs-on'", run.JobID))
+			}
+		}
+	}
+
 	maxJobNameLen := 0
 
 	stagePipeline := make([]common.Executor, 0)
-	log.Debugf("Plan Stages: %v", plan.Stages)
+	logging.Debugf("Plan Stages: %v", plan.Stages)
 
-	for i := range plan.Stages {
-		stage := plan.Stages[i]
+	for _, stage := range plan.Stages {
 		stagePipeline = append(stagePipeline, func(ctx context.Context) error {
 			pipeline := make([]common.Executor, 0)
 			for _, run := range stage.Runs {
-				log.Debugf("Stages Runs: %v", stage.Runs)
+				logging.Debugf("Stages Runs: %v", stage.Runs)
 				stageExecutor := make([]common.Executor, 0)
 				job := run.Job()
-				log.Debugf("Job.Name: %v", job.Name)
-				log.Debugf("Job.RawNeeds: %v", job.RawNeeds)
-				log.Debugf("Job.RawRunsOn: %v", job.RawRunsOn)
-				log.Debugf("Job.Env: %v", job.Env)
-				log.Debugf("Job.If: %v", job.If)
+				logging.Debugf("Job.Name: %v", job.Name)
+				logging.Debugf("Job.RawNeeds: %v", job.RawNeeds)
+				logging.Debugf("Job.RawRunsOn: %v", job.RawRunsOn)
+				logging.Debugf("Job.Env: %v", job.Env)
+				logging.Debugf("Job.If: %v", job.If)
 				for step := range job.Steps {
 					if nil != job.Steps[step] {
-						log.Debugf("Job.Steps: %v", job.Steps[step].String())
+						logging.Debugf("Job.Steps: %v", job.Steps[step].String())
 					}
 				}
-				log.Debugf("Job.TimeoutMinutes: %v", job.TimeoutMinutes)
-				log.Debugf("Job.Services: %v", job.Services)
-				log.Debugf("Job.Strategy: %v", job.Strategy)
-				log.Debugf("Job.RawContainer: %v", job.RawContainer)
-				log.Debugf("Job.Defaults.Run.Shell: %v", job.Defaults.Run.Shell)
-				log.Debugf("Job.Defaults.Run.WorkingDirectory: %v", job.Defaults.Run.WorkingDirectory)
-				log.Debugf("Job.Outputs: %v", job.Outputs)
-				log.Debugf("Job.Uses: %v", job.Uses)
-				log.Debugf("Job.With: %v", job.With)
-				// log.Debugf("Job.RawSecrets: %v", job.RawSecrets)
-				log.Debugf("Job.Result: %v", job.Result)
+				logging.Debugf("Job.TimeoutMinutes: %v", job.TimeoutMinutes)
+				logging.Debugf("Job.Services: %v", job.Services)
+				logging.Debugf("Job.Strategy: %v", job.Strategy)
+				logging.Debugf("Job.RawContainer: %v", job.RawContainer)
+				logging.Debugf("Job.Defaults.Run.Shell: %v", job.Defaults.Run.Shell)
+				logging.Debugf("Job.Defaults.Run.WorkingDirectory: %v", job.Defaults.Run.WorkingDirectory)
+				logging.Debugf("Job.Outputs: %v", job.Outputs)
+				logging.Debugf("Job.Uses: %v", job.Uses)
+				logging.Debugf("Job.With: %v", job.With)
+				logging.Debugf("Job.Result: %v", job.Result)
 
-				if job.Strategy != nil {
-					log.Debugf("Job.Strategy.FailFast: %v", job.Strategy.FailFast)
-					log.Debugf("Job.Strategy.MaxParallel: %v", job.Strategy.MaxParallel)
-					log.Debugf("Job.Strategy.FailFastString: %v", job.Strategy.FailFastString)
-					log.Debugf("Job.Strategy.MaxParallelString: %v", job.Strategy.MaxParallelString)
-					log.Debugf("Job.Strategy.RawMatrix: %v", job.Strategy.RawMatrix)
-
-					strategyRc := runner.newRunContext(ctx, run, nil)
-					// Resolve template expressions in the matrix node before Matrix() is called.
-					// On failure the literal string is kept and normalizeMatrixValue wraps it as a fallback.
-					if err := strategyRc.NewExpressionEvaluator(ctx).EvaluateYamlNode(ctx, &job.Strategy.RawMatrix); err != nil {
-						log.Errorf("Error while evaluating matrix: %v", err)
+				if job.Strategy != nil || job.RawStrategy.Kind == yaml.ScalarNode {
+					strategyRc, err := runner.newRunContext(ctx, run, nil)
+					if err != nil {
+						return err
+					}
+					if job.RawStrategy.Kind == yaml.ScalarNode {
+						if err := model.DecodeEvaluated("job strategy", job.RawStrategy, strategyRc.ExprEval.shared(ctx).EvaluateYamlNode, &job.Strategy); err != nil {
+							return err
+						}
+					} else {
+						logging.Debugf("Job.Strategy.FailFast: %v", job.Strategy.GetFailFast())
+						logging.Debugf("Job.Strategy.FailFastString: %v", job.Strategy.FailFastString)
+						logging.Debugf("Job.Strategy.MaxParallelString: %v", job.Strategy.MaxParallelString)
+						logging.Debugf("Job.Strategy.RawMatrix: %v", job.Strategy.RawMatrix)
+						// An unevaluated expression is left in place, which GetMatrixes below rejects.
+						if err := strategyRc.NewExpressionEvaluator(ctx).EvaluateYamlNode(ctx, &job.Strategy.RawMatrix); err != nil {
+							logging.Errorf("Error while evaluating matrix: %v", err)
+						}
+						for _, value := range []*string{&job.Strategy.FailFastString, &job.Strategy.MaxParallelString} {
+							if evaluated, err := strategyRc.ExprEval.Interpolate(ctx, *value); err == nil {
+								*value = evaluated
+							}
+						}
 					}
 				}
 
-				var matrixes []map[string]any
-				if m, err := job.GetMatrixes(); err != nil {
-					log.Errorf("Error while get job's matrix: %v", err)
-				} else {
-					log.Debugf("Job Matrices: %v", m)
-					log.Debugf("Runner Matrices: %v", runner.config.Matrix)
-					matrixes = selectMatrixes(m, runner.config.Matrix)
+				matrixes, err := job.GetMatrixes()
+				if err != nil {
+					return fmt.Errorf("could not get job matrix: %w", err)
 				}
-				log.Debugf("Final matrix after applying user inclusions '%v'", matrixes)
+				logging.Debugf("Job Matrices: %v", matrixes)
 
-				maxParallel := 4
-				if job.Strategy != nil {
-					// Ensure GetMaxParallel() is called if MaxParallel is still 0
-					if job.Strategy.MaxParallel == 0 {
-						job.Strategy.MaxParallel = job.Strategy.GetMaxParallel()
-					}
-					maxParallel = job.Strategy.MaxParallel
-					log.Debugf("Using job.Strategy.MaxParallel: %d", maxParallel)
-				}
+				maxParallel := maxParallelFor(job.Strategy, len(matrixes))
 
-				if len(matrixes) < maxParallel {
-					log.Debugf("Adjusting maxParallel from %d to %d (number of matrix combinations)", maxParallel, len(matrixes))
-					maxParallel = len(matrixes)
-				}
-
-				log.Infof("Running job with maxParallel=%d for %d matrix combinations", maxParallel, len(matrixes))
+				logging.Infof("Running job with maxParallel=%d for %d matrix combinations", maxParallel, len(matrixes))
 
 				for i, matrix := range matrixes {
-					rc := runner.newRunContext(ctx, run, matrix)
+					index, total := i, len(matrixes)
+					if runner.caller == nil && runner.config.PresetGitHubContext != nil && len(matrix) > 0 {
+						var expanded struct {
+							Index int `yaml:"job-index"`
+							Total int `yaml:"job-total"`
+						}
+						_ = job.RawStrategy.Decode(&expanded) // Gitea expanded the combination, a version writing neither leaves them unknown
+						index, total = expanded.Index, expanded.Total
+					}
+					rc, err := runner.newCombinationRunContext(ctx, run, matrix, index, total)
+					if err != nil {
+						return err
+					}
 					rc.JobName = rc.Name
 					if len(matrixes) > 1 {
 						rc.Name = fmt.Sprintf("%s-%d", rc.Name, i+1)
 					}
-					if len(rc.String()) > maxJobNameLen {
-						maxJobNameLen = len(rc.String())
-					}
+					maxJobNameLen = max(maxJobNameLen, len(rc.String()))
 					if rc.caller != nil { // For Gitea
-						rc.caller.setReusedWorkflowJobResult(rc.JobName, "pending")
+						rc.caller.setReusedWorkflowJobResult(rc.Run.JobID, "pending")
 					}
 					stageExecutor = append(stageExecutor, func(ctx context.Context) error {
 						jobName := fmt.Sprintf("%-*s", maxJobNameLen, rc.String())
@@ -305,7 +309,7 @@ func (runner *runnerImpl) NewPlanExecutor(plan *model.Plan) common.Executor {
 			if len(pipeline) == 1 {
 				// Single run/job: execute directly without additional parallelization wrapper
 				// This ensures max-parallel is the only limiting factor
-				log.Debugf("Single pipeline element, executing directly")
+				logging.Debugf("Single pipeline element, executing directly")
 				return pipeline[0](ctx)
 			}
 
@@ -315,22 +319,22 @@ func (runner *runnerImpl) NewPlanExecutor(plan *model.Plan) common.Executor {
 			// If MaxParallel is set in config, use it
 			if runner.config.MaxParallel > 0 {
 				parallelism = runner.config.MaxParallel
-				log.Debugf("Using configured max-parallel: %d", parallelism)
+				logging.Debugf("Using configured max-parallel: %d", parallelism)
 			} else {
-				log.Debugf("Using CPU count for parallelism: %d", parallelism)
+				logging.Debugf("Using CPU count for parallelism: %d", parallelism)
 			}
 
-			// Don't exceed the number of pipeline elements
-			if parallelism > len(pipeline) {
-				parallelism = len(pipeline)
-			}
+			parallelism = min(parallelism, len(pipeline))
 
-			log.Infof("Executing %d pipeline elements with parallelism %d", len(pipeline), parallelism)
+			logging.Infof("Executing %d pipeline elements with parallelism %d", len(pipeline), parallelism)
 			return common.NewParallelExecutor(parallelism, pipeline...)(ctx)
 		})
 	}
 
-	return common.NewPipelineExecutor(stagePipeline...).Then(handleFailure(plan))
+	executor := common.NewPipelineExecutor(stagePipeline...).Then(handleFailure(plan))
+	return func(ctx context.Context) error {
+		return executor(container.WithRunnerArch(ghcontext.WithPinnedCheckout(ctx, &sync.Map{})))
+	}
 }
 
 func handleFailure(plan *model.Plan) common.Executor {
@@ -338,7 +342,7 @@ func handleFailure(plan *model.Plan) common.Executor {
 		for _, stage := range plan.Stages {
 			for _, run := range stage.Runs {
 				if run.Job().Result == "failure" && !run.Job().ContinueOnError {
-					return fmt.Errorf("Job '%s' failed", run.String())
+					return fmt.Errorf("job '%s' failed", run.String())
 				}
 			}
 		}
@@ -346,51 +350,43 @@ func handleFailure(plan *model.Plan) common.Executor {
 	}
 }
 
-func selectMatrixes(originalMatrixes []map[string]any, targetMatrixValues map[string]map[string]bool) []map[string]any {
-	matrixes := make([]map[string]any, 0)
-	for _, original := range originalMatrixes {
-		flag := true
-		for key, val := range original {
-			if allowedVals, ok := targetMatrixValues[key]; ok {
-				valToString := fmt.Sprintf("%v", val)
-				if _, ok := allowedVals[valToString]; !ok {
-					flag = false
-				}
-			}
-		}
-		if flag {
-			matrixes = append(matrixes, original)
-		}
-	}
-	return matrixes
+func (runner *runnerImpl) newRunContext(ctx context.Context, run *model.Run, matrix map[string]any) (*RunContext, error) {
+	return runner.newCombinationRunContext(ctx, run, matrix, 0, 1)
 }
 
-func (runner *runnerImpl) newRunContext(ctx context.Context, run *model.Run, matrix map[string]any) *RunContext {
+func (runner *runnerImpl) newCombinationRunContext(ctx context.Context, run *model.Run, matrix map[string]any, index, total int) (*RunContext, error) {
 	rc := &RunContext{
-		Config:      runner.config,
-		Run:         run,
-		EventJSON:   runner.eventJSON,
-		StepResults: make(map[string]*model.StepResult),
-		Matrix:      matrix,
-		caller:      runner.caller,
-		containerHooks: &containerHooks{
-			StepSpecs: make(map[int]*hooks.ContainerStepSpec),
-		},
+		Config:         runner.config,
+		Run:            run,
+		EventJSON:      runner.eventJSON,
+		StepResults:    make(map[string]*model.StepResult),
+		Matrix:         matrix,
+		caller:         runner.caller,
+		containerHooks: &containerHooks{StepSpecs: make(map[int]*hooks.ContainerStepSpec)},
+		jobIndex:       index,
+		jobTotal:       total,
+
+		runtimeToken: runner.config.RuntimeTokens[run.Workflow],
+	}
+	if runner.caller != nil {
+		rc.runtimeToken = runner.caller.runContext.runtimeToken
+	}
+	if err := rc.resolveWorkflowCall(ctx); err != nil {
+		return nil, err
 	}
 	rc.ExprEval = rc.NewExpressionEvaluator(ctx)
-	rc.Name = rc.ExprEval.Interpolate(ctx, run.String())
-	// Snapshot the job's pristine output expressions now, before any matrix combo runs and
-	// rewrites the shared Job.Outputs (see interpolateOutputs).
-	if job := run.Job(); job != nil {
-		rc.outputTemplate = maps.Clone(job.Outputs)
+	rc.Name = rc.maskSecrets(rc.ExprEval.InterpolateName(ctx, run.String()))
+	if job := run.Job(); job != nil && job.RawOutputs.Kind != 0 {
+		job.Outputs = nil // a job no combination ran for reads "" as on GitHub, a Gitea needs placeholder has no RawOutputs and keeps its outputs
 	}
 
-	return rc
+	return rc, nil
 }
 
 // For Gitea
-func (c *caller) setReusedWorkflowJobResult(jobName, result string) {
+// Keyed by job id, not name: only the values are read, and masking can collapse two names into one.
+func (c *caller) setReusedWorkflowJobResult(jobID, result string) {
 	c.updateResultLock.Lock()
 	defer c.updateResultLock.Unlock()
-	c.reusedWorkflowJobResults[jobName] = result
+	c.reusedWorkflowJobResults[jobID] = result
 }

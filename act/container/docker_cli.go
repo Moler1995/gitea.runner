@@ -2,12 +2,14 @@
 // Copyright 2022 The nektos/act Authors. All rights reserved.
 // SPDX-License-Identifier: MIT
 
-//go:build !(WITHOUT_DOCKER || !(linux || darwin || windows || netbsd))
+//go:build !(WITHOUT_DOCKER || !(linux || darwin || windows || netbsd || freebsd))
 
-// This file is exact copy of https://github.com/docker/cli/blob/dfc4efb1e2ab8c06d70d2a1366ad448d2f917e90/cli/command/container/opts.go with:
+// This file is based on https://github.com/docker/cli/blob/4a63305d74332de5ceba7fcbccbc3cbb7412f5ba/cli/command/container/opts.go with:
 // * appended with license information
-// * regexp and loader.ParseVolume in place of the import-restricted internal/lazyregexp and internal/volumespec
-// * invalidParameter from the package's errors.go, and convertPortSet/convertPortMap for the callers in docker_run.go
+// * regexp and ParseVolume in place of the import-restricted internal/lazyregexp and internal/volumespec
+// * cdiDeviceName in place of the container-device-interface parser's IsQualifiedName
+// * jsontext in place of json.Compact for the seccomp profile
+// * invalidParameter from the package's errors.go, and convertPortSet/convertPortMap for nat port types
 //
 // docker/cli is licensed under the Apache License, Version 2.0.
 // See DOCKER_LICENSE for the full license text.
@@ -17,8 +19,7 @@
 package container
 
 import (
-	"bytes"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"net"
@@ -33,14 +34,12 @@ import (
 	"time"
 
 	cerrdefs "github.com/containerd/errdefs"
-	"github.com/docker/cli/cli/compose/loader"
 	"github.com/docker/cli/opts"
 	"github.com/docker/go-connections/nat"
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/mount"
 	"github.com/moby/moby/api/types/network"
 	"github.com/spf13/pflag"
-	cdi "tags.cncf.io/container-device-interface/pkg/parser"
 )
 
 const (
@@ -153,10 +152,8 @@ type containerOptions struct {
 	runtime             string
 	autoRemove          bool
 	init                bool
+	umask               opts.UmaskOpt
 	annotations         *opts.MapOpts
-
-	Image string
-	Args  []string
 }
 
 // addFlags adds all command line flags that will be used by parse to the FlagSet
@@ -327,6 +324,9 @@ func addFlags(flags *pflag.FlagSet) *containerOptions {
 	flags.Var(&copts.shmSize, "shm-size", "Size of /dev/shm")
 	flags.StringVar(&copts.utsMode, "uts", "", "UTS namespace to use")
 	flags.StringVar(&copts.runtime, "runtime", "", "Runtime to use for this container")
+	flags.Var(&copts.umask, "umask", "Set umask for the container")
+	flags.SetAnnotation("umask", "version", []string{"1.56"})
+	flags.SetAnnotation("umask", "ostype", []string{"linux"})
 
 	flags.BoolVar(&copts.init, "init", false, "Run an init inside the container that forwards signals and reaps processes")
 	flags.SetAnnotation("init", "version", []string{"1.25"})
@@ -384,7 +384,7 @@ func parse(flags *pflag.FlagSet, copts *containerOptions, serverOS string) (*con
 	volumes := copts.volumes.GetMap()
 	// add any bind targets to the list of container volumes
 	for bind := range volumes {
-		parsed, err := loader.ParseVolume(bind)
+		parsed, err := ParseVolume(bind)
 		if err != nil {
 			return nil, err
 		}
@@ -392,7 +392,7 @@ func parse(flags *pflag.FlagSet, copts *containerOptions, serverOS string) (*con
 		if parsed.Source != "" {
 			toBind := bind
 
-			if parsed.Type == string(mount.TypeBind) {
+			if parsed.Type == mount.TypeBind {
 				if hostPart, targetPath, ok := strings.Cut(bind, ":"); ok {
 					if !filepath.IsAbs(hostPart) && strings.HasPrefix(hostPart, ".") {
 						if absHostPart, err := filepath.Abs(hostPart); err == nil {
@@ -419,12 +419,7 @@ func parse(flags *pflag.FlagSet, copts *containerOptions, serverOS string) (*con
 		tmpfs[k] = v
 	}
 
-	var runCmd, entrypoint []string
-
-	if len(copts.Args) > 0 {
-		runCmd = copts.Args
-	}
-
+	var entrypoint []string
 	if copts.entrypoint != "" {
 		entrypoint = []string{copts.entrypoint}
 	} else if flags.Changed("entrypoint") {
@@ -445,36 +440,15 @@ func parse(flags *pflag.FlagSet, copts *containerOptions, serverOS string) (*con
 	if err != nil {
 		return nil, err
 	}
-	portBindings := network.PortMap{}
-	for port, bindings := range natPortBindings {
-		p, err := network.ParsePort(string(port))
-		if err != nil {
-			return nil, err
-		}
-		portBindings[p] = []network.PortBinding{}
-		for _, b := range bindings {
-			var hostIP netip.Addr
-			if b.HostIP != "" {
-				hostIP, err = netip.ParseAddr(b.HostIP)
-				if err != nil {
-					return nil, err
-				}
-			}
-			portBindings[p] = append(portBindings[p], network.PortBinding{
-				HostIP:   hostIP,
-				HostPort: b.HostPort,
-			})
-		}
+	portBindings, err := convertPortMap(natPortBindings)
+	if err != nil {
+		return nil, err
 	}
 
 	// Add published ports as exposed ports.
-	exposedPorts := network.PortSet{}
-	for port := range ports {
-		p, err := network.ParsePort(string(port))
-		if err != nil {
-			return nil, err
-		}
-		exposedPorts[p] = struct{}{}
+	exposedPorts, err := convertPortSet(ports)
+	if err != nil {
+		return nil, err
 	}
 
 	// Merge in exposed ports to the map of published ports
@@ -500,7 +474,7 @@ func parse(flags *pflag.FlagSet, copts *containerOptions, serverOS string) (*con
 	deviceMappings := make([]container.DeviceMapping, 0, len(devices))
 	cdiDeviceNames := make([]string, 0, len(devices))
 	for _, device := range devices {
-		if cdi.IsQualifiedName(device) {
+		if cdiDeviceName.MatchString(device) {
 			cdiDeviceNames = append(cdiDeviceNames, device)
 			continue
 		}
@@ -615,11 +589,10 @@ func parse(flags *pflag.FlagSet, copts *containerOptions, serverOS string) (*con
 
 	deviceRequests := copts.gpus.Value()
 	if len(cdiDeviceNames) > 0 {
-		cdiDeviceRequest := container.DeviceRequest{
+		deviceRequests = append(deviceRequests, container.DeviceRequest{
 			Driver:    "cdi",
 			DeviceIDs: cdiDeviceNames,
-		}
-		deviceRequests = append(deviceRequests, cdiDeviceRequest)
+		})
 	}
 
 	resources := container.Resources{
@@ -665,8 +638,6 @@ func parse(flags *pflag.FlagSet, copts *containerOptions, serverOS string) (*con
 		AttachStdout: attachStdout,
 		AttachStderr: attachStderr,
 		Env:          envVariables,
-		Cmd:          runCmd,
-		Image:        copts.Image,
 		Volumes:      volumes,
 		Entrypoint:   entrypoint,
 		WorkingDir:   copts.workingDir,
@@ -722,6 +693,7 @@ func parse(flags *pflag.FlagSet, copts *containerOptions, serverOS string) (*con
 		MaskedPaths:    maskedPaths,
 		ReadonlyPaths:  readonlyPaths,
 		Annotations:    copts.annotations.GetAll(),
+		Umask:          copts.umask.Value(),
 	}
 
 	if copts.autoRemove && !hostConfig.RestartPolicy.IsNone() {
@@ -752,6 +724,10 @@ func parse(flags *pflag.FlagSet, copts *containerOptions, serverOS string) (*con
 	}, nil
 }
 
+func isUserDefinedNetwork(mode container.NetworkMode) bool { // Docker's helper uses the host OS instead of the daemon's.
+	return !mode.IsDefault() && mode != network.NetworkBridge && mode != network.NetworkHost && !mode.IsNone() && !mode.IsContainer()
+}
+
 // parseNetworkOpts converts --network advanced options to endpoint-specs, and combines
 // them with the old --network-alias and --links. If returns an error if conflicting options
 // are found.
@@ -780,7 +756,7 @@ func parseNetworkOpts(copts *containerOptions) (map[string]*network.EndpointSett
 	}
 
 	for i, n := range copts.netMode.Value() {
-		if container.NetworkMode(n.Target).IsUserDefined() {
+		if isUserDefinedNetwork(container.NetworkMode(n.Target)) {
 			hasUserDefined = true
 		} else {
 			hasNonUserDefined = true
@@ -806,10 +782,8 @@ func parseNetworkOpts(copts *containerOptions) (map[string]*network.EndpointSett
 		// For backward compatibility: if no custom options are provided for the network,
 		// and only a single network is specified, omit the endpoint-configuration
 		// on the client (the daemon will still create it when creating the container)
-		if i == 0 && len(copts.netMode.Value()) == 1 {
-			if ep == nil || reflect.ValueOf(*ep).IsZero() {
-				continue
-			}
+		if i == 0 && len(copts.netMode.Value()) == 1 && reflect.ValueOf(*ep).IsZero() {
+			continue
 		}
 		endpoints[n.Target] = ep
 	}
@@ -840,14 +814,12 @@ func applyContainerOptions(n *opts.NetworkAttachmentOpts, copts *containerOption
 		return invalidParameter(errors.New("conflicting options: cannot specify both --link-local-ip and per-network link-local IP addresses"))
 	}
 	if copts.aliases.Len() > 0 {
-		n.Aliases = make([]string, copts.aliases.Len())
-		copy(n.Aliases, copts.aliases.GetSlice())
+		n.Aliases = slices.Clone(copts.aliases.GetSlice())
 	}
 	// For a user-defined network, "--link" is an endpoint option, it creates an alias. But,
 	// for the default bridge it defines a legacy-link.
-	if container.NetworkMode(n.Target).IsUserDefined() && copts.links.Len() > 0 {
-		n.Links = make([]string, copts.links.Len())
-		copy(n.Links, copts.links.GetSlice())
+	if isUserDefinedNetwork(container.NetworkMode(n.Target)) && copts.links.Len() > 0 {
+		n.Links = slices.Clone(copts.links.GetSlice())
 	}
 	if copts.ipv4Address != nil {
 		if ipv4, ok := netip.AddrFromSlice(copts.ipv4Address.To4()); ok {
@@ -872,7 +844,7 @@ func parseNetworkAttachmentOpt(ep opts.NetworkAttachmentOpts) (*network.Endpoint
 	if strings.TrimSpace(ep.Target) == "" {
 		return nil, errors.New("no name set for network")
 	}
-	if !container.NetworkMode(ep.Target).IsUserDefined() {
+	if !isUserDefinedNetwork(container.NetworkMode(ep.Target)) {
 		if len(ep.Aliases) > 0 {
 			return nil, errors.New("network-scoped aliases are only supported for user-defined networks")
 		}
@@ -886,7 +858,6 @@ func parseNetworkAttachmentOpt(ep opts.NetworkAttachmentOpts) (*network.Endpoint
 	}
 	epConfig.Aliases = append(epConfig.Aliases, ep.Aliases...)
 	if len(ep.DriverOpts) > 0 {
-		epConfig.DriverOpts = make(map[string]string)
 		epConfig.DriverOpts = ep.DriverOpts
 	}
 	if len(ep.Links) > 0 {
@@ -930,11 +901,10 @@ func convertToStandardNotation(ports []string) ([]string, error) {
 }
 
 func parseLoggingOpts(loggingDriver string, loggingOpts []string) (map[string]string, error) {
-	loggingOptsMap := opts.ConvertKVStringsToMap(loggingOpts)
 	if loggingDriver == "none" && len(loggingOpts) > 0 {
 		return map[string]string{}, fmt.Errorf("invalid logging opts for driver %s", loggingDriver)
 	}
-	return loggingOptsMap, nil
+	return opts.ConvertKVStringsToMap(loggingOpts), nil
 }
 
 // takes a local seccomp daemon, reads the file contents for sending to the daemon
@@ -959,11 +929,11 @@ func parseSecurityOpts(securityOpts []string) ([]string, error) {
 				if err != nil {
 					return securityOpts, fmt.Errorf("opening seccomp profile (%s) failed: %w", v, err)
 				}
-				var b bytes.Buffer
-				if err := json.Compact(&b, f); err != nil {
+				profile := jsontext.Value(f)
+				if err := profile.Compact(); err != nil {
 					return securityOpts, fmt.Errorf("compacting json for seccomp profile (%s) failed: %w", v, err)
 				}
-				securityOpts[key] = "seccomp=" + b.String()
+				securityOpts[key] = "seccomp=" + string(profile)
 			}
 		}
 	}
@@ -1191,6 +1161,8 @@ func convertPortSet(ports nat.PortSet) (network.PortSet, error) {
 	}
 	return converted, nil
 }
+
+var cdiDeviceName = regexp.MustCompile(`^[a-zA-Z]([a-zA-Z0-9_.-]*[a-zA-Z0-9])?/[a-zA-Z]([a-zA-Z0-9_.-]*[a-zA-Z0-9])?=[a-zA-Z0-9]([a-zA-Z0-9_.:-]*[a-zA-Z0-9])?$`)
 
 func convertPortMap(bindings nat.PortMap) (network.PortMap, error) {
 	converted := make(network.PortMap, len(bindings))

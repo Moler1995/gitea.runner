@@ -1,0 +1,229 @@
+// Copyright 2026 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+//go:build e2e
+
+package e2e
+
+import (
+	"cmp"
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"net"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"gitea.com/gitea/runner/internal/app/poll"
+
+	mobyclient "github.com/moby/moby/client"
+)
+
+const runTimeout = 3 * time.Minute
+
+const cleanupTimeout = 2 * time.Minute
+
+var nonRepoChars = regexp.MustCompile(`[^a-zA-Z0-9._-]+`)
+
+var fixture *GiteaFixture
+
+var skipReason string
+
+var binDir string
+
+var dockerCLI mobyclient.APIClient
+
+var runnerBinary = sync.OnceValues(func() (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), runTimeout)
+	defer cancel()
+	bin := filepath.Join(binDir, "gitea-runner")
+	if out, err := exec.CommandContext(ctx, cmp.Or(os.Getenv("GO"), "go"), "build", "-o", bin, "..").CombinedOutput(); err != nil {
+		return "", fmt.Errorf("build runner: %w\n%s", err, out)
+	}
+	return bin, nil
+})
+
+func TestMain(m *testing.M) {
+	os.Exit(runSuite(m))
+}
+
+func runSuite(m *testing.M) int {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	cli, err := dockerClient(ctx)
+	if err != nil {
+		skipReason = fmt.Sprintf("docker unavailable: %v", err)
+		return m.Run()
+	}
+	dockerCLI = cli
+
+	if binDir, err = os.MkdirTemp("", "gitea-runner-e2e-"); err != nil {
+		fmt.Fprintf(os.Stderr, "create binary dir: %v\n", err)
+		return 1
+	}
+	defer os.RemoveAll(binDir)
+	defer stopCluster()
+	if flag.Parse(); flag.Lookup("test.run").Value.String() == "" { // a filtered run starts the cluster only if it needs it
+		go func() { _, _ = k3s() }()
+	}
+
+	f, err := StartGitea(ctx, cli)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "start gitea fixture: %v\n", err)
+		return 1
+	}
+	fixture = f
+	defer func() { _ = fixture.Close() }()
+
+	fmt.Fprintf(os.Stderr, "gitea fixture: image=%s version=%s\n", fixture.image, fixture.version)
+
+	code := m.Run()
+	if err := checkClusterLeaks(); err != nil && code == 0 {
+		fmt.Fprintln(os.Stderr, err)
+		code = 1
+	}
+	return code
+}
+
+func newScenario(t *testing.T) (*GiteaAPI, string) {
+	t.Helper()
+
+	repo := strings.ToLower(nonRepoChars.ReplaceAllString(t.Name(), "-"))
+	api := &GiteaAPI{baseURL: fixture.baseURL, token: fixture.adminToken}
+	if err := api.CreateRepo(t.Context(), repo); err != nil {
+		t.Fatalf("create repo: %v", err)
+	}
+	return api, repo
+}
+
+func startIsolatedScenario(t *testing.T, workflow, label string, options runnerOptions) (*GiteaAPI, string, *poll.Poller) {
+	t.Helper()
+
+	api, repo := newScenario(t)
+	poller := startRunner(t, repo, label, options)
+	pushWorkflow(t, api, repo, workflow)
+	return api, repo, poller
+}
+
+func pushWorkflow(t *testing.T, api *GiteaAPI, repo, workflow string) {
+	t.Helper()
+
+	content, err := os.ReadFile("testdata/workflows/" + workflow)
+	if err != nil {
+		t.Fatalf("read workflow fixture %s: %v", workflow, err)
+	}
+	if err := api.CreateFile(t.Context(), repo, ".gitea/workflows/"+workflow, string(content), "add "+workflow); err != nil {
+		t.Fatalf("push workflow %s: %v", workflow, err)
+	}
+}
+
+func requireSuccess(t *testing.T, api *GiteaAPI, repo string, runID int64) {
+	t.Helper()
+
+	completed, err := api.WaitForRunConclusion(t.Context(), repo, runID, runTimeout)
+	if err != nil {
+		dumpRunLogs(t, api, repo, runID)
+		t.Fatalf("wait for run: %v", err)
+	}
+	if completed.Conclusion != "success" {
+		dumpRunLogs(t, api, repo, runID)
+		t.Fatalf("run concluded %q, want success", completed.Conclusion)
+	}
+}
+
+func runLogs(t *testing.T, api *GiteaAPI, repo string, runID int64) string {
+	t.Helper()
+	ctx := t.Context()
+
+	jobs, err := api.Jobs(ctx, repo, runID)
+	if err != nil {
+		t.Fatalf("list jobs: %v", err)
+	}
+	var all strings.Builder
+	for _, job := range jobs {
+		logs, err := api.JobLogs(ctx, repo, job.ID)
+		var response statusError
+		if errors.As(err, &response) && response.code == http.StatusNotFound {
+			continue // skipped jobs and reusable workflow callers never ran a task, so have no log
+		}
+		if err != nil {
+			t.Fatalf("job logs for %s: %v", job.Name, err)
+		}
+		all.WriteString(logs)
+	}
+	return all.String()
+}
+
+func dumpRunLogs(t *testing.T, api *GiteaAPI, repo string, runID int64) {
+	t.Helper()
+	ctx := t.Context()
+
+	jobs, err := api.Jobs(ctx, repo, runID)
+	if err != nil {
+		t.Logf("dump run %d: list jobs: %v", runID, err)
+		return
+	}
+	for _, job := range jobs {
+		logs, err := api.JobLogs(ctx, repo, job.ID)
+		if err != nil {
+			t.Logf("job %q (%s): logs unavailable: %v", job.Name, job.Conclusion, err)
+			continue
+		}
+		t.Logf("job %q concluded %q:\n%s", job.Name, job.Conclusion, logs)
+	}
+}
+
+// newGate serves a URL that answers 503 until release, for jobs to poll instead of sleeping.
+func newGate(t *testing.T) (string, func()) {
+	t.Helper()
+	var released atomic.Bool
+	listener, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatalf("listen for the gate: %v", err)
+	}
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if !released.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+	}), ReadHeaderTimeout: time.Second}
+	go func() { _ = server.Serve(listener) }()
+	t.Cleanup(func() { _ = server.Close() })
+	return fmt.Sprintf("http://%s/", net.JoinHostPort(fixture.selfIP, strconv.Itoa(listener.Addr().(*net.TCPAddr).Port))), func() { released.Store(true) }
+}
+
+func waitForRun(t *testing.T, api *GiteaAPI, repo string) *ActionRun {
+	t.Helper()
+	return waitForRunAfter(t, api, repo, 0)
+}
+
+func waitForRunAfter(t *testing.T, api *GiteaAPI, repo string, previousID int64) *ActionRun {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+
+	for {
+		runs, err := api.Runs(ctx, repo)
+		if err != nil {
+			t.Fatalf("get latest run: %v", err)
+		}
+		if len(runs) > 0 && runs[0].ID > previousID {
+			return &runs[0]
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("no run appeared for %s within timeout", repo)
+		case <-time.After(pollInterval):
+		}
+	}
+}

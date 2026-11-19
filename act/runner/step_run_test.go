@@ -5,9 +5,13 @@
 package runner
 
 import (
-	"bytes"
+	"cmp"
 	"context"
 	"io"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 
 	"gitea.com/gitea/runner/act/container"
@@ -15,7 +19,13 @@ import (
 	"gitea.dev/actionslib/pkg/model"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
+	"go.yaml.in/yaml/v4"
 )
+
+type shellContainerMock struct{ *containerMock }
+
+func (*shellContainerMock) ReplaceLogWriter(_, _ io.Writer) (io.Writer, io.Writer) { return nil, nil }
 
 func TestStepRun(t *testing.T) {
 	cm := &containerMock{}
@@ -28,71 +38,238 @@ func TestStepRun(t *testing.T) {
 	sr := &stepRun{
 		RunContext: &RunContext{
 			StepResults: map[string]*model.StepResult{},
-			ExprEval:    &expressionEvaluator{},
-			Config:      &Config{},
+			Config:      &Config{Env: testCheckoutEnv()},
 			Run: &model.Run{
 				JobID: "1",
 				Workflow: &model.Workflow{
 					Jobs: map[string]*model.Job{
-						"1": {
-							Defaults: model.Defaults{
-								Run: model.RunDefaults{
-									Shell: "bash",
-								},
-							},
-						},
+						"1": {},
 					},
 				},
 			},
-			JobContainer: cm,
+			JobContainer:   cm,
+			jobRunDefaults: model.RunDefaults{Shell: "bash"},
+			Env:            map[string]string{"GITHUB_ACTION_REPOSITORY": "other/composite", "GITHUB_ACTION_REF": "v1"},
 		},
 		Step: &model.Step{
 			ID:               "1",
-			Run:              "cmd",
+			Run:              "cmd${{ github.action_repository }}${{ github.action_ref }}",
 			WorkingDirectory: "workdir",
+			If:               yaml.Node{Value: "github.action_repository == 'other/composite' && github.action_ref == 'v1'"},
 		},
 	}
+	sr.RunContext.ExprEval = sr.RunContext.NewExpressionEvaluator(t.Context())
+	require.NoError(t, sr.Step.Env.Encode(map[string]string{
+		"GITHUB_ACTION_REPOSITORY": "forged/repo", "GITHUB_ACTION_REF": "forged-ref",
+		"GITEA_ACTION_REPOSITORY": "forged/repo", "GITEA_ACTION_REF": "forged-ref",
+	}))
 
-	cm.On("Copy", "/var/run/act", []*container.FileEntry{fileEntry}).Return(func(ctx context.Context) error {
-		return nil
-	})
-	cm.On("Exec", []string{"bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "/var/run/act/workflow/1.sh"}, mock.AnythingOfType("map[string]string"), "", "workdir").Return(func(ctx context.Context) error {
-		return nil
-	})
+	cm.On("Copy", "/var/run/act", []*container.FileEntry{fileEntry}).Return(noopExecutor)
+	cm.On("Exec", []string{"bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "/var/run/act/workflow/1.sh"}, mock.AnythingOfType("map[string]string"), "", "workdir").Return(noopExecutor)
 
-	cm.On("Copy", "/var/run/act", mock.AnythingOfType("[]*container.FileEntry")).Return(func(ctx context.Context) error {
-		return nil
-	})
-
-	cm.On("UpdateFromEnv", "/var/run/act/workflow/envs.txt", mock.AnythingOfType("*map[string]string")).Return(func(ctx context.Context) error {
-		return nil
-	})
-
-	cm.On("UpdateFromEnv", "/var/run/act/workflow/statecmd.txt", mock.AnythingOfType("*map[string]string")).Return(func(ctx context.Context) error {
-		return nil
-	})
-
-	cm.On("UpdateFromEnv", "/var/run/act/workflow/outputcmd.txt", mock.AnythingOfType("*map[string]string")).Return(func(ctx context.Context) error {
-		return nil
-	})
-
-	ctx := context.Background()
-
-	cm.On("GetContainerArchive", ctx, "/var/run/act/workflow/pathcmd.txt").Return(io.NopCloser(&bytes.Buffer{}), nil)
-
-	err := sr.main()(ctx)
-	assert.NoError(t, err) //nolint:testifylint // pre-existing issue from nektos/act
+	expectStepFileCommands(t, cm)
+	require.NoError(t, sr.main()(t.Context()))
+	assert.Empty(t, sr.env["GITHUB_ACTION_REPOSITORY"])
+	assert.Empty(t, sr.env["GITHUB_ACTION_REF"])
+	assert.Empty(t, sr.env["GITEA_ACTION_REPOSITORY"])
+	assert.Empty(t, sr.env["GITEA_ACTION_REF"])
+	assert.Equal(t, sr.env["GITHUB_STEP_SUMMARY"], sr.env["GITEA_STEP_SUMMARY"])
+	assert.Equal(t, "other/composite", sr.RunContext.Env["GITHUB_ACTION_REPOSITORY"])
+	assert.Equal(t, "v1", sr.RunContext.Env["GITHUB_ACTION_REF"])
 
 	cm.AssertExpectations(t)
 }
 
-func TestStepRunPrePost(t *testing.T) {
-	ctx := context.Background()
-	sr := &stepRun{}
+func TestStepRunShellParity(t *testing.T) {
+	const powershellScript = "$ErrorActionPreference = 'stop'\n$OutputEncoding = [System.Text.UTF8Encoding]::new($false)\ntry { [Console]::OutputEncoding = $OutputEncoding } catch {}\necho 你好，世界\nif ((Test-Path -LiteralPath variable:/LASTEXITCODE)) { exit $LASTEXITCODE }"
+	for _, test := range []struct {
+		name, run, shell, workingDir string
+		hostOS, wantCmdline          string
+		actPath                      string
+		env                          map[string]string
+		host                         bool
+		probeErr                     error
+		wantExt                      string
+		wantCmd                      []string
+		wantScript                   string
+		wantErr                      string
+	}{
+		{
+			name:    "implicit host bash",
+			host:    true,
+			wantCmd: []string{"bash", "-e", "/var/run/act/workflow/1.sh"},
+		},
+		{
+			name:    "implicit container bash",
+			wantCmd: []string{"bash", "-e", "/var/run/act/workflow/1.sh"},
+		},
+		{
+			name:     "implicit container sh fallback",
+			probeErr: assert.AnError,
+			wantCmd:  []string{"sh", "-e", "/var/run/act/workflow/1.sh"},
+		},
+		{
+			name:       "builtin pwsh",
+			run:        "echo 你好，世界",
+			shell:      "pwsh",
+			actPath:    "/var/run/act with spaces/O'Brien",
+			wantExt:    ".ps1",
+			wantCmd:    []string{"pwsh", "-command", ". '/var/run/act with spaces/O''Brien/workflow/1.ps1'"},
+			wantScript: powershellScript,
+		},
+		{
+			name:       "builtin powershell",
+			actPath:    "/var/run/act/O'Brien",
+			run:        "echo 你好，世界",
+			shell:      "powershell",
+			wantExt:    ".ps1",
+			wantCmd:    []string{"powershell", "-command", ". '/var/run/act/O''Brien/workflow/1.ps1'"},
+			wantScript: "\ufeff" + powershellScript,
+		},
+		{
+			name:       "custom pwsh template",
+			run:        "echo 你好，世界",
+			shell:      "pwsh -NoProfile -File {0}",
+			wantExt:    ".ps1",
+			wantCmd:    []string{"pwsh", "-NoProfile", "-File", "/var/run/act/workflow/1.ps1"},
+			wantScript: powershellScript,
+		},
+		{
+			name:       "builtin cmd reads and emits UTF-8 without a BOM",
+			run:        "echo 你好，世界",
+			shell:      "cmd",
+			wantExt:    ".cmd",
+			wantCmd:    []string{"cmd", "/D", "/E:ON", "/V:OFF", "/S", "/C", "CALL /var/run/act/workflow/1.cmd"},
+			wantScript: "@echo off\r\necho 你好，世界\r\n",
+		},
+		{
+			name:        "Windows custom executable preserves backslashes and raw arguments",
+			shell:       `C:\Python313\python.exe -X 'utf8' "{0}"`,
+			actPath:     `C:\runner\O'Brien`,
+			hostOS:      "windows",
+			wantCmd:     []string{`C:\Python313\python.exe`},
+			wantCmdline: `C:\Python313\python.exe -X 'utf8' "{0}"`,
+		},
+		{
+			name:        "Windows quoted custom executable preserves spaces and backslashes",
+			shell:       `"C:\Program Files\Python313\python.exe" "{0}"`,
+			actPath:     `C:\runner`,
+			hostOS:      "windows",
+			wantCmd:     []string{`C:\Program Files\Python313\python.exe`},
+			wantCmdline: `"C:\Program Files\Python313\python.exe" "{0}"`,
+		},
+		{
+			name:        "Windows PowerShell escapes apostrophes in the raw command line",
+			run:         "echo 你好，世界",
+			shell:       "pwsh",
+			actPath:     `C:\runner\O'Brien`,
+			hostOS:      "windows",
+			wantExt:     ".ps1",
+			wantCmd:     []string{"pwsh"},
+			wantCmdline: `pwsh -command ". '{0}'"`,
+			wantScript:  powershellScript,
+		},
+		{
+			name:    "Windows unclosed executable quote",
+			shell:   `"C:\Program Files\python.exe {0}`,
+			actPath: `C:\runner`,
+			hostOS:  "windows",
+			wantErr: "expected a double-quoted executable",
+		},
+		{name: "linux builtin bash quotes script path", shell: "bash", actPath: `C:/Users/Jane Doe/O'Brien`, wantCmd: []string{"bash", "--noprofile", "--norc", "-e", "-o", "pipefail", `C:/Users/Jane Doe/O'Brien/workflow/1.sh`}},
+		{name: "linux builtin sh quotes script path", shell: "sh", actPath: `C:/Users/Jane Doe/O'Brien`, wantCmd: []string{"sh", "-e", `C:/Users/Jane Doe/O'Brien/workflow/1.sh`}},
+		{name: "linux builtin python quotes script path", shell: "python", actPath: `C:/Users/Jane Doe/O'Brien`, wantExt: ".py", wantCmd: []string{"python", `C:/Users/Jane Doe/O'Brien/workflow/1.py`}},
+		{name: "windows builtin bash quotes script path", shell: "bash", hostOS: "windows", actPath: `C:\Users\Jane Doe\O'Brien`, wantExt: ".sh", wantCmd: []string{"bash"}, wantCmdline: `bash --noprofile --norc -e -o pipefail "{0}"`},
+		{name: "windows builtin sh quotes script path", shell: "sh", hostOS: "windows", actPath: `C:\Users\Jane Doe\O'Brien`, wantExt: ".sh", wantCmd: []string{"sh"}, wantCmdline: `sh -e "{0}"`},
+		{name: "windows builtin python quotes script path", shell: "python", hostOS: "windows", actPath: `C:\Users\Jane Doe\O'Brien`, wantExt: ".py", wantCmd: []string{"python"}, wantCmdline: `python "{0}"`},
+		{
+			name:    "missing placeholder",
+			shell:   "bash -e",
+			wantErr: `invalid shell option "bash -e": format must contain {0}`,
+		},
+		{
+			name:    "all placeholders",
+			shell:   "bash -c '. {0}; . {0}'",
+			wantCmd: []string{"bash", "-c", ". /var/run/act/workflow/1.sh; . /var/run/act/workflow/1.sh"},
+		},
+		{
+			name:       "step env expressions",
+			shell:      "${{ env.SHELL }}",
+			workingDir: "${{ env.DIR }}",
+			env:        map[string]string{"SHELL": "python {0}", "DIR": "subdir"},
+			wantExt:    ".py",
+			wantCmd:    []string{"python", "/var/run/act/workflow/1.py"},
+		},
+		{
+			name:    "run expression without a context",
+			run:     "echo ${{ COMMIT_SHA }}",
+			wantErr: "unable to interpolate the run script:",
+		},
+		{
+			name:    "shell expression without a context",
+			shell:   "${{ SHELL }}",
+			wantErr: "unable to interpolate the shell:",
+		},
+		{
+			name:       "working directory expression without a context",
+			workingDir: "${{ DIR }}",
+			wantErr:    "unable to interpolate the working directory:",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cm := &containerMock{}
+			var jobContainer container.ExecutionsEnvironment = &shellContainerMock{cm}
+			switch {
+			case test.actPath != "":
+				jobContainer = &container.HostEnvironment{ActPath: test.actPath}
+			case test.host:
+				if runtime.GOOS == "windows" {
+					t.Skip("Linux host shell selection")
+				}
+				test.env = map[string]string{"PATH": t.TempDir()}
+				require.NoError(t, os.WriteFile(filepath.Join(test.env["PATH"], "bash"), nil, 0o755))
+				jobContainer = &container.HostEnvironment{ActPath: "/var/run/act"}
+			case test.shell == "":
+				cm.On("Exec", []string{"sh", "-c", "command -v bash >/dev/null 2>&1"},
+					mock.AnythingOfType("map[string]string"), "", "").Return(func(context.Context) error {
+					return test.probeErr
+				})
+			}
 
-	err := sr.pre()(ctx)
-	assert.NoError(t, err) //nolint:testifylint // pre-existing issue from nektos/act
+			sr := &stepRun{
+				RunContext: &RunContext{
+					Config:       &Config{PresetGitHubContext: &model.GithubContext{}},
+					Run:          &model.Run{JobID: "1", Workflow: &model.Workflow{Jobs: map[string]*model.Job{"1": {}}}},
+					JobContainer: jobContainer,
+				},
+				Step: &model.Step{ID: "1", Run: cmp.Or(test.run, "echo hi"), Shell: test.shell, WorkingDirectory: test.workingDir},
+				env:  test.env,
+			}
 
-	err = sr.post()(ctx)
-	assert.NoError(t, err)
+			original := hostOS
+			hostOS = cmp.Or(test.hostOS, "linux")
+			t.Cleanup(func() { hostOS = original })
+			name, script, err := sr.setupShellCommand(t.Context())
+			if test.wantErr != "" {
+				require.ErrorContains(t, err, test.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			if test.wantExt == "" && test.hostOS != "windows" {
+				test.wantExt = ".sh"
+			}
+			assert.Equal(t, "workflow/1"+test.wantExt, name)
+			assert.Equal(t, cmp.Or(test.wantScript, "\necho hi\n"), script)
+			assert.Equal(t, test.wantCmd, sr.cmd)
+			if test.wantCmdline != "" {
+				scriptPath := jobContainer.GetActPath() + "/workflow/1" + test.wantExt
+				if test.shell == "pwsh" || test.shell == "powershell" {
+					scriptPath = strings.ReplaceAll(scriptPath, "'", "''")
+				}
+				assert.Equal(t, strings.ReplaceAll(test.wantCmdline, "{0}", scriptPath), sr.cmdline)
+			}
+			assert.Equal(t, test.env["DIR"], sr.WorkingDirectory)
+			cm.AssertExpectations(t)
+		})
+	}
 }

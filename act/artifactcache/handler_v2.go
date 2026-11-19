@@ -5,7 +5,8 @@ package artifactcache
 
 import (
 	"cmp"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -14,8 +15,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/julienschmidt/httprouter"
 )
 
 // The cache service v2 API. A client on this version talks twirp to
@@ -38,24 +37,26 @@ const (
 
 	blobUploadURLTTL = time.Hour
 
-	// twirpInternal is the only error code that is not the client's fault.
-	twirpInternal = "internal"
+	twirpInternal        = "internal"
+	twirpUnavailable     = "unavailable"
+	twirpUnauthenticated = "unauthenticated"
+	twirpDenied          = "permission_denied"
 )
 
-func (h *Handler) registerV2Routes(router *httprouter.Router) {
-	router.POST(cacheServiceV2Path+"/CreateCacheEntry", h.bearerAuth(h.v2CreateCacheEntry))
-	router.POST(cacheServiceV2Path+"/FinalizeCacheEntryUpload", h.bearerAuth(h.v2FinalizeCacheEntryUpload))
-	router.POST(cacheServiceV2Path+"/GetCacheEntryDownloadURL", h.bearerAuth(h.v2GetCacheEntryDownloadURL))
-	router.PUT(blobPath+"/:id", h.signedAuth(blobUploadPurpose, h.v2UploadBlob))
+func (h *Handler) registerV2Routes(router *http.ServeMux) {
+	router.HandleFunc("POST "+cacheServiceV2Path+"/CreateCacheEntry", h.cacheModeAuth(true, h.v2CreateCacheEntry))
+	router.HandleFunc("POST "+cacheServiceV2Path+"/FinalizeCacheEntryUpload", h.cacheModeAuth(true, h.v2FinalizeCacheEntryUpload))
+	router.HandleFunc("POST "+cacheServiceV2Path+"/GetCacheEntryDownloadURL", h.cacheModeAuth(false, h.v2GetCacheEntryDownloadURL))
+	router.HandleFunc("PUT "+blobPath+"/{id}", h.signedAuth(blobUploadPurpose, h.v2UploadBlob))
 }
 
 // An entry that already exists is reported as not ok, which is how the client learns to skip
 // the upload.
-func (h *Handler) v2CreateCacheEntry(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+func (h *Handler) v2CreateCacheEntry(w http.ResponseWriter, r *http.Request) {
 	cred := credFromContext(r.Context())
 	req, err := decodeTwirpRequest[v2CreateRequest](r)
 	if err != nil {
-		h.twirpError(w, r, "malformed_request", err)
+		h.twirpError(w, r, "malformed", err)
 		return
 	}
 	if req.Key == "" || req.Version == "" {
@@ -73,7 +74,7 @@ func (h *Handler) v2CreateCacheEntry(w http.ResponseWriter, r *http.Request, _ h
 	// An exact (key, version) match means the entry is already cached; the client then skips
 	// the upload. A prefix match must not count here, or a shorter key would be reported as
 	// existing and silently never saved.
-	if existing, err := findExactCache(db, cred.Repo, req.Key, req.Version, true); err != nil {
+	if existing, err := findExactCache(db, cred, req.Key, req.Version, true); err != nil {
 		h.twirpError(w, r, twirpInternal, err)
 		return
 	} else if existing != nil {
@@ -82,16 +83,37 @@ func (h *Handler) v2CreateCacheEntry(w http.ResponseWriter, r *http.Request, _ h
 		return
 	}
 
-	now := time.Now().Unix()
-	cache := &Cache{
-		Repo:      cred.Repo,
-		Key:       req.Key,
-		Version:   req.Version,
-		Size:      -1, // the size is only known at finalize time
-		CreatedAt: now,
-		UsedAt:    now,
+	// A second live reservation is finalized by whichever job calls last, against the other's upload.
+	owner := hashedToken(bearerToken(r))
+	if pending, err := findExactCache(db, cred, req.Key, req.Version, false); err != nil {
+		h.twirpError(w, r, twirpInternal, err)
+		return
+	} else if pending != nil && pending.UsedAt > time.Now().Add(-uploadStallTimeout).Unix() {
+		if pending.Owner != owner {
+			h.twirpNotOK(w, r)
+			return
+		}
+		h.touch(db, pending)                                // still uploading, so it must not go stale under the sweep
+		h.responseJSON(w, r, http.StatusOK, map[string]any{ // this job retrying its own reservation
+			"ok":                true,
+			"signed_upload_url": h.signedURL(cred, blobPath, blobUploadPurpose, pending.ID, time.Now().Add(blobUploadURLTTL)),
+		})
+		return
 	}
-	if err := insertCache(db, cache); err != nil {
+
+	now := time.Now()
+	cache := &Cache{
+		Repo:           cred.Repo,
+		Ref:            cred.Ref,
+		Key:            req.Key,
+		Version:        req.Version,
+		Owner:          owner,
+		Size:           -1, // the size is only known at finalize time
+		CreatedAt:      now.Unix(),
+		CreatedAtNanos: now.Nanosecond(),
+		UsedAt:         now.Unix(),
+	}
+	if err := h.insertCache(db, cache); err != nil {
 		h.twirpError(w, r, twirpInternal, err)
 		return
 	}
@@ -102,11 +124,11 @@ func (h *Handler) v2CreateCacheEntry(w http.ResponseWriter, r *http.Request, _ h
 	})
 }
 
-func (h *Handler) v2FinalizeCacheEntryUpload(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+func (h *Handler) v2FinalizeCacheEntryUpload(w http.ResponseWriter, r *http.Request) {
 	cred := credFromContext(r.Context())
 	req, err := decodeTwirpRequest[v2FinalizeRequest](r)
 	if err != nil {
-		h.twirpError(w, r, "malformed_request", err)
+		h.twirpError(w, r, "malformed", err)
 		return
 	}
 
@@ -117,7 +139,14 @@ func (h *Handler) v2FinalizeCacheEntryUpload(w http.ResponseWriter, r *http.Requ
 	}
 	defer db.Close()
 
-	cache, err := findExactCache(db, cred.Repo, req.Key, req.Version, false)
+	cache, err := findExactCache(db, cred, req.Key, req.Version, false)
+	if err == nil && cache != nil && cache.Owner != hashedToken(bearerToken(r)) {
+		cache = nil // not the reservation this job made, so not this job's to commit
+	}
+	if err == nil && cache == nil {
+		// A retry whose first response was lost finds the entry already committed.
+		cache, err = findExactCache(db, cred, req.Key, req.Version, true)
+	}
 	if err != nil {
 		h.twirpError(w, r, twirpInternal, err)
 		return
@@ -126,13 +155,15 @@ func (h *Handler) v2FinalizeCacheEntryUpload(w http.ResponseWriter, r *http.Requ
 		h.twirpNotOK(w, r)
 		return
 	}
-	db.Close() // commitCache needs the store closed
 
-	cache.Size, _ = cmp.Or(req.SizeBytes, req.SizeBytesCamel).Int64()
-	if err := h.commitCache(cache); err != nil {
-		h.logger.Errorf("finalize cache %d (%s): %v", cache.ID, cache.Key, err)
-		h.twirpNotOK(w, r)
-		return
+	if !cache.Complete {
+		db.Close() // commitCache needs the store closed
+		cache.Size = int64(cmp.Or(req.SizeBytes, req.SizeBytesCamel))
+		if err := h.commitCache(cache); err != nil {
+			h.logger.Errorf("finalize cache %d (%s): %v", cache.ID, cache.Key, err)
+			h.twirpNotOK(w, r)
+			return
+		}
 	}
 
 	h.responseJSON(w, r, http.StatusOK, map[string]any{
@@ -142,11 +173,11 @@ func (h *Handler) v2FinalizeCacheEntryUpload(w http.ResponseWriter, r *http.Requ
 	})
 }
 
-func (h *Handler) v2GetCacheEntryDownloadURL(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+func (h *Handler) v2GetCacheEntryDownloadURL(w http.ResponseWriter, r *http.Request) {
 	cred := credFromContext(r.Context())
 	req, err := decodeTwirpRequest[v2DownloadRequest](r)
 	if err != nil {
-		h.twirpError(w, r, "malformed_request", err)
+		h.twirpError(w, r, "malformed", err)
 		return
 	}
 
@@ -157,7 +188,7 @@ func (h *Handler) v2GetCacheEntryDownloadURL(w http.ResponseWriter, r *http.Requ
 	}
 	defer db.Close()
 
-	cache, err := h.lookupCache(db, cred.Repo, req.keys(), req.Version)
+	cache, err := h.lookupCache(db, cred, req.keys(), req.Version)
 	if err != nil {
 		h.twirpError(w, r, twirpInternal, err)
 		return
@@ -177,8 +208,8 @@ func (h *Handler) v2GetCacheEntryDownloadURL(w http.ResponseWriter, r *http.Requ
 // The archive arrives over the subset of the Azure blob API the toolkit uses: a small
 // cache is a single PUT, a large one is staged as blocks that a final block list puts
 // in order.
-func (h *Handler) v2UploadBlob(w http.ResponseWriter, r *http.Request, params httprouter.Params) {
-	id, err := strconv.ParseUint(params.ByName("id"), 10, 64)
+func (h *Handler) v2UploadBlob(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseUint(r.PathValue("id"), 10, 64)
 	if err != nil {
 		h.responseJSON(w, r, http.StatusBadRequest, err)
 		return
@@ -188,6 +219,7 @@ func (h *Handler) v2UploadBlob(w http.ResponseWriter, r *http.Request, params ht
 		h.responseJSON(w, r, http.StatusBadRequest, err)
 		return
 	}
+	h.makeRoom(r.ContentLength)
 
 	query := r.URL.Query()
 	switch strings.ToLower(query.Get("comp")) {
@@ -229,8 +261,15 @@ func (h *Handler) twirpNotOK(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) twirpError(w http.ResponseWriter, r *http.Request, code string, err error) {
 	h.logger.Debugf("%s %s: %v", r.Method, r.URL.Path, err)
 	status := http.StatusBadRequest
-	if code == twirpInternal {
+	switch code {
+	case twirpInternal:
 		status = http.StatusInternalServerError
+	case twirpUnavailable:
+		status = http.StatusServiceUnavailable
+	case twirpUnauthenticated:
+		status = http.StatusUnauthorized
+	case twirpDenied:
+		status = http.StatusForbidden
 	}
 	h.responseJSON(w, r, status, map[string]any{"code": code, "msg": err.Error()})
 }
@@ -245,10 +284,10 @@ type (
 	}
 
 	v2FinalizeRequest struct {
-		Key            string      `json:"key"`
-		Version        string      `json:"version"`
-		SizeBytes      json.Number `json:"size_bytes"`
-		SizeBytesCamel json.Number `json:"sizeBytes"`
+		Key            string     `json:"key"`
+		Version        string     `json:"version"`
+		SizeBytes      twirpInt64 `json:"size_bytes"`
+		SizeBytesCamel twirpInt64 `json:"sizeBytes"`
 	}
 
 	v2DownloadRequest struct {
@@ -258,6 +297,31 @@ type (
 		RestoreKeysCamel []string `json:"restoreKeys"`
 	}
 )
+
+// twirpInt64 accepts its value as the JSON string the mapping prescribes or as a bare number.
+type twirpInt64 int64
+
+func (n *twirpInt64) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
+	val, err := dec.ReadValue()
+	if err != nil {
+		return err
+	}
+	digits := []byte(val)
+	switch val.Kind() {
+	case 'n': // absent, keep the zero value
+		return nil
+	case '"':
+		if digits, err = jsontext.AppendUnquote(nil, val); err != nil {
+			return err
+		}
+	}
+	parsed, err := strconv.ParseInt(string(digits), 10, 64)
+	if err != nil {
+		return err
+	}
+	*n = twirpInt64(parsed)
+	return nil
+}
 
 func (d v2DownloadRequest) keys() []string {
 	restoreKeys := d.RestoreKeys
@@ -269,6 +333,6 @@ func (d v2DownloadRequest) keys() []string {
 
 func decodeTwirpRequest[T any](r *http.Request) (T, error) {
 	var req T
-	err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req)
+	err := json.UnmarshalRead(io.LimitReader(r.Body, 1<<20), &req)
 	return req, err
 }

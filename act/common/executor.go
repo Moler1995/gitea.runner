@@ -7,9 +7,11 @@ package common
 import (
 	"context"
 	"fmt"
+	"math/rand/v2"
 	"runtime/debug"
+	"time"
 
-	log "github.com/sirupsen/logrus"
+	"gitea.com/gitea/runner/act/common/logging"
 )
 
 // Executor define contract for the steps of a workflow
@@ -21,8 +23,7 @@ type Conditional func(ctx context.Context) bool
 // NewInfoExecutor is an executor that logs messages
 func NewInfoExecutor(format string, args ...any) Executor {
 	return func(ctx context.Context) error {
-		logger := Logger(ctx)
-		logger.Infof(format, args...)
+		Logger(ctx).Infof(format, args...)
 		return nil
 	}
 }
@@ -30,8 +31,7 @@ func NewInfoExecutor(format string, args ...any) Executor {
 // NewDebugExecutor is an executor that logs messages
 func NewDebugExecutor(format string, args ...any) Executor {
 	return func(ctx context.Context) error {
-		logger := Logger(ctx)
-		logger.Debugf(format, args...)
+		Logger(ctx).Debugf(format, args...)
 		return nil
 	}
 }
@@ -39,9 +39,7 @@ func NewDebugExecutor(format string, args ...any) Executor {
 // NewPipelineExecutor creates a new executor from a series of other executors
 func NewPipelineExecutor(executors ...Executor) Executor {
 	if len(executors) == 0 {
-		return func(ctx context.Context) error {
-			return nil
-		}
+		return NewErrorExecutor(nil)
 	}
 	var rtn Executor
 	for _, executor := range executors {
@@ -54,26 +52,17 @@ func NewPipelineExecutor(executors ...Executor) Executor {
 	return rtn
 }
 
-// NewConditionalExecutor creates a new executor based on conditions
-func NewConditionalExecutor(conditional Conditional, trueExecutor, falseExecutor Executor) Executor {
-	return func(ctx context.Context) error {
-		if conditional(ctx) {
-			if trueExecutor != nil {
-				return trueExecutor(ctx)
-			}
-		} else {
-			if falseExecutor != nil {
-				return falseExecutor(ctx)
-			}
-		}
-		return nil
-	}
-}
-
 // NewErrorExecutor creates a new executor that always errors out
 func NewErrorExecutor(err error) Executor {
 	return func(ctx context.Context) error {
 		return err
+	}
+}
+
+func RecoverPanic(err *error) { // defer directly in workers to keep stacks in host logs
+	if recovered := recover(); recovered != nil {
+		logging.Errorf("panic: %v\n%s", recovered, debug.Stack())
+		*err = fmt.Errorf("panic: %v", recovered)
 	}
 }
 
@@ -90,34 +79,29 @@ func NewParallelExecutor(parallel int, executors ...Executor) Executor {
 		errs := make(chan error, len(executors))
 
 		if 1 > parallel {
-			log.Debugf("Parallel tasks (%d) below minimum, setting to 1", parallel)
+			logging.Debugf("Parallel tasks (%d) below minimum, setting to 1", parallel)
 			parallel = 1
 		}
 
-		log.Infof("NewParallelExecutor: Creating %d workers for %d executors", parallel, len(executors))
+		logging.Infof("NewParallelExecutor: Creating %d workers for %d executors", parallel, len(executors))
 
-		for i := 0; i < parallel; i++ {
-			go func(workerID int, work <-chan Executor, errs chan<- error) {
-				log.Debugf("Worker %d started", workerID)
+		for workerID := range parallel {
+			go func() {
+				logging.Debugf("Worker %d started", workerID)
 				taskCount := 0
 				for executor := range work {
 					taskCount++
-					log.Debugf("Worker %d executing task %d", workerID, taskCount)
+					logging.Debugf("Worker %d executing task %d", workerID, taskCount)
 					// Recover from panics in executors to avoid crashing the worker
 					// goroutine which would leave the runner process hung.
 					// https://gitea.com/gitea/runner/issues/371
 					errs <- func() (err error) {
-						defer func() {
-							if r := recover(); r != nil {
-								log.Errorf("panic in executor: %v\n%s", r, debug.Stack())
-								err = fmt.Errorf("panic: %v", r)
-							}
-						}()
+						defer RecoverPanic(&err)
 						return executor(ctx)
 					}()
 				}
-				log.Debugf("Worker %d finished (%d tasks executed)", workerID, taskCount)
-			}(i, work, errs)
+				logging.Debugf("Worker %d finished (%d tasks executed)", workerID, taskCount)
+			}()
 		}
 
 		for i := range executors {
@@ -166,12 +150,7 @@ func (e Executor) If(conditional Conditional) Executor {
 
 // IfNot only runs this executor if conditional is true
 func (e Executor) IfNot(conditional Conditional) Executor {
-	return func(ctx context.Context) error {
-		if !conditional(ctx) {
-			return e(ctx)
-		}
-		return nil
-	}
+	return e.If(func(ctx context.Context) bool { return !conditional(ctx) })
 }
 
 // IfBool only runs this executor if conditional is true
@@ -181,21 +160,39 @@ func (e Executor) IfBool(conditional bool) Executor {
 	})
 }
 
+// RetryBackoff is the wait between Retry's attempts, random between 1 and 10 seconds like GitHub's runner.
+var RetryBackoff = func() time.Duration { return time.Second + rand.N(9*time.Second) }
+
+// Retry runs the executor up to attempts times until it succeeds.
+func (e Executor) Retry(attempts int) Executor {
+	return func(ctx context.Context) error {
+		for attempt := 1; ; attempt++ {
+			err := e(ctx)
+			if err == nil || attempt == attempts || ctx.Err() != nil {
+				return err
+			}
+			backoff := RetryBackoff()
+			Logger(ctx).Warnf("%v, retrying in %s", err, backoff.Round(time.Second))
+			select {
+			case <-ctx.Done():
+				return err
+			case <-time.After(backoff):
+			}
+		}
+	}
+}
+
 // Finally adds an executor to run after other executor
 func (e Executor) Finally(finally Executor) Executor {
 	return func(ctx context.Context) error {
 		err := e(ctx)
 		err2 := finally(ctx)
 		if err2 != nil {
-			return fmt.Errorf("Error occurred running finally: %v (original error: %v)", err2, err)
+			if err != nil {
+				return fmt.Errorf("error occurred running finally: %w (original error: %w)", err2, err)
+			}
+			return fmt.Errorf("error occurred running finally: %w (original error: %v)", err2, err)
 		}
 		return err
-	}
-}
-
-// Not return an inverted conditional
-func (c Conditional) Not() Conditional {
-	return func(ctx context.Context) bool {
-		return !c(ctx)
 	}
 }

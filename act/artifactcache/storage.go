@@ -5,8 +5,11 @@
 package artifactcache
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -30,13 +33,11 @@ func NewStorage(rootDir string) (*Storage, error) {
 }
 
 func (s *Storage) Exist(id uint64) (bool, error) {
-	name := s.filename(id)
-	if _, err := os.Stat(name); os.IsNotExist(err) {
+	_, err := os.Stat(s.filename(id))
+	if os.IsNotExist(err) {
 		return false, nil
-	} else if err != nil {
-		return false, err
 	}
-	return true, nil
+	return err == nil, err
 }
 
 func (s *Storage) Write(id uint64, offset int64, reader io.Reader) error {
@@ -51,9 +52,10 @@ func (s *Storage) writeFile(name string, reader io.Reader) error {
 	if err != nil {
 		return err
 	}
-	defer file.Close()
-
 	_, err = io.Copy(file, reader)
+	if err = errors.Join(err, file.Close()); err != nil {
+		_ = os.Remove(name)
+	}
 	return err
 }
 
@@ -66,6 +68,18 @@ func (s *Storage) WriteBlock(id uint64, blockID string, reader io.Reader) error 
 // rename pass is safe because a staged name always carries blockFilePrefix and a target name
 // never does, so no rename can collide with a block not yet moved.
 func (s *Storage) OrderBlocks(id uint64, blockIDs []string) error {
+	wanted, err := json.Marshal(blockIDs) // a block id is client-chosen, so it cannot be a separator
+	if err != nil {
+		return err
+	}
+	list := filepath.Join(s.tempDir(id), blockFilePrefix+"list")
+	if recorded, err := os.ReadFile(list); err == nil {
+		// A retry repeats the list it already sent; another one would reorder what is now staged.
+		if !bytes.Equal(recorded, wanted) {
+			return fmt.Errorf("cache %d was already assembled from a different block list", id)
+		}
+		return nil
+	}
 	for i, blockID := range blockIDs {
 		if err := os.Rename(s.blockName(id, blockID), s.tempName(id, int64(i))); err != nil {
 			if os.IsNotExist(err) {
@@ -74,13 +88,11 @@ func (s *Storage) OrderBlocks(id uint64, blockIDs []string) error {
 			return err
 		}
 	}
-	return nil
+	return os.WriteFile(list, wanted, 0o600)
 }
 
 func (s *Storage) Commit(id uint64, size int64) (int64, error) {
-	defer func() {
-		_ = os.RemoveAll(s.tempDir(id))
-	}()
+	defer func() { _ = os.RemoveAll(s.tempDir(id)) }()
 
 	name := s.filename(id)
 	tempNames, err := s.tempNames(id)
@@ -92,55 +104,50 @@ func (s *Storage) Commit(id uint64, size int64) (int64, error) {
 		return 0, err
 	}
 	written, err := assemble(name, tempNames)
-	if err != nil {
-		return 0, err
+	if err == nil && size >= 0 && written != size { // old clients like actions/cache@v2 send no size
+		err = fmt.Errorf("broken file: %v != %v", written, size)
 	}
-	// If size is less than 0, it means the size is unknown.
-	// We can't check the size of the file, just skip the check.
-	// It happens when the request comes from old versions of actions, like `actions/cache@v2`.
-	if size >= 0 && written != size {
+	if err != nil {
 		_ = os.Remove(name)
-		return 0, fmt.Errorf("broken file: %v != %v", written, size)
+		return 0, err
 	}
 	return written, nil
 }
 
-// assemble concatenates the uploaded parts into name. A single part, which is what the v2 API
-// produces below the client's block threshold, is already the whole archive and is moved.
+// assemble appends the parts into the first, deleting each once copied, so it never needs twice the space.
 func assemble(name string, tempNames []string) (int64, error) {
-	if len(tempNames) == 1 {
-		info, err := os.Stat(tempNames[0])
-		if err != nil {
-			return 0, err
-		}
-		return info.Size(), os.Rename(tempNames[0], name)
+	if len(tempNames) == 0 {
+		return 0, errors.New("nothing was uploaded")
 	}
-
-	file, err := os.Create(name)
+	if err := os.Rename(tempNames[0], name); err != nil {
+		return 0, err
+	}
+	file, err := os.OpenFile(name, os.O_WRONLY|os.O_APPEND, 0)
 	if err != nil {
 		return 0, err
 	}
 	defer file.Close()
-
-	var written int64
-	for _, v := range tempNames {
-		f, err := os.Open(v)
+	for _, v := range tempNames[1:] {
+		part, err := os.Open(v)
 		if err != nil {
 			return 0, err
 		}
-		n, err := io.Copy(file, f)
-		_ = f.Close()
+		_, err = io.Copy(file, part)
+		_ = part.Close()
 		if err != nil {
 			return 0, err
 		}
-		written += n
+		_ = os.Remove(v)
 	}
-	return written, nil
+	info, err := file.Stat()
+	if err != nil {
+		return 0, err
+	}
+	return info.Size(), file.Close()
 }
 
 func (s *Storage) Serve(w http.ResponseWriter, r *http.Request, id uint64) {
-	name := s.filename(id)
-	http.ServeFile(w, r, name)
+	http.ServeFile(w, r, s.filename(id))
 }
 
 // Remove deletes an entry's blob and any staged parts. It reports failure so the caller can

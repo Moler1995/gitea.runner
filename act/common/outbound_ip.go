@@ -6,9 +6,15 @@ package common
 
 import (
 	"net"
+	"slices"
 	"sort"
 	"strings"
 )
+
+type interfaceIP struct {
+	net.IP
+	Name string
+}
 
 // GetOutboundIP returns an outbound IP address of this machine.
 // It tries to access the internet and returns the local IP address of the connection.
@@ -26,11 +32,7 @@ func GetOutboundIP() net.IP {
 
 	// So the machine cannot access the internet. Pick an IP address from network interfaces.
 	if ifs, err := net.Interfaces(); err == nil {
-		type IP struct {
-			net.IP
-			net.Interface
-		}
-		var ips []IP
+		var ips []interfaceIP
 		for _, i := range ifs {
 			if addrs, err := i.Addrs(); err == nil {
 				for _, addr := range addrs {
@@ -42,40 +44,44 @@ func GetOutboundIP() net.IP {
 						ip = v.IP
 					}
 					if ip.IsGlobalUnicast() {
-						ips = append(ips, IP{ip, i})
+						ips = append(ips, interfaceIP{ip, i.Name})
 					}
 				}
 			}
 		}
-		if len(ips) > 1 {
-			sort.Slice(ips, func(i, j int) bool {
-				ifi := ips[i].Interface
-				ifj := ips[j].Interface
-
-				// ethernet is preferred
-				if vi, vj := strings.HasPrefix(ifi.Name, "e"), strings.HasPrefix(ifj.Name, "e"); vi != vj {
-					return vi
-				}
-
-				ipi := ips[i].IP
-				ipj := ips[j].IP
-
-				// IPv4 is preferred
-				if vi, vj := ipi.To4() != nil, ipj.To4() != nil; vi != vj {
-					return vi
-				}
-
-				// en0 is preferred to en1
-				if ifi.Name != ifj.Name {
-					return ifi.Name < ifj.Name
-				}
-
-				// fallback
-				return ipi.String() < ipj.String()
-			})
-			return ips[0].IP
-		}
+		return preferredIP(ips)
 	}
 
 	return nil
+}
+
+func preferredIP(ips []interfaceIP) net.IP {
+	ips = slices.DeleteFunc(ips, func(ip interfaceIP) bool {
+		return len(ip.Name) == 15 && strings.HasPrefix(ip.Name, "br-") && strings.Trim(ip.Name[3:], "0123456789abcdef") == "" // a Docker network's bridge, removed with the network
+	})
+	if len(ips) == 0 {
+		return nil
+	}
+	sort.Slice(ips, func(i, j int) bool {
+		first, second := ips[i], ips[j]
+
+		// IPv4 is preferred, as job networks are IPv4-only by default
+		if vi, vj := first.To4() != nil, second.To4() != nil; vi != vj {
+			return vi
+		}
+
+		// ethernet is preferred
+		if vi, vj := strings.HasPrefix(first.Name, "e"), strings.HasPrefix(second.Name, "e"); vi != vj {
+			return vi
+		}
+
+		// en0 is preferred to en1
+		if first.Name != second.Name {
+			return first.Name < second.Name
+		}
+
+		// fallback
+		return first.String() < second.String()
+	})
+	return ips[0].IP
 }

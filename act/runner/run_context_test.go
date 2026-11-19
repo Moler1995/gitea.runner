@@ -7,21 +7,34 @@ package runner
 import (
 	"bytes"
 	"context"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
+	"io"
+	"maps"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"runtime"
+	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"gitea.com/gitea/runner/act/common"
+	"gitea.com/gitea/runner/act/common/logging"
+	"gitea.com/gitea/runner/act/common/logging/logtest"
 	"gitea.com/gitea/runner/act/container"
 
 	"gitea.dev/actionslib/pkg/exprparser"
 	"gitea.dev/actionslib/pkg/model"
-	"github.com/docker/cli/cli/compose/loader"
-	log "github.com/sirupsen/logrus"
+	"github.com/moby/moby/api/types/volume"
 	assert "github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	require "github.com/stretchr/testify/require"
@@ -29,16 +42,10 @@ import (
 )
 
 func TestRunContext_EvalBool(t *testing.T) {
-	var yml yaml.Node
-	err := yml.Encode(map[string][]any{
-		"os":  {"Linux", "Windows"},
-		"foo": {"bar", "baz"},
-	})
-	assert.NoError(t, err) //nolint:testifylint // pre-existing issue from nektos/act
-
 	rc := &RunContext{
 		Config: &Config{
 			Workdir: ".",
+			Env:     testCheckoutEnv(),
 		},
 		Env: map[string]string{
 			"SOMETHING_TRUE":  "true",
@@ -50,50 +57,27 @@ func TestRunContext_EvalBool(t *testing.T) {
 			Workflow: &model.Workflow{
 				Name: "test-workflow",
 				Jobs: map[string]*model.Job{
-					"job1": {
-						Strategy: &model.Strategy{
-							RawMatrix: yml,
-						},
-					},
+					"job1": {},
 				},
 			},
-		},
-		Matrix: map[string]any{
-			"os":  "Linux",
-			"foo": "bar",
 		},
 		StepResults: map[string]*model.StepResult{
-			"id1": {
-				Conclusion: model.StepStatusSuccess,
-				Outcome:    model.StepStatusFailure,
-				Outputs: map[string]string{
-					"foo": "bar",
-				},
-			},
+			"id1": {Conclusion: model.StepStatusSuccess, Outcome: model.StepStatusFailure},
 		},
 	}
-	rc.ExprEval = rc.NewExpressionEvaluator(context.Background())
+	rc.ExprEval = rc.NewExpressionEvaluator(t.Context())
 
 	tables := []struct {
 		in      string
 		out     bool
 		wantErr bool
 	}{
-		// The basic ones
 		{in: "failure()", out: false},
 		{in: "success()", out: true},
 		{in: "cancelled()", out: false},
 		{in: "always()", out: true},
-		// TODO: move to sc.NewExpressionEvaluator(), because "steps" context is not available here
-		// {in: "steps.id1.conclusion == 'success'", out: true},
-		// {in: "steps.id1.conclusion != 'success'", out: false},
-		// {in: "steps.id1.outcome == 'failure'", out: true},
-		// {in: "steps.id1.outcome != 'failure'", out: false},
 		{in: "true", out: true},
 		{in: "false", out: false},
-		// TODO: This does not throw an error, because the evaluator does not know if the expression is inside ${{ }} or not
-		// {in: "!true", wantErr: true},
-		// {in: "!false", wantErr: true},
 		{in: "1 != 0", out: true},
 		{in: "1 != 1", out: false},
 		{in: "${{ 1 != 0 }}", out: true},
@@ -102,32 +86,24 @@ func TestRunContext_EvalBool(t *testing.T) {
 		{in: "1 == 1", out: true},
 		{in: "1 > 2", out: false},
 		{in: "1 < 2", out: true},
-		// And or
 		{in: "true && false", out: false},
 		{in: "true && 1 < 2", out: true},
 		{in: "false || 1 < 2", out: true},
 		{in: "false || false", out: false},
-		// None boolable
 		{in: "env.UNKNOWN == 'true'", out: false},
 		{in: "env.UNKNOWN", out: false},
-		// Inline expressions
 		{in: "env.SOME_TEXT", out: true},
 		{in: "env.SOME_TEXT == 'text'", out: true},
 		{in: "env.SOMETHING_TRUE == 'true'", out: true},
 		{in: "env.SOMETHING_FALSE == 'true'", out: false},
 		{in: "env.SOMETHING_TRUE", out: true},
 		{in: "env.SOMETHING_FALSE", out: true},
-		// TODO: This does not throw an error, because the evaluator does not know if the expression is inside ${{ }} or not
-		// {in: "!env.SOMETHING_TRUE", wantErr: true},
-		// {in: "!env.SOMETHING_FALSE", wantErr: true},
 		{in: "${{ !env.SOMETHING_TRUE }}", out: false},
 		{in: "${{ !env.SOMETHING_FALSE }}", out: false},
 		{in: "${{ ! env.SOMETHING_TRUE }}", out: false},
 		{in: "${{ ! env.SOMETHING_FALSE }}", out: false},
 		{in: "${{ env.SOMETHING_TRUE }}", out: true},
 		{in: "${{ env.SOMETHING_FALSE }}", out: true},
-		{in: "${{ !env.SOMETHING_TRUE }}", out: false},
-		{in: "${{ !env.SOMETHING_FALSE }}", out: false},
 		{in: "${{ !env.SOMETHING_TRUE && true }}", out: false},
 		{in: "${{ !env.SOMETHING_FALSE && true }}", out: false},
 		{in: "${{ !env.SOMETHING_TRUE || true }}", out: true},
@@ -135,14 +111,11 @@ func TestRunContext_EvalBool(t *testing.T) {
 		{in: "${{ env.SOMETHING_TRUE && true }}", out: true},
 		{in: "${{ env.SOMETHING_FALSE || true }}", out: true},
 		{in: "${{ env.SOMETHING_FALSE || false }}", out: true},
-		// TODO: This does not throw an error, because the evaluator does not know if the expression is inside ${{ }} or not
-		// {in: "!env.SOMETHING_TRUE || true", wantErr: true},
 		{in: "${{ env.SOMETHING_TRUE == 'true'}}", out: true},
 		{in: "${{ env.SOMETHING_FALSE == 'true'}}", out: false},
 		{in: "${{ env.SOMETHING_FALSE == 'false'}}", out: true},
 		{in: "${{ env.SOMETHING_FALSE }} && ${{ env.SOMETHING_TRUE }}", out: true},
 
-		// All together now
 		{in: "false || env.SOMETHING_TRUE == 'true'", out: true},
 		{in: "true || env.SOMETHING_FALSE == 'true'", out: true},
 		{in: "true && env.SOMETHING_TRUE == 'true'", out: true},
@@ -151,74 +124,42 @@ func TestRunContext_EvalBool(t *testing.T) {
 		{in: "env.SOMETHING_FALSE == 'true' && true", out: false},
 		{in: "${{ env.SOMETHING_FALSE == 'true' }} && true", out: true},
 		{in: "true && ${{ env.SOMETHING_FALSE == 'true' }}", out: true},
-		// Check github context
 		{in: "github.actor == 'nektos/act'", out: true},
 		{in: "github.actor == 'unknown'", out: false},
 		{in: "github.job == 'job1'", out: true},
-		// The special ACT flag
 		{in: "${{ env.ACT }}", out: true},
 		{in: "${{ !env.ACT }}", out: false},
-		// Invalid expressions should be reported
 		{in: "INVALID_EXPRESSION", wantErr: true},
 	}
 
 	for _, table := range tables {
 		t.Run(table.in, func(t *testing.T) {
-			assertObject := assert.New(t)
-			b, err := EvalBool(context.Background(), rc.ExprEval, table.in, exprparser.DefaultStatusCheckSuccess)
+			b, err := EvalBool(t.Context(), rc.ExprEval, table.in, exprparser.DefaultStatusCheckSuccess)
 			if table.wantErr {
-				assertObject.Error(err) //nolint:testifylint // pre-existing issue from nektos/act
+				require.Error(t, err)
 			}
 
-			assertObject.Equal(table.out, b, fmt.Sprintf("Expected %s to be %v, was %v", table.in, table.out, b)) //nolint:testifylint // pre-existing issue from nektos/act
+			assert.Equal(t, table.out, b)
 		})
 	}
 }
 
-func TestRunContextHandleCredentialsDoesNotUseDockerSecrets(t *testing.T) {
-	workflow, err := model.ReadWorkflow(strings.NewReader(`
-name: test
-on: push
-jobs:
-  job:
-    runs-on: ubuntu-latest
-    steps: []
-`))
-	require.NoError(t, err)
-
-	rc := &RunContext{
-		Config: &Config{
-			Secrets: map[string]string{
-				"DOCKER_USERNAME": "docker-user",
-				"DOCKER_PASSWORD": "docker-password",
-			},
-			Env: map[string]string{},
-		},
-		Run: &model.Run{
-			JobID:    "job",
-			Workflow: workflow,
-		},
-	}
-
-	// DOCKER_USERNAME/DOCKER_PASSWORD secrets should not be used as implicit job container pull credentials.
-	username, password, err := rc.handleCredentials(t.Context())
-	require.NoError(t, err)
-	assert.Empty(t, username)
-	assert.Empty(t, password)
-}
-
-// fakeContainer turns every container operation into a no-op, so startJobContainer
-// runs without a Docker daemon. The embedded interface is nil, so any method the
-// test does not exercise panics rather than silently doing the wrong thing.
 type fakeContainer struct {
 	container.ExecutionsEnvironment
+	caseInsensitive bool
 }
 
-func (fakeContainer) Pull(bool) common.Executor  { return func(context.Context) error { return nil } }
+func (c fakeContainer) IsEnvironmentCaseInsensitive() bool { return c.caseInsensitive }
+
+func (fakeContainer) Pull(bool) common.Executor { return func(context.Context) error { return nil } }
+
 func (fakeContainer) Start(bool) common.Executor { return func(context.Context) error { return nil } }
-func (fakeContainer) Remove() common.Executor    { return func(context.Context) error { return nil } }
-func (fakeContainer) Close() common.Executor     { return func(context.Context) error { return nil } }
-func (fakeContainer) GetActPath() string         { return "/var/run/act" }
+
+func (fakeContainer) Remove() common.Executor { return func(context.Context) error { return nil } }
+
+func (fakeContainer) Close() common.Executor             { return func(context.Context) error { return nil } }
+func (fakeContainer) GetActPath() string                 { return "/var/run/act" }
+func (fakeContainer) ToContainerPath(path string) string { return path }
 func (fakeContainer) Create([]string, []string) common.Executor {
 	return func(context.Context) error { return nil }
 }
@@ -227,16 +168,93 @@ func (fakeContainer) Copy(string, ...*container.FileEntry) common.Executor {
 	return func(context.Context) error { return nil }
 }
 
+func (fakeContainer) UpdateFromImageEnv(_env *map[string]string) common.Executor {
+	return noopExecutor
+}
+
+func (fakeContainer) GetContainerArchive(_ctx context.Context, _srcPath string) (io.ReadCloser, error) {
+	return nil, os.ErrNotExist
+}
+
 func (fakeContainer) Inspect(context.Context) (*container.Info, error) {
 	return &container.Info{ID: "fake", State: "running", Health: container.HealthNone}, nil
 }
 
 func (fakeContainer) DumpLogs(context.Context) error { return nil }
 
-// Regression test: a service without a `credentials:` block resolves to empty
-// credentials, which used to overwrite the job container's own credentials.
+func fakeDockerDaemon(t *testing.T, handler http.HandlerFunc) {
+	t.Helper()
+	daemon := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(request.URL.Path, "/_ping") {
+			writer.Header().Set("API-Version", "1.47")
+		} else {
+			handler(writer, request)
+		}
+	}))
+	t.Cleanup(daemon.Close)
+	t.Setenv("DOCKER_HOST", daemon.URL)
+}
+
+func startJobContainerInputs(t *testing.T, workflowYAML string, cfg *Config) []*container.NewContainerInput {
+	t.Helper()
+	workflow, err := model.ReadWorkflow(strings.NewReader(workflowYAML))
+	require.NoError(t, err)
+
+	var inputs []*container.NewContainerInput
+	origNewContainer := newContainer
+	newContainer = func(input *container.NewContainerInput) container.ExecutionsEnvironment {
+		inputs = append(inputs, input)
+		return fakeContainer{}
+	}
+	t.Cleanup(func() { newContainer = origNewContainer })
+
+	cfg.Workdir = "/tmp"
+	cfg.ContainerNetworkMode = "host"
+	cfg.Env = testCheckoutEnv()
+	cfg.Secrets = map[string]string{}
+
+	rc := &RunContext{
+		Name:   "test",
+		Config: cfg,
+		Run: &model.Run{
+			JobID:    "job",
+			Workflow: workflow,
+		},
+	}
+	rc.ExprEval = rc.NewExpressionEvaluator(t.Context())
+	require.NoError(t, rc.resolvePlatformImage(t.Context()))
+
+	daemon := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/_ping"):
+			w.Header().Set("API-Version", "1.47")
+			_, _ = io.WriteString(w, "OK")
+		case strings.HasSuffix(r.URL.Path, "/containers/json"), strings.HasSuffix(r.URL.Path, "/networks"):
+			_, _ = io.WriteString(w, "[]")
+		case strings.HasSuffix(r.URL.Path, "/volumes"):
+			_, _ = io.WriteString(w, `{"Volumes":[]}`)
+		case r.Method == http.MethodDelete && strings.Contains(r.URL.Path, "/volumes/"):
+			w.WriteHeader(http.StatusNoContent)
+		case strings.HasSuffix(r.URL.Path, "/info"):
+			_, _ = io.WriteString(w, `{"Architecture":"amd64","OSType":"linux"}`)
+		case strings.Contains(r.URL.Path, "/containers/") && strings.HasSuffix(r.URL.Path, "/json"):
+			http.NotFound(w, r)
+		default:
+			t.Errorf("unexpected Docker request: %s %s", r.Method, r.URL)
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(daemon.Close)
+	t.Setenv("DOCKER_HOST", daemon.URL)
+	require.NoError(t, rc.startJobContainer()(t.Context()))
+
+	return inputs
+}
+
 func TestStartJobContainerKeepsJobCredentialsWithServices(t *testing.T) {
-	workflow, err := model.ReadWorkflow(strings.NewReader(`
+	inputs := startJobContainerInputs(t, `
 name: test
 on: push
 jobs:
@@ -256,54 +274,126 @@ jobs:
           username: db-user
           password: db-password
     steps: []
-`))
-	require.NoError(t, err)
-
-	var inputs []*container.NewContainerInput
-	origNewContainer := newContainer
-	newContainer = func(input *container.NewContainerInput) container.ExecutionsEnvironment {
-		inputs = append(inputs, input)
-		return fakeContainer{}
-	}
-	t.Cleanup(func() { newContainer = origNewContainer })
-
-	rc := &RunContext{
-		Name: "test",
-		Config: &Config{
-			Workdir: "/tmp",
-			// no daemon: an explicit network mode creates no network, and
-			// reusing containers short-circuits the volume cleanup executors
-			ContainerNetworkMode: "host",
-			ReuseContainers:      true,
-			Env:                  map[string]string{},
-			Secrets:              map[string]string{},
-		},
-		Env: map[string]string{},
-		Run: &model.Run{
-			JobID:    "job",
-			Workflow: workflow,
-		},
-	}
-	rc.ExprEval = rc.NewExpressionEvaluator(t.Context())
-
-	require.NoError(t, rc.startJobContainer()(t.Context()))
+`, &Config{})
 
 	credentials := map[string][2]string{}
 	for _, in := range inputs {
 		credentials[in.Image] = [2]string{in.Username, in.Password}
 	}
 
-	// the job container keeps its own credentials, whichever services exist
 	require.Equal(t, [2]string{"job-user", "job-password"}, credentials["registry.example/private:latest"])
-	// each service keeps its own, and a service without credentials gets none
 	require.Equal(t, [2]string{"db-user", "db-password"}, credentials["postgres:latest"])
 	require.Equal(t, [2]string{"", ""}, credentials["redis:latest"])
 }
 
-// A service container reaches the internet the same way the job does, so it inherits the
-// job's proxy; a service that sets the variable itself keeps its own value.
+func TestStartJobContainerMountsWorkflowVolumesAndContainerVolumesOnUnclaimedTargets(t *testing.T) {
+	const ca, certs = "/host/ca.crt:/etc/ssl/certs/ca-certificates.crt:ro", "/host/certs:/certs"
+	inputs := startJobContainerInputs(t, `
+jobs:
+  job:
+    container:
+      image: node:24
+      volumes:
+        - /job/certs:/certs
+    services:
+      redis:
+        image: redis:latest
+        volumes:
+          - data:/data
+          - data:/backup
+          - /blocked/ca.crt:/etc/ssl/certs/ca-certificates.crt:ro
+          - blocked:/certs
+`, &Config{ValidVolumes: []string{"data", "/job/certs"}, ContainerVolumes: []string{ca, certs}})
+	require.Len(t, inputs, 2)
+	redis, job := inputs[0], inputs[1]
+
+	require.Equal(t, "redis:latest", redis.Image)
+	require.Equal(t, []string{"data", "/job/certs", "/host/ca.crt:ro", "/host/certs"}, redis.ValidVolumes)
+	require.Equal(t, map[string]string{"data": "/data"}, redis.Mounts)
+	require.Equal(t, []string{"data:/backup", ca, certs}, redis.Binds)
+	require.Empty(t, redis.WorkingDir)
+	require.Nil(t, redis.Entrypoint)
+	require.Nil(t, redis.Cmd)
+	assert.Subset(t, job.Binds, []string{"/job/certs:/certs", ca})
+	assert.NotContains(t, job.Binds, certs)
+	assert.Subset(t, job.ValidVolumes, []string{"/job/certs", "/host/ca.crt:ro", "/host/certs"})
+	assert.NotContains(t, job.ValidVolumes, "/host/ca.crt", "a workflow must not mount a read-only source writable")
+}
+
+func TestStartJobContainerBuildsEvaluatedJobAndServiceInputs(t *testing.T) {
+	inputs := startJobContainerInputs(t, `
+jobs:
+  job:
+    container: ${{ fromJSON('{"image":"docker://node:20","options":"--label ${{ github.job }}","credentials":{"username":"user","password":"${{ vars.TITLE }}"}}') }}
+    services: ${{ fromJSON('{"redis":{"image":"docker://redis:latest","volumes":["data:/data"],"env":{"TITLE":"${{ github.job }}"},"credentials":{"username":"user","password":"${{ github.job }}"},"entrypoint":"/entry.sh","command":"redis-server --port 6380"}}') }}
+`, &Config{ValidVolumes: []string{"data"}})
+	redis, job := inputs[0], inputs[1]
+
+	require.Equal(t, "redis:latest", redis.Image)
+	require.Equal(t, map[string]string{"data": "/data"}, redis.Mounts)
+	require.Equal(t, []string{"TITLE=${{ github.job }}"}, redis.Env)
+	require.Equal(t, "${{ github.job }}", redis.Password)
+	require.Equal(t, []string{"/entry.sh"}, redis.Entrypoint)
+	require.Equal(t, []string{"redis-server", "--port", "6380"}, redis.Cmd)
+	require.Equal(t, "node:20", job.Image)
+	require.Equal(t, "sleep", job.Entrypoint[0])
+	require.Equal(t, "--label ${{ github.job }}", job.WorkflowOptions)
+	require.Equal(t, "${{ vars.TITLE }}", job.Password)
+
+	inputs = startJobContainerInputs(t, `
+env:
+  REG_USER: ${{ vars.REG_USER }}
+  TEXT: ${{ vars.TEXT }}
+  JOB_CONTAINER_NAME: from-workflow
+jobs:
+  job:
+    container:
+      image: node:20
+      credentials: {username: "${{ env.REG_USER }}", password: pass}
+      ports: ["8080:80"]
+    services:
+      redis:
+        image: redis:latest
+        credentials: {username: "${{ env.REG_USER }}", password: pass}
+        env: {TEXT: "${{ env.TEXT }}"}
+        options: --volumes-from ${{ env.JOB_CONTAINER_NAME }}
+`, &Config{Vars: map[string]string{"REG_USER": "user", "TEXT": "${{ 'literal' }}"}})
+	redis, job = inputs[0], inputs[1]
+	require.Equal(t, "user", job.Username)
+	require.Equal(t, "8080", job.PortBindings["80/tcp"][0].HostPort)
+	require.Equal(t, "user", redis.Username)
+	require.Equal(t, []string{"TEXT=${{ 'literal' }}"}, redis.Env)
+	require.Equal(t, "--volumes-from "+job.Name, redis.WorkflowOptions)
+}
+
+func TestStartJobContainerKeepsRunnerOptionsApartFromWorkflowOptions(t *testing.T) {
+	inputs := startJobContainerInputs(t, `
+name: test
+on: push
+jobs:
+  job:
+    runs-on: ubuntu-latest
+    container:
+      image: registry.example/job:latest
+      options: --cap-add SYS_PTRACE
+    services:
+      redis:
+        image: redis:latest
+        options: --shm-size 1g
+    steps: []
+`, &Config{ContainerOptions: "--device /dev/fuse"})
+
+	options := map[string][2]string{}
+	for _, in := range inputs {
+		options[in.Image] = [2]string{in.RunnerOptions, in.WorkflowOptions}
+	}
+
+	require.Equal(t, [2]string{"--device /dev/fuse", "--cap-add SYS_PTRACE"}, options["registry.example/job:latest"])
+	require.Equal(t, [2]string{"", "--shm-size 1g"}, options["redis:latest"])
+}
+
 func TestStartJobContainerGivesServicesTheJobProxy(t *testing.T) {
-	workflow, err := model.ReadWorkflow(strings.NewReader(`
+	inputs := startJobContainerInputs(t, `
 name: test
 on: push
 jobs:
@@ -319,52 +409,17 @@ jobs:
         env:
           no_proxy: db-only.example
     steps: []
-`))
-	require.NoError(t, err)
+`, &Config{ProxyEnv: map[string]string{"http_proxy": "http://proxy:3128", "no_proxy": "internal.example"}})
 
-	var inputs []*container.NewContainerInput
-	origNewContainer := newContainer
-	newContainer = func(input *container.NewContainerInput) container.ExecutionsEnvironment {
-		inputs = append(inputs, input)
-		return fakeContainer{}
-	}
-	t.Cleanup(func() { newContainer = origNewContainer })
+	db, redis := inputs[0], inputs[1]
 
-	rc := &RunContext{
-		Name: "test",
-		Config: &Config{
-			Workdir:              "/tmp",
-			ContainerNetworkMode: "host",
-			ReuseContainers:      true,
-			Env:                  map[string]string{},
-			ProxyEnv:             map[string]string{"http_proxy": "http://proxy:3128", "no_proxy": "internal.example"},
-			Secrets:              map[string]string{},
-		},
-		Env: map[string]string{},
-		Run: &model.Run{
-			JobID:    "job",
-			Workflow: workflow,
-		},
-	}
-	rc.ExprEval = rc.NewExpressionEvaluator(t.Context())
-
-	require.NoError(t, rc.startJobContainer()(t.Context()))
-
-	env := map[string][]string{}
-	for _, in := range inputs {
-		env[in.Image] = in.Env
-	}
-
-	require.Contains(t, env["redis:latest"], "http_proxy=http://proxy:3128")
-	require.Contains(t, env["redis:latest"], "no_proxy=internal.example")
-	// the service's own env wins over what the runner injected, without dropping the rest
-	require.Contains(t, env["postgres:latest"], "no_proxy=db-only.example")
-	require.NotContains(t, env["postgres:latest"], "no_proxy=internal.example")
-	require.Contains(t, env["postgres:latest"], "http_proxy=http://proxy:3128")
+	require.Contains(t, redis.Env, "http_proxy=http://proxy:3128")
+	require.Contains(t, redis.Env, "no_proxy=internal.example")
+	require.Contains(t, db.Env, "no_proxy=db-only.example")
+	require.NotContains(t, db.Env, "no_proxy=internal.example")
+	require.Contains(t, db.Env, "http_proxy=http://proxy:3128")
 }
 
-// act builds Dockerfile actions through the API, which does not pre-populate the proxy
-// build args the docker CLI would, so the RUN steps would have no network behind a proxy.
 func TestProxyBuildArgs(t *testing.T) {
 	rc := &RunContext{Config: &Config{ProxyEnv: map[string]string{"http_proxy": "http://proxy:3128"}}}
 
@@ -373,69 +428,56 @@ func TestProxyBuildArgs(t *testing.T) {
 	require.Len(t, args, 1)
 	require.Equal(t, "http://proxy:3128", *args["http_proxy"])
 
-	// a job without a proxy builds exactly as it does today
 	require.Nil(t, (&RunContext{Config: &Config{}}).proxyBuildArgs())
 }
 
 func TestRunContext_GetBindsAndMounts(t *testing.T) {
-	rctemplate := &RunContext{
-		Name: "TestRCName",
-		Run: &model.Run{
-			Workflow: &model.Workflow{
-				Name: "TestWorkflowName",
+	newRunContext := func(config *Config) *RunContext {
+		return &RunContext{
+			Name: "TestRCName",
+			Run: &model.Run{
+				Workflow: &model.Workflow{Name: "TestWorkflowName"},
 			},
-		},
-		Config: &Config{
-			BindWorkdir: false,
-		},
+			Config: config,
+		}
 	}
+	rctemplate := newRunContext(&Config{})
 
 	tests := []struct {
 		windowsPath bool
-		name        string
-		rc          *RunContext
-		wantbind    string
-		wantmount   string
+		name, want  string
 	}{
-		{false, "/mnt/linux", rctemplate, "/mnt/linux", "/mnt/linux"},
-		{false, "/mnt/path with spaces/linux", rctemplate, "/mnt/path with spaces/linux", "/mnt/path with spaces/linux"},
-		{true, "C:\\Users\\TestPath\\MyTestPath", rctemplate, "/mnt/c/Users/TestPath/MyTestPath", "/mnt/c/Users/TestPath/MyTestPath"},
-		{true, "C:\\Users\\Test Path with Spaces\\MyTestPath", rctemplate, "/mnt/c/Users/Test Path with Spaces/MyTestPath", "/mnt/c/Users/Test Path with Spaces/MyTestPath"},
-		{true, "/LinuxPathOnWindowsShouldFail", rctemplate, "", ""},
+		{false, "/mnt/linux", "/mnt/linux"},
+		{false, "/mnt/path with spaces/linux", "/mnt/path with spaces/linux"},
+		{true, `C:\Users\TestPath\MyTestPath`, "/mnt/c/Users/TestPath/MyTestPath"},
+		{true, `C:\Users\Test Path with Spaces\MyTestPath`, "/mnt/c/Users/Test Path with Spaces/MyTestPath"},
+		{true, "/LinuxPathOnWindowsShouldFail", ""},
 	}
 
-	isWindows := runtime.GOOS == "windows"
-
 	for _, testcase := range tests {
-		// pin for scopelint
+		if (runtime.GOOS == "windows") != testcase.windowsPath {
+			continue
+		}
 		for _, bindWorkDir := range []bool{true, false} {
-			// pin for scopelint
 			testBindSuffix := ""
 			if bindWorkDir {
 				testBindSuffix = "Bind"
 			}
+			t.Run(testcase.name+testBindSuffix, func(t *testing.T) {
+				rctemplate.Config.Workdir = testcase.name
+				rctemplate.Config.BindWorkdir = bindWorkDir
+				gotbind, gotmount, _ := rctemplate.GetBindsAndMounts(t.Context())
 
-			// Only run windows path tests on windows and non-windows on non-windows
-			if (isWindows && testcase.windowsPath) || (!isWindows && !testcase.windowsPath) {
-				t.Run((testcase.name + testBindSuffix), func(t *testing.T) {
-					config := testcase.rc.Config
-					config.Workdir = testcase.name
-					config.BindWorkdir = bindWorkDir
-					gotbind, gotmount := rctemplate.GetBindsAndMounts()
-
-					// Name binds/mounts are either/or
-					if config.BindWorkdir {
-						fullBind := testcase.name + ":" + testcase.wantbind
-						if runtime.GOOS == "darwin" {
-							fullBind += ":delegated"
-						}
-						assert.Contains(t, gotbind, fullBind)
-					} else {
-						mountkey := testcase.rc.jobContainerName()
-						assert.EqualValues(t, testcase.wantmount, gotmount[mountkey]) //nolint:testifylint // pre-existing issue from nektos/act
+				if bindWorkDir {
+					fullBind := testcase.name + ":" + testcase.want
+					if runtime.GOOS == "darwin" {
+						fullBind += ":delegated"
 					}
-				})
-			}
+					assert.Contains(t, gotbind, fullBind)
+				} else {
+					assert.Equal(t, testcase.want, gotmount[rctemplate.jobContainerName()])
+				}
+			})
 		}
 	}
 
@@ -449,6 +491,7 @@ func TestRunContext_GetBindsAndMounts(t *testing.T) {
 			{"BindAnonymousVolume", []string{"/volume"}, "/volume", map[string]string{}},
 			{"BindHostFile", []string{"/path/to/file/on/host:/volume"}, "/path/to/file/on/host:/volume", map[string]string{}},
 			{"MountExistingVolume", []string{"volume-id:/volume"}, "", map[string]string{"volume-id": "/volume"}},
+			{"MountExistingVolumeTwice", []string{"volume-id:/volume", "volume-id:/other"}, "volume-id:/other", map[string]string{"volume-id": "/volume"}},
 			{"MountExistingVolumeReadOnly", []string{"volume-id:/volume:ro"}, "volume-id:/volume:ro", map[string]string{}},
 			{"BindRelativeHostPath", []string{"./relative:/volume"}, "./relative:/volume", map[string]string{}},
 			{"OverridesToolCache", []string{"/host/tools:/opt/hostedtoolcache"}, "/host/tools:/opt/hostedtoolcache", map[string]string{}},
@@ -457,30 +500,25 @@ func TestRunContext_GetBindsAndMounts(t *testing.T) {
 
 		t.Run("InterpolatedContainerVolumes", func(t *testing.T) {
 			job := &model.Job{}
-			err := job.RawContainer.Encode(map[string][]string{
-				"volumes": {"${{ secrets.MAME }}:/root/.mame/roms:ro"},
+			err := job.RawContainer.Encode(map[string]any{
+				"image":   "node:20",
+				"volumes": []string{"${{ secrets.MAME }}:/root/.mame/roms:ro"},
 			})
 			require.NoError(t, err)
 
-			rc := &RunContext{
-				Name: "TestRCName",
-				Run: &model.Run{
-					Workflow: &model.Workflow{
-						Name: "TestWorkflowName",
-					},
+			rc := newRunContext(&Config{
+				Env:          testCheckoutEnv(),
+				ValidVolumes: []string{"**"},
+				Secrets: map[string]string{
+					"MAME": "/host/mame/roms",
 				},
-				Config: &Config{
-					BindWorkdir: false,
-					Secrets: map[string]string{
-						"MAME": "/host/mame/roms",
-					},
-				},
-			}
+			})
 			rc.Run.JobID = "job1"
 			rc.Run.Workflow.Jobs = map[string]*model.Job{"job1": job}
-			rc.ExprEval = rc.NewExpressionEvaluator(context.Background())
+			rc.ExprEval = rc.NewExpressionEvaluator(t.Context())
+			require.NoError(t, rc.resolvePlatformImage(t.Context()))
 
-			gotbind, gotmount := rc.GetBindsAndMounts()
+			gotbind, gotmount, _ := rc.GetBindsAndMounts(t.Context())
 			assert.Contains(t, gotbind, "/host/mame/roms:/root/.mame/roms:ro")
 			assert.NotContains(t, gotbind, "${{ secrets.MAME }}")
 			assert.NotContains(t, gotmount, "${{ secrets.MAME }}")
@@ -488,76 +526,86 @@ func TestRunContext_GetBindsAndMounts(t *testing.T) {
 
 		for _, testcase := range tests {
 			t.Run(testcase.name, func(t *testing.T) {
-				job := &model.Job{}
-				err := job.RawContainer.Encode(map[string][]string{
-					"volumes": testcase.volumes,
+				rc := newRunContext(&Config{
+					SharedToolCache: true,
+					ValidVolumes:    []string{"**"},
 				})
-				assert.NoError(t, err) //nolint:testifylint // pre-existing issue from nektos/act
-
-				rc := &RunContext{
-					Name: "TestRCName",
-					Run: &model.Run{
-						Workflow: &model.Workflow{
-							Name: "TestWorkflowName",
-						},
-					},
-					Config: &Config{
-						BindWorkdir:     false,
-						SharedToolCache: true, // so OverridesToolCache has a mount to displace
-					},
-				}
+				rc.containerSpec.Volumes = testcase.volumes
 				rc.Run.JobID = "job1"
-				rc.Run.Workflow.Jobs = map[string]*model.Job{"job1": job}
 
-				jobBinds, jobMounts := rc.GetBindsAndMounts()
-				svcBinds, svcMounts := rc.GetServiceBindsAndMounts(testcase.volumes)
-				// job and service containers classify volumes alike, only their own mounts differ
-				for _, got := range []struct {
-					binds  []string
-					mounts map[string]string
-				}{{jobBinds, jobMounts}, {svcBinds, svcMounts}} {
-					gotbind, gotmount := got.binds, got.mounts
+				gotbind, gotmount, _ := rc.GetBindsAndMounts(t.Context())
 
-					if len(testcase.wantbind) > 0 {
-						assert.Contains(t, gotbind, testcase.wantbind)
-					}
+				if len(testcase.wantbind) > 0 {
+					assert.Contains(t, gotbind, testcase.wantbind)
+				}
 
-					for k, v := range testcase.wantmount {
-						assert.Contains(t, gotmount, k)
-						assert.Equal(t, gotmount[k], v)
-					}
+				for k, v := range testcase.wantmount {
+					assert.Contains(t, gotmount, k)
+					assert.Equal(t, gotmount[k], v)
+				}
 
-					// Docker rejects a container with two mounts on one target, so the job's own
-					// volumes must displace the runner's rather than pile up next to them.
-					targets := map[string]bool{}
-					for _, bind := range gotbind {
-						parsed, err := loader.ParseVolume(bind)
-						require.NoError(t, err)
-						assert.NotContains(t, targets, parsed.Target, "%s mounts an already mounted target", bind)
-						targets[parsed.Target] = true
-					}
-					for source, target := range gotmount {
-						assert.NotContains(t, targets, target, "%s mounts an already mounted target", source)
-						targets[target] = true
-					}
+				targets := map[string]bool{}
+				for _, bind := range gotbind {
+					parsed, err := container.ParseVolume(bind)
+					require.NoError(t, err)
+					assert.NotContains(t, targets, parsed.Target, "%s mounts an already mounted target", bind)
+					targets[parsed.Target] = true
+				}
+				for source, target := range gotmount {
+					assert.NotContains(t, targets, target, "%s mounts an already mounted target", source)
+					targets[target] = true
 				}
 			})
 		}
 	})
 
 	t.Run("ToolCacheMount", func(t *testing.T) {
-		rc := &RunContext{
-			Name:   "TestRCName",
-			Run:    &model.Run{Workflow: &model.Workflow{Name: "TestWorkflowName"}},
-			Config: &Config{},
-		}
+		rc := newRunContext(&Config{})
 
-		_, gotmount := rc.GetBindsAndMounts()
+		_, gotmount, _ := rc.GetBindsAndMounts(t.Context())
 		assert.NotContains(t, gotmount, sharedToolCacheVolume)
 
 		rc.Config.SharedToolCache = true
-		_, gotmount = rc.GetBindsAndMounts()
+		rc.containerSpec.Volumes = []string{"/unapproved:" + container.DefaultToolCache}
+		_, gotmount, _ = rc.GetBindsAndMounts(t.Context())
 		assert.Equal(t, container.DefaultToolCache, gotmount[sharedToolCacheVolume])
+
+		rc.Config.ToolCacheSlot = "1"
+		_, gotmount, _ = rc.GetBindsAndMounts(t.Context())
+		assert.Equal(t, container.DefaultToolCache, gotmount[sharedToolCacheVolume+"-1"])
+		assert.NotContains(t, gotmount, sharedToolCacheVolume)
+		assert.Contains(t, rc.validVolumes(), sharedToolCacheVolume+"-1")
+	})
+
+	t.Run("DaemonMountsAboveOwnerRepo", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("container paths are linux paths")
+		}
+		rc := &RunContext{
+			Run:    &model.Run{JobID: "job1", Workflow: &model.Workflow{Jobs: map[string]*model.Job{"job1": {}}}},
+			Config: &Config{BindWorkdir: true, Workdir: "/workspace/1/owner/repo", PresetGitHubContext: &model.GithubContext{}, ValidVolumes: []string{"claimed"}},
+		}
+
+		gotbind, _, workspace := rc.GetBindsAndMounts(t.Context())
+		assert.True(t, slices.ContainsFunc(gotbind, func(bind string) bool { return strings.HasPrefix(bind, "/workspace/1:/workspace/1") }), gotbind)
+		assert.Equal(t, "/workspace/1", workspace)
+
+		rc.Config.BindWorkdir = false
+		_, gotmount, workspace := rc.GetBindsAndMounts(t.Context())
+		assert.Equal(t, "/workspace/1", gotmount[rc.jobContainerName()])
+		assert.Empty(t, workspace)
+
+		rc.containerSpec.Volumes = []string{"claimed:/workspace/1"}
+		_, gotmount, _ = rc.GetBindsAndMounts(t.Context())
+		assert.Equal(t, "/workspace/1/owner/repo", gotmount[rc.jobContainerName()])
+		rc.Config.BindWorkdir = true
+		_, _, workspace = rc.GetBindsAndMounts(t.Context())
+		assert.Equal(t, "/workspace/1/owner/repo", workspace)
+
+		rc.containerSpec.Volumes = nil
+		rc.Config.PresetGitHubContext = nil
+		_, _, workspace = rc.GetBindsAndMounts(t.Context())
+		assert.Empty(t, workspace)
 	})
 }
 
@@ -571,17 +619,29 @@ func TestRunContextValidVolumes(t *testing.T) {
 
 	got := rc.validVolumes()
 
-	// the configured volumes plus the ones the runner mounts automatically
 	assert.Subset(t, got, []string{"my-vol", "/host/path", sharedToolCacheVolume, name, name + "-env", "/var/run/docker.sock"})
 
-	// deriving the list must never mutate or grow the shared Config slice: parallel matrix
-	// combinations share one *Config, and the previous in-place append was a data race.
 	assert.Equal(t, []string{"my-vol", "/host/path"}, rc.Config.ValidVolumes)
 	assert.Len(t, rc.validVolumes(), len(got), "repeated calls must be stable, not accumulate")
 
-	// a job may mount it only while the runner does
 	rc.Config.SharedToolCache = false
 	assert.NotContains(t, rc.validVolumes(), sharedToolCacheVolume)
+
+	rc.Config.Workdir = "/workspace/1/owner/repo"
+	assert.NotContains(t, rc.validVolumes(), rc.Config.Workdir)
+	rc.Config.BindWorkdir = true
+	assert.Contains(t, rc.validVolumes(), rc.Config.Workdir)
+	rc.Config.PresetGitHubContext = &model.GithubContext{}
+	assert.Contains(t, rc.validVolumes(), filepath.FromSlash("/workspace/1"))
+
+	hostEnv := &container.HostEnvironment{Path: t.TempDir(), ActPath: t.TempDir()}
+	rc.JobContainer = hostEnv
+	rc.Config.BindWorkdir = false
+	rc.Config.SharedToolCache = true
+	binds, mounts, _ := rc.GetBindsAndMounts(t.Context())
+	assert.Subset(t, binds, []string{hostEnv.Path + ":" + hostEnv.Path, hostEnv.GetActPath() + ":" + hostEnv.GetActPath()})
+	assert.Contains(t, mounts, sharedToolCacheVolume)
+	assert.Equal(t, binds, container.SanitizeBinds(t.Context(), rc.validVolumes(), binds))
 }
 
 func TestCleanupJobResourcesCleansServicesWithoutJobContainer(t *testing.T) {
@@ -594,60 +654,315 @@ func TestCleanupJobResourcesCleansServicesWithoutJobContainer(t *testing.T) {
 		serviceContainers: []*serviceContainer{{name: "svc", container: service}},
 	}
 
-	err := rc.cleanupJobResources("external-network", false)(context.Background())
+	err := rc.cleanupJobResources("external-network", false, true)(common.WithDryrun(t.Context(), true))
 	require.NoError(t, err)
 	service.AssertExpectations(t)
 }
 
-// cleanup used to bail out on a previous step's error and on a cancelled context
-func TestCleanupJobResourcesContinuesAfterFailure(t *testing.T) {
-	t.Setenv("DOCKER_HOST", "unix:///nonexistent.sock")
-
-	jobContainer := &containerMock{}
-	jobContainer.On("Remove").Return(func(context.Context) error { return errors.New("removal failed") }).Once()
-	service := &containerMock{}
-	service.On("Remove").Return(func(context.Context) error { return nil }).Once()
-	service.On("Close").Return(func(context.Context) error { return nil }).Once()
-
+func TestCleanupJobVolumesReapsAbandonedDeferredCleanup(t *testing.T) {
+	now := time.Date(2026, time.September, 10, 12, 0, 0, 0, time.UTC)
 	rc := &RunContext{
-		Name:              "job",
-		Config:            &Config{},
-		Run:               &model.Run{Workflow: &model.Workflow{Name: "wf"}, JobID: "job"},
-		JobContainer:      jobContainer,
-		serviceContainers: []*serviceContainer{{name: "svc", container: service}},
+		Config:       &Config{ContainerNetworkCreateOptions: container.NewDockerNetworkCreateExecutorInput{RunnerUUID: "runner-1"}},
+		Run:          &model.Run{Workflow: &model.Workflow{Name: "workflow"}, JobID: "job"},
+		JobContainer: fakeContainer{},
 	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	require.Error(t, rc.cleanupJobResources("job-network", true)(ctx))
-	jobContainer.AssertExpectations(t)
-	service.AssertExpectations(t)
+	volumes := map[string]volume.Volume{}
+	fakeDockerDaemon(t, func(writer http.ResponseWriter, request *http.Request) {
+		path := strings.TrimPrefix(request.URL.Path, "/v1.47")
+		switch {
+		case path == "/volumes/create":
+			options := volume.Volume{CreatedAt: now.Format(time.RFC3339)}
+			assert.NoError(t, json.UnmarshalRead(request.Body, &options))
+			volumes[options.Name] = options
+			assert.NoError(t, json.MarshalWrite(writer, volumes[options.Name]))
+		case path == "/volumes":
+			assert.JSONEq(t, `{"label":{"com.gitea.runner.uuid=runner-1":true},"dangling":{"true":true}}`, request.URL.Query().Get("filters"))
+			assert.NoError(t, json.MarshalWrite(writer, map[string]any{"Volumes": slices.Collect(maps.Values(volumes))}))
+		case request.Method == http.MethodDelete:
+			name := strings.TrimPrefix(path, "/volumes/")
+			assert.NotContains(t, []string{"1", "true"}, request.URL.Query().Get("force"))
+			if name == "became-active" || name == "remove-failed" {
+				writer.WriteHeader(http.StatusConflict)
+				_, _ = fmt.Fprintf(writer, `{"message":%q}`, name)
+				return
+			}
+			delete(volumes, name)
+			writer.WriteHeader(http.StatusNoContent)
+		default:
+			t.Errorf("unexpected Docker request: %s %s", request.Method, request.URL)
+		}
+	})
+	name := rc.jobContainerName()
+	require.NoError(t, rc.createJobVolumes(t.Context(), map[string]string{name: "/workspace", name + "-env": "/var/run/act", "shared-cache": "/cache"}))
+	assert.ElementsMatch(t, []string{name, name + "-env"}, slices.Collect(maps.Keys(volumes)))
+	rc.deferVolumeCleanup = func(common.Executor) {}
+	require.NoError(t, rc.cleanupJobResources("", false, false)(t.Context()))
+	require.Len(t, volumes, 2)
+	for _, name := range []string{"became-active", "remove-failed"} {
+		volumes[name] = volume.Volume{Name: name, Labels: volumes[rc.jobContainerName()].Labels, CreatedAt: now.Format(time.RFC3339)}
+	}
+	volumes["foreign"] = volume.Volume{Name: "foreign", Labels: map[string]string{"com.gitea.runner.uuid": "runner-2"}, CreatedAt: now.Format(time.RFC3339)}
+	volumes["fresh"] = volume.Volume{Name: "fresh", Labels: volumes[name].Labels, CreatedAt: now.Add(48 * time.Hour).Format(time.RFC3339)}
+	volumes["unknown-age"] = volume.Volume{Name: "unknown-age", Labels: volumes[name].Labels}
+	err := container.RemoveOrphanJobVolumes(t.Context(), "runner-1", now.Add(24*time.Hour))
+	require.ErrorContains(t, err, "became-active")
+	require.ErrorContains(t, err, "remove-failed")
+	assert.ElementsMatch(t, []string{"became-active", "remove-failed", "foreign", "fresh", "unknown-age"}, slices.Collect(maps.Keys(volumes)))
 }
 
-// TestInterpolateOutputsIsPerMatrixCombo guards the matrix-output fix: combinations share one
-// *model.Job, so each must interpolate from its own pristine snapshot. Otherwise the first
-// combo's resolved value freezes the shared template and later combos can't resolve their own.
-func TestInterpolateOutputsIsPerMatrixCombo(t *testing.T) {
-	job := &model.Job{Outputs: map[string]string{"o": "${{ matrix.v }}"}}
-	run := &model.Run{JobID: "j", Workflow: &model.Workflow{Name: "w", Jobs: map[string]*model.Job{"j": job}}}
-	r := &runnerImpl{config: &Config{}}
-	ctx := context.Background()
+func TestCleanupJobResourcesEmptiesTaskWorkspace(t *testing.T) {
+	defer func(previous bool) { runnerCanRemoveJobFiles = previous }(runnerCanRemoveJobFiles)
+	for _, tt := range []struct {
+		name, workspace string
+		caller          *caller
+		runnerCanRemove bool
+		execErr         error
+		log             string
+	}{
+		{name: "refusal is logged", workspace: "/workspace/1", execErr: container.ExitCodeError(3), log: "not emptying workspace /workspace/1"},
+		{name: "failure does not fail the job", workspace: "/workspace/1", execErr: errors.New("no rm"), log: "could not empty workspace /workspace/1"},
+		{name: "no runner bind"},
+		{name: "called workflow shares it", workspace: "/workspace/1", caller: &caller{}},
+		{name: "runner removes it itself", workspace: "/workspace/1", runnerCanRemove: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			runnerCanRemoveJobFiles = tt.runnerCanRemove
+			processLog := logtest.SetDefault(t)
+			var jobLog bytes.Buffer
+			var calls []string
+			job := &containerMock{}
+			if tt.log != "" {
+				job.On("ReplaceLogWriter", io.Discard, io.Discard).Return(&jobLog, &jobLog).Once()
+				job.On("ReplaceLogWriter", &jobLog, &jobLog).Return(io.Discard, io.Discard).Once()
+				job.On("Exec", mock.MatchedBy(func(command []string) bool { return command[4] == tt.workspace }), map[string]string{"PATH": "/usr/sbin:/usr/bin:/sbin:/bin"}, "0", "/").Return(func(ctx context.Context) error {
+					calls = append(calls, "exec")
+					deadline, ok := ctx.Deadline()
+					assert.True(t, ok)
+					assert.LessOrEqual(t, time.Until(deadline), 10*time.Second-container.DrainGracePeriod)
+					common.Logger(ctx).Infof("workspace script output")
+					return tt.execErr
+				})
+			}
+			job.On("Remove").Return(func(context.Context) error {
+				calls = append(calls, "remove")
+				return nil
+			})
+			rc := &RunContext{
+				Config:             &Config{},
+				Run:                &model.Run{Workflow: &model.Workflow{Name: "workflow"}, JobID: "job"},
+				JobContainer:       job,
+				taskWorkspace:      tt.workspace,
+				caller:             tt.caller,
+				deferVolumeCleanup: func(common.Executor) {},
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+			defer cancel()
+			ctx = common.WithLogger(ctx, logging.New(logging.NewLevelHandler(newJobLogHandler(&jobLog, cyan), logging.LevelInfo)))
+			require.NoError(t, rc.cleanupJobResources("", false, false)(ctx))
+			job.AssertExpectations(t)
+			assert.NotContains(t, jobLog.String(), "workspace")
+			if tt.log == "" {
+				assert.Equal(t, []string{"remove"}, calls)
+				return
+			}
+			assert.Equal(t, []string{"exec", "remove"}, calls)
+			assert.True(t, slices.ContainsFunc(processLog.AllRecords(), func(record logging.Record) bool {
+				return strings.HasPrefix(record.Message, tt.log)
+			}), processLog.AllRecords())
+		})
+	}
+}
 
-	rcA := r.newRunContext(ctx, run, map[string]any{"v": "a"})
-	rcB := r.newRunContext(ctx, run, map[string]any{"v": "b"})
+func TestEmptyTaskWorkspaceScript(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the script runs in the linux job container")
+	}
+	run := func(t *testing.T, workspace string, mountpoints ...string) error {
+		t.Helper()
+		var mountinfo strings.Builder
+		for _, mountpoint := range mountpoints {
+			fmt.Fprintf(&mountinfo, "36 35 98:0 /src %s rw - ext4 /dev/sda1 rw\n", mountpoint)
+		}
+		info := filepath.Join(t.TempDir(), "mountinfo")
+		require.NoError(t, os.WriteFile(info, []byte(mountinfo.String()), 0o600))
+		return exec.Command("sh", "-c", emptyTaskWorkspaceScript, "sh", workspace, info).Run()
+	}
+
+	workspace := t.TempDir()
+	for _, file := range []string{"owner/repo/file", ".hidden", "..odd"} {
+		require.NoError(t, os.MkdirAll(filepath.Dir(filepath.Join(workspace, file)), 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(workspace, file), nil, 0o600))
+	}
+	require.NoError(t, run(t, workspace, workspace))
+	entries, err := os.ReadDir(workspace)
+	require.NoError(t, err)
+	assert.Empty(t, entries)
+
+	for _, tt := range []struct {
+		name, workspace string
+		mountpoints     []string
+	}{
+		{"a mount below it", "/nonexistent/1", []string{"/nonexistent/1", "/nonexistent/1/owner/repo/cache"}},
+		{"a workspace that is not a mountpoint", "/nonexistent/1", []string{"/nonexistent/2"}},
+		{"a top-level directory", "/nonexistent", []string{"/nonexistent"}},
+	} {
+		t.Run("refuses "+tt.name, func(t *testing.T) {
+			var exitErr *exec.ExitError
+			require.ErrorAs(t, run(t, tt.workspace, tt.mountpoints...), &exitErr)
+			assert.Equal(t, 3, exitErr.ExitCode())
+		})
+	}
+}
+
+func TestRemoveDockerActionImagesByTag(t *testing.T) {
+	var removed []string
+	fakeDockerDaemon(t, func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method == http.MethodDelete {
+			removed = append(removed, strings.TrimPrefix(request.URL.Path, "/v1.47/images/"))
+			_, _ = io.WriteString(writer, "[]")
+			return
+		}
+		_, _ = io.WriteString(writer, `{"Id":"sha256:shared"}`)
+	})
+	(&RunContext{dockerActionImages: map[*model.Step]string{{}: "act-action-dockeraction:latest-job"}}).removeDockerActionImages(t.Context())
+	assert.Equal(t, []string{"act-action-dockeraction:latest-job"}, removed)
+}
+
+func TestCleanupJobResources(t *testing.T) {
+	t.Setenv("TMPDIR", "/tmp")
+	proxyDir := t.TempDir()
+	for _, name := range []string{"synchronous", "proxy", "closed proxy", "kept proxy", "deferred", "preclean deferred", "canceled proxy"} {
+		t.Run(name, func(t *testing.T) {
+			proxy, preclean, deferred := strings.HasSuffix(name, "proxy"), strings.HasPrefix(name, "preclean"), strings.HasSuffix(name, "deferred")
+			removesLabelled := (proxy || preclean) && name != "kept proxy"
+			if proxy && runtime.GOOS == "windows" {
+				t.Skip("Unix socket ownership is unavailable on Windows")
+			}
+			jobError, removeError, closeError := errors.New("remove job"), errors.New("remove service"), errors.New("close service")
+			job, service := &containerMock{}, &containerMock{}
+			removeAlongside := func(started, other chan struct{}, failure error) func(context.Context) error {
+				return func(context.Context) error {
+					close(started)
+					select {
+					case <-other:
+					case <-time.After(10 * time.Second):
+						t.Error("the containers are removed one after the other instead of alongside each other")
+					}
+					return failure
+				}
+			}
+			jobRemoving, serviceRemoving := make(chan struct{}), make(chan struct{})
+			job.On("Remove").Return(removeAlongside(jobRemoving, serviceRemoving, jobError)).Once()
+			service.On("Remove").Return(removeAlongside(serviceRemoving, jobRemoving, removeError)).Once()
+			service.On("Close").Return(func(context.Context) error { return closeError }).Once()
+			rc := &RunContext{
+				Config:            &Config{CacheContainer: "cache-container", Sweep: name != "kept proxy"},
+				Run:               &model.Run{Workflow: &model.Workflow{Name: "wf"}, JobID: "job"},
+				JobContainer:      job,
+				serviceContainers: []*serviceContainer{{name: "svc", container: service}},
+			}
+			var volumeCleanup []common.Executor
+			if deferred {
+				rc.deferVolumeCleanup = func(cleanup common.Executor) { volumeCleanup = append(volumeCleanup, cleanup) }
+			}
+			volumeRemovals := 0
+			fakeDockerDaemon(t, func(writer http.ResponseWriter, request *http.Request) {
+				if request.Method == http.MethodDelete {
+					volumeRemovals++
+				}
+				operation := request.Method + " " + strings.TrimPrefix(request.URL.Path, "/v1.47")
+				if request.URL.Query().Has("filters") {
+					operation = "labelled " + operation
+				}
+				writer.WriteHeader(http.StatusInternalServerError)
+				_, _ = fmt.Fprintf(writer, `{"message":%q}`, operation)
+			})
+			if proxy {
+				listener, err := net.Listen("unix", filepath.Join(proxyDir, "d.sock"))
+				require.NoError(t, err)
+				t.Cleanup(func() { require.NoError(t, listener.Close()) })
+				rc.dockerProxy, err = container.StartDockerProxy(listener.Addr().String(), proxyDir, rc.jobContainerName())
+				require.NoError(t, err)
+				t.Cleanup(func() { require.NoError(t, rc.closeDockerProxy(context.Background())) })
+				if name == "closed proxy" {
+					require.NoError(t, rc.closeDockerProxy(t.Context()))
+				}
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			if name == "canceled proxy" {
+				cancel()
+			}
+			err := rc.cleanupJobResources("job-network", true, preclean)(ctx)
+			if deferred && !preclean {
+				require.Len(t, volumeCleanup, 1)
+				assert.Zero(t, volumeRemovals)
+				err = errors.Join(err, volumeCleanup[0](ctx))
+			} else {
+				assert.Empty(t, volumeCleanup)
+			}
+			for _, failure := range []error{jobError, removeError, closeError} {
+				require.ErrorIs(t, err, failure)
+			}
+			for _, operation := range []string{"DELETE /volumes/" + rc.jobContainerName(), "DELETE /volumes/" + rc.jobContainerName() + "-env", "POST /networks/job-network/disconnect", "GET /networks"} {
+				require.ErrorContains(t, err, operation)
+			}
+			assert.Equal(t, 2, volumeRemovals)
+			assert.Equal(t, removesLabelled, strings.Contains(err.Error(), "labelled GET /containers/json"))
+			if removesLabelled {
+				require.ErrorContains(t, err, "labelled GET /networks")
+				require.ErrorContains(t, err, "labelled GET /volumes")
+			}
+			assert.Nil(t, rc.dockerProxy)
+			assert.Equal(t, proxy, rc.hadDockerProxy)
+		})
+	}
+}
+
+func TestInterpolateOutputsIsPerMatrixComboKeepingNeedsOutputs(t *testing.T) {
+	job := &model.Job{Outputs: map[string]string{"o": "${{ matrix.v }}"}}
+	require.NoError(t, job.RawOutputs.Encode(job.Outputs))
+	needed := &model.Job{Outputs: map[string]string{"o": "from-gitea"}}
+	run := &model.Run{JobID: "j", Workflow: &model.Workflow{Name: "w", Jobs: map[string]*model.Job{"j": job, "needed": needed}}}
+	r := &runnerImpl{config: &Config{PresetGitHubContext: &model.GithubContext{}}}
+	ctx := t.Context()
+
+	_, err := r.newRunContext(ctx, &model.Run{JobID: "needed", Workflow: run.Workflow}, nil)
+	require.NoError(t, err)
+	rcA, err := r.newRunContext(ctx, run, map[string]any{"v": "a"})
+	require.NoError(t, err)
+	rcB, err := r.newRunContext(ctx, run, map[string]any{"v": "b"})
+	require.NoError(t, err)
+	rcEmpty, err := r.newRunContext(ctx, run, map[string]any{"v": ""})
+	require.NoError(t, err)
+	require.Empty(t, job.Outputs)
 
 	require.NoError(t, rcA.interpolateOutputs()(ctx))
 	require.NoError(t, rcB.interpolateOutputs()(ctx))
+	require.NoError(t, rcEmpty.interpolateOutputs()(ctx))
 
-	// Last combo wins (matching GitHub) instead of being frozen to combo A's "a".
-	require.Equal(t, "b", job.Outputs["o"])
+	require.Equal(t, map[string]string{"o": "b"}, job.Outputs)
+	require.Equal(t, map[string]string{"o": "from-gitea"}, needed.Outputs)
+}
+
+func TestInterpolateOutputsFromExpression(t *testing.T) {
+	var rawOutputs yaml.Node
+	require.NoError(t, rawOutputs.Encode(`${{ fromJSON('{"o":"resolved"}') }}`))
+
+	job := &model.Job{RawOutputs: rawOutputs}
+	run := &model.Run{JobID: "j", Workflow: &model.Workflow{Name: "w", Jobs: map[string]*model.Job{"j": job}}}
+	rc, err := (&runnerImpl{config: &Config{PresetGitHubContext: &model.GithubContext{}}}).newRunContext(t.Context(), run, nil)
+	require.NoError(t, err)
+
+	require.NoError(t, rc.interpolateOutputs()(t.Context()))
+	require.Equal(t, "resolved", job.Outputs["o"])
 }
 
 func TestGetGitHubContext(t *testing.T) {
-	log.SetLevel(log.DebugLevel)
+	logging.SetLevel(logging.LevelDebug)
 
 	cwd, err := os.Getwd()
-	assert.NoError(t, err) //nolint:testifylint // pre-existing issue from nektos/act
+	require.NoError(t, err)
 
 	rc := &RunContext{
 		Config: &Config{
@@ -660,21 +975,19 @@ func TestGetGitHubContext(t *testing.T) {
 		Run: &model.Run{
 			Workflow: &model.Workflow{
 				Name: "GitHubContextTest",
+				Jobs: map[string]*model.Job{"job1": {}},
 			},
 		},
-		Name:           "GitHubContextTest",
-		CurrentStep:    "step",
-		Matrix:         map[string]any{},
-		Env:            map[string]string{},
-		ExtraPath:      []string{},
-		StepResults:    map[string]*model.StepResult{},
-		OutputMappings: map[MappableOutput]MappableOutput{},
+		Name:        "GitHubContextTest",
+		CurrentStep: "step",
+		Matrix:      map[string]any{},
+		Env:         map[string]string{},
+		ExtraPath:   []string{},
+		StepResults: map[string]*model.StepResult{},
 	}
 	rc.Run.JobID = "job1"
 
-	ghc := rc.getGithubContext(context.Background())
-
-	log.Debugf("%v", ghc)
+	ghc := rc.getGithubContext(t.Context())
 
 	actor := "nektos/act"
 	if a := os.Getenv("ACT_ACTOR"); a != "" {
@@ -691,15 +1004,77 @@ func TestGetGitHubContext(t *testing.T) {
 		owner = o
 	}
 
-	assert.Equal(t, ghc.RunID, "1")         //nolint:testifylint // pre-existing issue from nektos/act
-	assert.Equal(t, ghc.RunNumber, "1")     //nolint:testifylint // pre-existing issue from nektos/act
-	assert.Equal(t, ghc.RetentionDays, "0") //nolint:testifylint // pre-existing issue from nektos/act
-	assert.Equal(t, ghc.Actor, actor)
-	assert.Equal(t, ghc.Repository, repo)
-	assert.Equal(t, ghc.RepositoryOwner, owner)
-	assert.Equal(t, ghc.RunnerPerflog, "/dev/null") //nolint:testifylint // pre-existing issue from nektos/act
-	assert.Equal(t, ghc.Token, rc.Config.Secrets["GITHUB_TOKEN"])
-	assert.Equal(t, ghc.Job, "job1") //nolint:testifylint // pre-existing issue from nektos/act
+	assert.Equal(t, "1", ghc.RunID)
+	assert.Equal(t, "1", ghc.RunNumber)
+	assert.Equal(t, "0", ghc.RetentionDays)
+	assert.Equal(t, actor, ghc.Actor)
+	assert.Equal(t, repo, ghc.Repository)
+	assert.Equal(t, owner, ghc.RepositoryOwner)
+	assert.Equal(t, "/dev/null", ghc.RunnerPerflog)
+	assert.Equal(t, rc.Config.Secrets["GITHUB_TOKEN"], ghc.Token)
+	assert.Equal(t, "job1", ghc.Job)
+
+	rc.Config.PresetGitHubContext = &model.GithubContext{
+		Actor:             "preset-actor",
+		ActorID:           "12",
+		TriggeringActor:   "triggerer",
+		Job:               "preset-job",
+		RepositoryID:      "34",
+		RepositoryOwnerID: "56",
+		WorkflowRef:       "owner/repo/.gitea/workflows/test.yml@refs/heads/main",
+		RefProtected:      true,
+	}
+	ghc = rc.getGithubContext(t.Context())
+	assert.Equal(t, "preset-actor", ghc.Actor)
+	assert.Equal(t, "triggerer", ghc.TriggeringActor)
+	assert.Equal(t, "job1", ghc.Job)
+	env := map[string]string{"GITHUB_WORKFLOW_SHA": "workflow-sha"}
+	rc.withGithubEnv(t.Context(), ghc, env)
+	for suffix, value := range map[string]string{
+		"ACTOR_ID":            "12",
+		"TRIGGERING_ACTOR":    "triggerer",
+		"REPOSITORY_ID":       "34",
+		"REPOSITORY_OWNER_ID": "56",
+		"WORKFLOW_REF":        "owner/repo/.gitea/workflows/test.yml@refs/heads/main",
+		"WORKFLOW_SHA":        "workflow-sha",
+		"REF_PROTECTED":       "true",
+	} {
+		assert.Equal(t, value, env["GITHUB_"+suffix], suffix)
+		assert.Equal(t, value, env["GITEA_"+suffix], suffix)
+	}
+	ghc.RefProtected = false
+	rc.withGithubEnv(t.Context(), ghc, env)
+	assert.Equal(t, "false", env["GITHUB_REF_PROTECTED"])
+
+	preset := &model.GithubContext{ServerURL: "https://preset.test", APIURL: "https://preset.test/api/v1"}
+	for _, testcase := range []struct {
+		name, instance, serverURL, apiURL string
+		preset                            *model.GithubContext
+		env                               map[string]string
+	}{
+		{name: "unknown instance"},
+		{name: "bare host with trailing slash", instance: "gitea.test/", serverURL: "https://gitea.test", apiURL: "https://gitea.test/api/v1"},
+		{name: "scheme port and base path", instance: "http://gitea.test:3000/gitea/", serverURL: "http://gitea.test:3000/gitea", apiURL: "http://gitea.test:3000/gitea/api/v1"},
+		{name: "daemon instance replaces preset endpoints", instance: "gitea.test", preset: preset, serverURL: "https://gitea.test", apiURL: "https://gitea.test/api/v1"},
+		{name: "daemon keeps preset endpoints without instance", preset: preset, serverURL: "https://preset.test", apiURL: "https://preset.test/api/v1"},
+		{name: "environment overrides", env: map[string]string{"GITHUB_SERVER_URL": "https://override.test", "GITHUB_API_URL": "https://override.test/api"}, serverURL: "https://override.test", apiURL: "https://override.test/api"},
+	} {
+		t.Run(testcase.name, func(t *testing.T) {
+			rc.Config.GitHubInstance = testcase.instance
+			rc.Config.PresetGitHubContext = testcase.preset
+			rc.Config.Env = map[string]string{"GITHUB_REPOSITORY": "owner/repo", "GITHUB_REF": "refs/heads/main", "SHA_REF": "1234567890"}
+			maps.Copy(rc.Config.Env, testcase.env)
+			github := rc.getGithubContext(t.Context())
+			assert.Equal(t, testcase.serverURL, github.ServerURL)
+			assert.Equal(t, testcase.apiURL, github.APIURL)
+			env := map[string]string{"GITEA_SERVER_URL": "stale", "GITEA_API_URL": "stale"}
+			rc.withGithubEnv(t.Context(), github, env)
+			_, exported := env["GITHUB_SERVER_URL"]
+			assert.Equal(t, testcase.serverURL != "", exported)
+			assert.Equal(t, testcase.serverURL, env["GITEA_SERVER_URL"])
+			assert.Equal(t, testcase.apiURL, env["GITEA_API_URL"])
+		})
+	}
 }
 
 func TestGetGithubContextRef(t *testing.T) {
@@ -728,6 +1103,7 @@ func TestGetGithubContextRef(t *testing.T) {
 				Config: &Config{
 					EventName: data.event,
 					Workdir:   "",
+					Env:       map[string]string{"GITHUB_REPOSITORY": "owner/repo", "SHA_REF": "1234567890"},
 				},
 				Run: &model.Run{
 					Workflow: &model.Workflow{
@@ -736,7 +1112,7 @@ func TestGetGithubContextRef(t *testing.T) {
 				},
 			}
 
-			ghc := rc.getGithubContext(context.Background())
+			ghc := rc.getGithubContext(t.Context())
 
 			assert.Equal(t, data.ref, ghc.Ref)
 		})
@@ -745,13 +1121,7 @@ func TestGetGithubContextRef(t *testing.T) {
 
 func createIfTestRunContext(jobs map[string]*model.Job) *RunContext {
 	rc := &RunContext{
-		Config: &Config{
-			Workdir: ".",
-			Platforms: map[string]string{
-				"ubuntu-latest": "ubuntu-latest",
-			},
-		},
-		Env: map[string]string{},
+		Config: &Config{Workdir: ".", PresetGitHubContext: &model.GithubContext{}, PlatformPicker: func([]string) string { return "ubuntu-latest" }},
 		Run: &model.Run{
 			JobID: "job1",
 			Workflow: &model.Workflow{
@@ -775,216 +1145,138 @@ func createJob(t *testing.T, input, result string) *model.Job {
 }
 
 func TestRunContextRunsOnPlatformNames(t *testing.T) {
-	log.SetLevel(log.DebugLevel)
-	assertObject := assert.New(t)
-
-	rc := createIfTestRunContext(map[string]*model.Job{
-		"job1": createJob(t, `runs-on: ubuntu-latest`, ""),
-	})
-	assertObject.Equal([]string{"ubuntu-latest"}, rc.runsOnPlatformNames(context.Background()))
-
-	rc = createIfTestRunContext(map[string]*model.Job{
-		"job1": createJob(t, `runs-on: ${{ 'ubuntu-latest' }}`, ""),
-	})
-	assertObject.Equal([]string{"ubuntu-latest"}, rc.runsOnPlatformNames(context.Background()))
-
-	rc = createIfTestRunContext(map[string]*model.Job{
-		"job1": createJob(t, `runs-on: [self-hosted, my-runner]`, ""),
-	})
-	assertObject.Equal([]string{"self-hosted", "my-runner"}, rc.runsOnPlatformNames(context.Background()))
-
-	rc = createIfTestRunContext(map[string]*model.Job{
-		"job1": createJob(t, `runs-on: [self-hosted, "${{ 'my-runner' }}"]`, ""),
-	})
-	assertObject.Equal([]string{"self-hosted", "my-runner"}, rc.runsOnPlatformNames(context.Background()))
-
-	rc = createIfTestRunContext(map[string]*model.Job{
-		"job1": createJob(t, `runs-on: ${{ fromJSON('["ubuntu-latest"]') }}`, ""),
-	})
-	assertObject.Equal([]string{"ubuntu-latest"}, rc.runsOnPlatformNames(context.Background()))
-
-	// test missing / invalid runs-on
-	rc = createIfTestRunContext(map[string]*model.Job{
-		"job1": createJob(t, `name: something`, ""),
-	})
-	assertObject.Equal([]string{}, rc.runsOnPlatformNames(context.Background()))
-
-	rc = createIfTestRunContext(map[string]*model.Job{
-		"job1": createJob(t, `runs-on:
-  mapping: value`, ""),
-	})
-	assertObject.Equal([]string{}, rc.runsOnPlatformNames(context.Background()))
-
-	rc = createIfTestRunContext(map[string]*model.Job{
-		"job1": createJob(t, `runs-on: ${{ invalid expression }}`, ""),
-	})
-	assertObject.Equal([]string{}, rc.runsOnPlatformNames(context.Background()))
+	for _, testcase := range []struct {
+		job  string
+		want []string
+	}{
+		{"runs-on: ubuntu-latest", []string{"ubuntu-latest"}},
+		{"runs-on: ${{ 'ubuntu-latest' }}", []string{"ubuntu-latest"}},
+		{"runs-on: [self-hosted, my-runner]", []string{"self-hosted", "my-runner"}},
+		{`runs-on: [self-hosted, "${{ 'my-runner' }}"]`, []string{"self-hosted", "my-runner"}},
+		{`runs-on: ${{ fromJSON('["ubuntu-latest"]') }}`, []string{"ubuntu-latest"}},
+		{"name: something", []string{}},
+		{"runs-on: {mapping: value}", []string{}},
+		{"runs-on: ${{ invalid expression }}", []string{}},
+	} {
+		t.Run(testcase.job, func(t *testing.T) {
+			rc := createIfTestRunContext(map[string]*model.Job{"job1": createJob(t, testcase.job, "")})
+			assert.Equal(t, testcase.want, rc.runsOnPlatformNames(t.Context()))
+		})
+	}
 }
 
 func TestRunContextIsEnabled(t *testing.T) {
-	log.SetLevel(log.DebugLevel)
-	assertObject := assert.New(t)
-
-	// success()
-	rc := createIfTestRunContext(map[string]*model.Job{
-		"job1": createJob(t, `runs-on: ubuntu-latest
-if: success()`, ""),
-	})
-	assertObject.True(rc.isEnabled(context.Background()))
-
-	rc = createIfTestRunContext(map[string]*model.Job{
-		"job1": createJob(t, `runs-on: ubuntu-latest`, "failure"),
-		"job2": createJob(t, `runs-on: ubuntu-latest
-needs: [job1]
-if: success()`, ""),
-	})
-	rc.Run.JobID = "job2"
-	assertObject.False(rc.isEnabled(context.Background()))
-
-	rc = createIfTestRunContext(map[string]*model.Job{
-		"job1": createJob(t, `runs-on: ubuntu-latest`, "success"),
-		"job2": createJob(t, `runs-on: ubuntu-latest
-needs: [job1]
-if: success()`, ""),
-	})
-	rc.Run.JobID = "job2"
-	assertObject.True(rc.isEnabled(context.Background()))
-
-	rc = createIfTestRunContext(map[string]*model.Job{
-		"job1": createJob(t, `runs-on: ubuntu-latest`, "failure"),
-		"job2": createJob(t, `runs-on: ubuntu-latest
-if: success()`, ""),
-	})
-	rc.Run.JobID = "job2"
-	assertObject.True(rc.isEnabled(context.Background()))
-
-	// failure()
-	rc = createIfTestRunContext(map[string]*model.Job{
-		"job1": createJob(t, `runs-on: ubuntu-latest
-if: failure()`, ""),
-	})
-	assertObject.False(rc.isEnabled(context.Background()))
-
-	rc = createIfTestRunContext(map[string]*model.Job{
-		"job1": createJob(t, `runs-on: ubuntu-latest`, "failure"),
-		"job2": createJob(t, `runs-on: ubuntu-latest
-needs: [job1]
-if: failure()`, ""),
-	})
-	rc.Run.JobID = "job2"
-	assertObject.True(rc.isEnabled(context.Background()))
-
-	rc = createIfTestRunContext(map[string]*model.Job{
-		"job1": createJob(t, `runs-on: ubuntu-latest`, "success"),
-		"job2": createJob(t, `runs-on: ubuntu-latest
-needs: [job1]
-if: failure()`, ""),
-	})
-	rc.Run.JobID = "job2"
-	assertObject.False(rc.isEnabled(context.Background()))
-
-	rc = createIfTestRunContext(map[string]*model.Job{
-		"job1": createJob(t, `runs-on: ubuntu-latest`, "failure"),
-		"job2": createJob(t, `runs-on: ubuntu-latest
-if: failure()`, ""),
-	})
-	rc.Run.JobID = "job2"
-	assertObject.False(rc.isEnabled(context.Background()))
-
-	// always()
-	rc = createIfTestRunContext(map[string]*model.Job{
-		"job1": createJob(t, `runs-on: ubuntu-latest
-if: always()`, ""),
-	})
-	assertObject.True(rc.isEnabled(context.Background()))
-
-	rc = createIfTestRunContext(map[string]*model.Job{
-		"job1": createJob(t, `runs-on: ubuntu-latest`, "failure"),
-		"job2": createJob(t, `runs-on: ubuntu-latest
-needs: [job1]
-if: always()`, ""),
-	})
-	rc.Run.JobID = "job2"
-	assertObject.True(rc.isEnabled(context.Background()))
-
-	rc = createIfTestRunContext(map[string]*model.Job{
-		"job1": createJob(t, `runs-on: ubuntu-latest`, "success"),
-		"job2": createJob(t, `runs-on: ubuntu-latest
-needs: [job1]
-if: always()`, ""),
-	})
-	rc.Run.JobID = "job2"
-	assertObject.True(rc.isEnabled(context.Background()))
-
-	rc = createIfTestRunContext(map[string]*model.Job{
-		"job1": createJob(t, `runs-on: ubuntu-latest`, "success"),
-		"job2": createJob(t, `runs-on: ubuntu-latest
-if: always()`, ""),
-	})
-	rc.Run.JobID = "job2"
-	assertObject.True(rc.isEnabled(context.Background()))
-
-	rc = createIfTestRunContext(map[string]*model.Job{
-		"job1": createJob(t, `uses: ./.github/workflows/reusable.yml`, ""),
-	})
-	assertObject.True(rc.isEnabled(context.Background()))
-
-	rc = createIfTestRunContext(map[string]*model.Job{
-		"job1": createJob(t, `uses: ./.github/workflows/reusable.yml
-if: false`, ""),
-	})
-	assertObject.False(rc.isEnabled(context.Background()))
+	for _, testcase := range []struct {
+		name, job, neededResult string
+		want, envError          bool
+	}{
+		{name: "broken env fails at setup", job: "runs-on: ubuntu-latest\nenv:\n  BROKEN: ${{ fromJSON('invalid') }}\nif: success()", want: true, envError: true},
+		{name: "success with failed dependency", job: "runs-on: ubuntu-latest\nneeds: [needed]\nif: success()", neededResult: "failure"},
+		{name: "success with successful dependency", job: "runs-on: ubuntu-latest\nneeds: [needed]\nif: success()", neededResult: "success", want: true},
+		{name: "success with unrelated failed job", job: "runs-on: ubuntu-latest\nif: success()", neededResult: "failure", want: true},
+		{name: "failure without dependencies", job: "runs-on: ubuntu-latest\nif: failure()"},
+		{name: "failure with failed dependency", job: "runs-on: ubuntu-latest\nneeds: [needed]\nif: failure()", neededResult: "failure", want: true},
+		{name: "failure with successful dependency", job: "runs-on: ubuntu-latest\nneeds: [needed]\nif: failure()", neededResult: "success"},
+		{name: "failure with unrelated failed job", job: "runs-on: ubuntu-latest\nif: failure()", neededResult: "failure"},
+		{name: "always without dependencies", job: "runs-on: ubuntu-latest\nif: always()", want: true},
+		{name: "always with failed dependency", job: "runs-on: ubuntu-latest\nneeds: [needed]\nif: always()", neededResult: "failure", want: true},
+		{name: "always with successful dependency", job: "runs-on: ubuntu-latest\nneeds: [needed]\nif: always()", neededResult: "success", want: true},
+		{name: "always with unrelated successful job", job: "runs-on: ubuntu-latest\nif: always()", neededResult: "success", want: true},
+		{name: "reusable workflow", job: "uses: ./.github/workflows/reusable.yml", want: true},
+		{name: "disabled reusable workflow", job: "uses: ./.github/workflows/reusable.yml\nif: false"},
+		{name: "invalid condition", job: "if: ${{ fromJSON('not-json') }}"},
+	} {
+		t.Run(testcase.name, func(t *testing.T) {
+			jobs := map[string]*model.Job{"job1": createJob(t, testcase.job, "")}
+			if testcase.neededResult != "" {
+				jobs["needed"] = createJob(t, "runs-on: ubuntu-latest", testcase.neededResult)
+			}
+			rc := createIfTestRunContext(jobs)
+			enabled, err := rc.isEnabled(t.Context())
+			require.NoError(t, err)
+			assert.Equal(t, testcase.want, enabled)
+			if testcase.envError {
+				require.Error(t, evaluateJobEnvAndDefaults(t.Context(), rc))
+			}
+		})
+	}
 }
 
 func TestRunContextGetEnv(t *testing.T) {
-	tests := []struct {
-		description string
-		rc          *RunContext
-		targetEnv   string
-		want        string
+	for _, testcase := range []struct {
+		name string
+		env  map[string]string
+		want string
 	}{
-		{
-			description: "Env from Config should overwrite",
-			rc: &RunContext{
-				Config: &Config{
-					Env: map[string]string{"OVERWRITTEN": "true"},
-				},
+		{"Env from Config should overwrite", map[string]string{"OVERWRITTEN": "true"}, "true"},
+		{"No overwrite occurs", map[string]string{"SOME_OTHER_VAR": "true"}, "false"},
+	} {
+		t.Run(testcase.name, func(t *testing.T) {
+			rc := &RunContext{
+				Config: &Config{Env: testcase.env},
 				Run: &model.Run{
+					JobID: "test",
 					Workflow: &model.Workflow{
-						Jobs: map[string]*model.Job{"test": {Name: "test"}},
+						Jobs: map[string]*model.Job{"test": {}},
 						Env:  map[string]string{"OVERWRITTEN": "false"},
 					},
-					JobID: "test",
 				},
-			},
-			targetEnv: "OVERWRITTEN",
-			want:      "true",
-		},
-		{
-			description: "No overwrite occurs",
-			rc: &RunContext{
-				Config: &Config{
-					Env: map[string]string{"SOME_OTHER_VAR": "true"},
-				},
-				Run: &model.Run{
-					Workflow: &model.Workflow{
-						Jobs: map[string]*model.Job{"test": {Name: "test"}},
-						Env:  map[string]string{"OVERWRITTEN": "false"},
-					},
-					JobID: "test",
-				},
-			},
-			targetEnv: "OVERWRITTEN",
-			want:      "false",
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.description, func(t *testing.T) {
-			envMap := test.rc.GetEnv()
-			assert.EqualValues(t, test.want, envMap[test.targetEnv]) //nolint:testifylint // pre-existing issue from nektos/act
+			}
+			assert.Equal(t, testcase.want, rc.GetEnv()["OVERWRITTEN"])
 		})
 	}
+}
+
+func TestRunContextEnvCaseSensitivity(t *testing.T) {
+	for _, caseInsensitive := range []bool{false, true} {
+		t.Run(strconv.FormatBool(caseInsensitive), func(t *testing.T) {
+			rc := createIfTestRunContext(map[string]*model.Job{
+				"job1": createJob(t, "runs-on: self-hosted\nenv:\n  build_mode: job\n  config_value: job", ""),
+			})
+			rc.Run.Workflow.Env = map[string]string{"BUILD_MODE": "workflow", "CONFIG_VALUE": "workflow", "PATH": "workflow-path", "runner_tool_cache": "workflow-cache"}
+			rc.Config.Env = map[string]string{"CONFIG_VALUE": "config", "RUNNER_TOOL_CACHE": "configured-cache"}
+			rc.Config.DisableActEnv, rc.Config.NoSkipCheckout = true, true
+			rc.Env = nil
+			rc.GetEnv()
+			rc.JobContainer = fakeContainer{ExecutionsEnvironment: &container.HostEnvironment{}, caseInsensitive: caseInsensitive}
+			require.NoError(t, rc.resolvePlatformImage(t.Context()))
+			if caseInsensitive {
+				assert.Equal(t, map[string]string{"build_mode": "job", "CONFIG_VALUE": "config", "PATH": "workflow-path", "RUNNER_TOOL_CACHE": "configured-cache"}, rc.GetEnv())
+			} else {
+				assert.Equal(t, map[string]string{
+					"BUILD_MODE": "workflow", "build_mode": "job", "CONFIG_VALUE": "config",
+					"config_value": "job", "PATH": "workflow-path", "runner_tool_cache": "workflow-cache", "RUNNER_TOOL_CACHE": "configured-cache",
+				}, rc.GetEnv())
+			}
+			want := maps.Clone(rc.GetEnv())
+			rc.Run.Workflow.Env = nil
+			require.NoError(t, rc.Run.Workflow.RawEnv.Encode(`${{ fromJSON('{"BUILD_MODE":"workflow","CONFIG_VALUE":"workflow","PATH":"workflow-path","runner_tool_cache":"workflow-cache"}') }}`))
+			rc.Env = nil
+			evaluated, err := evaluateJobEnv(t.Context(), rc)
+			require.NoError(t, err)
+			assert.Equal(t, want, evaluated)
+			rc.Env = evaluated
+
+			rc.importHostEnv([]string{"Path=host-path", "HOST_ONLY=value", "RUNNER_TRACKING_ID=parent", "runner_tracking_id=parent-lower"})
+			assert.NotContains(t, rc.Env, "RUNNER_TRACKING_ID")
+			assert.Equal(t, "workflow-path", rc.Env["PATH"])
+			assert.Equal(t, "value", rc.Env["HOST_ONLY"])
+			if caseInsensitive {
+				assert.NotContains(t, rc.Env, "Path")
+				assert.NotContains(t, rc.Env, "runner_tracking_id")
+			} else {
+				assert.Equal(t, "host-path", rc.Env["Path"])
+				assert.Equal(t, "parent-lower", rc.Env["runner_tracking_id"])
+			}
+		})
+	}
+}
+
+func TestSetActionEnvRefreshesInputs(t *testing.T) {
+	rc := &RunContext{}
+	rc.setActionEnv(map[string]string{"INPUT_MSG": "pre"})
+	rc.setActionEnv(map[string]string{"INPUT_MSG": "main"})
+	assert.Equal(t, map[string]any{"msg": "main"}, rc.actionInputs)
 }
 
 func TestCreateContainerNameBoundedForLongMatrixInput(t *testing.T) {
@@ -1003,12 +1295,9 @@ func TestCreateContainerNameBoundedForLongMatrixInput(t *testing.T) {
 
 func TestPrintStartJobContainerGroupGolden(t *testing.T) {
 	buf := &bytes.Buffer{}
-	logger := log.New()
-	logger.SetOutput(buf)
-	logger.SetLevel(log.InfoLevel)
-	logger.SetFormatter(&jobLogFormatter{color: cyan})
-	entry := logger.WithFields(log.Fields{"job": "j1"})
-	ctx := common.WithLogger(context.Background(), entry)
+	logger := logging.New(logging.NewLevelHandler(newJobLogHandler(buf, cyan), logging.LevelInfo))
+	entry := logger.With("job", "j1")
+	ctx := common.WithLogger(t.Context(), entry)
 
 	printStartJobContainerGroup(ctx, "node:20", "GITEA-WORKFLOW-build-JOB-test", "gitea-runner-network")()
 
@@ -1023,61 +1312,155 @@ func TestPrintStartJobContainerGroupGolden(t *testing.T) {
 	assert.Equal(t, want, buf.String())
 }
 
+func TestStartHostEnvironmentToolCacheSlotIsSubdirOfSharedCache(t *testing.T) {
+	cacheDir := t.TempDir()
+	override := filepath.Join(cacheDir, "override")
+	for sharedCache, env := range map[string]map[string]string{
+		filepath.Join(cacheDir, "tool_cache"): {},
+		override:                              {"RUNNER_TOOL_CACHE": override},
+	} {
+		rc := &RunContext{
+			Config: &Config{ActionCacheDir: cacheDir, SharedToolCache: true, ToolCacheSlot: "1"},
+			Env:    env,
+			Run:    &model.Run{Workflow: &model.Workflow{Name: "wf"}},
+		}
+		require.NoError(t, rc.startHostEnvironment()(t.Context()))
+		t.Cleanup(func() { require.NoError(t, rc.cleanUpJobContainer(context.Background())) })
+		want := filepath.Join(sharedCache, "1")
+		assert.Equal(t, want, rc.JobContainer.(*container.HostEnvironment).ToolCache)
+		assert.Equal(t, want, rc.Env["RUNNER_TOOL_CACHE"])
+	}
+}
+
 func TestRunContext_cleanupFailedStart(t *testing.T) {
 	type ctxKey string
 	const sentinel = ctxKey("sentinel")
 
-	// the fresh context is cancelled via defer on return, so capture state inside the stub
-	type capture struct {
-		calls    int
-		err      error
-		sentinel any
-	}
-	newRC := func(c *capture) *RunContext {
-		return &RunContext{
-			JobName: "job",
-			cleanUpJobContainer: func(ctx context.Context) error {
-				c.calls++
-				c.err = ctx.Err()
-				c.sentinel = ctx.Value(sentinel)
-				return nil
-			},
+	t.Run("removes host directories when tool cache creation fails", func(t *testing.T) {
+		cacheDir := t.TempDir()
+		toolCache := filepath.Join(t.TempDir(), "file")
+		require.NoError(t, os.WriteFile(toolCache, nil, 0o600))
+		rc := &RunContext{
+			Config:        &Config{ActionCacheDir: cacheDir},
+			Env:           map[string]string{"RUNNER_TOOL_CACHE": toolCache},
+			platformImage: "-self-hosted",
 		}
+		require.Error(t, rc.startContainer()(t.Context()))
+		entries, err := os.ReadDir(cacheDir)
+		require.NoError(t, err)
+		assert.Empty(t, entries)
+		assert.FileExists(t, toolCache)
+	})
+
+	for name, canceled := range map[string]bool{"cancellation during cleanup": false, "already canceled": true} {
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.WithValue(t.Context(), sentinel, "v"))
+			defer cancel()
+			if canceled {
+				cancel()
+			}
+			calls := 0
+			(&RunContext{cleanUpJobContainer: func(ctx context.Context) error {
+				calls++
+				cancel()
+				deadline, ok := ctx.Deadline()
+				require.True(t, ok)
+				assert.WithinDuration(t, time.Now().Add(time.Minute), deadline, time.Second)
+				require.NoError(t, ctx.Err())
+				assert.Equal(t, "v", ctx.Value(sentinel))
+				return nil
+			}}).cleanupFailedStart(ctx)
+			assert.Equal(t, 1, calls)
+		})
 	}
 
-	t.Run("runs teardown on the live context", func(t *testing.T) {
-		var c capture
-		ctx := context.WithValue(context.Background(), sentinel, "v")
+	for _, testcase := range []struct {
+		name, health          string
+		pullError, startError error
+	}{
+		{name: "healthy", health: container.HealthHealthy},
+		{name: "unhealthy", health: container.HealthUnhealthy},
+		{name: "pull failure", pullError: errors.New("pull failed")},
+		{name: "start failure", startError: errors.New("start failed")},
+	} {
+		t.Run(testcase.name, func(t *testing.T) {
+			var operations []string
+			var operationsMu sync.Mutex
+			record := func(operation string, failure error) func(context.Context) error {
+				return func(context.Context) error {
+					operationsMu.Lock()
+					defer operationsMu.Unlock()
+					operations = append(operations, operation)
+					return failure
+				}
+			}
+			job, service := &containerMock{}, &containerMock{}
+			for name, instance := range map[string]*containerMock{"job": job, "service": service} {
+				instance.On("Pull", true).Return(record(name+".Pull", map[string]error{"job": testcase.pullError}[name]))
+				instance.On("Create", mock.Anything, mock.Anything).Return(record(name+".Create", nil))
+				instance.On("Start", false).Return(record(name+".Start", map[string]error{"service": testcase.startError}[name]))
+				instance.On("Remove").Return(record(name+".Remove", nil))
+				instance.On("Close").Return(record(name+".Close", nil))
+			}
+			job.On("Copy", mock.Anything, mock.Anything).Return(record("job.Copy", nil))
+			job.On("GetContainerArchive", mock.Anything, mock.Anything).Return(nil, os.ErrNotExist)
+			job.On("Inspect", mock.Anything).Return(&container.Info{ID: "job-id"}, nil).
+				Run(func(mock.Arguments) { operations = append(operations, "job.Inspect") })
+			for _, health := range []string{container.HealthStarting, testcase.health} {
+				service.On("Inspect", mock.Anything).Return(&container.Info{State: "running", Health: health}, nil).
+					Run(func(mock.Arguments) { operations = append(operations, "service.Inspect") }).Once()
+			}
+			stdouts := map[string]io.Writer{}
+			service.On("DumpLogs", mock.Anything).Return(nil).Run(func(mock.Arguments) {
+				operations = append(operations, "service.DumpLogs")
+				fmt.Fprintln(stdouts["postgres:latest"], "::add-mask::leak")
+			})
+			origNewContainer := newContainer
+			newContainer = func(input *container.NewContainerInput) container.ExecutionsEnvironment {
+				stdouts[input.Image] = input.Stdout
+				return map[string]*containerMock{"postgres:latest": service, "node:20": job}[input.Image]
+			}
+			t.Cleanup(func() { newContainer = origNewContainer })
+			workflow, err := model.ReadWorkflow(strings.NewReader("jobs: {job: {services: {postgres: {image: postgres:latest}}}}"))
+			require.NoError(t, err)
+			rc := &RunContext{
+				Config:        &Config{ForcePull: true, ContainerNetworkMode: "host", Workdir: "/workspace", Env: testCheckoutEnv()},
+				Run:           &model.Run{JobID: "job", Workflow: workflow},
+				platformImage: "node:20",
+			}
+			logger, hook := logtest.NewLogger()
+			ctx := common.WithLogger(common.WithDryrun(t.Context(), true), logger)
+			rc.ExprEval = rc.NewExpressionEvaluator(ctx)
+			err = rc.startContainer().Then(rc.stopContainer()).Finally(rc.closeContainer())(ctx)
+			want := "job.Remove service.Close service.Remove service.Pull job.Pull"
+			switch {
+			case testcase.pullError != nil:
+				require.ErrorIs(t, err, testcase.pullError)
+			case testcase.startError != nil:
+				require.ErrorIs(t, err, testcase.startError)
+				want += " service.Create service.Start service.DumpLogs"
+			default:
+				want += " service.Create service.Start service.Inspect job.Create job.Start job.Inspect job.Copy service.Inspect service.DumpLogs"
+				if testcase.health == container.HealthUnhealthy {
+					require.ErrorContains(t, err, "the service 'postgres' is unhealthy")
+				} else {
+					require.NoError(t, err)
+				}
+			}
+			slices.Sort(operations[:3])
+			slices.Sort(operations[len(operations)-4 : len(operations)-1])
+			assert.Equal(t, strings.Fields(want+" job.Remove service.Close service.Remove job.Close"), operations)
+			assert.Equal(t, strings.Contains(want, "service.DumpLogs"), slices.Contains(rc.Masks, "leak"))
+			assert.Equal(t, testcase.pullError == nil && testcase.health != container.HealthUnhealthy, slices.ContainsFunc(hook.AllRecords(), func(entry logging.Record) bool {
+				return strings.HasPrefix(entry.Message, "::group::Print service container logs")
+			}))
+		})
+	}
 
-		newRC(&c).cleanupFailedStart(ctx)
-
-		assert.Equal(t, 1, c.calls)
-		require.NoError(t, c.err)
-		assert.Equal(t, "v", c.sentinel)
-	})
-
-	t.Run("falls back to a fresh context when the input is done", func(t *testing.T) {
-		var c capture
-		ctx, cancel := context.WithCancel(context.WithValue(context.Background(), sentinel, "v"))
-		cancel()
-
-		newRC(&c).cleanupFailedStart(ctx)
-
-		assert.Equal(t, 1, c.calls)
-		require.NoError(t, c.err)
-		assert.Nil(t, c.sentinel)
-	})
-
-	t.Run("no-op when there is nothing to clean up", func(t *testing.T) {
-		assert.NotPanics(t, func() { (&RunContext{}).cleanupFailedStart(context.Background()) })
-	})
+	(&RunContext{}).cleanupFailedStart(t.Context())
 }
 
 func TestWaitForServiceContainers(t *testing.T) {
-	origInterval := serviceReadyPollInterval
-	serviceReadyPollInterval = time.Millisecond
-	defer func() { serviceReadyPollInterval = origInterval }()
-
 	newRunContext := func(timeout time.Duration, services ...*serviceContainer) *RunContext {
 		return &RunContext{
 			Config:            &Config{ServiceReadyTimeout: timeout},
@@ -1085,60 +1468,60 @@ func TestWaitForServiceContainers(t *testing.T) {
 		}
 	}
 
-	t.Run("returns as soon as a service without a healthcheck runs", func(t *testing.T) {
-		service := &containerMock{}
-		service.On("Inspect", mock.Anything).
-			Return(&container.Info{ID: "id", State: "running", Health: container.HealthNone}, nil).Once()
+	for _, testcase := range []struct {
+		name, serviceName string
+		timeout           time.Duration
+		info              *container.Info
+		inspectError      error
+		wantError, wantID string
+	}{
+		{name: "returns as soon as a service without a healthcheck runs", serviceName: "redis", info: &container.Info{ID: "id", State: "running", Health: container.HealthNone}},
+		{name: "fails with the probe output when a service is unhealthy", serviceName: "postgres", info: &container.Info{State: "running", Health: container.HealthUnhealthy, HealthOutput: "connection refused"}, wantError: "the service 'postgres' is unhealthy: connection refused"},
+		{name: "lets the steps run when a service exits without a healthcheck", serviceName: "postgres", info: &container.Info{State: "exited", ExitCode: 2, Health: container.HealthNone}},
+		{name: "proceeds when the container is gone", serviceName: "postgres", inspectError: container.ErrContainerNotFound},
+		{name: "does not wait when the timeout is negative", serviceName: "postgres", timeout: -1, info: &container.Info{ID: "id", State: "running", Health: container.HealthStarting}, wantID: "id"},
+		{name: "fails on an inspect error even when the timeout is negative", serviceName: "postgres", timeout: -1, inspectError: errors.New("daemon is gone"), wantError: "failed to inspect service 'postgres'"},
+	} {
+		t.Run(testcase.name, func(t *testing.T) {
+			service := &containerMock{}
+			service.On("Inspect", mock.Anything).Return(testcase.info, testcase.inspectError).Once()
+			if testcase.info != nil && testcase.info.Health == container.HealthUnhealthy {
+				service.On("DumpLogs", mock.Anything).Return(nil).Once()
+			}
+			svc := &serviceContainer{name: testcase.serviceName, container: service}
+			err := newRunContext(testcase.timeout, svc).waitForServiceContainers()(t.Context())
+			if testcase.wantError != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), testcase.wantError)
+			} else {
+				require.NoError(t, err)
+			}
+			if testcase.wantID != "" {
+				assert.Equal(t, testcase.wantID, svc.info.ID)
+			}
+			service.AssertExpectations(t)
+		})
+	}
 
-		rc := newRunContext(0, &serviceContainer{name: "redis", container: service})
-		require.NoError(t, rc.waitForServiceContainers()(context.Background()))
-		service.AssertExpectations(t)
-	})
+	t.Run("polls at a fixed interval and logs starting only once", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			var pollTimes []time.Duration
+			started := time.Now()
+			service := &containerMock{}
+			service.On("Inspect", mock.Anything).
+				Run(func(_ mock.Arguments) { pollTimes = append(pollTimes, time.Since(started)) }).
+				Return(&container.Info{ID: "id", State: "running", Health: container.HealthStarting}, nil).Twice()
+			service.On("Inspect", mock.Anything).
+				Run(func(_ mock.Arguments) { pollTimes = append(pollTimes, time.Since(started)) }).
+				Return(&container.Info{ID: "id", State: "running", Health: container.HealthHealthy}, nil).Once()
 
-	t.Run("waits while a service is still starting", func(t *testing.T) {
-		service := &containerMock{}
-		service.On("Inspect", mock.Anything).
-			Return(&container.Info{ID: "id", State: "running", Health: container.HealthStarting}, nil).Twice()
-		service.On("Inspect", mock.Anything).
-			Return(&container.Info{ID: "id", State: "running", Health: container.HealthHealthy}, nil).Once()
-
-		rc := newRunContext(0, &serviceContainer{name: "postgres", container: service})
-		require.NoError(t, rc.waitForServiceContainers()(context.Background()))
-		service.AssertExpectations(t)
-	})
-
-	t.Run("fails with the probe output when a service is unhealthy", func(t *testing.T) {
-		service := &containerMock{}
-		service.On("Inspect", mock.Anything).Return(&container.Info{
-			State:        "running",
-			Health:       container.HealthUnhealthy,
-			HealthOutput: "connection refused",
-		}, nil).Once()
-		service.On("DumpLogs", mock.Anything).Return(nil).Once()
-
-		rc := newRunContext(0, &serviceContainer{name: "postgres", container: service})
-		err := rc.waitForServiceContainers()(context.Background())
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "the service 'postgres' is unhealthy: connection refused")
-		service.AssertExpectations(t)
-	})
-
-	t.Run("lets the steps run when a service exits without a healthcheck", func(t *testing.T) {
-		service := &containerMock{}
-		service.On("Inspect", mock.Anything).
-			Return(&container.Info{State: "exited", ExitCode: 2, Health: container.HealthNone}, nil).Once()
-
-		rc := newRunContext(0, &serviceContainer{name: "postgres", container: service})
-		require.NoError(t, rc.waitForServiceContainers()(context.Background()))
-	})
-
-	t.Run("proceeds when the container is gone", func(t *testing.T) {
-		service := &containerMock{}
-		service.On("Inspect", mock.Anything).
-			Return((*container.Info)(nil), container.ErrContainerNotFound).Once()
-
-		rc := newRunContext(0, &serviceContainer{name: "postgres", container: service})
-		require.NoError(t, rc.waitForServiceContainers()(context.Background()))
+			var output bytes.Buffer
+			logger := logging.New(logging.NewLevelHandler(newJobLogHandler(&output, cyan), logging.LevelInfo))
+			require.NoError(t, newRunContext(0, &serviceContainer{name: "postgres", container: service}).waitForServiceContainers()(common.WithLogger(t.Context(), logger)))
+			assert.Equal(t, []time.Duration{0, serviceReadyPollInterval, 2 * serviceReadyPollInterval}, pollTimes)
+			assert.Equal(t, 1, strings.Count(output.String(), "postgres service is starting."))
+			assert.Contains(t, output.String(), "postgres service is healthy.")
+		})
 	})
 
 	t.Run("fails right away when one service fails while another is still starting", func(t *testing.T) {
@@ -1172,7 +1555,7 @@ func TestWaitForServiceContainers(t *testing.T) {
 			Return(&container.Info{State: "running", Health: container.HealthStarting}, nil)
 
 		rc := newRunContext(20*time.Millisecond, &serviceContainer{name: "postgres", container: service})
-		err := rc.waitForServiceContainers()(context.Background())
+		err := rc.waitForServiceContainers()(t.Context())
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "did not become healthy within")
 	})
@@ -1184,36 +1567,13 @@ func TestWaitForServiceContainers(t *testing.T) {
 			Return((*container.Info)(nil), errors.New("inspect aborted"))
 
 		rc := newRunContext(20*time.Millisecond, &serviceContainer{name: "postgres", container: service})
-		err := rc.waitForServiceContainers()(context.Background())
+		err := rc.waitForServiceContainers()(t.Context())
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "did not become healthy within")
 	})
 
-	t.Run("does not wait when the timeout is negative", func(t *testing.T) {
-		service := &containerMock{}
-		// Still described once, so the `job.services` context is filled either way.
-		service.On("Inspect", mock.Anything).
-			Return(&container.Info{ID: "id", State: "running", Health: container.HealthStarting}, nil).Once()
-
-		svc := &serviceContainer{name: "postgres", container: service}
-		rc := newRunContext(-1, svc)
-		require.NoError(t, rc.waitForServiceContainers()(context.Background()))
-		service.AssertExpectations(t)
-		assert.Equal(t, "id", svc.info.ID)
-	})
-
-	t.Run("fails on an inspect error even when the timeout is negative", func(t *testing.T) {
-		service := &containerMock{}
-		service.On("Inspect", mock.Anything).Return((*container.Info)(nil), errors.New("daemon is gone")).Once()
-
-		rc := newRunContext(-1, &serviceContainer{name: "postgres", container: service})
-		err := rc.waitForServiceContainers()(context.Background())
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "failed to inspect service 'postgres'")
-	})
-
 	t.Run("is a no-op without services", func(t *testing.T) {
-		require.NoError(t, newRunContext(0).waitForServiceContainers()(context.Background()))
+		require.NoError(t, newRunContext(0).waitForServiceContainers()(t.Context()))
 	})
 }
 
@@ -1229,7 +1589,7 @@ func TestReportUnstartedServices(t *testing.T) {
 		{name: "redis", container: running},
 	}}
 
-	require.NoError(t, rc.reportUnstartedServices()(context.Background()))
+	require.NoError(t, rc.reportUnstartedServices()(t.Context()))
 	dead.AssertExpectations(t)
 	running.AssertExpectations(t)
 }
@@ -1240,9 +1600,7 @@ func TestGetJobContextReportsContainers(t *testing.T) {
 		jobContainerID: "job-container-id",
 		serviceContainers: []*serviceContainer{
 			{name: "postgres", info: &container.Info{ID: "svc-id", Ports: map[string]string{"5432": "49153"}}},
-			// A service that publishes no port reports an empty map, as GitHub does.
 			{name: "redis", info: &container.Info{ID: "redis-id", Ports: map[string]string{}}},
-			// A service that never reported is left out rather than reported as empty.
 			{name: "mailhog"},
 		},
 	}
@@ -1257,7 +1615,75 @@ func TestGetJobContextReportsContainers(t *testing.T) {
 	}, jobContext.Services)
 }
 
-// A job that never started a container reports an empty context, not a placeholder.
+type imageEnvContainer struct {
+	*container.HostEnvironment
+	imageEnv  map[string]string
+	osRelease []byte
+}
+
+func (c imageEnvContainer) UpdateFromImageEnv(env *map[string]string) common.Executor {
+	return func(_ctx context.Context) error { maps.Copy(*env, c.imageEnv); return nil }
+}
+
+func (c imageEnvContainer) GetContainerArchive(_ctx context.Context, srcPath string) (io.ReadCloser, error) {
+	if srcPath != "/usr/lib/os-release" || c.osRelease == nil {
+		return nil, os.ErrNotExist
+	}
+	return io.NopCloser(bytes.NewReader(c.osRelease)), nil
+}
+
+func TestCopyWorkflowFilesHandsNodeTheRunnerCAUnlessTheJobOrImageSetsIt(t *testing.T) {
+	caFile, actPath := filepath.Join(t.TempDir(), "ca.crt"), t.TempDir()
+	require.NoError(t, os.WriteFile(caFile, []byte("PEM\n"), 0o600))
+	own := map[string]string{"NODE_EXTRA_CA_CERTS": "/own.pem"}
+	stepEnv := func(caFile string, jobEnv, containerEnv, imageEnv map[string]string) map[string]string {
+		rc := &RunContext{
+			Config:       &Config{CAFile: caFile},
+			Run:          &model.Run{JobID: "job", Workflow: &model.Workflow{Jobs: map[string]*model.Job{"job": {}}}},
+			Env:          maps.Clone(jobEnv),
+			JobContainer: imageEnvContainer{&container.HostEnvironment{Path: t.TempDir(), ActPath: actPath, StdOut: io.Discard}, imageEnv, nil},
+		}
+		rc.containerSpec.Env = containerEnv
+		require.NoError(t, rc.copyWorkflowFiles()(t.Context()))
+		env := map[string]string{}
+		require.NoError(t, setupEnv(t.Context(), &stepRun{RunContext: rc, Step: &model.Step{}, env: env}))
+		return env
+	}
+
+	assert.Equal(t, filepath.ToSlash(actPath)+"/ca.crt", stepEnv(caFile, nil, nil, nil)["NODE_EXTRA_CA_CERTS"])
+	ca, err := os.ReadFile(filepath.Join(actPath, "ca.crt"))
+	require.NoError(t, err)
+	assert.Equal(t, "PEM\n", string(ca))
+	assert.Equal(t, "/own.pem", stepEnv(caFile, own, nil, nil)["NODE_EXTRA_CA_CERTS"])
+	assert.Equal(t, "/own.pem", stepEnv(caFile, nil, own, nil)["NODE_EXTRA_CA_CERTS"])
+	assert.NotContains(t, stepEnv(caFile, nil, nil, own), "NODE_EXTRA_CA_CERTS")
+	assert.NotContains(t, stepEnv("", nil, nil, nil), "NODE_EXTRA_CA_CERTS")
+}
+
+func TestCaptureJobContainerInfoExportsDockerWorkspace(t *testing.T) {
+	workdir := t.TempDir()
+	job := &containerMock{}
+	job.On("Inspect", mock.Anything).Return(&container.Info{
+		ID:     "job-container-id",
+		Mounts: map[string]string{job.ToContainerPath(workdir): "/var/lib/docker/volumes/job/_data"},
+	}, nil)
+	rc := &RunContext{
+		Config:       &Config{Workdir: filepath.Join(workdir, "owner", "repo") + string(filepath.Separator)},
+		Env:          map[string]string{},
+		JobContainer: job,
+	}
+
+	require.NoError(t, rc.captureJobContainerInfo()(t.Context()))
+
+	assert.Equal(t, "job-container-id", rc.jobContainerID)
+	assert.Equal(t, "/var/lib/docker/volumes/job/_data/owner/repo", rc.Env["GITEA_DOCKER_WORKSPACE"])
+
+	rc.Config.Workdir = filepath.Dir(workdir)
+	rc.Env = map[string]string{}
+	require.NoError(t, rc.captureJobContainerInfo()(t.Context()))
+	assert.NotContains(t, rc.Env, "GITEA_DOCKER_WORKSPACE")
+}
+
 func TestGetJobContextWithoutContainer(t *testing.T) {
 	jobContext := (&RunContext{}).getJobContext()
 
@@ -1293,31 +1719,85 @@ func TestImageOSFromImage(t *testing.T) {
 	}
 }
 
+func TestResolvePlatformImageAppliesImagelessContainerToRunsOnImage(t *testing.T) {
+	for _, tc := range []struct {
+		name, image string
+		want        model.ContainerSpec
+	}{
+		{"without image key", "", model.ContainerSpec{Volumes: []string{"/host/data:/data"}, Env: map[string]string{"KEY": "value"}}},
+		{"with empty image", "image: '', ", model.ContainerSpec{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rc := createIfTestRunContext(map[string]*model.Job{
+				"job1": createJob(t, "runs-on: toolkit\ncontainer: {"+tc.image+"volumes: [/host/data:/data], env: {KEY: value}}", ""),
+			})
+			require.NoError(t, rc.resolvePlatformImage(t.Context()))
+			require.NoError(t, evaluateJobEnvAndDefaults(t.Context(), rc))
+
+			assert.Equal(t, "ubuntu-latest", rc.platformImage)
+			assert.Equal(t, tc.want, rc.containerSpec)
+		})
+	}
+}
+
 func createRunsOnRunContext(t *testing.T, runsOn string) *RunContext {
 	return createIfTestRunContext(map[string]*model.Job{
 		"job1": createJob(t, "runs-on: "+runsOn, ""),
 	})
 }
 
+func TestRunContextContainerImageCannotSelectBackend(t *testing.T) {
+	rc := createIfTestRunContext(map[string]*model.Job{"job1": createJob(t, "container: -self-hosted", "")})
+	require.NoError(t, rc.resolvePlatformImage(t.Context()))
+	assert.False(t, rc.IsHostEnv())
+
+	rc = createIfTestRunContext(map[string]*model.Job{"job1": createJob(t, "runs-on: ${{ fromJSON('x') }}\ncontainer: node", "")})
+	require.ErrorContains(t, rc.resolvePlatformImage(t.Context()), "runs-on")
+}
+
 func TestRunContextImageOS(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
+
+	t.Run("keeps an ImageOS from the image, the job env or the job's Ubuntu release", func(t *testing.T) {
+		ubuntu := tarArchive(t, tarEntry{name: "os-release", body: "ID=ubuntu\nVERSION_ID=\"22.04\"\n"})
+		for _, tc := range []struct {
+			imageEnv  map[string]string
+			jobEnv    string
+			osRelease []byte
+			want      string
+		}{
+			{imageEnv: map[string]string{"ImageOS": "ubuntu24-arm64"}, osRelease: ubuntu, want: "ubuntu24-arm64"},
+			{imageEnv: map[string]string{"ImageOS": "ubuntu24-arm64"}, jobEnv: "ImageOS: ubuntu20", want: "ubuntu20"},
+			{osRelease: ubuntu, want: "ubuntu22"},
+			{osRelease: tarArchive(t, tarEntry{name: "os-release", body: "ID=debian\nVERSION_ID=\"12\"\n"}), want: "ubuntu24"},
+		} {
+			rc := createRunsOnRunContext(t, "ubuntu-latest\nenv: {"+tc.jobEnv+"}")
+			rc.platformImage = "docker.gitea.com/runner-images:ubuntu-latest"
+			rc.JobContainer = imageEnvContainer{&container.HostEnvironment{ActPath: t.TempDir()}, tc.imageEnv, tc.osRelease}
+			require.NoError(t, rc.copyWorkflowFiles()(ctx))
+			require.NoError(t, evaluateJobEnvAndDefaults(ctx, rc))
+			env := map[string]string{}
+			require.NoError(t, setupEnv(ctx, &stepRun{RunContext: rc, Step: &model.Step{}, env: env}))
+			assert.Equal(t, tc.want, env["ImageOS"])
+		}
+	})
 
 	t.Run("prefers the release in the resolved image tag", func(t *testing.T) {
 		rc := createRunsOnRunContext(t, "ubuntu-latest")
-		rc.Config.Platforms = map[string]string{
-			"ubuntu-latest": "docker.gitea.com/runner-images:ubuntu-24.04",
-		}
+		rc.Config.PlatformPicker = func([]string) string { return "docker.gitea.com/runner-images:ubuntu-24.04" }
+		require.NoError(t, rc.resolvePlatformImage(ctx))
 		assert.Equal(t, "ubuntu24", rc.imageOS(ctx))
 	})
 
 	t.Run("falls back to the runs-on label", func(t *testing.T) {
 		rc := createRunsOnRunContext(t, "ubuntu-22.04")
-		rc.Config.Platforms = map[string]string{"ubuntu-22.04": "some-image"}
+		rc.Config.PlatformPicker = func([]string) string { return "some-image" }
+		require.NoError(t, rc.resolvePlatformImage(ctx))
 		assert.Equal(t, "ubuntu22", rc.imageOS(ctx))
 	})
 
-	t.Run("keeps the historical value for a rolling label with no release", func(t *testing.T) {
-		assert.Equal(t, "ubuntu20", createRunsOnRunContext(t, "ubuntu-latest").imageOS(ctx))
+	t.Run("reports the current release for the rolling ubuntu-latest label", func(t *testing.T) {
+		assert.Equal(t, "ubuntu24", createRunsOnRunContext(t, "ubuntu-latest").imageOS(ctx))
 	})
 
 	t.Run("is empty for the synthetic job of a composite action", func(t *testing.T) {
@@ -1327,34 +1807,86 @@ func TestRunContextImageOS(t *testing.T) {
 }
 
 func TestRunContextGetRunnerContext(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	t.Run("adds the runner values the container cannot know", func(t *testing.T) {
 		rc := createRunsOnRunContext(t, "ubuntu-latest")
 		rc.Config.RunnerName = "runner-1"
+		rc.Config.Workdir = "/workspace/owner/repo"
 
 		runnerContext := rc.getRunnerContext(ctx)
 		assert.Equal(t, "runner-1", runnerContext["name"])
 		assert.Equal(t, "self-hosted", runnerContext["environment"])
+		assert.Equal(t, "/workspace/owner", runnerContext["workspace"])
+		assert.Equal(t, "/workspace/owner/repo", rc.getGithubContext(ctx).Workspace)
+		rc.Config.Env = map[string]string{"GITHUB_WORKSPACE": "/configured/work"}
+		assert.Equal(t, "/configured/work", rc.getGithubContext(ctx).Workspace)
 		assert.NotContains(t, runnerContext, "debug")
 	})
 
-	t.Run("reports debug when step debugging is on", func(t *testing.T) {
+	t.Run("reports debug from the secret, else the variable, also in composites", func(t *testing.T) {
 		rc := createRunsOnRunContext(t, "ubuntu-latest")
 		rc.Config.Secrets = map[string]string{"ACTIONS_STEP_DEBUG": "true"}
-
 		assert.Equal(t, "1", rc.getRunnerContext(ctx)["debug"])
+		assert.Equal(t, "1", (&RunContext{Parent: rc, Config: &Config{}}).getRunnerContext(ctx)["debug"])
+
+		rc.Config.Secrets = map[string]string{}
+		rc.Config.Vars = map[string]string{"ACTIONS_STEP_DEBUG": "true"}
+		assert.Equal(t, "1", rc.getRunnerContext(ctx)["debug"])
+
+		rc.Config.Secrets = map[string]string{"ACTIONS_STEP_DEBUG": "false"}
+		assert.NotContains(t, rc.getRunnerContext(ctx), "debug")
 	})
 
 	t.Run("keeps the execution environment values", func(t *testing.T) {
 		rc := createRunsOnRunContext(t, "ubuntu-latest")
-		rc.JobContainer = &container.HostEnvironment{TmpDir: "/tmp/act", ToolCache: "/tmp/tool_cache"}
+		rc.Config.Workdir = "/host/work/owner/repo"
+		rc.JobContainer = &container.HostEnvironment{Workdir: rc.Config.Workdir, Path: "/container/work/owner/repo", TmpDir: "/tmp/act", ToolCache: "/tmp/tool_cache", ActPath: "/tmp/act-files"}
 
 		runnerContext := rc.getRunnerContext(ctx)
 		assert.Equal(t, "/tmp/act", runnerContext["temp"])
 		assert.Equal(t, "/tmp/tool_cache", runnerContext["tool_cache"])
+		assert.Equal(t, "/container/work/owner", runnerContext["workspace"])
+		githubContext := rc.getGithubContext(ctx)
+		assert.Equal(t, "/container/work/owner/repo", githubContext.Workspace)
+		assert.Equal(t, "/tmp/act-files/workflow/envs.txt", githubContext.Env)
+		assert.Equal(t, "/tmp/act-files/workflow/pathcmd.txt", githubContext.Path)
 		assert.NotEmpty(t, runnerContext["os"])
 	})
+}
+
+func TestRunContextUpdateExtraPath(t *testing.T) {
+	t.Parallel()
+	longPath := strings.Repeat("x", 64*1024+1)
+	for _, testcase := range []struct {
+		name    string
+		content string
+		want    string
+		wantErr bool
+	}{
+		{name: "UTF-8 BOM", content: "\xef\xbb\xbf/utf8/tools\n", want: "/utf8/tools"},
+		{name: "UTF-16 BOM", content: "\xff\xfeC\x00:\x00\\\x00t\x00o\x00o\x00l\x00s\x00\n\x00", want: `C:\tools`},
+		{name: "over 64 KiB", content: longPath + "\n", want: longPath},
+		{name: "over 16 MiB", content: strings.Repeat("x", 16*1024*1024+1), wantErr: true},
+	} {
+		t.Run(testcase.name, func(t *testing.T) {
+			logger := logging.New(logging.DiscardHandler)
+			ctx := common.WithLogger(t.Context(), logger)
+			jobContainer := &containerMock{}
+			jobContainer.On("GetContainerArchive", mock.Anything, "/github/path").
+				Return(io.NopCloser(bytes.NewReader(tarArchive(t, tarEntry{name: "path", body: testcase.content}))), nil).Once()
+			defer jobContainer.AssertExpectations(t)
+			rc := &RunContext{JobContainer: jobContainer}
+
+			err := rc.UpdateExtraPath(ctx, "/github/path")
+			if testcase.wantErr {
+				require.ErrorContains(t, err, "reading path file")
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, []string{testcase.want}, rc.ExtraPath)
+		})
+	}
 }
 
 func TestParentDir(t *testing.T) {
@@ -1366,10 +1898,14 @@ func TestParentDir(t *testing.T) {
 }
 
 func TestRunContextWithGithubEnvRunnerValues(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	rc := createRunsOnRunContext(t, "ubuntu-latest")
 	rc.Config.RunnerName = "runner-1"
 	rc.Config.Secrets = map[string]string{"ACTIONS_STEP_DEBUG": "true"}
+	t.Setenv("ACTIONS_RUNTIME_URL", "")
+	rc.Config.ArtifactServerPath = "artifacts"
+	rc.Config.ArtifactServerAddr = "2001:db8::1"
+	rc.Config.ArtifactServerPort = "8080"
 
 	env := map[string]string{}
 	rc.withGithubEnv(ctx, &model.GithubContext{Workspace: "/workspace/owner/repo"}, env)
@@ -1378,4 +1914,16 @@ func TestRunContextWithGithubEnvRunnerValues(t *testing.T) {
 	assert.Equal(t, "self-hosted", env["RUNNER_ENVIRONMENT"])
 	assert.Equal(t, "/workspace/owner", env["RUNNER_WORKSPACE"])
 	assert.Equal(t, "1", env["RUNNER_DEBUG"])
+	assert.Equal(t, "http://[2001:db8::1]:8080/", env["ACTIONS_RUNTIME_URL"])
+	assert.Equal(t, "true", env["CI"])
+
+	for _, ci := range []string{"false", ""} {
+		env["CI"] = ci
+		rc.withGithubEnv(ctx, &model.GithubContext{}, env)
+		assert.Equal(t, ci, env["CI"])
+	}
+
+	rc.runtimeToken = "run-token"
+	newTestCompositeRunContext(t, rc).withGithubEnv(ctx, &model.GithubContext{}, env)
+	assert.Equal(t, "run-token", env["ACTIONS_RUNTIME_TOKEN"])
 }

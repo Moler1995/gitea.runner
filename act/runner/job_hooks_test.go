@@ -12,9 +12,11 @@ import (
 	"testing"
 
 	"gitea.com/gitea/runner/act/common"
+	"gitea.com/gitea/runner/act/common/logging"
+	"gitea.com/gitea/runner/act/common/logging/logtest"
+	"gitea.com/gitea/runner/act/container"
 
 	"gitea.dev/actionslib/pkg/model"
-	"github.com/sirupsen/logrus/hooks/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -26,8 +28,11 @@ type hookContainer struct {
 	cmd     []string
 	env     map[string]string
 	err     error
+	copyErr error
 	envFile map[string]string
 	pathTar []byte
+	output  string
+	stdout  io.Writer
 }
 
 func (c *hookContainer) ToContainerPath(path string) string { return path }
@@ -40,8 +45,23 @@ func (c *hookContainer) GetRunnerContext(context.Context) map[string]any {
 func (c *hookContainer) Exec(command []string, env map[string]string, _, _ string) common.Executor {
 	return func(context.Context) error {
 		c.cmd, c.env = command, env
+		if c.output != "" {
+			if _, err := io.WriteString(c.stdout, c.output); err != nil {
+				return err
+			}
+		}
 		return c.err
 	}
+}
+
+func (c *hookContainer) ReplaceLogWriter(stdout, _ io.Writer) (io.Writer, io.Writer) {
+	old := c.stdout
+	c.stdout = stdout
+	return old, nil
+}
+
+func (c *hookContainer) Copy(_destPath string, _files ...*container.FileEntry) common.Executor {
+	return common.NewErrorExecutor(c.copyErr)
 }
 
 func (c *hookContainer) UpdateFromEnv(_ string, env *map[string]string) common.Executor {
@@ -58,27 +78,41 @@ func (c *hookContainer) GetContainerArchive(context.Context, string) (io.ReadClo
 // newHookRunContext returns a RunContext and the context to run a hook with, whose logger is
 // silenced so the hook's job-log output does not reach the test output.
 func newHookRunContext(jobContainer *hookContainer, config *Config) (*RunContext, context.Context) {
-	// Env is left nil so that it is built from the config, as it is for a real job.
+	config.PresetGitHubContext = &model.GithubContext{}
 	rc := &RunContext{
 		Config:       config,
 		Run:          &model.Run{JobID: "job", Workflow: &model.Workflow{Jobs: map[string]*model.Job{"job": {}}}},
 		JobContainer: jobContainer,
 	}
-	logger, _ := test.NewNullLogger()
-	ctx := common.WithJobErrorContainer(common.WithLogger(context.Background(), logger.WithField("test", true)))
+	logger := logging.New(logtest.New())
+	ctx := common.WithJobErrorContainer(common.WithLogger(context.Background(), logger.With("test", true)))
 	rc.ExprEval = rc.NewExpressionEvaluator(ctx)
 	return rc, ctx
 }
 
 func TestRunJobHook(t *testing.T) {
-	t.Run("runs the hook with the job environment", func(t *testing.T) {
-		jobContainer := &hookContainer{}
+	t.Run("runs the hook with the job environment after its closed header group", func(t *testing.T) {
+		jobContainer := &hookContainer{output: "from the hook\n"}
 		rc, ctx := newHookRunContext(jobContainer, &Config{
 			JobStartedHook: "/hooks/started.sh",
 			Env:            map[string]string{"A_VAR": "value", jobStartedHookEnv: "/from/env.sh"},
 		})
+		records := logtest.New()
+		ctx = common.WithLogger(ctx, logging.New(records))
 
 		require.NoError(t, rc.runJobStartedHook(ctx))
+
+		var lines []string
+		for _, record := range records.AllRecords() {
+			lines = append(lines, record.Message)
+		}
+		assert.Equal(t, []string{
+			"A job started hook has been configured by the runner administrator",
+			"::group::Run '/hooks/started.sh'",
+			"shell: bash -e {0}",
+			"::endgroup::",
+			"from the hook\n",
+		}, lines)
 
 		// The setting wins over the environment variable.
 		assert.Equal(t, []string{"bash", "-e", "/hooks/started.sh"}, jobContainer.cmd)
@@ -87,6 +121,58 @@ func TestRunJobHook(t *testing.T) {
 		assert.Equal(t, "job", jobContainer.env["GITHUB_JOB"])
 		assert.Equal(t, "/var/run/act/workflow/hook-envs.txt", jobContainer.env["GITHUB_ENV"])
 		assert.Equal(t, "/var/run/act/workflow/hook-path.txt", jobContainer.env["GITHUB_PATH"])
+		assert.Equal(t, jobContainer.env["GITHUB_PATH"], jobContainer.env["GITEA_PATH"])
+	})
+
+	t.Run("each hook has its own command state", func(t *testing.T) {
+		jobContainer := &hookContainer{output: "::stop-commands::token77"}
+		rc, ctx := newHookRunContext(jobContainer, &Config{JobStartedHook: "/started.sh", JobCompletedHook: "/completed.sh"})
+		jobWriter := rc.commandLogWriter(ctx)
+		jobContainer.stdout = jobWriter
+
+		require.NoError(t, rc.runJobStartedHook(ctx))
+		jobContainer.output = "::add-mask::s3cret"
+		require.NoError(t, rc.runJobCompletedHook(ctx))
+		assert.Equal(t, []string{"token77", "s3cret"}, rc.Masks)
+		assert.Same(t, jobWriter, jobContainer.stdout)
+	})
+
+	t.Run("fails on refused commands and honors the container opt-in", func(t *testing.T) {
+		for _, allow := range []bool{false, true} {
+			jobContainer := &hookContainer{output: "::set-env name=FROM_HOOK::1\n::add-path::/opt/hook/bin"}
+			rc, ctx := newHookRunContext(jobContainer, &Config{JobStartedHook: "/started.sh"})
+			if allow {
+				rc.containerSpec.Env = map[string]string{allowUnsecureCommandsVar: "true"}
+			}
+
+			err := rc.runJobStartedHook(ctx)
+			if allow {
+				require.NoError(t, err)
+				assert.Equal(t, "1", rc.Env["FROM_HOOK"])
+				assert.Equal(t, []string{"/opt/hook/bin"}, rc.ExtraPath)
+			} else {
+				require.ErrorContains(t, err, "workflow command is disabled")
+				assert.Equal(t, "failure", rc.getJobContext().Status)
+				require.ErrorContains(t, common.JobError(ctx), "workflow command is disabled")
+				assert.NotContains(t, rc.Env, "FROM_HOOK")
+				assert.Empty(t, rc.ExtraPath)
+			}
+			assert.Nil(t, rc.currentStepEnv())
+			require.NoError(t, rc.takeUnsecureCommandError())
+		}
+	})
+
+	t.Run("the completed hook has no preceding step identity", func(t *testing.T) {
+		jobContainer := &hookContainer{output: "::set-output name=value::after\n::save-state name=value::after"}
+		rc, ctx := newHookRunContext(jobContainer, &Config{JobCompletedHook: "/completed.sh"})
+		rc.CurrentStep = "last-step"
+		rc.StepResults = map[string]*model.StepResult{"last-step": {Outputs: map[string]string{"value": "before"}}}
+
+		require.NoError(t, rc.runJobCompletedHook(ctx))
+		assert.Empty(t, jobContainer.env["GITHUB_ACTION"])
+		assert.Equal(t, "before", rc.StepResults["last-step"].Outputs["value"])
+		assert.Empty(t, rc.IntraActionState)
+		assert.Equal(t, "last-step", rc.CurrentStep)
 	})
 
 	// Each hook reads its own variable, so a swapped constant cannot pass.
@@ -134,6 +220,15 @@ func TestRunJobHook(t *testing.T) {
 		require.ErrorContains(t, common.JobError(ctx), "boom")
 	})
 
+	t.Run("a hook whose file commands cannot be reset neither runs nor exports stale ones", func(t *testing.T) {
+		jobContainer := &hookContainer{copyErr: errors.New("boom"), envFile: map[string]string{"STALE": "1"}}
+		rc, ctx := newHookRunContext(jobContainer, &Config{JobStartedHook: "/hooks/started.sh"})
+
+		require.ErrorContains(t, rc.runJobStartedHook(ctx), "boom")
+		assert.NotContains(t, jobContainer.cmd, "/hooks/started.sh")
+		assert.NotContains(t, rc.Env, "STALE")
+	})
+
 	t.Run("is a no-op without a hook", func(t *testing.T) {
 		jobContainer := &hookContainer{}
 		rc, ctx := newHookRunContext(jobContainer, &Config{})
@@ -147,16 +242,26 @@ func TestRunJobHook(t *testing.T) {
 // actions/runner deliberately runs a hook without the flags it gives `run:` steps, and an
 // executable without a known extension speaks for itself through its shebang.
 func TestHookCommand(t *testing.T) {
-	for hookPath, want := range map[string]struct {
-		cmd   []string
-		shell string
+	for _, tc := range []struct {
+		hookPath string
+		hasShell bool
+		cmd      []string
+		shell    string
 	}{
-		"/hooks/started.sh":  {[]string{"bash", "-e", "/hooks/started.sh"}, "bash -e {0}"},
-		"/hooks/started.PS1": {[]string{"pwsh", "-command", ". '/hooks/started.PS1'"}, `pwsh -command ". '{0}'"`},
-		"/hooks/started":     {[]string{"/hooks/started"}, ""},
+		{"/hooks/started.sh", true, []string{"bash", "-e", "/hooks/started.sh"}, "bash -e {0}"},
+		{"/hooks/started.sh", false, []string{"sh", "-e", "/hooks/started.sh"}, "sh -e {0}"},
+		{"/hooks/started.PS1", true, []string{"pwsh", "-command", ". '/hooks/started.PS1'"}, `pwsh -command ". '{0}'"`},
+		{"/hooks/started.PS1", false, []string{"powershell", "-command", ". '/hooks/started.PS1'"}, `powershell -command ". '{0}'"`},
+		{"/hooks/started", false, []string{"/hooks/started"}, ""},
+		{`C:\hooks\O'Brien\started.ps1`, true, []string{"pwsh", "-command", `. 'C:\hooks\O''Brien\started.ps1'`}, `pwsh -command ". '{0}'"`},
 	} {
-		cmd, shell := hookCommand(hookPath)
-		assert.Equal(t, want.cmd, cmd, hookPath)
-		assert.Equal(t, want.shell, shell, hookPath)
+		cmd, shell := hookCommand(tc.hookPath, func(preferred, fallback string) string {
+			if tc.hasShell {
+				return preferred
+			}
+			return fallback
+		})
+		assert.Equal(t, tc.cmd, cmd, tc.hookPath)
+		assert.Equal(t, tc.shell, shell, tc.hookPath)
 	}
 }

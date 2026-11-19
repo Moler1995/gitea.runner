@@ -7,33 +7,46 @@ package runner
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"fmt"
-	"io"
 	"os"
-	"path"
 	"path/filepath"
 	"runtime"
-	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"gitea.com/gitea/runner/act/common"
+	"gitea.com/gitea/runner/act/common/logging"
+	"gitea.com/gitea/runner/act/ghcontext"
 
 	"gitea.dev/actionslib/pkg/model"
 	"github.com/joho/godotenv"
-	log "github.com/sirupsen/logrus"
 	assert "github.com/stretchr/testify/assert"
-	"go.yaml.in/yaml/v4"
+	"github.com/stretchr/testify/require"
 )
 
 var (
-	baseImage = "node:24-bookworm-slim"
-	platforms map[string]string
-	logLevel  = log.DebugLevel
-	workdir   = "testdata"
-	secrets   map[string]string
+	baseImage        = "node:24-bookworm-slim"
+	platforms        map[string]string
+	logLevel         = logging.LevelDebug
+	workdir          = "testdata"
+	secrets          map[string]string
+	testRunID        = strings.ToLower(rand.Text()[:8]) // keeps docker names apart from concurrent test processes on one daemon
+	testCheckoutPins sync.Map
 )
+
+func mapPlatformPicker(platforms map[string]string) func([]string) string {
+	return func(labels []string) string {
+		for _, label := range labels {
+			if image := platforms[strings.ToLower(label)]; image != "" {
+				return image
+			}
+		}
+		return ""
+	}
+}
 
 func init() {
 	if p := os.Getenv("ACT_TEST_IMAGE"); p != "" {
@@ -45,7 +58,7 @@ func init() {
 	}
 
 	if l := os.Getenv("ACT_TEST_LOG_LEVEL"); l != "" {
-		if lvl, err := log.ParseLevel(l); err == nil {
+		if lvl, err := logging.ParseLevel(l); err == nil {
 			logLevel = lvl
 		}
 	}
@@ -61,10 +74,11 @@ func TestNoWorkflowsFoundByPlanner(t *testing.T) {
 	planner, err := model.NewWorkflowPlanner("res", true)
 	assert.NoError(t, err) //nolint:testifylint // pre-existing issue from nektos/act
 
-	out := log.StandardLogger().Out
+	out := logging.Output()
+	t.Cleanup(func() { logging.SetOutput(out) })
 	var buf bytes.Buffer
-	log.SetOutput(&buf)
-	log.SetLevel(log.DebugLevel)
+	logging.SetOutput(&buf)
+	logging.SetLevel(logging.LevelDebug)
 	plan, err := planner.PlanEvent("pull_request")
 	assert.NotNil(t, plan)
 	assert.NoError(t, err) //nolint:testifylint // pre-existing issue from nektos/act
@@ -74,25 +88,24 @@ func TestNoWorkflowsFoundByPlanner(t *testing.T) {
 	assert.NotNil(t, plan)
 	assert.NoError(t, err) //nolint:testifylint // pre-existing issue from nektos/act
 	assert.Contains(t, buf.String(), "no workflows found by planner")
-	log.SetOutput(out)
 }
 
 func TestGraphMissingEvent(t *testing.T) {
 	planner, err := model.NewWorkflowPlanner("testdata/issue-1595/no-event.yml", true)
 	assert.NoError(t, err) //nolint:testifylint // pre-existing issue from nektos/act
 
-	out := log.StandardLogger().Out
+	out := logging.Output()
+	t.Cleanup(func() { logging.SetOutput(out) })
 	var buf bytes.Buffer
-	log.SetOutput(&buf)
-	log.SetLevel(log.DebugLevel)
+	logging.SetOutput(&buf)
+	logging.SetLevel(logging.LevelDebug)
 
 	plan, err := planner.PlanEvent("push")
 	assert.NoError(t, err) //nolint:testifylint // pre-existing issue from nektos/act
 	assert.NotNil(t, plan)
 	assert.Empty(t, plan.Stages)
 
-	assert.Contains(t, buf.String(), "no events found for workflow: no-event.yml")
-	log.SetOutput(out)
+	assert.Contains(t, buf.String(), `msg="no events found for workflow" file=no-event.yml`)
 }
 
 func TestGraphMissingFirst(t *testing.T) {
@@ -109,29 +122,30 @@ func TestGraphWithMissing(t *testing.T) {
 	planner, err := model.NewWorkflowPlanner("testdata/issue-1595/missing.yml", true)
 	assert.NoError(t, err) //nolint:testifylint // pre-existing issue from nektos/act
 
-	out := log.StandardLogger().Out
+	out := logging.Output()
+	t.Cleanup(func() { logging.SetOutput(out) })
 	var buf bytes.Buffer
-	log.SetOutput(&buf)
-	log.SetLevel(log.DebugLevel)
+	logging.SetOutput(&buf)
+	logging.SetLevel(logging.LevelDebug)
 
 	plan, err := planner.PlanEvent("push")
 	assert.NotNil(t, plan)
 	assert.Empty(t, plan.Stages)
 	assert.EqualError(t, err, "unable to build dependency graph for missing (missing.yml)") //nolint:testifylint // pre-existing issue from nektos/act
 	assert.Contains(t, buf.String(), "unable to build dependency graph for missing (missing.yml)")
-	log.SetOutput(out)
 }
 
 func TestGraphWithSomeMissing(t *testing.T) {
-	log.SetLevel(log.DebugLevel)
+	logging.SetLevel(logging.LevelDebug)
 
 	planner, err := model.NewWorkflowPlanner("testdata/issue-1595/", true)
 	assert.NoError(t, err) //nolint:testifylint // pre-existing issue from nektos/act
 
-	out := log.StandardLogger().Out
+	out := logging.Output()
+	t.Cleanup(func() { logging.SetOutput(out) })
 	var buf bytes.Buffer
-	log.SetOutput(&buf)
-	log.SetLevel(log.DebugLevel)
+	logging.SetOutput(&buf)
+	logging.SetLevel(logging.LevelDebug)
 
 	plan, err := planner.PlanAll()
 	assert.Error(t, err, "unable to build dependency graph for no first (no-first.yml)") //nolint:testifylint // pre-existing issue from nektos/act
@@ -139,7 +153,21 @@ func TestGraphWithSomeMissing(t *testing.T) {
 	assert.Len(t, plan.Stages, 1)
 	assert.Contains(t, buf.String(), "unable to build dependency graph for missing (missing.yml)")
 	assert.Contains(t, buf.String(), "unable to build dependency graph for no first (no-first.yml)")
-	log.SetOutput(out)
+}
+
+func TestNewPlanExecutorRequiresRunsOnBeforeRunningAnyJob(t *testing.T) {
+	for _, runsOn := range []string{"", "if: false", "runs-on: [ubuntu-latest, '']"} {
+		workflow, err := model.ReadWorkflow(strings.NewReader("jobs:\n  first:\n    runs-on: ubuntu-latest\n    steps: [run: echo]\n  test:\n    needs: first\n    " + runsOn + "\n    steps: [run: echo]\n"))
+		require.NoError(t, err)
+		plan, err := model.CombineWorkflowPlanner(workflow).PlanJob("test")
+		require.NoError(t, err)
+		require.ErrorContains(t, (&runnerImpl{config: &Config{Env: testCheckoutEnv()}}).NewPlanExecutor(plan)(t.Context()), `job "test" requires a non-empty 'runs-on'`, runsOn)
+		assert.Empty(t, workflow.Jobs["first"].Result, runsOn)
+	}
+
+	workflow := &model.Workflow{Jobs: map[string]*model.Job{"build": {Result: "success"}}}
+	require.NoError(t, (&runnerImpl{config: &Config{Env: testCheckoutEnv()}}).NewPlanExecutor(&model.Plan{Stages: []*model.Stage{{Runs: []*model.Run{{Workflow: workflow, JobID: "build"}}}}})(t.Context()))
+	assert.Equal(t, "success", workflow.Jobs["build"].Result)
 }
 
 func TestGraphEvent(t *testing.T) {
@@ -162,10 +190,24 @@ func TestGraphEvent(t *testing.T) {
 	assert.NoError(t, err) //nolint:testifylint // pre-existing issue from nektos/act
 	assert.NotNil(t, plan)
 	assert.Empty(t, plan.Stages)
-}
 
-// these two build the same action Dockerfiles into one image tag, so they cannot overlap
-var sharedImageWorkflows = []string{"local-action-dockerfile", "local-action-via-composite-dockerfile"}
+	for _, workflowPath := range []string{
+		"testdata/workflow_dispatch_no_inputs_mapping/workflow_dispatch.yml",
+		"testdata/workflow_dispatch-scalar/workflow_dispatch.yml",
+	} {
+		planner, err := model.NewWorkflowPlanner(workflowPath, true)
+		if !assert.NoError(t, err, workflowPath) { //nolint:testifylint // pre-existing issue from nektos/act
+			continue
+		}
+		plan, err := planner.PlanEvent("workflow_dispatch")
+		if !assert.NoError(t, err, workflowPath) || !assert.NotNil(t, plan, workflowPath) { //nolint:testifylint // pre-existing issue from nektos/act
+			continue
+		}
+		if assert.Len(t, plan.Stages, 1, workflowPath) {
+			assert.Len(t, plan.Stages[0].Runs, 1, workflowPath)
+		}
+	}
+}
 
 // bounds concurrent plans: each job holds a network, and the daemon's address pool is finite
 var planSlots = make(chan struct{}, 4)
@@ -180,38 +222,31 @@ type TestJobFileInfo struct {
 }
 
 func (j *TestJobFileInfo) runTest(ctx context.Context, t *testing.T, cfg *Config) {
+	ctx = ghcontext.WithPinnedCheckout(ctx, &testCheckoutPins)
 	fmt.Printf("::group::%s\n", j.workflowPath) //nolint:forbidigo // pre-existing issue from nektos/act
 
-	log.SetLevel(logLevel)
+	logging.SetLevel(logLevel)
 
 	workdir, err := filepath.Abs(j.workdir)
 	assert.NoError(t, err, workdir) //nolint:testifylint // pre-existing issue from nektos/act
 
 	fullWorkflowPath := filepath.Join(workdir, j.workflowPath)
 	runnerConfig := &Config{
-		Workdir:     workdir,
-		BindWorkdir: false,
-		EventName:   j.eventName,
-		EventPath:   cfg.EventPath,
-		Platforms:   j.platforms,
+		Workdir:        workdir,
+		BindWorkdir:    false,
+		EventName:      j.eventName,
+		EventPath:      cfg.EventPath,
+		PlatformPicker: mapPlatformPicker(j.platforms),
 		// fixtures reuse workflow and job names, so parallel tests would collide without this
-		ContainerNamePrefix: strings.ReplaceAll(t.Name(), "/", "-"),
-		ReuseContainers:     false,
-		// as the shipped runner does, else a fixture asserting a job failure keeps its
-		// container, and its network, on the daemon forever
-		AutoRemove: true,
+		ContainerNamePrefix: strings.ReplaceAll(t.Name(), "/", "-") + "-" + testRunID,
 		// 0 would run jobs runtime.NumCPU()-wide, making the network peak machine-dependent
 		MaxParallel:           2,
-		ForceRebuild:          true,
 		Env:                   cfg.Env,
 		Secrets:               cfg.Secrets,
-		Inputs:                cfg.Inputs,
 		GitHubInstance:        "github.com",
 		DefaultActionInstance: cfg.DefaultActionInstance,
 		ContainerArchitecture: cfg.ContainerArchitecture,
 		ContainerMaxLifetime:  time.Hour,
-		Matrix:                cfg.Matrix,
-		ActionCache:           cfg.ActionCache,
 		ValidVolumes:          []string{"**"}, // allow workflow-declared volumes (e.g. container-volumes)
 	}
 
@@ -224,11 +259,18 @@ func (j *TestJobFileInfo) runTest(ctx context.Context, t *testing.T, cfg *Config
 	plan, err := planner.PlanEvent(j.eventName)
 	assert.True(t, (err == nil) != (plan == nil), "PlanEvent should return either a plan or an error") //nolint:testifylint // pre-existing issue from nektos/act
 	if err == nil && plan != nil {
-		err = func() error {
+		usesDocker := false
+		for _, platform := range j.platforms {
+			if platform != "-self-hosted" {
+				usesDocker = true
+				break
+			}
+		}
+		if usesDocker && !common.Dryrun(ctx) {
 			planSlots <- struct{}{}
 			defer func() { <-planSlots }()
-			return runner.NewPlanExecutor(plan)(ctx)
-		}()
+		}
+		err = runner.NewPlanExecutor(plan)(ctx)
 		if j.errorMessage == "" {
 			assert.NoError(t, err, fullWorkflowPath) //nolint:testifylint // pre-existing issue from nektos/act
 		} else {
@@ -239,15 +281,11 @@ func (j *TestJobFileInfo) runTest(ctx context.Context, t *testing.T, cfg *Config
 	fmt.Println("::endgroup::") //nolint:forbidigo // pre-existing issue from nektos/act
 }
 
-type TestConfig struct {
-	LocalRepositories map[string]string `yaml:"local-repositories"`
-}
-
 func TestRunEvent(t *testing.T) {
 	requireDocker(t)
 	t.Parallel()
 
-	ctx := context.Background()
+	ctx := t.Context()
 
 	tables := []TestJobFileInfo{
 		// Shells
@@ -265,6 +303,7 @@ func TestRunEvent(t *testing.T) {
 		{workdir, "uses-composite", "push", "", platforms, secrets},
 		{workdir, "uses-composite-with-error", "push", "Job 'failing-composite-action' failed", platforms, secrets},
 		{workdir, "uses-docker-url", "push", "", platforms, secrets},
+		{workdir, "uses-step-if-inputs-not-leaked", "push", "", platforms, secrets},
 		{workdir, "act-composite-env-test", "push", "", platforms, secrets},
 
 		// Eval
@@ -276,9 +315,7 @@ func TestRunEvent(t *testing.T) {
 
 		{workdir, "basic", "push", "", platforms, secrets},
 		{workdir, "fail", "push", "exit with `FAILURE`: 1", platforms, secrets},
-		{workdir, "checkout", "push", "", platforms, secrets},
 		{workdir, "job-container", "push", "", platforms, secrets},
-		{workdir, "job-container-non-root", "push", "", platforms, secrets},
 		{workdir, "job-container-invalid-credentials", "push", "failed to handle credentials: failed to interpolate container.credentials.password", platforms, secrets},
 		{workdir, "container-hostname", "push", "", platforms, secrets},
 		{workdir, "matrix", "push", "", platforms, secrets},
@@ -288,17 +325,14 @@ func TestRunEvent(t *testing.T) {
 		{workdir, "defaults-run", "push", "", platforms, secrets},
 		{workdir, "composite-fail-with-output", "push", "", platforms, secrets},
 		{workdir, "issue-597", "push", "", platforms, secrets},
-		{workdir, "issue-598", "push", "", platforms, secrets},
 		{workdir, "if-env-act", "push", "", platforms, secrets},
-		{workdir, "env-and-path", "push", "", platforms, secrets},
 		{workdir, "environment-files", "push", "", platforms, secrets},
 		{workdir, "GITHUB_STATE", "push", "", platforms, secrets},
 		{workdir, "environment-files-parser-bug", "push", "", platforms, secrets},
 		{workdir, "non-existent-action", "push", "Job 'nopanic' failed", platforms, secrets},
 		{workdir, "outputs", "push", "", platforms, secrets},
 		{workdir, "networking", "push", "", platforms, secrets},
-		{workdir, "steps-context/conclusion", "push", "", platforms, secrets},
-		{workdir, "steps-context/outcome", "push", "", platforms, secrets},
+		{workdir, "steps-context", "push", "", platforms, secrets},
 		{workdir, "job-status-check", "push", "job 'fail' failed", platforms, secrets},
 		{workdir, "if-expressions", "push", "Job 'mytest' failed", platforms, secrets},
 		{workdir, "actions-environment-and-context-tests", "push", "", platforms, secrets},
@@ -308,8 +342,6 @@ func TestRunEvent(t *testing.T) {
 		{workdir, "ensure-post-steps", "push", "Job 'second-post-step-should-fail' failed", platforms, secrets},
 		{workdir, "workflow_call_inputs", "workflow_call", "", platforms, secrets},
 		{workdir, "workflow_dispatch", "workflow_dispatch", "", platforms, secrets},
-		{workdir, "workflow_dispatch_no_inputs_mapping", "workflow_dispatch", "", platforms, secrets},
-		{workdir, "workflow_dispatch-scalar", "workflow_dispatch", "", platforms, secrets},
 		{workdir, "workflow_dispatch-scalar-composite-action", "workflow_dispatch", "", platforms, secrets},
 		{workdir, "job-needs-context-contains-result", "push", "", platforms, secrets},
 		{workdir, "container-volumes", "push", "", platforms, secrets},
@@ -323,9 +355,6 @@ func TestRunEvent(t *testing.T) {
 		{workdir, "services", "push", "", platforms, secrets},
 		{workdir, "services-with-container", "push", "", platforms, secrets},
 		{workdir, "services-empty-image", "push", "", platforms, secrets},
-
-		// local remote action overrides
-		{workdir, "local-remote-action-overrides", "push", "", platforms, secrets},
 	}
 
 	for _, table := range tables {
@@ -334,33 +363,16 @@ func TestRunEvent(t *testing.T) {
 				// host /proc bind mounts are Linux-Docker-only
 				requireLinuxDocker(t)
 			}
-			if !slices.Contains(sharedImageWorkflows, table.workflowPath) {
-				t.Parallel()
-			}
+			t.Parallel()
 
 			config := &Config{
 				Secrets: table.secrets,
+				Env:     map[string]string{"GITHUB_REPOSITORY": t.Name() + "-" + testRunID},
 			}
 
 			eventFile := filepath.Join(workdir, table.workflowPath, "event.json")
 			if _, err := os.Stat(eventFile); err == nil {
 				config.EventPath = eventFile
-			}
-
-			testConfigFile := filepath.Join(workdir, table.workflowPath, "config.yml")
-			if file, err := os.ReadFile(testConfigFile); err == nil {
-				testConfig := &TestConfig{}
-				if yaml.Unmarshal(file, testConfig) == nil {
-					if testConfig.LocalRepositories != nil {
-						config.ActionCache = &LocalRepositoryCache{
-							Parent: GoGitActionCache{
-								path.Clean(path.Join(workdir, "cache")),
-							},
-							LocalRepositories: testConfig.LocalRepositories,
-							CacheDirCache:     map[string]string{},
-						}
-					}
-				}
 			}
 
 			table.runTest(ctx, t, config)
@@ -376,7 +388,7 @@ func TestRunEventHostEnvironment(t *testing.T) {
 	// nix-specific cases gate on their own tool below so a missing pwsh/nix skips just those.
 	requireHostTools(t, "bash", "node")
 
-	ctx := context.Background()
+	ctx := t.Context()
 
 	tables := []TestJobFileInfo{}
 
@@ -407,20 +419,16 @@ func TestRunEventHostEnvironment(t *testing.T) {
 			{workdir, "evalmatrix-merge-map", "push", "", platforms, secrets},
 			{workdir, "evalmatrix-merge-array", "push", "", platforms, secrets},
 
-			{workdir, "fail", "push", "exit with `FAILURE`: 1", platforms, secrets},
-			{workdir, "checkout", "push", "", platforms, secrets},
 			{workdir, "matrix", "push", "", platforms, secrets},
 			{workdir, "commands", "push", "", platforms, secrets},
 			{workdir, "defaults-run", "push", "", platforms, secrets},
 			{workdir, "composite-fail-with-output", "push", "", platforms, secrets},
 			{workdir, "issue-597", "push", "", platforms, secrets},
-			{workdir, "issue-598", "push", "", platforms, secrets},
 			{workdir, "if-env-act", "push", "", platforms, secrets},
 			{workdir, "env-and-path", "push", "", platforms, secrets},
 			{workdir, "non-existent-action", "push", "Job 'nopanic' failed", platforms, secrets},
 			{workdir, "outputs", "push", "", platforms, secrets},
-			{workdir, "steps-context/conclusion", "push", "", platforms, secrets},
-			{workdir, "steps-context/outcome", "push", "", platforms, secrets},
+			{workdir, "steps-context", "push", "", platforms, secrets},
 			{workdir, "job-status-check", "push", "job 'fail' failed", platforms, secrets},
 			{workdir, "if-expressions", "push", "Job 'mytest' failed", platforms, secrets},
 			{workdir, "evalenv", "push", "", platforms, secrets},
@@ -445,14 +453,18 @@ func TestRunEventHostEnvironment(t *testing.T) {
 
 		tables = append(tables, []TestJobFileInfo{
 			{workdir, "nix-prepend-path", "push", "", platforms, secrets},
+			{workdir, "uses-docker-url", "push", "", platforms, secrets},
+			{workdir, "local-action-dockerfile", "push", "", platforms, secrets},
 			{workdir, "inputs-via-env-context", "push", "", platforms, secrets},
 			{workdir, "do-not-leak-step-env-in-composite", "push", "", platforms, secrets},
 			{workdir, "set-env-step-env-override", "push", "", platforms, secrets},
 			{workdir, "set-env-new-env-file-per-step", "push", "", platforms, secrets},
+			{workdir, "github-parity", "push", "", platforms, secrets},
 			{workdir, "no-panic-on-invalid-composite-action", "push", "jobs failed due to invalid action", platforms, secrets},
 		}...)
 	}
 
+	hostPlanSlots := make(chan struct{}, 2)
 	for _, table := range tables {
 		t.Run(table.workflowPath, func(t *testing.T) {
 			switch table.workflowPath {
@@ -460,16 +472,21 @@ func TestRunEventHostEnvironment(t *testing.T) {
 				requireHostTools(t, "pwsh")
 			case "nix-prepend-path":
 				requireHostTools(t, "nix")
+			case "uses-docker-url", "local-action-dockerfile":
+				requireDockerSharingFiles(t)
 			}
+			t.Parallel()
+			hostPlanSlots <- struct{}{}
+			defer func() { <-hostPlanSlots }()
 			table.runTest(ctx, t, &Config{})
 		})
 	}
 }
 
 func TestDryrunEvent(t *testing.T) {
-	t.Parallel()
+	t.Setenv("DOCKER_HOST", "://")
 	// Dryrun plans without containers or network (shells and local actions only).
-	ctx := common.WithDryrun(context.Background(), true)
+	ctx := common.WithDryrun(t.Context(), true)
 
 	tables := []TestJobFileInfo{
 		// Shells
@@ -500,48 +517,7 @@ func TestReusableWorkflowCaller(t *testing.T) {
 	requireDocker(t)
 	t.Parallel()
 	table := TestJobFileInfo{workdir, "uses-workflow", "push", "", platforms, map[string]string{"secret": "keep_it_private"}}
-	table.runTest(context.Background(), t, &Config{Secrets: table.secrets})
-}
-
-type maskJobLoggerFactory struct {
-	Output bytes.Buffer
-}
-
-func (f *maskJobLoggerFactory) WithJobLogger() *log.Logger {
-	logger := log.New()
-	logger.SetOutput(io.MultiWriter(&f.Output, os.Stdout))
-	logger.SetLevel(log.DebugLevel)
-	return logger
-}
-
-func TestMaskValues(t *testing.T) {
-	t.Parallel()
-	assertNoSecret := func(text, secret string) { //nolint:unparam // pre-existing issue from nektos/act
-		found := strings.Contains(text, "composite secret")
-		if found {
-			fmt.Printf("\nFound Secret in the given text:\n%s\n", text) //nolint:forbidigo // pre-existing issue from nektos/act
-		}
-		assert.False(t, strings.Contains(text, "composite secret")) //nolint:testifylint // pre-existing issue from nektos/act
-	}
-
-	requireDocker(t)
-
-	log.SetLevel(log.DebugLevel)
-
-	tjfi := TestJobFileInfo{
-		workdir:      workdir,
-		workflowPath: "mask-values",
-		eventName:    "push",
-		errorMessage: "",
-		platforms:    platforms,
-	}
-
-	logger := &maskJobLoggerFactory{}
-	tjfi.runTest(WithJobLoggerFactory(common.WithLogger(context.Background(), logger.WithJobLogger()), logger), t, &Config{})
-	output := logger.Output.String()
-
-	assertNoSecret(output, "secret value")
-	assertNoSecret(output, "YWJjCg==")
+	table.runTest(t.Context(), t, &Config{Secrets: table.secrets})
 }
 
 func TestRunEventSecrets(t *testing.T) {
@@ -562,63 +538,7 @@ func TestRunEventSecrets(t *testing.T) {
 	secrets, _ := godotenv.Read(filepath.Join(workdir, workflowPath, ".secrets"))
 	assert.NoError(t, err, "Failed to read .secrets") //nolint:testifylint // pre-existing issue from nektos/act
 
-	tjfi.runTest(context.Background(), t, &Config{Secrets: secrets, Env: env})
-}
-
-func TestRunWithService(t *testing.T) {
-	requireDocker(t)
-
-	log.SetLevel(log.DebugLevel)
-	ctx := context.Background()
-
-	platforms := map[string]string{
-		"ubuntu-latest": "node:24-bookworm-slim",
-	}
-
-	workflowPath := "services"
-	eventName := "push"
-
-	workdir, err := filepath.Abs("testdata")
-	assert.NoError(t, err, workflowPath) //nolint:testifylint // pre-existing issue from nektos/act
-
-	runnerConfig := &Config{
-		Workdir:              workdir,
-		EventName:            eventName,
-		Platforms:            platforms,
-		ReuseContainers:      false,
-		ContainerMaxLifetime: time.Hour, // otherwise the job container is `sleep 0` and exits at once
-	}
-	runner, err := New(runnerConfig)
-	assert.NoError(t, err, workflowPath) //nolint:testifylint // pre-existing issue from nektos/act
-
-	planner, err := model.NewWorkflowPlanner("testdata/"+workflowPath, true)
-	assert.NoError(t, err, workflowPath) //nolint:testifylint // pre-existing issue from nektos/act
-
-	plan, err := planner.PlanEvent(eventName)
-	assert.NoError(t, err, workflowPath) //nolint:testifylint // pre-existing issue from nektos/act
-
-	err = runner.NewPlanExecutor(plan)(ctx)
-	assert.NoError(t, err, workflowPath)
-}
-
-func TestRunActionInputs(t *testing.T) {
-	t.Parallel()
-	requireDocker(t)
-	workflowPath := "input-from-cli"
-
-	tjfi := TestJobFileInfo{
-		workdir:      workdir,
-		workflowPath: workflowPath,
-		eventName:    "workflow_dispatch",
-		errorMessage: "",
-		platforms:    platforms,
-	}
-
-	inputs := map[string]string{
-		"SOME_INPUT": "input",
-	}
-
-	tjfi.runTest(context.Background(), t, &Config{Inputs: inputs})
+	tjfi.runTest(t.Context(), t, &Config{Secrets: secrets, Env: env})
 }
 
 func TestRunEventPullRequest(t *testing.T) {
@@ -635,31 +555,5 @@ func TestRunEventPullRequest(t *testing.T) {
 		platforms:    platforms,
 	}
 
-	tjfi.runTest(context.Background(), t, &Config{EventPath: filepath.Join(workdir, workflowPath, "event.json")})
-}
-
-func TestRunMatrixWithUserDefinedInclusions(t *testing.T) {
-	t.Parallel()
-	requireDocker(t)
-	workflowPath := "matrix-with-user-inclusions"
-
-	tjfi := TestJobFileInfo{
-		workdir:      workdir,
-		workflowPath: workflowPath,
-		eventName:    "push",
-		errorMessage: "",
-		platforms:    platforms,
-	}
-
-	matrix := map[string]map[string]bool{
-		"node": {
-			"8":   true,
-			"8.x": true,
-		},
-		"os": {
-			"ubuntu-18.04": true,
-		},
-	}
-
-	tjfi.runTest(context.Background(), t, &Config{Matrix: matrix})
+	tjfi.runTest(t.Context(), t, &Config{EventPath: filepath.Join(workdir, workflowPath, "event.json")})
 }

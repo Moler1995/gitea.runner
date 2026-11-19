@@ -7,28 +7,38 @@ package runner
 import (
 	"archive/tar"
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/base64"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"path"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"gitea.com/gitea/runner/act/common"
+	"gitea.com/gitea/runner/act/common/logging"
 	"gitea.com/gitea/runner/act/container"
 
 	"gitea.dev/actionslib/pkg/exprparser"
 	"gitea.dev/actionslib/pkg/model"
+	unicodeencoding "golang.org/x/text/encoding/unicode"
+	"golang.org/x/text/transform"
 )
 
-const maxJobSummaryBytes = 1024 * 1024
+const (
+	jobCleanupTimeout  = time.Minute
+	maxJobSummaryBytes = 1024 * 1024
+)
 
 // jobSummaryTruncationMarker is appended to a summary that exceeded the size limit
 // so the rendered output makes the truncation visible instead of silently cutting off.
@@ -76,7 +86,7 @@ func reportStepError(ctx context.Context, rc *RunContext, err error) {
 // executor can fetch all of them up front.
 type actionPreparer interface {
 	prepareActionExecutor() common.Executor
-	actionDownloadInfo() (reference, sha string, ok bool)
+	actionDownloadInfo() (reference, sha string)
 }
 
 // printPrepareActions downloads every action the job uses before its first step runs and reports
@@ -88,41 +98,72 @@ func printPrepareActions(rc *RunContext, preparers []actionPreparer) common.Exec
 			return nil
 		}
 
-		rawLogger := common.Logger(ctx).WithField(rawOutputField, true)
+		rawLogger := common.Logger(ctx).With(rawOutputField, true)
 		rawLogger.Infof("Prepare all required actions")
+
+		fetchCtx, cancelFetches := context.WithCancel(ctx)
+		var fetches sync.WaitGroup
+		defer func() { cancelFetches(); fetches.Wait() }()
+		slots := make(chan struct{}, 4)
+		job := rc.topLevelRunContext()
+		if job.actionDownloads == nil {
+			job.actionDownloads = map[string]*actionDownload{}
+		}
+		for _, preparer := range preparers {
+			action, ok := preparer.(*stepActionRemote)
+			if !ok || strings.Contains(action.Step.Uses, "${{") || action.action != nil {
+				continue
+			}
+			github := action.RunContext.getGithubContext(common.WithLogger(ctx, logging.New(logging.DiscardHandler)))
+			remote, err := newRemoteAction(action.Step.Uses, github, action.RunContext.Config.GitHubInstance)
+			if err != nil || action.skipsLocalCheckout(remote, github) {
+				continue
+			}
+			key := remote.downloadKey(action.RunContext.Config.DefaultActionURL())
+			if job.actionDownloads[key] != nil {
+				continue
+			}
+			download := &actionDownload{fetched: make(chan struct{})}
+			job.actionDownloads[key] = download
+			fetches.Go(func() {
+				defer close(download.fetched)
+				defer common.RecoverPanic(&download.err)
+				slots <- struct{}{}
+				defer func() { <-slots }()
+				download.dir, download.sha, download.err = action.fetchAction(fetchCtx, remote, github.Token)
+			})
+		}
 
 		for _, preparer := range preparers {
 			if err := preparer.prepareActionExecutor()(ctx); err != nil {
 				// No step has run yet, so the failure belongs to the job.
 				reportStepError(ctx, rc, err)
-				return err
+				return setupError{err}
 			}
-			reference, sha, ok := preparer.actionDownloadInfo()
-			if !ok {
+			reference, sha := preparer.actionDownloadInfo()
+			if sha == "" {
 				continue
 			}
-			if sha == "" {
-				rawLogger.Infof("Download action repository '%s'", reference)
-			} else {
-				rawLogger.Infof("Download action repository '%s' (SHA:%s)", reference, sha)
-			}
+			rawLogger.Infof("Download action repository '%s' (SHA:%s)", reference, sha)
 		}
 		return nil
 	}
 }
 
+// setupError is a failure of the job setup, such as an action that cannot be downloaded.
+type setupError struct{ error }
+
+func (e setupError) Unwrap() error { return e.error }
+
 // printCompleteJobName closes the setup section the way actions/runner ends its "Set up job" step.
 func printCompleteJobName(rc *RunContext) common.Executor {
 	return func(ctx context.Context) error {
 		// Name holds a matrix combination; JobName is the shared name GitHub reports.
-		name := rc.JobName
-		if name == "" {
-			name = rc.Name
-		}
+		name := cmp.Or(rc.JobName, rc.Name)
 		if name == "" && rc.Run != nil {
 			name = rc.Run.JobID
 		}
-		common.Logger(ctx).WithField(rawOutputField, true).Infof("Complete job name: %s", name)
+		common.Logger(ctx).With(rawOutputField, true).Infof("Complete job name: %s", name)
 		return nil
 	}
 }
@@ -135,14 +176,6 @@ func newJobExecutor(info jobInfo, sf stepFactory, rc *RunContext) common.Executo
 	preparers := make([]actionPreparer, 0)
 	var postExecutor common.Executor
 
-	steps = append(steps, func(ctx context.Context) error {
-		logger := common.Logger(ctx)
-		if len(info.matrix()) > 0 {
-			logger.Infof("Matrix: %v", info.matrix())
-		}
-		return nil
-	})
-
 	infoSteps := info.steps()
 
 	if len(infoSteps) == 0 {
@@ -150,15 +183,19 @@ func newJobExecutor(info jobInfo, sf stepFactory, rc *RunContext) common.Executo
 	}
 
 	preSteps = append(preSteps, func(ctx context.Context) error {
+		if len(info.matrix()) > 0 {
+			common.Logger(ctx).Infof("Matrix: %v", info.matrix())
+		}
+		return nil
+	})
+	preSteps = append(preSteps, func(ctx context.Context) error {
 		// Have to be skipped for some Tests
 		if rc.Run == nil {
 			return nil
 		}
-		rc.ExprEval = rc.NewExpressionEvaluator(ctx)
-		// evaluate environment variables since they can contain
-		// GitHub's special environment variables.
-		for k, v := range rc.GetEnv() {
-			rc.Env[k] = rc.ExprEval.Interpolate(ctx, v)
+		if err := evaluateJobEnvAndDefaults(ctx, rc); err != nil {
+			reportStepError(ctx, rc, err)
+			return err
 		}
 		return nil
 	})
@@ -178,6 +215,7 @@ func newJobExecutor(info jobInfo, sf stepFactory, rc *RunContext) common.Executo
 		if err != nil {
 			return common.NewErrorExecutor(err)
 		}
+
 		if d, ok := step.(stepPreparer); ok && rc.Config.ContainerHooks.Enabled {
 			spec, descErr := d.prepareContainerStep()
 			if descErr != nil {
@@ -237,6 +275,7 @@ func newJobExecutor(info jobInfo, sf stepFactory, rc *RunContext) common.Executo
 
 	// The setup section of the job log. The started hook goes first, so what it sets up is
 	// in place for the first action download and the first step.
+	// The pre steps come after it, as steps of their own.
 	preSteps = append(preSteps, rc.runJobStartedHook)
 	preSteps = append(preSteps, printPrepareActions(rc, preparers))
 	preSteps = append(preSteps, stepPreSteps...)
@@ -244,76 +283,57 @@ func newJobExecutor(info jobInfo, sf stepFactory, rc *RunContext) common.Executo
 	preSteps = append(preSteps, printCompleteJobName(rc))
 
 	// Ahead of the teardown below, while the job environment is still up.
-	postExecutor = postExecutor.Finally(rc.runJobCompletedHook)
+	postExecutor = postExecutor.Finally(useJobStageLogger(StageComplete, rc.runJobCompletedHook))
+	postExecutor = postExecutor.Finally(useJobStageLogger(StageComplete, func(ctx context.Context) error {
+		// swallowed: a bad output fails this job, it must not abandon the rest of the plan
+		if err := info.interpolateOutputs()(ctx); err != nil {
+			reportStepError(ctx, rc, err)
+		} else if err := setJobOutputs(ctx, rc); err != nil {
+			reportStepError(ctx, rc, err)
+		}
+		return nil
+	}))
 
-	postExecutor = postExecutor.Finally(func(ctx context.Context) error {
+	postExecutor = postExecutor.Finally(useJobStageLogger(StageComplete, func(ctx context.Context) error {
 		jobError := common.JobError(ctx)
 		var err error
-		// jobError == nil keeps a failed job's container alive for post-mortem debugging when
-		// AutoRemove is off (the act-CLI --rm behavior; the shipped runner always sets
-		// AutoRemove). A cancelled run is not a failure to inspect, and the cancel-path post
-		// context now carries its own error container so a failing post step makes jobError
-		// non-nil — OR in rc.jobCancelled so cancellation still always tears the container down.
-		if rc.Config.AutoRemove || jobError == nil || rc.jobCancelled {
-			// always allow 1 min for stopping and removing the runner, even if we were cancelled
-			ctx, cancel := context.WithTimeout(common.WithLogger(context.Background(), common.Logger(ctx)), time.Minute)
-			defer cancel()
+		// always allow 1 min for stopping and removing the runner, even if we were cancelled
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), jobCleanupTimeout)
+		defer cancel()
 
-			logger := common.Logger(ctx)
-			tryUploadJobSummary(ctx, rc)
-			// For Gitea
-			// We don't need to call `stopServiceContainers` here since it will be called by following `info.stopContainer`
-			// logger.Infof("Cleaning up services for job %s", rc.JobName)
-			// if err := rc.stopServiceContainers()(ctx); err != nil {
-			// 	logger.Errorf("Error while cleaning services: %v", err)
-			// }
-
-			logger.Infof("Cleaning up container for job %s", rc.JobName)
-			if err = info.stopContainer()(ctx); err != nil {
-				logger.Errorf("##[error]%s", EscapeCommandData("Error while stop job container: "+err.Error()))
-			}
-
-			// For Gitea
-			// We don't need to call `NewDockerNetworkRemoveExecutor` here since it is called by above `info.stopContainer`
-			// if !rc.IsHostEnv(ctx) && rc.Config.ContainerNetworkMode == "" {
-			// 	// clean network in docker mode only
-			// 	// if the value of `ContainerNetworkMode` is empty string,
-			// 	// it means that the network to which containers are connecting is created by `runner`,
-			// 	// so, we should remove the network at last.
-			// 	networkName, _ := rc.networkName()
-			// 	logger.Infof("Cleaning up network for job %s, and network name is: %s", rc.JobName, networkName)
-			// 	if err := container.NewDockerNetworkRemoveExecutor(networkName)(ctx); err != nil {
-			// 		logger.Errorf("Error while cleaning network: %v", err)
-			// 	}
-			// }
+		logger := common.Logger(ctx)
+		tryUploadJobSummary(ctx, rc)
+		logger.Infof("Cleaning up container for job %s", rc.JobName)
+		if err = info.stopContainer()(ctx); err != nil {
+			logger.Errorf("##[error]%s", EscapeCommandData("Error while stop job container: "+err.Error()))
 		}
 		setJobResult(ctx, info, rc, jobError == nil)
-		setJobOutputs(ctx, rc)
+		rc.removeDockerActionImages(ctx)
 
 		return err
-	})
+	}))
 
-	stepsExecutor := newStepsExecutor(rc, preSteps, steps)
-
-	return common.NewPipelineExecutor(info.startContainer(), stepsExecutor.
-		Finally(func(ctx context.Context) error {
+	return common.Executor(func(ctx context.Context) error {
+		if err := info.startContainer()(ctx); err != nil {
+			return err
+		}
+		return newStepsExecutor(rc, preSteps, steps).Finally(func(ctx context.Context) error {
 			// Record an interrupt (backstop for interrupts that land outside the main
 			// step loop) so the post steps observe the cancelled/failed job status.
 			rc.markInterrupted(ctx.Err())
 			postCtx, cancel := postStepsContext(ctx)
 			defer cancel()
 			return postExecutor(postCtx)
-		}).
-		Finally(info.interpolateOutputs()).
-		Finally(info.closeContainer()))
+		})(ctx)
+	}).Finally(info.closeContainer())
 }
 
 // postStepsContext derives the context used to run the job's post/cleanup steps from the
 // finished main-pipeline context. Cleanup has to run even when the run was interrupted, so the
 // returned context always carries a fresh bounded deadline and is never itself cancelled.
 //
-//   - context.Canceled (server cancel): detach from the cancelled context via a fresh root so
-//     the post steps can run.
+//   - context.Canceled (server cancel): detach with WithoutCancel under a fresh job-error
+//     container, so a failing post step cannot turn the cancellation into a failure.
 //   - context.DeadlineExceeded (job timeout): detach the deadline with WithoutCancel, which
 //     keeps the original values — including the job-error container — so the timeout failure and
 //     any post-step error are preserved and the job is still reported as failed.
@@ -321,10 +341,7 @@ func newJobExecutor(info jobInfo, sf stepFactory, rc *RunContext) common.Executo
 func postStepsContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	switch ctx.Err() {
 	case context.Canceled:
-		// The cancelled context is abandoned for a fresh root, which drops the job-error
-		// container installed at the job root. Re-attach a fresh one so a failing post step
-		// records its error via SetJobError instead of panicking on a nil container.
-		return context.WithTimeout(common.WithJobErrorContainer(common.WithLogger(context.Background(), common.Logger(ctx))), 5*time.Minute)
+		return context.WithTimeout(common.WithJobErrorContainer(context.WithoutCancel(ctx)), 5*time.Minute)
 	case context.DeadlineExceeded:
 		return context.WithTimeout(context.WithoutCancel(ctx), 5*time.Minute)
 	default:
@@ -348,11 +365,11 @@ func newStepsExecutor(rc *RunContext, preSteps, steps []common.Executor) common.
 	mainExecutor := newMainStepsExecutor(rc, steps)
 	return func(ctx context.Context) error {
 		preErr := preExecutor(ctx)
-		mainErr := mainExecutor(ctx)
-		if preErr != nil {
-			return preErr
+		if errors.As(preErr, new(setupError)) {
+			return preErr // as on GitHub, no step runs after the job setup failed
 		}
-		return mainErr
+		mainErr := mainExecutor(ctx)
+		return cmp.Or(preErr, mainErr)
 	}
 }
 
@@ -396,13 +413,14 @@ func runMainStepsAfterInterrupt(ctx context.Context, rc *RunContext, steps []com
 
 func setJobResult(ctx context.Context, info jobInfo, rc *RunContext, success bool) {
 	logger := common.Logger(ctx)
+	success = success && !rc.jobFailed
 
 	// Matrix combinations share one *model.Job and run in parallel; serialize the
 	// read-modify-write of the job result so a failing combination is not lost-updated by a
 	// concurrent succeeding one.
 	job := rc.Run.Job()
 	var continueOnError bool
-	if !success {
+	if !success && !rc.jobCancelled {
 		// Use a fresh context so an expired job timeout cannot block expression evaluation.
 		evalCtx := common.WithLogger(context.Background(), common.Logger(ctx))
 		continueOnError = evaluateJobContinueOnError(evalCtx, rc, job)
@@ -415,7 +433,11 @@ func setJobResult(ctx context.Context, info jobInfo, rc *RunContext, success boo
 		if len(info.matrix()) > 0 && job.Result != "" {
 			result = job.Result
 		}
-		if !success {
+		// cancelled is sticky, so a sibling combination finishing last cannot mask it
+		switch {
+		case rc.jobCancelled:
+			result = "cancelled"
+		case !success && result != "cancelled":
 			result = "failure"
 			job.SetContinueOnError(continueOnError)
 		}
@@ -425,43 +447,86 @@ func setJobResult(ctx context.Context, info jobInfo, rc *RunContext, success boo
 
 	if rc.caller != nil {
 		// set reusable workflow job result
-		rc.caller.setReusedWorkflowJobResult(rc.JobName, jobResult) // For Gitea
+		rc.caller.setReusedWorkflowJobResult(rc.Run.JobID, jobResult) // For Gitea
 		return
 	}
 
-	jobResultMessage := "succeeded"
-	if jobResult != "success" {
-		jobResultMessage = "failed"
+	jobResultMessage := "failed"
+	switch jobResult {
+	case "success":
+		jobResultMessage = "succeeded"
+	case "cancelled":
+		jobResultMessage = "cancelled"
 	}
 
-	logger.WithField("jobResult", jobResult).Infof("Job %s", jobResultMessage)
+	logger.With("jobResult", jobResult).Infof("Job %s", jobResultMessage)
 }
 
-func setJobOutputs(ctx context.Context, rc *RunContext) {
-	if rc.caller != nil {
-		// map outputs for reusable workflows
-		callerOutputs := make(map[string]string)
-
-		ee := rc.NewExpressionEvaluator(ctx)
-
-		for k, v := range rc.Run.Workflow.WorkflowCallConfig().Outputs {
-			callerOutputs[k] = ee.Interpolate(ctx, ee.Interpolate(ctx, v.Value))
+// evaluateJobEnv returns the workflow and job env evaluated, as far as it got on error, leaving rc.Env raw.
+func evaluateJobEnv(ctx context.Context, rc *RunContext) (map[string]string, error) {
+	env := rc.GetEnv()
+	evaluated := maps.Clone(env)
+	evaluator := rc.NewExpressionEvaluatorWithEnv(ctx, evaluated)
+	var workflowEnv map[string]string
+	if rc.Run.Workflow.Env == nil {
+		if err := model.DecodeEvaluated("workflow env", rc.Run.Workflow.RawEnv, evaluator.shared(ctx).EvaluateYamlNode, &workflowEnv); err != nil {
+			return evaluated, err
 		}
-
-		// Matrix combinations of a reusable-workflow caller share the caller's *model.Job;
-		// serialize the write so parallel combos don't race on its Outputs field.
-		callerJob := rc.caller.runContext.Run.Job()
-		defer lockJob(callerJob)()
-		callerJob.Outputs = callerOutputs
 	}
+	if workflowEnv != nil {
+		evaluated = rc.mergeEnv(workflowEnv, env)
+		evaluator = rc.NewExpressionEvaluatorWithEnv(ctx, evaluated)
+	}
+	var err error
+	for k, v := range env {
+		if evaluated[k], err = evaluator.Interpolate(ctx, v); err != nil {
+			return evaluated, fmt.Errorf("unable to interpolate env %s: %w", k, err)
+		}
+	}
+	return evaluated, nil
+}
+
+// evaluateJobEnvAndDefaults resolves the job's env, defaults.run and container env once, as GitHub does at job setup.
+func evaluateJobEnvAndDefaults(ctx context.Context, rc *RunContext) error {
+	env, err := evaluateJobEnv(ctx, rc)
+	rc.Env = env
+	rc.ExprEval = rc.NewExpressionEvaluator(ctx)
+	if err != nil {
+		return err
+	}
+	var defaults model.Defaults
+	if err := model.DecodeEvaluated("defaults", rc.Run.Job().RawDefaults, rc.ExprEval.shared(ctx).EvaluateYamlNode, &defaults); err != nil {
+		return err
+	}
+	rc.jobRunDefaults = defaults.Run
+	return model.DecodeEvaluated("container env", rc.containerEnv, rc.ExprEval.shared(ctx).EvaluateYamlNode, &rc.containerSpec.Env)
+}
+
+func setJobOutputs(ctx context.Context, rc *RunContext) error {
+	if rc.caller == nil {
+		return nil
+	}
+	callerOutputs, err := rc.NewExpressionEvaluator(ctx).shared(ctx).EvaluateWorkflowCallOutputs(rc.Run.Workflow.WorkflowCallConfig())
+	if err != nil {
+		return fmt.Errorf("unable to interpolate workflow %w", err)
+	}
+
+	// Matrix combinations of a reusable-workflow caller share the caller's *model.Job;
+	// serialize the write so parallel combos don't race on its Outputs field.
+	callerJob := rc.caller.runContext.Run.Job()
+	defer lockJob(callerJob)()
+	callerJob.Outputs = callerOutputs
+	return nil
 }
 
 // applyJobTimeout applies the job-level timeout-minutes to ctx, mirroring the
 // step-level evaluateStepTimeout in step.go.
 func applyJobTimeout(ctx context.Context, rc *RunContext, job *model.Job) (context.Context, context.CancelFunc) {
-	timeout := rc.ExprEval.Interpolate(ctx, job.TimeoutMinutes)
-	if timeout != "" {
-		if timeoutMinutes, err := strconv.ParseInt(timeout, 10, 64); err == nil {
+	timeout, err := rc.ExprEval.Interpolate(ctx, job.TimeoutMinutes)
+	if err != nil {
+		common.Logger(ctx).Errorf("An error occurred when attempting to determine the job timeout: %s", err)
+	} else if timeout != "" {
+		if timeoutMinutes, err := strconv.ParseInt(timeout, 10, 64); err == nil && timeoutMinutes > 0 {
 			return context.WithTimeout(ctx, time.Duration(timeoutMinutes)*time.Minute)
 		}
 	}
@@ -491,8 +556,7 @@ func tryUploadJobSummary(ctx context.Context, rc *RunContext) {
 	ctx, cancel := context.WithTimeout(ctx, jobSummaryUploadPhaseTimeout)
 	defer cancel()
 	env := rc.GetEnv()
-	caps := strings.TrimSpace(env["GITEA_ACTIONS_CAPABILITIES"])
-	if !hasJobSummaryCapability(caps) {
+	if !hasJobSummaryCapability(env["GITEA_ACTIONS_CAPABILITIES"]) {
 		// Server did not advertise support. Do not attempt upload.
 		return
 	}
@@ -517,15 +581,45 @@ func tryUploadJobSummary(ctx context.Context, rc *RunContext) {
 		"/jobs/" + strconv.FormatInt(jobID, 10) + "/steps/"
 	actPath := rc.JobContainer.GetActPath()
 	// Reuse a single client across all step uploads so connections can be pooled.
-	client := &http.Client{Timeout: jobSummaryUploadRequestTimeout}
+	client := &http.Client{Timeout: jobSummaryUploadRequestTimeout, Transport: rc.Config.instanceTransportFor(base)}
+	maskers := rc.secretMaskers()
+	longestMask := 0
+	for i := 0; i < len(maskers); i += 2 {
+		longestMask = max(longestMask, len(maskers[i]))
+	}
+	masker := NewSecretReplacer(maskers)
+	limit := maxJobSummaryBytes + longestMask
 	for i := range rc.Run.Job().Steps {
-		summaryPath := path.Join(actPath, "workflow", "step-summary-"+strconv.Itoa(i)+".md")
-		body, ok := readSingleFileFromContainerArchive(ctx, rc.JobContainer, summaryPath, maxJobSummaryBytes)
+		summaryPath := container.JoinPath(actPath, "workflow", "step-summary-"+strconv.Itoa(i)+".md")
+		body, ok := readSingleFileFromContainerArchive(ctx, rc.JobContainer, summaryPath, int64(limit+1))
 		if !ok || len(body) == 0 {
 			continue
 		}
+		masked := masker.Replace(string(body))
+		split := len(body) > limit
+		if split { // the read can end inside a secret, so keep only what masks alike without the lookahead
+			unsplit := masker.Replace(string(body[:maxJobSummaryBytes]))
+			kept := 0
+			for kept < len(unsplit) && kept < len(masked) && unsplit[kept] == masked[kept] {
+				kept++
+			}
+			for kept > 0 && kept < len(masked) && !utf8.RuneStart(masked[kept]) {
+				kept--
+			}
+			masked = masked[:kept]
+		}
+		body = truncateJobSummary(ctx, []byte(masked), summaryPath, maxJobSummaryBytes, split)
 		uploadJobSummary(ctx, client, base+strconv.Itoa(i)+"/summary", runtimeToken, body)
 	}
+}
+
+// For Gitea
+// instanceTransportFor returns InstanceTransport only for URLs on the registered address, as steps can rewrite the summary URL through GITHUB_ENV.
+func (c Config) instanceTransportFor(rawURL string) http.RoundTripper {
+	if !strings.HasPrefix(rawURL, c.GitHubInstance+"/") {
+		return nil
+	}
+	return c.InstanceTransport
 }
 
 // extractJobIDFromRuntimeToken returns the JobID claim from an ACTIONS_RUNTIME_TOKEN JWT
@@ -615,69 +709,50 @@ func readSingleFileFromContainerArchive(ctx context.Context, env container.Execu
 	}
 	defer rc.Close()
 
+	requestedPath := path.Clean(strings.TrimPrefix(p, "/"))
 	tr := tar.NewReader(rc)
 	for {
 		header, err := tr.Next()
-		if err == io.EOF {
-			return nil, false
-		}
 		if err != nil {
 			return nil, false
 		}
 		if header.Typeflag != tar.TypeReg {
 			continue
 		}
-		if !archiveEntryMatchesPath(header.Name, p) {
+		entryName := path.Clean(strings.TrimPrefix(header.Name, "/"))
+		if entryName != requestedPath && entryName != path.Base(requestedPath) {
 			continue
 		}
-		// Summaries larger than the limit are truncated rather than dropped, so the
-		// user still gets the leading content (mirroring how GitHub caps oversized
-		// step summaries instead of discarding them). Read one extra byte so an
-		// over-limit file is detected from the actual stream rather than trusting
-		// header.Size, then cap the returned content at maxBytes.
-		b, err := io.ReadAll(io.LimitReader(tr, maxBytes+1))
+		b, err := io.ReadAll(io.LimitReader(transform.NewReader(tr, unicodeencoding.BOMOverride(unicodeencoding.UTF8.NewDecoder())), maxBytes))
 		if err != nil {
 			return nil, false
-		}
-		if int64(len(b)) > maxBytes {
-			// Reserve room for the marker so the marked-up result still fits in maxBytes.
-			marker := []byte(jobSummaryTruncationMarker)
-			keep := max(maxBytes-int64(len(marker)), 0)
-			b = append(b[:keep], marker...)
-			common.Logger(ctx).Warnf("job summary truncated: path=%s max=%d", p, maxBytes)
 		}
 		return b, true
 	}
 }
 
-func archiveEntryMatchesPath(entryName, requestedPath string) bool {
-	entryName = path.Clean(strings.TrimPrefix(entryName, "/"))
-	requestedPath = path.Clean(strings.TrimPrefix(requestedPath, "/"))
-	return entryName == requestedPath || entryName == path.Base(requestedPath)
+func truncateJobSummary(ctx context.Context, body []byte, summaryPath string, maxBytes int, split bool) []byte {
+	if !split && len(body) <= maxBytes {
+		return body
+	}
+	keep := max(min(len(body), maxBytes-len(jobSummaryTruncationMarker)), 0)
+	for keep > 0 && keep < len(body) && !utf8.RuneStart(body[keep]) {
+		keep--
+	}
+	common.Logger(ctx).Warnf("job summary truncated: path=%s max=%d", summaryPath, maxBytes)
+	return append(body[:keep], jobSummaryTruncationMarker...)
+}
+
+// useJobStageLogger tags the log entries of a job level executor with the stage they belong to.
+func useJobStageLogger(stage string, executor common.Executor) common.Executor {
+	return func(ctx context.Context) error {
+		return executor(common.WithLogger(ctx, common.Logger(ctx).With("stage", stage)))
+	}
 }
 
 func useStepLogger(rc *RunContext, stepModel *model.Step, stage stepStage, executor common.Executor) common.Executor {
 	return func(ctx context.Context) error {
-		ctx = withStepLogger(ctx, stepModel.Number, stepModel.ID, rc.ExprEval.Interpolate(ctx, stepModel.String()), stage.String())
-
-		rawLogger := common.Logger(ctx).WithField("raw_output", true)
-		logWriter := common.NewLineWriter(rc.commandHandler(ctx), func(s string) bool {
-			if rc.Config.LogOutput {
-				rawLogger.Infof("%s", s)
-			} else {
-				rawLogger.Debugf("%s", s)
-			}
-			return true
-		})
-
-		oldout, olderr := rc.JobContainer.ReplaceLogWriter(logWriter, logWriter)
-		defer rc.JobContainer.ReplaceLogWriter(oldout, olderr)
-
-		// Flush any buffered, not-yet-newline-terminated trailing line once the
-		// step has finished, so the final line of the step's output is not lost
-		// when it is not newline-terminated.
-		defer common.FlushWriter(logWriter)
-
-		return executor(ctx)
+		ctx = withStepLogger(ctx, stepModel.Number, stepModel.ID, rc.ExprEval.InterpolateName(ctx, stepModel.String()), stage.String())
+		return rc.withCommandLogWriter(ctx, executor)
 	}
 }

@@ -6,11 +6,11 @@
 package process
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -36,9 +36,8 @@ func processAlive(pid int) bool {
 	if b, readErr := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid)); readErr == nil {
 		// Format: "pid (comm) state ..." — state follows the closing ')' of the
 		// command name (which may itself contain spaces and parens).
-		rest := string(b)
-		if idx := strings.LastIndex(rest, ") "); idx >= 0 {
-			fields := strings.Fields(rest[idx+2:])
+		if _, after, found := strings.CutLast(string(b), ") "); found {
+			fields := strings.Fields(after)
 			if len(fields) > 0 && fields[0] == "Z" {
 				return false // zombie: terminated but not yet reaped
 			}
@@ -47,23 +46,8 @@ func processAlive(pid int) bool {
 	return true
 }
 
-// TestKillerKillsTree verifies that a process group captured by the killer is
-// terminated together with a child the process spawns afterwards. This mirrors
-// a step or post-task script that launches a child which spawns further
-// processes, where cancelling must take down the whole tree, not just the
-// direct child.
 func TestKillerKillsTree(t *testing.T) {
-	dir := t.TempDir()
-	pidFile := filepath.Join(dir, "child.pid")
-
-	// Parent shell backgrounds a long-lived child (writing its PID to a file)
-	// and then sleeps. With job control off (non-interactive sh) the backgrounded
-	// child stays in the parent's process group, so the group kill must reach it.
-	script := fmt.Sprintf(`sleep 600 & echo $! > %q; sleep 600`, pidFile)
-	cmd := exec.Command("/bin/sh", "-c", script)
-	// Launch as its own process-group leader, exactly like a real process does
-	// (see SysProcAttr), so the killer's PGID == the process PID.
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd, ready := newTestProcess(t, "parent", false)
 	require.NoError(t, cmd.Start())
 	t.Cleanup(func() {
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
@@ -74,28 +58,73 @@ func TestKillerKillsTree(t *testing.T) {
 	require.NoError(t, err)
 	defer killer.Close()
 
-	// Wait for the backgrounded child PID to be reported.
-	var childPID int
-	require.Eventually(t, func() bool {
-		b, e := os.ReadFile(pidFile)
-		if e != nil {
-			return false
-		}
-		s := strings.TrimSpace(string(b))
-		if s == "" {
-			return false
-		}
-		childPID, _ = strconv.Atoi(s)
-		return childPID > 0 && processAlive(childPID)
-	}, 20*time.Second, 100*time.Millisecond, "child process should start")
+	childPID := ready()
+	require.True(t, processAlive(childPID), "child process should start")
 
-	// Killing the group must terminate both the parent and the backgrounded child.
 	require.NoError(t, killer.Kill())
-	// Reap the parent so it does not linger as a zombie (which would still report
-	// as alive); SIGKILL makes Wait return promptly.
 	_ = cmd.Wait()
 
 	require.Eventually(t, func() bool {
 		return !processAlive(childPID)
 	}, 20*time.Second, 100*time.Millisecond, "backgrounded child should be terminated")
+}
+
+func TestTreeKillCancelBeforeCaptureKillsTree(t *testing.T) {
+	stdin, input, err := os.Pipe()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = stdin.Close() })
+	t.Cleanup(func() { _ = input.Close() })
+	cmd := exec.CommandContext(t.Context(), "/bin/sh", "-c", "exec 3<&0; cat <&3 & echo $!; read value")
+	cmd.Stdin = stdin
+	cmd.SysProcAttr = SysProcAttr("", false)
+	output, err := cmd.StdoutPipe()
+	require.NoError(t, err)
+	treeKill := NewTreeKill(cmd)
+	require.NoError(t, cmd.Start())
+	t.Cleanup(func() {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		_ = cmd.Wait()
+	})
+	var childPID int
+	_, err = fmt.Fscan(output, &childPID)
+	require.NoError(t, err)
+	require.True(t, processAlive(childPID))
+
+	require.NoError(t, cmd.Cancel())
+	killer, err := treeKill.Capture(cmd.Process)
+	require.NoError(t, err)
+	defer killer.Close()
+	require.Error(t, cmd.Wait())
+	require.Eventually(t, func() bool { return !processAlive(childPID) }, 5*time.Second, 10*time.Millisecond)
+}
+
+func TestTreeKillCancelRunsInterruptTrap(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	marker := filepath.Join(t.TempDir(), "interrupted")
+	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", `trap 'echo interrupted > "$1"; exit 0' INT; echo ready; read value`, "sh", marker)
+	cmd.SysProcAttr = SysProcAttr("", false)
+	input, err := cmd.StdinPipe()
+	require.NoError(t, err)
+	defer input.Close()
+	output, err := cmd.StdoutPipe()
+	require.NoError(t, err)
+	treeKill := NewTreeKill(cmd)
+	treeKill.GracefulCancel = true
+	require.NoError(t, cmd.Start())
+	killer, err := treeKill.Capture(cmd.Process)
+	require.NoError(t, err)
+	defer killer.Close()
+	t.Cleanup(func() {
+		_ = killer.Kill()
+		_ = cmd.Wait()
+	})
+	var ready string
+	_, err = fmt.Fscanln(output, &ready)
+	require.NoError(t, err)
+	require.Equal(t, "ready", ready)
+
+	cancel()
+	require.ErrorIs(t, treeKill.Wait(ctx, cmd), context.Canceled)
+	require.FileExists(t, marker)
 }

@@ -7,10 +7,10 @@ package container
 import (
 	"archive/tar"
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
-	"maps"
 	"strings"
 
 	"gitea.com/gitea/runner/act/common"
@@ -19,8 +19,14 @@ import (
 	"golang.org/x/text/transform"
 )
 
-func parseEnvFile(e Container, srcPath string, env *map[string]string) common.Executor {
-	localEnv := *env
+// parseEnvFile reads a GITHUB_ENV style file, splitting lines like GitHub's runner on Windows or elsewhere.
+func parseEnvFile(e Container, srcPath string, env *map[string]string, windows bool) common.Executor {
+	return ParseEnvFile(e, srcPath, func(name, value string) {
+		(*env)[name] = value
+	}, windows)
+}
+
+func ParseEnvFile(e Container, srcPath string, setEnv func(name, value string), windows bool) common.Executor {
 	return func(ctx context.Context) error {
 		envTar, err := e.GetContainerArchive(ctx, srcPath)
 		if err != nil {
@@ -36,14 +42,72 @@ func parseEnvFile(e Container, srcPath string, env *map[string]string) common.Ex
 		// tools emit a UTF-8 BOM. Without a BOM the file is read as UTF-8, as before.
 		decoded := transform.NewReader(reader, unicode.BOMOverride(unicode.UTF8.NewDecoder()))
 
-		parsed, err := ParseEnvFileContent(decoded)
-		if err != nil {
-			return err
+		s := bufio.NewScanner(decoded)
+		// Default 64 KiB max token size is too small for realistic env-file lines; allow up to 16 MiB.
+		s.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+		scanned := 0
+		s.Split(func(data []byte, atEOF bool) (int, []byte, error) {
+			if index := bytes.IndexByte(data[scanned:], '\n'); index >= 0 {
+				advance := scanned + index + 1
+				scanned = 0
+				return advance, data[:advance], nil
+			}
+			scanned = len(data)
+			if atEOF && len(data) > 0 {
+				scanned = 0
+				return len(data), data, nil
+			}
+			return 0, nil, nil
+		})
+		for s.Scan() {
+			line := trimEnvLineEnding(s.Text(), windows)
+			// GitHub's runner ignores blank lines
+			if strings.TrimSpace(line) == "" {
+				continue
+			}
+			singleLineEnv := strings.Index(line, "=")
+			multiLineEnv := strings.Index(line, "<<")
+			switch {
+			case singleLineEnv != -1 && (multiLineEnv == -1 || singleLineEnv < multiLineEnv):
+				setEnv(line[:singleLineEnv], line[singleLineEnv+1:])
+			case multiLineEnv != -1:
+				var multiLineEnvContent []string
+				multiLineEnvDelimiter := line[multiLineEnv+2:]
+				if multiLineEnv == 0 || multiLineEnvDelimiter == "" {
+					return fmt.Errorf("invalid format '%v', name and delimiter must not be empty", line)
+				}
+				delimiterFound := false
+				for s.Scan() {
+					content := s.Text()
+					if trimEnvLineEnding(content, windows) == multiLineEnvDelimiter {
+						delimiterFound = true
+						break
+					}
+					multiLineEnvContent = append(multiLineEnvContent, content)
+				}
+				if err := s.Err(); err != nil {
+					return fmt.Errorf("reading env file: %w", err)
+				}
+				if !delimiterFound {
+					return fmt.Errorf("invalid format delimiter '%v' not found before end of file", multiLineEnvDelimiter)
+				}
+				setEnv(line[:multiLineEnv], trimEnvLineEnding(strings.Join(multiLineEnvContent, ""), windows))
+			default:
+				return fmt.Errorf("invalid format '%v', expected a line with '=' or '<<'", line)
+			}
 		}
-		maps.Copy(localEnv, parsed)
-		env = &localEnv
+		if err := s.Err(); err != nil {
+			return fmt.Errorf("reading env file: %w", err)
+		}
 		return nil
 	}
+}
+
+func trimEnvLineEnding(line string, windows bool) string {
+	if windows && strings.HasSuffix(line, "\r\n") {
+		return line[:len(line)-2]
+	}
+	return strings.TrimSuffix(line, "\n")
 }
 
 func ParseEnvFileContent(decoded io.Reader) (map[string]string, error) {

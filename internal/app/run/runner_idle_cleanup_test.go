@@ -11,7 +11,9 @@ import (
 	"testing"
 	"time"
 
+	"gitea.com/gitea/runner/act/container"
 	"gitea.com/gitea/runner/internal/pkg/config"
+	"gitea.com/gitea/runner/internal/pkg/labels"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -19,8 +21,7 @@ import (
 
 func TestRunnerCleanupStaleTaskDirs(t *testing.T) {
 	now := time.Date(2026, time.April, 29, 20, 0, 0, 0, time.UTC)
-	workdirRoot := filepath.Join(t.TempDir(), "workspace")
-	require.NoError(t, os.MkdirAll(workdirRoot, 0o700))
+	workdirRoot := t.TempDir()
 
 	oldTask := filepath.Join(workdirRoot, "1001")
 	freshTask := filepath.Join(workdirRoot, "1002")
@@ -44,7 +45,7 @@ func TestRunnerCleanupStaleTaskDirs(t *testing.T) {
 		now: func() time.Time { return now },
 	}
 
-	r.cleanupStaleTaskDirs(context.Background(), workdirRoot)
+	r.cleanupStaleDirs(t.Context(), workdirRoot, isTaskIDDir)
 
 	assert.NoDirExists(t, oldTask)
 	assert.DirExists(t, freshTask)
@@ -57,8 +58,7 @@ func TestRunnerCleanupStaleTaskDirs(t *testing.T) {
 // be reclaimed, while the shared tool_cache and operator data are preserved.
 func TestRunnerOnIdleCleansStaleHostScratchDirs(t *testing.T) {
 	now := time.Date(2026, time.April, 29, 20, 0, 0, 0, time.UTC)
-	hostRoot := filepath.Join(t.TempDir(), "act")
-	require.NoError(t, os.MkdirAll(hostRoot, 0o700))
+	hostRoot := t.TempDir()
 
 	staleScratch := filepath.Join(hostRoot, "0123456789abcdef") // 16 hex
 	freshScratch := filepath.Join(hostRoot, "fedcba9876543210")
@@ -83,7 +83,7 @@ func TestRunnerOnIdleCleansStaleHostScratchDirs(t *testing.T) {
 		now: func() time.Time { return now },
 	}
 
-	r.OnIdle(context.Background())
+	r.OnIdle(t.Context())
 
 	assert.NoDirExists(t, staleScratch) // stale scratch reclaimed
 	assert.DirExists(t, freshScratch)   // within cleanup age, kept
@@ -111,13 +111,12 @@ func TestRunnerCleanupStaleTaskDirsMissingRoot(t *testing.T) {
 
 	// Must be a silent no-op rather than a warning or panic when the root
 	// has not yet been created (e.g. the runner has never executed a task).
-	r.cleanupStaleTaskDirs(context.Background(), filepath.Join(t.TempDir(), "missing"))
+	r.cleanupStaleDirs(t.Context(), filepath.Join(t.TempDir(), "missing"), isTaskIDDir)
 }
 
 func TestRunnerCleanupStaleTaskDirsHonorsContext(t *testing.T) {
 	now := time.Date(2026, time.April, 29, 20, 0, 0, 0, time.UTC)
-	workdirRoot := filepath.Join(t.TempDir(), "workspace")
-	require.NoError(t, os.MkdirAll(workdirRoot, 0o700))
+	workdirRoot := t.TempDir()
 
 	for i := 1001; i <= 1003; i++ {
 		dir := filepath.Join(workdirRoot, strconv.Itoa(i))
@@ -125,7 +124,7 @@ func TestRunnerCleanupStaleTaskDirsHonorsContext(t *testing.T) {
 		require.NoError(t, os.Chtimes(dir, now.Add(-3*time.Hour), now.Add(-3*time.Hour)))
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 
 	r := &Runner{
@@ -135,7 +134,7 @@ func TestRunnerCleanupStaleTaskDirsHonorsContext(t *testing.T) {
 		now: func() time.Time { return now },
 	}
 
-	r.cleanupStaleTaskDirs(ctx, workdirRoot)
+	r.cleanupStaleDirs(ctx, workdirRoot, isTaskIDDir)
 
 	for i := 1001; i <= 1003; i++ {
 		assert.DirExists(t, filepath.Join(workdirRoot, strconv.Itoa(i)))
@@ -239,9 +238,6 @@ func TestRunnerShouldRunIdleCleanupSkipsWhenDisabled(t *testing.T) {
 	})
 }
 
-// TestRunnerOnIdleIntegratesCleanup wires the full OnIdle entry point and
-// confirms it walks workdir_parent (after the leading-slash trim that
-// matches the production path construction) and removes stale numeric dirs.
 func TestRunnerOnIdleIntegratesCleanup(t *testing.T) {
 	now := time.Date(2026, time.April, 29, 20, 0, 0, 0, time.UTC)
 	root := t.TempDir()
@@ -253,7 +249,7 @@ func TestRunnerOnIdleIntegratesCleanup(t *testing.T) {
 		cfg: &config.Config{
 			Container: config.Container{
 				BindWorkdir:   true,
-				WorkdirParent: root, // leading slash absent, OnIdle reattaches it
+				WorkdirParent: root,
 			},
 			Runner: config.Runner{
 				WorkdirCleanupAge:   24 * time.Hour,
@@ -263,7 +259,7 @@ func TestRunnerOnIdleIntegratesCleanup(t *testing.T) {
 		now: func() time.Time { return now },
 	}
 
-	r.OnIdle(context.Background())
+	r.OnIdle(t.Context())
 
 	assert.NoDirExists(t, stale)
 }
@@ -291,7 +287,7 @@ func TestRunnerOnIdleSkipsWhenAlreadyCancelled(t *testing.T) {
 		now: func() time.Time { return now },
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	r.OnIdle(ctx)
 
@@ -311,23 +307,74 @@ func TestRunnerOnIdleRemovesOrphanNetworks(t *testing.T) {
 	}
 
 	var swept []string
+	var detached []string
+	var sweptVolumes []string
 	var sweptCutoff time.Time
 	origRemoveOrphanNetworks := removeOrphanNetworks
-	removeOrphanNetworks = func(_ context.Context, runnerUUID string, createdBefore time.Time) error {
+	removeOrphanNetworks = func(ctx context.Context, runnerUUID, detach string, createdBefore time.Time) error {
+		_, hasDeadline := ctx.Deadline()
+		assert.True(t, hasDeadline)
 		swept = append(swept, runnerUUID)
+		detached = append(detached, detach)
 		sweptCutoff = createdBefore
 		return nil
 	}
 	t.Cleanup(func() { removeOrphanNetworks = origRemoveOrphanNetworks })
+	origRemoveOrphanJobVolumes := removeOrphanJobVolumes
+	removeOrphanJobVolumes = func(_ context.Context, runnerUUID string, createdBefore time.Time) error {
+		sweptVolumes = append(sweptVolumes, runnerUUID)
+		assert.Equal(t, now.Add(-orphanDockerResourceAge), createdBefore)
+		return nil
+	}
+	t.Cleanup(func() { removeOrphanJobVolumes = origRemoveOrphanJobVolumes })
+	var sweptPods []string
+	origRemoveOrphanKubernetesResources := removeOrphanKubernetesResources
+	removeOrphanKubernetesResources = func(ctx context.Context, options container.KubernetesOptions, createdBefore time.Time) error {
+		_, hasDeadline := ctx.Deadline()
+		assert.True(t, hasDeadline)
+		sweptPods = append(sweptPods, options.RunnerUUID)
+		assert.Equal(t, now.Add(-24*time.Hour), createdBefore)
+		return nil
+	}
+	t.Cleanup(func() { removeOrphanKubernetesResources = origRemoveOrphanKubernetesResources })
+	kubernetesLabel, err := labels.Parse("k8s:kubernetes://node")
+	require.NoError(t, err)
 
-	r := &Runner{uuid: "runner-1", cfg: cfg, now: func() time.Time { return now }}
-	r.OnIdle(context.Background())
+	r := &Runner{uuid: "runner-1", cfg: cfg, labels: labels.Labels{kubernetesLabel}, now: func() time.Time { return now }}
+	r.isolatedCacheContainer = func(_cacheURL string) string { return "a1b2c3d4e5f6" }
+	r.OnIdle(t.Context())
 	assert.Equal(t, []string{"runner-1"}, swept)
+	assert.Equal(t, swept, sweptVolumes)
 	// a network of a job starting during the pass is younger than this and so out of scope
-	assert.Equal(t, now.Add(-24*time.Hour), sweptCutoff)
+	assert.Equal(t, now.Add(-orphanDockerResourceAge), sweptCutoff)
 
 	// a host-only runner has no daemon to sweep
+	origDockerReachable := dockerReachable
+	dockerReachable = func(context.Context) bool { return false }
+	t.Cleanup(func() { dockerReachable = origDockerReachable })
 	hostOnly := &Runner{uuid: "runner-2", cfg: &config.Config{Runner: cfg.Runner}, now: func() time.Time { return now }}
-	hostOnly.OnIdle(context.Background())
+	hostOnly.isolatedCacheContainer = func(_cacheURL string) string { return "" }
+	hostOnly.OnIdle(t.Context())
 	assert.Equal(t, []string{"runner-1"}, swept)
+	assert.Equal(t, swept, sweptVolumes)
+
+	dockerReachable = func(context.Context) bool { return true }
+	now = now.Add(time.Minute)
+	hostOnly.OnIdle(t.Context())
+	assert.Equal(t, []string{"runner-1", "runner-2"}, sweptVolumes)
+	assert.Equal(t, []string{"a1b2c3d4e5f6", ""}, detached)
+	assert.Equal(t, []string{"runner-1"}, sweptPods)
+}
+
+func TestContainerWorkdirRoot(t *testing.T) {
+	absolute := t.TempDir()
+	rooted := filepath.Join(string(filepath.Separator), "workspace")
+	for input, want := range map[string]string{
+		"workspace":          rooted,
+		"/workspace/":        rooted,
+		absolute:             absolute,
+		absolute + "/nested": filepath.Join(absolute, "nested"),
+	} {
+		assert.Equal(t, want, containerWorkdirRoot(input), input)
+	}
 }

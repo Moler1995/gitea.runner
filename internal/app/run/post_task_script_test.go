@@ -7,15 +7,17 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
+	"gitea.com/gitea/runner/act/common/logging"
+	"gitea.com/gitea/runner/act/common/logging/logtest"
 	"gitea.com/gitea/runner/internal/pkg/config"
 	"gitea.com/gitea/runner/internal/pkg/metrics"
 	"gitea.com/gitea/runner/internal/pkg/report"
 
 	runnerv1 "gitea.dev/actionslib/runner/v1"
-	log "github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/types/known/structpb"
@@ -25,40 +27,39 @@ func TestRunPostTaskScriptSkippedWhenEmpty(t *testing.T) {
 	r := &Runner{
 		cfg: &config.Config{},
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	taskCtx, err := structpb.NewStruct(map[string]any{})
-	require.NoError(t, err)
-	task := &runnerv1.Task{Id: 1, Context: taskCtx}
-	reporter := report.NewReporter(ctx, cancel, nil, task, r.cfg)
 
 	require.NotPanics(t, func() {
-		r.runPostTaskScript(ctx, reporter, task, "/workspace/owner/repo")
+		r.runPostTaskScript(t.Context(), nil, nil, "/workspace/owner/repo")
 	})
 }
 
 func TestRunPostTaskScriptNonZeroExitDoesNotPanic(t *testing.T) {
+	hook := logtest.SetDefault(t)
 	dir := t.TempDir()
 	scriptPath := filepath.Join(dir, "fail.sh")
-	require.NoError(t, os.WriteFile(scriptPath, []byte("#!/bin/sh\nexit 2\n"), 0o700))
+	script := "#!/bin/sh\nexit 2\n"
+	if runtime.GOOS == "windows" {
+		scriptPath = filepath.Join(dir, "fail.cmd")
+		script = "@exit /b 2\r\n"
+	}
+	require.NoError(t, os.WriteFile(scriptPath, []byte(script), 0o700))
 
 	cfg, err := config.LoadDefault("")
 	require.NoError(t, err)
 	cfg.Runner.PostTaskScript = scriptPath
 
 	r := &Runner{cfg: cfg}
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
-	taskCtx, err := structpb.NewStruct(map[string]any{})
-	require.NoError(t, err)
-	task := &runnerv1.Task{Id: 1, Context: taskCtx}
+	task := &runnerv1.Task{Id: 1, Context: &structpb.Struct{}}
 	reporter := report.NewReporter(ctx, cancel, nil, task, cfg)
 
 	require.NotPanics(t, func() {
 		r.runPostTaskScript(ctx, reporter, task, "/workspace/owner/repo")
 	})
+	require.NotNil(t, hook.LastRecord())
+	assert.Contains(t, hook.LastRecord().Message, "exited with code 2")
 }
 
 func TestPostTaskScriptContextUsesFullTimeout(t *testing.T) {
@@ -66,7 +67,7 @@ func TestPostTaskScriptContextUsesFullTimeout(t *testing.T) {
 
 	// A task context that finished close to its own deadline must not truncate the
 	// script's budget: the script should still get its full configured timeout.
-	near, cancelNear := context.WithTimeout(context.Background(), time.Second)
+	near, cancelNear := context.WithTimeout(t.Context(), time.Second)
 	defer cancelNear()
 	scriptCtx, cancel := postTaskScriptContext(near, timeout)
 	defer cancel()
@@ -75,7 +76,7 @@ func TestPostTaskScriptContextUsesFullTimeout(t *testing.T) {
 	assert.Greater(t, time.Until(deadline), time.Minute, "script timeout truncated to task deadline")
 
 	// An already-cancelled task context must not cancel the script either.
-	cancelledCtx, cancelIt := context.WithCancel(context.Background())
+	cancelledCtx, cancelIt := context.WithCancel(t.Context())
 	cancelIt()
 	scriptCtx2, cancel2 := postTaskScriptContext(cancelledCtx, timeout)
 	defer cancel2()
@@ -91,7 +92,7 @@ func TestPostTaskScriptEnv(t *testing.T) {
 		envs: map[string]string{"BASE": "1"},
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
 	taskCtx, err := structpb.NewStruct(map[string]any{
@@ -113,10 +114,15 @@ func TestPostTaskScriptEnv(t *testing.T) {
 }
 
 func TestRunPostTaskScriptIntegration(t *testing.T) {
-	dir := t.TempDir()
+	dir := filepath.Join(t.TempDir(), "script directory")
+	require.NoError(t, os.Mkdir(dir, 0o700))
 	outFile := filepath.Join(dir, "out.txt")
 	scriptPath := filepath.Join(dir, "post-task.sh")
 	script := "#!/bin/sh\nprintf '%s %s %s' \"$GITEA_TASK_ID\" \"$GITEA_JOB_RESULT\" \"$CUSTOM\" > \"" + outFile + "\"\n"
+	if runtime.GOOS == "windows" {
+		scriptPath = filepath.Join(dir, "post-task.cmd")
+		script = "@echo off\r\n<nul set /p \"=%GITEA_TASK_ID% %GITEA_JOB_RESULT% %CUSTOM%\" > \"" + outFile + "\"\r\nexit /b 0\r\n"
+	}
 	require.NoError(t, os.WriteFile(scriptPath, []byte(script), 0o700))
 
 	cfg, err := config.LoadDefault("")
@@ -128,12 +134,10 @@ func TestRunPostTaskScriptIntegration(t *testing.T) {
 		envs: map[string]string{"CUSTOM": "runner-env"},
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
-	taskCtx, err := structpb.NewStruct(map[string]any{})
-	require.NoError(t, err)
-	task := &runnerv1.Task{Id: 11, Context: taskCtx}
+	task := &runnerv1.Task{Id: 11, Context: &structpb.Struct{}}
 	reporter := report.NewReporter(ctx, cancel, nil, task, cfg)
 	setReporterJobResult(t, reporter, runnerv1.Result_RESULT_SUCCESS)
 
@@ -146,12 +150,12 @@ func TestRunPostTaskScriptIntegration(t *testing.T) {
 
 func setReporterJobResult(t *testing.T, reporter *report.Reporter, result runnerv1.Result) {
 	t.Helper()
-	require.NoError(t, reporter.Fire(&log.Entry{
+	require.NoError(t, reporter.Handle(t.Context(), logging.Record{
 		Time:    time.Now(),
 		Message: "job finished",
-		Data: log.Fields{
-			"stage":     "Post",
-			"jobResult": metrics.ResultToStatusLabel(result),
+		Attrs: []logging.Attr{
+			{Key: "stage", Value: "Post"},
+			{Key: "jobResult", Value: metrics.ResultToStatusLabel(result)},
 		},
 	}))
 }

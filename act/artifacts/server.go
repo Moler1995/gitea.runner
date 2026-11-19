@@ -6,20 +6,20 @@ package artifacts
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"gitea.com/gitea/runner/act/common"
-
-	"github.com/julienschmidt/httprouter"
 )
 
 type FileContainerResourceURL struct {
@@ -50,140 +50,87 @@ type ResponseMessage struct {
 	Message string `json:"message"`
 }
 
-type WritableFile interface {
-	io.WriteCloser
-}
-
-type WriteFS interface {
-	OpenWritable(name string) (WritableFile, error)
-	OpenAppendable(name string) (WritableFile, error)
-}
-
-type readWriteFSImpl struct{}
-
-func (fwfs readWriteFSImpl) Open(name string) (fs.File, error) {
-	return os.Open(name)
-}
-
-func (fwfs readWriteFSImpl) OpenWritable(name string) (WritableFile, error) {
-	if err := os.MkdirAll(filepath.Dir(name), os.ModePerm); err != nil {
-		return nil, err
-	}
-	return os.OpenFile(name, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
-}
-
-func (fwfs readWriteFSImpl) OpenAppendable(name string) (WritableFile, error) {
-	if err := os.MkdirAll(filepath.Dir(name), os.ModePerm); err != nil {
-		return nil, err
-	}
-	file, err := os.OpenFile(name, os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
-		return nil, err
-	}
-
-	_, err = file.Seek(0, io.SeekEnd)
-	if err != nil {
-		return nil, err
-	}
-	return file, nil
-}
-
 var gzipExtension = ".gz__"
 
 func safeResolve(baseDir, relPath string) string {
 	return filepath.Join(baseDir, filepath.Clean(filepath.Join(string(os.PathSeparator), relPath)))
 }
 
-func uploads(router *httprouter.Router, baseDir string, fsys WriteFS) {
-	router.POST("/_apis/pipelines/workflows/:runId/artifacts", func(w http.ResponseWriter, req *http.Request, params httprouter.Params) {
-		runID := params.ByName("runId")
+func writeJSON(w http.ResponseWriter, value any) {
+	data, err := json.Marshal(value)
+	if err != nil {
+		panic(err)
+	}
+	if _, err := w.Write(data); err != nil {
+		panic(err)
+	}
+}
 
-		json, err := json.Marshal(FileContainerResourceURL{
-			FileContainerResourceURL: fmt.Sprintf("http://%s/upload/%s", req.Host, runID),
+func uploads(router *http.ServeMux, baseDir string) {
+	router.HandleFunc("POST /_apis/pipelines/workflows/{runId}/artifacts", func(w http.ResponseWriter, req *http.Request) {
+		writeJSON(w, FileContainerResourceURL{
+			FileContainerResourceURL: fmt.Sprintf("http://%s/upload/%s", req.Host, req.PathValue("runId")),
 		})
-		if err != nil {
-			panic(err)
-		}
-
-		_, err = w.Write(json)
-		if err != nil {
-			panic(err)
-		}
 	})
 
-	router.PUT("/upload/:runId", func(w http.ResponseWriter, req *http.Request, params httprouter.Params) {
+	router.HandleFunc("PUT /upload/{runId}", func(w http.ResponseWriter, req *http.Request) {
 		itemPath := req.URL.Query().Get("itemPath")
-		runID := params.ByName("runId")
 
 		if req.Header.Get("Content-Encoding") == "gzip" {
 			itemPath += gzipExtension
 		}
 
-		safeRunPath := safeResolve(baseDir, runID)
-		safePath := safeResolve(safeRunPath, itemPath)
+		safePath := safeResolve(safeResolve(baseDir, req.PathValue("runId")), itemPath)
 
-		file, err := func() (WritableFile, error) {
-			contentRange := req.Header.Get("Content-Range")
-			if contentRange != "" && !strings.HasPrefix(contentRange, "bytes 0-") {
-				return fsys.OpenAppendable(safePath)
+		if err := os.MkdirAll(filepath.Dir(safePath), os.ModePerm); err != nil {
+			panic(err)
+		}
+		var start int64
+		if contentRange := req.Header.Get("Content-Range"); contentRange != "" {
+			if _, err := fmt.Sscanf(contentRange, "bytes %d-", &start); err != nil || start < 0 {
+				http.Error(w, "invalid content range", http.StatusBadRequest)
+				return
 			}
-			return fsys.OpenWritable(safePath)
-		}()
+		}
+		flags := os.O_CREATE | os.O_WRONLY
+		if start == 0 {
+			flags |= os.O_TRUNC
+		}
+		file, err := os.OpenFile(safePath, flags, 0o644)
 		if err != nil {
 			panic(err)
 		}
 		defer file.Close()
-
-		writer, ok := file.(io.Writer)
-		if !ok {
-			panic(errors.New("File is not writable"))
+		if _, err := file.Seek(start, io.SeekStart); err != nil {
+			panic(err)
 		}
-
 		if req.Body == nil {
-			panic(errors.New("No body given"))
+			panic(errors.New("no body given"))
 		}
 
-		_, err = io.Copy(writer, req.Body)
+		_, err = io.Copy(file, req.Body)
 		if err != nil {
 			panic(err)
 		}
 
-		json, err := json.Marshal(ResponseMessage{
+		writeJSON(w, ResponseMessage{
 			Message: "success",
 		})
-		if err != nil {
-			panic(err)
-		}
-
-		_, err = w.Write(json)
-		if err != nil {
-			panic(err)
-		}
 	})
 
-	router.PATCH("/_apis/pipelines/workflows/:runId/artifacts", func(w http.ResponseWriter, req *http.Request, params httprouter.Params) {
-		json, err := json.Marshal(ResponseMessage{
+	router.HandleFunc("PATCH /_apis/pipelines/workflows/{runId}/artifacts", func(w http.ResponseWriter, _req *http.Request) {
+		writeJSON(w, ResponseMessage{
 			Message: "success",
 		})
-		if err != nil {
-			panic(err)
-		}
-
-		_, err = w.Write(json)
-		if err != nil {
-			panic(err)
-		}
 	})
 }
 
-func downloads(router *httprouter.Router, baseDir string, fsys fs.FS) {
-	router.GET("/_apis/pipelines/workflows/:runId/artifacts", func(w http.ResponseWriter, req *http.Request, params httprouter.Params) {
-		runID := params.ByName("runId")
+func downloads(router *http.ServeMux, baseDir string) {
+	router.HandleFunc("GET /_apis/pipelines/workflows/{runId}/artifacts", func(w http.ResponseWriter, req *http.Request) {
+		runID := req.PathValue("runId")
 
-		safePath := safeResolve(baseDir, runID)
-
-		entries, err := fs.ReadDir(fsys, safePath)
-		if err != nil {
+		entries, err := os.ReadDir(safeResolve(baseDir, runID))
+		if err != nil && !os.IsNotExist(err) {
 			panic(err)
 		}
 
@@ -195,27 +142,22 @@ func downloads(router *httprouter.Router, baseDir string, fsys fs.FS) {
 			})
 		}
 
-		json, err := json.Marshal(NamedFileContainerResourceURLResponse{
+		writeJSON(w, NamedFileContainerResourceURLResponse{
 			Count: len(list),
 			Value: list,
 		})
-		if err != nil {
-			panic(err)
-		}
-
-		_, err = w.Write(json)
-		if err != nil {
-			panic(err)
-		}
 	})
 
-	router.GET("/download/:container", func(w http.ResponseWriter, req *http.Request, params httprouter.Params) {
-		container := params.ByName("container")
+	router.HandleFunc("GET /download/{container}", func(w http.ResponseWriter, req *http.Request) {
+		container := req.PathValue("container")
 		itemPath := req.URL.Query().Get("itemPath")
 		safePath := safeResolve(baseDir, filepath.Join(container, itemPath))
 
 		var files []ContainerItem
-		err := fs.WalkDir(fsys, safePath, func(path string, entry fs.DirEntry, err error) error {
+		err := filepath.WalkDir(safePath, func(path string, entry fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
 			if !entry.IsDir() {
 				rel, err := filepath.Rel(safePath, path)
 				if err != nil {
@@ -224,50 +166,37 @@ func downloads(router *httprouter.Router, baseDir string, fsys fs.FS) {
 
 				// if it was upload as gzip
 				rel = strings.TrimSuffix(rel, gzipExtension)
-				path := filepath.Join(itemPath, rel)
-
-				rel = filepath.ToSlash(rel)
-				path = filepath.ToSlash(path)
 
 				files = append(files, ContainerItem{
-					Path:            path,
+					Path:            filepath.ToSlash(filepath.Join(itemPath, rel)),
 					ItemType:        "file",
-					ContentLocation: fmt.Sprintf("http://%s/artifact/%s/%s/%s", req.Host, container, itemPath, rel),
+					ContentLocation: (&url.URL{Scheme: "http", Host: req.Host, Path: "/artifact/" + container + "/" + itemPath + "/" + filepath.ToSlash(rel)}).String(),
 				})
 			}
 			return nil
 		})
-		if err != nil {
+		if err != nil && !os.IsNotExist(err) {
 			panic(err)
 		}
 
-		json, err := json.Marshal(ContainerItemResponse{
+		writeJSON(w, ContainerItemResponse{
 			Value: files,
 		})
-		if err != nil {
-			panic(err)
-		}
-
-		_, err = w.Write(json)
-		if err != nil {
-			panic(err)
-		}
 	})
 
-	router.GET("/artifact/*path", func(w http.ResponseWriter, req *http.Request, params httprouter.Params) {
-		path := params.ByName("path")[1:]
+	router.HandleFunc("GET /artifact/{path...}", func(w http.ResponseWriter, req *http.Request) {
+		safePath := safeResolve(baseDir, req.PathValue("path"))
 
-		safePath := safeResolve(baseDir, path)
-
-		file, err := fsys.Open(safePath)
+		file, err := os.Open(safePath)
 		if err != nil {
 			// try gzip file
-			file, err = fsys.Open(safePath + gzipExtension)
+			file, err = os.Open(safePath + gzipExtension)
 			if err != nil {
 				panic(err)
 			}
 			w.Header().Add("Content-Encoding", "gzip")
 		}
+		defer file.Close()
 
 		_, err = io.Copy(w, file)
 		if err != nil {
@@ -284,24 +213,25 @@ func Serve(ctx context.Context, artifactPath, addr, port string) context.CancelF
 		return cancel
 	}
 
-	router := httprouter.New()
+	router := http.NewServeMux()
 
 	logger.Debugf("Artifacts base path '%s'", artifactPath)
-	fsys := readWriteFSImpl{}
-	uploads(router, artifactPath, fsys)
-	downloads(router, artifactPath, fsys)
+	uploads(router, artifactPath)
+	downloads(router, artifactPath)
+	registerV4(router, artifactPath)
 
 	server := &http.Server{
-		Addr:              fmt.Sprintf("%s:%s", addr, port),
+		Addr:              net.JoinHostPort(addr, port),
 		ReadHeaderTimeout: 2 * time.Second,
 		Handler:           router,
 	}
 
 	// run server
 	go func() {
-		logger.Infof("Start server on http://%s:%s", addr, port)
+		logger.Infof("Start server on http://%s", server.Addr)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Fatal(err)
+			logger.Error(err)
+			os.Exit(1)
 		}
 	}()
 

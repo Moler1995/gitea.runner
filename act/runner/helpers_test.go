@@ -4,7 +4,7 @@
 package runner
 
 import (
-	"context"
+	"os"
 	"os/exec"
 	"runtime"
 	"testing"
@@ -29,7 +29,7 @@ func requireLinuxDocker(t *testing.T) {
 // so the daemon has to be pinged explicitly here to decide whether to skip.
 func requireDocker(t *testing.T) {
 	t.Helper()
-	ctx := context.Background()
+	ctx := t.Context()
 	cli, err := container.GetDockerClient(ctx)
 	if err != nil {
 		t.Skipf("skipping: docker client unavailable: %v", err)
@@ -37,6 +37,16 @@ func requireDocker(t *testing.T) {
 	defer cli.Close()
 	if _, err := cli.Ping(ctx, mobyclient.PingOptions{}); err != nil {
 		t.Skipf("skipping: docker daemon unreachable: %v", err)
+	}
+}
+
+func requireDockerSharingFiles(t *testing.T) {
+	t.Helper()
+	requireDocker(t)
+	for _, marker := range []string{"/.dockerenv", "/run/.containerenv"} {
+		if _, err := os.Stat(marker); err == nil {
+			t.Skip("skipping: inside a container, the docker daemon cannot bind-mount this process's files")
+		}
 	}
 }
 
@@ -49,4 +59,8 @@ func requireHostTools(t *testing.T, tools ...string) {
 			t.Skipf("skipping: required host tool %q not found: %v", tool, err)
 		}
 	}
+}
+
+func testCheckoutEnv() map[string]string {
+	return map[string]string{"GITHUB_REPOSITORY": "owner/repo", "GITHUB_REF": "refs/heads/main", "SHA_REF": "1234567890"}
 }

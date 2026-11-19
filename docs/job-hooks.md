@@ -28,8 +28,8 @@ The script is run according to its extension:
 
 | Extension | Command |
 | --- | --- |
-| `.sh` | `bash -e <path>` |
-| `.ps1` | `pwsh -command . '<path>'` |
+| `.sh` | `bash -e <path>`, or `sh -e <path>` without bash |
+| `.ps1` | `pwsh -command . '<path>'`, or `powershell` on a host without pwsh |
 | anything else | the file itself, which needs its own shebang and executable bit |
 
 As on GitHub, the shell flags applied to `run:` steps are **not** applied to a hook — set `pipefail` or anything else you want inside the script.
@@ -45,9 +45,9 @@ A hook path that does not exist inside the job environment fails the job with `N
 
 ## Environment
 
-A hook sees the job's environment: the workflow, job and `container:` `env:`, the runner's `envs`, and the `GITHUB_*` context variables, with the same masking applied to its output as to a step's. The step-specific ones (`GITHUB_ACTION`, `GITHUB_OUTPUT`, `GITHUB_STATE`) are not set — a hook is not a step, so `::save-state::` and `::set-output::` have nowhere to go.
+A hook sees the job's environment: the workflow, job and `container:` `env:`, the runner's `envs`, and the `GITHUB_*`/`GITEA_*` context variables, with the same masking applied to its output as to a step's. The step-specific ones (`GITHUB_ACTION`, `GITHUB_OUTPUT`, `GITHUB_STATE`) are not set — a hook is not a step, so `::save-state::` and `::set-output::` have nowhere to go.
 
-Its stdout is part of the job log, inside a collapsible group, and is scanned for workflow commands. `::add-mask::` registers a value to be masked for the rest of the job, `::set-env::` and `::add-path::` apply to the steps that follow.
+Its stdout is part of the job log, after a collapsible group naming the hook and its shell, and is scanned for workflow commands. `::add-mask::` registers a value to be masked for the rest of the job. `::set-env::` and `::add-path::` apply to the steps that follow, but as in a step they need `ACTIONS_ALLOW_UNSECURE_COMMANDS: true`, and a refused one fails the hook.
 
 `$GITHUB_ENV` and `$GITHUB_PATH` point at files that are read back after the hook exits, so the file-command form works too:
 
