@@ -1231,7 +1231,7 @@ func (rc *RunContext) copyWorkflowFiles() common.Executor {
 					}
 				}
 			}
-			imageOS = cmp.Or(imageOS, rc.imageOS(ctx))
+			imageOS = cmp.Or(imageOS, imageOSFromImage(rc.platformImage))
 		}
 		if set || imageOS != "" {
 			rc.defaultEnv["ImageOS"] = imageOS
@@ -1889,32 +1889,10 @@ func parentDir(p string) string {
 	return ""
 }
 
-// imageOS returns ImageOS, which setup-* actions use to tell one runner image release
-// from another. The resolved image tag is preferred over the runs-on label because it
-// still names a release when the label is a rolling one such as ubuntu-latest.
-func (rc *RunContext) imageOS(ctx context.Context) string {
-	if job := rc.Run.Job(); job == nil || job.RunsOn() == nil {
-		return "" // a composite action runs on a synthetic job without runs-on
-	}
-	if imageOS := imageOSFromImage(rc.platformImage); imageOS != "" {
-		return imageOS
-	}
-
-	for _, platformName := range slices.Backward(rc.runsOnPlatformNames(ctx)) {
-		if platformName == "ubuntu-latest" {
-			// Rolling label whose image names no release either, so report GitHub's current ubuntu-latest.
-			return "ubuntu24"
-		} else if platformName != "" {
-			return strings.SplitN(strings.Replace(platformName, `-`, ``, 1), `.`, 2)[0]
-		}
-	}
-	return ""
-}
-
 // imageOSTag matches an image reference tagged with an OS family ImageOS can report plus
 // its release, such as "docker.gitea.com/runner-images:ubuntu-24.04". Anything else
-// ("ubuntu-latest", "app:22.04", "catthehacker/ubuntu:act-22.04", or a registry port) is
-// left to the runs-on label rather than turned into a bogus OS.
+// ("ubuntu-latest", "app:22.04", "catthehacker/ubuntu:act-22.04", or a registry port)
+// yields no ImageOS rather than a bogus OS.
 var imageOSTag = regexp.MustCompile(`:(ubuntu|win|macos)-?([0-9]+)[^/]*$`)
 
 // imageOSFromImage derives ImageOS from an image reference, e.g.
