@@ -33,7 +33,7 @@ func generateWorkflow(task *runnerv1.Task) (*model.Workflow, string, error) {
 	for id, need := range task.Needs {
 		workflow.Jobs[id] = &model.Job{
 			Outputs: need.Outputs,
-			Result:  strings.ToLower(strings.TrimPrefix(need.Result.String(), "RESULT_")),
+			Result:  need.Result.Conclusion(),
 		}
 		rawNeeds.Content = append(rawNeeds.Content, &yaml.Node{
 			Kind:  yaml.ScalarNode,

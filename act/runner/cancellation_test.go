@@ -18,143 +18,57 @@ import (
 	"go.yaml.in/yaml/v4"
 )
 
-// TestCancelledJobStatusEnablesAlwaysAndCancelledSteps verifies that once a job is
-// cancelled, getJobContext reports the "cancelled" status so the step `if` functions
-// evaluate the way GitHub Actions does: cancelled()/always() are true, success()/failure()
-// are false. A step that defaults to success() is therefore skipped while an always() step
-// still runs. Before the fix the status could only ever be success/failure, so cancelled()
-// was structurally impossible and cancel-only cleanup steps never ran.
-func TestCancelledJobStatusEnablesAlwaysAndCancelledSteps(t *testing.T) {
-	rc := createIfTestRunContext(map[string]*model.Job{
-		"job1": createJob(t, `runs-on: ubuntu-latest`, ""),
-	})
-	rc.markCancelled()
-
-	// The core fix: the job status context now reports "cancelled" instead of being
-	// pinned to success/failure.
-	jobCtx := rc.getJobContext()
-	require.Equal(t, "cancelled", jobCtx.Status)
-
-	// Feed that status through the step-context expression functions, which is what a
-	// step `if` evaluates. On a cancelled job only always()/cancelled() are true.
-	interp := exprparser.NewInterpeter(
-		&exprparser.EvaluationEnvironment{Job: jobCtx},
-		exprparser.Config{Context: "step"},
-	)
-	for expr, want := range map[string]bool{
-		"cancelled()":  true,
-		"always()":     true,
-		"success()":    false,
-		"failure()":    false,
-		"!cancelled()": false,
+func TestStepsExecutorRunsMainStepsUnlessSetupFailed(t *testing.T) {
+	for name, tt := range map[string]struct {
+		stage, status, result string
+		cause                 error
+		ran                   []string
+	}{
+		"setup failure":        {"pre", "failure", "failure", setupError{assert.AnError}, []string{"pre"}},
+		"pre step failure":     {"pre", "failure", "failure", assert.AnError, []string{"pre", "main", "always"}},
+		"cancel during pre":    {"pre", "cancelled", "cancelled", context.Canceled, []string{"pre", "main", "always"}},
+		"cancel during main":   {"main", "cancelled", "cancelled", context.Canceled, []string{"pre", "main", "always"}},
+		"deadline during main": {"main", "cancelled", "failure", context.DeadlineExceeded, []string{"pre", "main", "always"}},
 	} {
-		got, err := interp.Evaluate(expr, exprparser.DefaultStatusCheckNone)
-		require.NoErrorf(t, err, "Evaluate(%q)", expr)
-		assert.Equalf(t, want, got, "Evaluate(%q) on a cancelled job", expr)
-	}
-
-	// A step without an `if` defaults to success() and must be skipped on cancel,
-	// while an `if: always()` step must still run.
-	disabled, err := interp.Evaluate("", exprparser.DefaultStatusCheckSuccess)
-	require.NoError(t, err)
-	assert.Equal(t, false, disabled, "default-success step must be skipped on a cancelled job")
-
-	enabled, err := interp.Evaluate("always()", exprparser.DefaultStatusCheckSuccess)
-	require.NoError(t, err)
-	assert.Equal(t, true, enabled, "`if: always()` step must run on a cancelled job")
-	setJobResult(t.Context(), rc, rc, true)
-	assert.Equal(t, "cancelled", rc.Run.Job().Result)
-}
-
-func TestMainStepsExecutorRunsAlwaysStepsAfterInterruption(t *testing.T) {
-	for name, wantError := range map[string]error{"cancel": context.Canceled, "timeout": context.DeadlineExceeded} {
 		t.Run(name, func(t *testing.T) {
-			rc := createIfTestRunContext(map[string]*model.Job{
-				"job1": createJob(t, `runs-on: ubuntu-latest`, ""),
-			})
-			var ctx context.Context
-			var interrupt func()
-			if wantError == context.Canceled {
-				ctx, interrupt = context.WithCancel(t.Context())
-				defer interrupt()
-			} else {
-				deadline := newControllableDeadlineContext(t.Context())
+			rc := makeTestRC(t, "{}")
+			ctx, interrupt := context.WithCancel(common.WithJobErrorContainer(t.Context()))
+			defer interrupt()
+			if tt.cause == context.DeadlineExceeded {
+				deadline := newControllableDeadlineContext(ctx)
 				ctx, interrupt = deadline, deadline.expire
 			}
-
 			var ran []string
-			var laterStepCtxErr error
-			err := newMainStepsExecutor(rc, []common.Executor{
-				func(_ctx context.Context) error {
-					ran = append(ran, "step1")
-					interrupt()
-					return nil
-				},
-				func(ctx context.Context) error {
-					ran = append(ran, "always-step")
-					laterStepCtxErr = ctx.Err()
-					return nil
-				},
-			})(ctx)
-
-			require.ErrorIs(t, err, wantError)
-			assert.Equal(t, []string{"step1", "always-step"}, ran)
-			require.NoError(t, laterStepCtxErr)
-			assert.Equal(t, wantError == context.Canceled, rc.jobCancelled)
-			assert.Equal(t, "cancelled", rc.getJobContext().Status)
-			setJobResult(t.Context(), rc, rc, true)
-			if wantError == context.DeadlineExceeded {
-				assert.True(t, rc.jobFailed)
-				assert.Equal(t, "failure", rc.Run.Job().Result)
-			} else {
-				assert.Equal(t, "cancelled", rc.Run.Job().Result)
-			}
-		})
-	}
-}
-
-func TestStepsExecutorRunsMainStepsAfterPreInterruption(t *testing.T) {
-	for name, tt := range map[string]struct {
-		cancel    bool
-		preErr    error
-		wantError error
-	}{
-		"cancel":  {cancel: true, wantError: context.Canceled},
-		"failure": {preErr: assert.AnError, wantError: assert.AnError},
-	} {
-		t.Run(name, func(t *testing.T) {
-			rc := createIfTestRunContext(map[string]*model.Job{
-				"job1": createJob(t, `runs-on: ubuntu-latest`, ""),
-			})
-			ctx := t.Context()
-			var cancel context.CancelFunc
-			if tt.cancel {
-				ctx, cancel = context.WithCancel(ctx)
-				defer cancel()
-			}
-
-			var ran []string
-			var mainStepCtxErr error
-			err := newStepsExecutor(rc, []common.Executor{
-				func(_ctx context.Context) error {
-					ran = append(ran, "pre1")
-					if tt.cancel {
-						cancel()
+			phase := func(stage string) common.Executor {
+				return func(stepCtx context.Context) error {
+					ran = append(ran, stage)
+					require.NoError(t, stepCtx.Err())
+					switch {
+					case stage != tt.stage:
+					case tt.cause == context.Canceled || tt.cause == context.DeadlineExceeded:
+						interrupt()
+					default:
+						reportStepError(stepCtx, rc, tt.cause)
+						return tt.cause
 					}
-					return tt.preErr
-				},
-			}, []common.Executor{
-				func(ctx context.Context) error {
-					ran = append(ran, "always-step")
-					mainStepCtxErr = ctx.Err()
 					return nil
-				},
-			})(ctx)
+				}
+			}
 
-			require.ErrorIs(t, err, tt.wantError)
-			assert.Equal(t, []string{"pre1", "always-step"}, ran)
-			require.NoError(t, mainStepCtxErr)
-			assert.Equal(t, tt.cancel, rc.jobCancelled)
+			require.ErrorIs(t, newStepsExecutor(rc, []common.Executor{phase("pre")}, []common.Executor{phase("main"), phase("always")})(ctx), tt.cause)
+			assert.Equal(t, tt.ran, ran)
+			assert.Equal(t, tt.cause == context.Canceled, rc.jobCancelled)
+			jobContext := rc.getJobContext()
+			assert.Equal(t, tt.status, jobContext.Status)
+			cancelled := tt.status == "cancelled"
+			evaluator := exprparser.NewInterpeter(&exprparser.EvaluationEnvironment{Job: jobContext}, exprparser.Config{Context: "step"})
+			for condition, want := range map[string]bool{"cancelled()": cancelled, "always()": true, "success()": false, "failure()": !cancelled, "!cancelled()": !cancelled, "": false} {
+				got, err := evaluator.Evaluate(condition, exprparser.DefaultStatusCheckSuccess)
+				require.NoError(t, err, condition)
+				assert.Equal(t, want, got, condition)
+			}
+			rc.setJobResult(t.Context(), true)
+			assert.Equal(t, tt.result, rc.Run.Job().Result)
 		})
 	}
 }

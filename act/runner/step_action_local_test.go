@@ -25,8 +25,8 @@ type stepActionMocks struct {
 	mock.Mock
 }
 
-func (salm *stepActionMocks) runAction(step actionStep, actionDir string, remoteAction *remoteAction) common.Executor {
-	args := salm.Called(step, actionDir, remoteAction)
+func (salm *stepActionMocks) runAction(step actionStep) common.Executor {
+	args := salm.Called(step)
 	return args.Get(0).(func(context.Context) error)
 }
 
@@ -89,7 +89,7 @@ func TestStepActionLocalTest(t *testing.T) {
 
 	expectStepFileCommands(t, cm)
 
-	salm.On("runAction", sal, filepath.Clean("/tmp/path/to/action"), (*remoteAction)(nil)).Return(func(ctx context.Context) error {
+	salm.On("runAction", sal).Return(func(ctx context.Context) error {
 		sal.RunContext.setOutput(ctx, map[string]string{"name": "value"}, "ran")
 		return nil
 	})

@@ -67,6 +67,7 @@ type RunContext struct {
 	JobContainer        container.ExecutionsEnvironment
 	serviceContainers   []*serviceContainer
 	kubernetes          bool
+	runsOn              []string
 	containerSpec       model.ContainerSpec // container:, resolved once with platformImage
 	containerEnv        yaml.Node           // container.env of the kept containerSpec, decoded once the job env resolves
 	defaultEnv          map[string]string   // ImageOS and the runner CA's NODE_EXTRA_CA_CERTS, beneath any env the job sets
@@ -78,8 +79,8 @@ type RunContext struct {
 	cleanUpJobContainer common.Executor
 	taskWorkspace       string
 	deferVolumeCleanup  func(common.Executor)
-	caller              *caller           // job calling this RunContext (reusable workflows)
-	workflowCallInputs  map[string]any    // the caller's with:, resolved once by resolveWorkflowCall
+	caller              *caller // job calling this RunContext (reusable workflows)
+	callerRunIndex      int
 	workflowCallSecrets map[string]string // the caller's secrets:, resolved once by resolveWorkflowCall
 	jobRunDefaults      model.RunDefaults // defaults.run, resolved once at job setup as GitHub does
 	platformImage       string            // container.image or the runs-on pick, resolved once by isEnabled
@@ -99,6 +100,7 @@ type RunContext struct {
 	// so writes from later phases and from composite sub-steps append to the same file.
 	// Only populated on the top-level RunContext; child RCs walk Parent via topLevelRunContext.
 	summaryFileInitialized map[int]bool
+	summaryUploads         *stepSummaryUploads
 	// jobCancelled records that this job's run was cancelled (context.Canceled). It makes
 	// getJobContext report the "cancelled" status so cancelled()/always() evaluate the way
 	// GitHub Actions does, letting cleanup and always() steps run while normal steps skip.
@@ -158,20 +160,6 @@ func (rc *RunContext) markFailed() {
 	rc.jobFailed = true
 }
 
-// markInterrupted records the job's interruption status from a context error so later step `if` evaluations and the job result observe it,
-// keeping the timeout path symmetric with the cancel path:
-//   - context.Canceled (server cancel) marks the job cancelled, matching GitHub's "only always()/cancelled() run on cancel".
-//   - context.DeadlineExceeded (job timeout-minutes) evaluates later steps as cancelled like GitHub, but reports the job failed.
-func (rc *RunContext) markInterrupted(err error) {
-	switch {
-	case errors.Is(err, context.Canceled):
-		rc.markCancelled()
-	case errors.Is(err, context.DeadlineExceeded):
-		rc.jobTimedOut = true
-		rc.markFailed()
-	}
-}
-
 // AddMask also hands the mask to the job logger's extra handler, which receives records unmasked.
 func (rc *RunContext) AddMask(ctx context.Context, mask string) {
 	rc.Masks = append(rc.Masks, mask)
@@ -183,8 +171,6 @@ func (rc *RunContext) AddMask(ctx context.Context, mask string) {
 func (rc *RunContext) String() string {
 	name := fmt.Sprintf("%s/%s", rc.Run.Workflow.Name, rc.Name)
 	if rc.caller != nil {
-		// prefix the reusable workflow with the caller job
-		// this is required to create unique container names
 		name = fmt.Sprintf("%s/%s", rc.caller.runContext.Name, name)
 	}
 	return name
@@ -223,12 +209,8 @@ func (rc *RunContext) setActionEnv(env map[string]string) {
 }
 
 func (rc *RunContext) jobContainerName() string {
-	// The job id, never evaluated, keeps two jobs apart when masking collapses their names.
-	nameParts := []string{rc.Config.ContainerNamePrefix, "WORKFLOW-" + rc.Run.Workflow.Name, "JOB-" + rc.Run.JobID, rc.Name}
-	if rc.caller != nil {
-		nameParts = append(nameParts, "CALLED-BY-"+rc.caller.runContext.JobName)
-	}
-	return createContainerName(nameParts...) // For Gitea
+	job := rc.topLevelRunContext()
+	return createContainerName(job.Config.ContainerNamePrefix, "WORKFLOW-"+job.Run.Workflow.Name, "JOB-"+job.Run.JobID, job.Name, job.runnerTrackingID())
 }
 
 // networkNameForGitea return the name of the network
@@ -553,7 +535,7 @@ func (rc *RunContext) startKubernetesPod() common.Executor {
 		}
 		var options container.KubernetesOptions
 		if rc.Config.KubernetesPicker != nil {
-			options = rc.Config.KubernetesPicker(rc.runsOnPlatformNames(ctx))
+			options = rc.Config.KubernetesPicker(rc.runsOn)
 		}
 		options.MaxLifetime, options.ForcePull = rc.Config.ContainerMaxLifetime, rc.Config.ForcePull
 		pod, err := container.NewKubernetesPod(options)
@@ -671,7 +653,6 @@ func (rc *RunContext) startJobContainer() common.Executor {
 			Name:            name,
 			Env:             envList,
 			NetworkMode:     networkName,
-			NetworkAliases:  []string{rc.Name},
 			ExposedPorts:    exposedPorts,
 			PortBindings:    portBindings,
 			Stdout:          logWriter,
@@ -1321,12 +1302,15 @@ func (rc *RunContext) interpolateOutputs() common.Executor {
 		if err := model.DecodeEvaluated("job outputs", job.RawOutputs, rc.NewExpressionEvaluator(ctx).shared(ctx).EvaluateYamlNode, &outputs); err != nil {
 			return err
 		}
-		// Matrix combinations share the job, so as on GitHub a failure publishes nothing and the last non-empty value wins.
-		maps0.DeleteFunc(outputs, func(_, value string) bool { return value == "" })
-		defer lockJob(job)()
-		job.Outputs = mergeMaps(job.Outputs, outputs)
+		mergeJobOutputs(job, outputs)
 		return nil
 	}
+}
+
+func mergeJobOutputs(job *model.Job, outputs map[string]string) {
+	maps0.DeleteFunc(outputs, func(_name, value string) bool { return value == "" }) // The last non-empty value wins across matrix combinations.
+	defer lockJob(job)()
+	job.Outputs = mergeMaps(job.Outputs, outputs)
 }
 
 func (rc *RunContext) startContainer() common.Executor {
@@ -1374,14 +1358,6 @@ func (rc *RunContext) closeContainer() common.Executor {
 	}
 }
 
-func (rc *RunContext) matrix() map[string]any {
-	return rc.Matrix
-}
-
-func (rc *RunContext) result(result string) {
-	rc.Run.Job().Result = result
-}
-
 func (rc *RunContext) steps() []*model.Step {
 	// Return per-job copies of the steps. Matrix combinations run in parallel and share the
 	// workflow model, but step execution mutates per-job fields and evaluates the If/Env nodes
@@ -1416,62 +1392,29 @@ func (rc *RunContext) Executor() (common.Executor, error) {
 	switch jobType {
 	case model.JobTypeDefault:
 		executor = newJobExecutor(rc, &stepFactoryImpl{}, rc)
-	case model.JobTypeReusableWorkflowLocal:
-		executor = newLocalReusableWorkflowExecutor(rc)
-	case model.JobTypeReusableWorkflowRemote:
-		executor = newRemoteReusableWorkflowExecutor(rc)
+	case model.JobTypeReusableWorkflowLocal, model.JobTypeReusableWorkflowRemote:
+		executor = rc.runReusableWorkflow
 	case model.JobTypeInvalid:
 		return nil, err
 	}
 
 	return func(ctx context.Context) error {
-		res, err := rc.isEnabled(ctx)
-		if err != nil {
-			// Record the failure so a job that cannot start gets a stop time. rc.caller is only set for reusable workflows.
-			rc.result("failure")
-			if rc.caller != nil { // For Gitea
-				rc.caller.setReusedWorkflowJobResult(rc.Run.JobID, "failure")
-			}
+		if enabled, err := rc.isEnabled(ctx); !enabled {
 			return err
 		}
-		if res {
-			return executor(ctx)
+		jobCtx, cancel, err := applyJobTimeout(ctx, rc, rc.Run.Job())
+		if err != nil {
+			common.Logger(ctx).Errorf("##[error]%s", EscapeCommandData(err.Error()))
+			rc.setJobResult(ctx, false)
+			return nil
 		}
-		return nil
+		defer cancel()
+		err = executor(jobCtx)
+		if rc.jobCancelled {
+			return ctx.Err() // downstream jobs still evaluate their conditions after a job timeout
+		}
+		return err
 	}, nil
-}
-
-func (rc *RunContext) runsOnImage(ctx context.Context) (string, error) {
-	runsOn := rc.Run.Job().RunsOn()
-	for i, v := range runsOn {
-		var err error
-		if runsOn[i], err = rc.ExprEval.Interpolate(ctx, v); err != nil {
-			return "", fmt.Errorf("unable to interpolate runs-on: %w", err)
-		}
-	}
-
-	if rc.Config.PlatformPicker != nil {
-		return rc.Config.PlatformPicker(runsOn), nil
-	}
-	return "", nil
-}
-
-func (rc *RunContext) runsOnPlatformNames(ctx context.Context) []string {
-	job := rc.Run.Job()
-
-	if job.RunsOn() == nil {
-		return []string{}
-	}
-
-	// Evaluate a copy: RawRunsOn is shared across parallel matrix jobs, so interpolating it in
-	// place would race and leak one matrix combination's runs-on into the others.
-	rawRunsOn := model.CloneYamlNode(job.RawRunsOn)
-	if err := rc.ExprEval.EvaluateYamlNode(ctx, &rawRunsOn); err != nil {
-		common.Logger(ctx).Errorf("Error while evaluating runs-on: %v", err)
-		return []string{}
-	}
-
-	return model.RunsOnFromNode(rawRunsOn)
 }
 
 // resolvePlatformImage evaluates the job's container once for every consumer, skipping one whose image is empty as GitHub does.
@@ -1486,9 +1429,14 @@ func (rc *RunContext) resolvePlatformImage(ctx context.Context) error {
 	if spec.Image != "" || imagelessContainer(withoutEnv) {
 		rc.containerSpec, rc.containerEnv = spec, env
 	}
-	image, err := rc.runsOnImage(ctx)
-	if err != nil {
-		return err
+	runsOn := model.CloneYamlNode(rc.Run.Job().RawRunsOn)
+	if err := rc.ExprEval.EvaluateYamlNode(ctx, &runsOn); err != nil {
+		return fmt.Errorf("unable to evaluate runs-on: %w", err)
+	}
+	rc.runsOn = model.RunsOnFromNode(runsOn)
+	var image string
+	if rc.Config.PlatformPicker != nil {
+		image = rc.Config.PlatformPicker(rc.runsOn)
 	}
 	image, rc.kubernetes = strings.CutPrefix(image, "kubernetes://")
 	rc.platformImage = cmp.Or(rc.containerSpec.Image, image)
@@ -1533,39 +1481,38 @@ func (rc *RunContext) isEnabled(ctx context.Context) (bool, error) {
 	job := rc.Run.Job()
 	l := common.Logger(ctx)
 	runJob, runJobErr := EvalBool(ctx, rc.ExprEval, job.If.Value, exprparser.DefaultStatusCheckSuccess)
-	jobType, jobTypeErr := job.Type()
-
 	if runJobErr != nil {
 		l.Errorf("Error when evaluating 'if' for job '%s'. %v", rc.Run.JobID, runJobErr)
 	}
 
-	if jobType == model.JobTypeInvalid {
-		return false, jobTypeErr
-	}
-
-	if !runJob {
-		if rc.caller != nil { // For Gitea
-			rc.caller.setReusedWorkflowJobResult(rc.Run.JobID, "skipped")
-			return false, nil
+	if runJob {
+		if job.Uses != "" {
+			return true, nil
 		}
-		l.With("jobResult", "skipped").Debugf("Skipping job '%s' due to '%s'", job.Name, job.If.Value)
-		return false, nil
-	}
-
-	if jobType != model.JobTypeDefault {
-		return true, nil
-	}
-
-	if err := rc.resolvePlatformImage(ctx); err != nil {
-		return false, err
-	}
-	if rc.platformImage == "" {
-		for _, platformName := range rc.runsOnPlatformNames(ctx) {
+		if err := rc.resolvePlatformImage(ctx); err != nil {
+			rc.setJobResult(ctx, false)
+			return false, err
+		}
+		if rc.platformImage != "" {
+			return true, nil
+		}
+		for _, platformName := range rc.runsOn {
 			l.Infof("Skipping unsupported platform -- Try running with `-P %+v=...`", platformName)
 		}
-		return false, nil
+		if len(job.Steps) == 0 { // Gitea's needs placeholders carry the result from the server
+			return false, nil
+		}
+	} else if rc.caller == nil {
+		l.With("jobResult", "skipped").Debugf("Skipping job '%s' due to '%s'", job.Name, job.If.Value)
 	}
-	return true, nil
+	defer lockJob(job)()
+	if rc.jobTotal == 1 || job.Result == "" {
+		job.Result = "skipped"
+	}
+	if rc.caller != nil {
+		rc.caller.reportedRuns[rc.callerRunIndex] = rc.Run
+	}
+	return false, nil
 }
 
 // proxyBuildArgs returns the job's proxy variables as docker build args. The docker CLI
@@ -1681,8 +1628,11 @@ func (rc *RunContext) getGithubContext(ctx context.Context) *model.GithubContext
 	ghc := &model.GithubContext{
 		Event:            make(map[string]any),
 		Workflow:         rc.Run.Workflow.Name,
+		WorkflowRef:      rc.Config.Env["GITHUB_WORKFLOW_REF"],
+		WorkflowSha:      rc.Config.Env["GITHUB_WORKFLOW_SHA"],
 		RunID:            cmp.Or(rc.Config.Env["GITHUB_RUN_ID"], "1"),
 		RunNumber:        cmp.Or(rc.Config.Env["GITHUB_RUN_NUMBER"], "1"),
+		RunAttempt:       cmp.Or(rc.Config.Env["GITHUB_RUN_ATTEMPT"], "1"),
 		Actor:            cmp.Or(rc.Config.Actor, "nektos/act"), // for configs that require a default rather than being run as a cmd
 		EventName:        rc.Config.EventName,
 		Action:           rc.CurrentStep,

@@ -114,7 +114,7 @@ func TestStepActionRemote(t *testing.T) {
 
 			sarm.On("readAction", sar.Step, actionDir, "", mock.Anything, mock.Anything).Return(&model.Action{}, nil)
 			if tt.status != model.StepStatusSkipped {
-				sarm.On("runAction", sar, actionDir, mustNewRemoteAction(t, sar.Step.Uses)).Return(func(_ctx context.Context) error { return tt.runError })
+				sarm.On("runAction", sar).Return(func(_ctx context.Context) error { return tt.runError })
 
 				expectStepFileCommands(t, cm)
 			}
@@ -133,17 +133,15 @@ func TestStepActionRemote(t *testing.T) {
 
 	t.Run("refreshes composite inputs without leaking environment", func(t *testing.T) {
 		step := &stepActionRemote{
-			Step:         &model.Step{Uses: "org/composite@v1", With: map[string]string{"SHARED": "first"}},
+			Step:         &model.Step{Uses: "org/composite@v1"},
 			RunContext:   &RunContext{Config: &Config{ActionCacheDir: t.TempDir(), PresetGitHubContext: &model.GithubContext{}}, Run: &model.Run{JobID: "job", Workflow: &model.Workflow{Jobs: map[string]*model.Job{"job": {}}}}, JobContainer: &jobContainerMock{}},
-			action:       &model.Action{Inputs: map[string]model.Input{"shared": {}}},
-			env:          map[string]string{},
+			action:       &model.Action{},
+			env:          map[string]string{"INPUT_SHARED": "stale", "INPUT_UNDECLARED": "stale"},
 			remoteAction: mustNewRemoteAction(t, "org/composite@v1"),
 		}
 
 		for _, value := range []string{"first", "second"} {
-			step.env["INPUT_SHARED"] = value
-			composite, err := step.getCompositeRunContext(t.Context())
-			require.NoError(t, err)
+			composite := step.getCompositeRunContext(t.Context(), map[string]string{"SHARED": value})
 			assert.Equal(t, map[string]any{"shared": value}, composite.actionInputs)
 			assert.NotContains(t, composite.Env, "INPUT_SHARED")
 		}

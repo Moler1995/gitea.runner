@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -17,65 +18,18 @@ import (
 	"gitea.dev/actionslib/pkg/model"
 )
 
-func evaluateCompositeInputAndEnv(ctx context.Context, parent *RunContext, step actionStep) (map[string]string, error) {
-	env := make(map[string]string)
-	stepEnv := *step.getEnv()
-	for k, v := range stepEnv {
-		// do not set current inputs into composite action
-		// the required inputs are added in the second loop
-		if !strings.HasPrefix(k, "INPUT_") {
-			env[k] = v
-		}
+func (rc *RunContext) setCompositeActionEnv(stepEnv, inputs map[string]string) {
+	isInput := func(key, _value string) bool { return strings.HasPrefix(key, "INPUT_") }
+	env := maps.Clone(stepEnv)
+	maps.DeleteFunc(env, isInput)
+	for name, value := range inputs {
+		env[inputEnvKey(name)] = value
 	}
-
-	ee := parent.NewStepExpressionEvaluator(ctx, step)
-
-	for inputID, input := range step.getActionModel().Inputs {
-		envKey := inputEnvKey(inputID)
-
-		// lookup if key is defined in the step but the already
-		// evaluated value from the environment
-		defined := false
-		for key := range step.getStepModel().With {
-			if strings.EqualFold(key, inputID) {
-				defined = true
-				break
-			}
-		}
-		if value, ok := stepEnv[envKey]; defined && ok {
-			env[envKey] = value
-		} else {
-			// defaults could contain expressions
-			var err error
-			if env[envKey], err = ee.Interpolate(ctx, input.Default); err != nil {
-				return nil, fmt.Errorf("unable to interpolate the default of input %s: %w", inputID, err)
-			}
-		}
-	}
-	for envKey, value := range (&model.Step{With: step.getStepModel().With}).GetEnv() {
-		if _, ok := env[envKey]; !ok {
-			env[envKey] = value
-		}
-	}
-
-	return env, nil
-}
-
-func (rc *RunContext) setCompositeActionEnv(env map[string]string) {
 	rc.setActionEnv(env)
-	for key := range rc.Env {
-		if strings.HasPrefix(key, "INPUT_") {
-			delete(rc.Env, key)
-		}
-	}
+	maps.DeleteFunc(rc.Env, isInput)
 }
 
-func newCompositeRunContext(ctx context.Context, parent *RunContext, step actionStep, actionPath string) (*RunContext, error) {
-	env, err := evaluateCompositeInputAndEnv(ctx, parent, step)
-	if err != nil {
-		return nil, err
-	}
-
+func newCompositeRunContext(ctx context.Context, parent *RunContext, step actionStep, actionPath string, inputs map[string]string) *RunContext {
 	// run with the global config but without secrets
 	configCopy := *parent.Config
 	configCopy.Secrets = nil
@@ -109,10 +63,10 @@ func newCompositeRunContext(ctx context.Context, parent *RunContext, step action
 		jobTotal:      parent.jobTotal,
 		runtimeToken:  parent.runtimeToken,
 	}
-	compositerc.setCompositeActionEnv(env)
+	compositerc.setCompositeActionEnv(*step.getEnv(), inputs)
 	compositerc.ExprEval = compositerc.NewExpressionEvaluator(ctx)
 
-	return compositerc, nil
+	return compositerc
 }
 
 // appendUniqueMasks appends the masks from src to dst, skipping any mask that
@@ -128,56 +82,41 @@ func appendUniqueMasks(dst, src []string) []string {
 	return dst
 }
 
-func execAsComposite(step actionStep) common.Executor {
+func execAsComposite(ctx context.Context, step actionStep, inputs map[string]string) error {
+	compositeRC := step.getCompositeRunContext(ctx, inputs)
+	ctx = WithCompositeLogger(ctx, &compositeRC.Masks)
 	rc := step.getRunContext()
-	action := step.getActionModel()
+	err := step.getCompositeSteps().main(ctx)
 
-	return func(ctx context.Context) error {
-		compositeRC, err := step.getCompositeRunContext(ctx)
-		if err != nil {
-			return err
+	// Map outputs from composite RunContext to job RunContext
+	eval := compositeRC.NewExpressionEvaluator(ctx)
+	for outputName, output := range step.getActionModel().Outputs {
+		value, outputErr := eval.Interpolate(ctx, output.Value)
+		if outputErr != nil {
+			err = errors.Join(err, fmt.Errorf("unable to interpolate output %s: %w", outputName, outputErr))
+			continue
 		}
-
-		steps := step.getCompositeSteps()
-
-		if steps == nil || steps.main == nil {
-			return errors.New("missing steps in composite action")
-		}
-
-		ctx = WithCompositeLogger(ctx, &compositeRC.Masks)
-
-		err = steps.main(ctx)
-
-		// Map outputs from composite RunContext to job RunContext
-		eval := compositeRC.NewExpressionEvaluator(ctx)
-		for outputName, output := range action.Outputs {
-			value, outputErr := eval.Interpolate(ctx, output.Value)
-			if outputErr != nil {
-				err = errors.Join(err, fmt.Errorf("unable to interpolate output %s: %w", outputName, outputErr))
-				continue
-			}
-			rc.setOutput(ctx, map[string]string{"name": outputName}, value)
-		}
-
-		// compositeRC.Masks is seeded with rc.Masks (see newCompositeRunContext)
-		// and may have additional masks appended while the composite action runs.
-		// Only append masks that are not already present, otherwise nested or
-		// repeated composite actions grow rc.Masks exponentially.
-		rc.Masks = appendUniqueMasks(rc.Masks, compositeRC.Masks)
-		rc.ExtraPath = compositeRC.ExtraPath
-		// Propagate GlobalEnv only, so composite inputs and step-local values do not escape.
-		mergeIntoMap := mergeIntoMapCaseSensitive
-		if rc.JobContainer.IsEnvironmentCaseInsensitive() {
-			mergeIntoMap = mergeIntoMapCaseInsensitive
-		}
-		if rc.GlobalEnv == nil {
-			rc.GlobalEnv = map[string]string{}
-		}
-		mergeIntoMap(rc.GlobalEnv, compositeRC.GlobalEnv)
-		mergeIntoMap(rc.Env, compositeRC.GlobalEnv)
-
-		return err
+		rc.setOutput(ctx, map[string]string{"name": outputName}, value)
 	}
+
+	// compositeRC.Masks is seeded with rc.Masks (see newCompositeRunContext)
+	// and may have additional masks appended while the composite action runs.
+	// Only append masks that are not already present, otherwise nested or
+	// repeated composite actions grow rc.Masks exponentially.
+	rc.Masks = appendUniqueMasks(rc.Masks, compositeRC.Masks)
+	rc.ExtraPath = compositeRC.ExtraPath
+	// Propagate GlobalEnv only, so composite inputs and step-local values do not escape.
+	mergeIntoMap := mergeIntoMapCaseSensitive
+	if rc.JobContainer.IsEnvironmentCaseInsensitive() {
+		mergeIntoMap = mergeIntoMapCaseInsensitive
+	}
+	if rc.GlobalEnv == nil {
+		rc.GlobalEnv = map[string]string{}
+	}
+	mergeIntoMap(rc.GlobalEnv, compositeRC.GlobalEnv)
+	mergeIntoMap(rc.Env, compositeRC.GlobalEnv)
+
+	return err
 }
 
 type compositeSteps struct {

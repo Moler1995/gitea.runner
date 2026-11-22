@@ -33,8 +33,6 @@ func ImageExistsLocally(ctx context.Context, imageName, platform string) (bool, 
 	return false, errors.ErrUnsupported
 }
 
-// RemoveImage removes image from local store, the function is used to run different
-// container image architectures
 func RemoveImage(ctx context.Context, imageName string, force, pruneChildren bool) (bool, error) {
 	return false, errors.ErrUnsupported
 }

@@ -27,6 +27,7 @@ import (
 	"gitea.com/gitea/runner/internal/pkg/metrics"
 
 	"gitea.dev/actionslib/pkg/model"
+	"gitea.dev/actionslib/pkg/protocol"
 	runnerv1 "gitea.dev/actionslib/runner/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -72,7 +73,7 @@ func TestReporter_LogLevelFiltering(t *testing.T) {
 	assert.True(t, reporter.shouldAppendLogRow(logging.Record{Level: logging.LevelWarn}))
 	reporter.RunDaemon()
 	defer func() {
-		require.NoError(t, reporter.Close(""))
+		require.NoError(t, reporter.Close(nil))
 	}()
 	reporter.ResetSteps(newTestSteps(2))
 
@@ -172,18 +173,13 @@ func TestReporter_RunDaemonClose_Race(t *testing.T) {
 		},
 	)
 
-	ctx, cancel := context.WithCancel(t.Context())
 	cfg, _ := config.LoadDefault("")
-	reporter := NewReporter(ctx, cancel, client, &runnerv1.Task{
-		Context: &structpb.Struct{},
-	}, cfg)
+	reporter := newTestReporter(t, client, cfg)
 	reporter.ResetSteps(newTestSteps(1))
 
 	reporter.RunDaemon()
 
-	require.NoError(t, reporter.Close(""))
-
-	cancel()
+	require.NoError(t, reporter.Close(nil))
 }
 
 func TestReporter_LogFlush(t *testing.T) {
@@ -215,7 +211,7 @@ func TestReporter_LogFlush(t *testing.T) {
 				reporter := newTestReporter(t, client, cfg)
 				reporter.ResetSteps(newTestSteps(1))
 				reporter.RunDaemon()
-				defer func() { require.NoError(t, reporter.Close("")) }()
+				defer func() { require.NoError(t, reporter.Close(nil)) }()
 
 				for _, message := range tc.messages {
 					require.NoError(t, fire(reporter, logEntry{
@@ -340,7 +336,7 @@ func TestReporter_StateNotifyFlush(t *testing.T) {
 		reporter.ResetSteps(newTestSteps(1))
 		reporter.RunDaemon()
 		defer func() {
-			_ = reporter.Close("")
+			_ = reporter.Close(nil)
 		}()
 
 		require.NoError(t, fire(reporter, logEntry{
@@ -394,7 +390,7 @@ func TestReporter_CloseFinalizesLogWithoutRows(t *testing.T) {
 	reporter.state.StoppedAt = timestamppb.Now()
 	reporter.stateMu.Unlock()
 
-	require.NoError(t, reporter.Close(""))
+	require.NoError(t, reporter.Close(nil))
 
 	require.Equal(t, int64(1), noMoreCalls.Load(), "Close must send exactly one UpdateLog with NoMore=true")
 	final := lastReq.Load()
@@ -436,65 +432,36 @@ func TestReporter_StateHeartbeat(t *testing.T) {
 }
 
 func TestReporter_ServerCancelStillFlushesFinal(t *testing.T) {
-	var (
-		updateTaskCalls    atomic.Int64
-		finalLogNoMoreSeen atomic.Bool
-		finalTaskStateSeen atomic.Bool
-	)
-
+	const message = "Ended by the server: failure"
 	client := mocks.NewClient(t)
-	client.On("UpdateLog", mock.Anything, mock.Anything).Return(
-		func(_ context.Context, req *runnerv1.UpdateLogRequest) (*runnerv1.UpdateLogResponse, error) {
-			if req.NoMore {
-				finalLogNoMoreSeen.Store(true)
-			}
-			return &runnerv1.UpdateLogResponse{
-				AckIndex: req.Index + int64(len(req.Rows)),
-			}, nil
-		},
-	)
-	client.On("UpdateTask", mock.Anything, mock.Anything).Return(
-		func(_ context.Context, req *runnerv1.UpdateTaskRequest) (*runnerv1.UpdateTaskResponse, error) {
-			n := updateTaskCalls.Add(1)
-			if n == 1 {
-				return &runnerv1.UpdateTaskResponse{
-					State: &runnerv1.TaskState{
-						Result: runnerv1.Result_RESULT_CANCELLED,
-					},
-				}, nil
-			}
-			if req.State != nil && req.State.Result != runnerv1.Result_RESULT_UNSPECIFIED {
-				finalTaskStateSeen.Store(true)
-			}
-			return &runnerv1.UpdateTaskResponse{}, nil
-		},
-	)
+	var lastState *runnerv1.TaskState
+	client.On("UpdateTask", mock.Anything, mock.Anything).Return(func(ctx context.Context, req *runnerv1.UpdateTaskRequest) (*runnerv1.UpdateTaskResponse, error) {
+		require.NoError(t, ctx.Err())
+		lastState = req.State
+		return &runnerv1.UpdateTaskResponse{State: &runnerv1.TaskState{Result: runnerv1.Result_RESULT_FAILURE}}, nil
+	})
+	client.On("UpdateLog", mock.Anything, mock.Anything).Return(func(ctx context.Context, req *runnerv1.UpdateLogRequest) (*runnerv1.UpdateLogResponse, error) {
+		require.NoError(t, ctx.Err())
+		require.True(t, req.NoMore)
+		require.Len(t, req.Rows, 3)
+		assert.Equal(t, []string{"running", message, "stopped"}, []string{req.Rows[0].Content, req.Rows[1].Content, req.Rows[2].Content})
+		return &runnerv1.UpdateLogResponse{AckIndex: int64(len(req.Rows))}, nil
+	}).Once()
 
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	cfg, _ := config.LoadDefault("")
-	reporter := NewReporter(ctx, cancel, client, &runnerv1.Task{Context: &structpb.Struct{}}, cfg)
-	reporter.ResetSteps(newTestSteps(1))
-
-	reporter.stateMu.Lock()
-	reporter.stateChanged = true
-	reporter.stateMu.Unlock()
-
-	require.NoError(t, reporter.ReportState(false))
-	require.Equal(t, int64(1), updateTaskCalls.Load())
-
-	select {
-	case <-ctx.Done():
-	case <-time.After(time.Second):
-		t.Fatal("expected r.ctx to be cancelled after server returned RESULT_CANCELLED")
-	}
-
+	reporter := newTestReporter(t, client, &config.Config{Runner: config.Runner{LogReportLevel: "info"}})
 	close(reporter.daemon)
-
-	require.NoError(t, reporter.Close("cancelled"))
-
-	assert.True(t, finalLogNoMoreSeen.Load(), "Close() must send a final UpdateLog{NoMore:true} even after server-side cancellation")
-	assert.True(t, finalTaskStateSeen.Load(), "Close() must send a final UpdateTask with the populated final state even after server-side cancellation")
+	reporter.ResetSteps(newTestSteps(1))
+	step := map[string]any{"stage": runner.StageMain, "stepNumber": 0, "raw_output": true}
+	require.NoError(t, fire(reporter, logEntry{Message: "running", Data: step}))
+	require.NoError(t, reporter.ReportState(false))
+	require.EqualError(t, context.Cause(reporter.ctx), message)
+	require.NoError(t, fire(reporter, logEntry{Message: "stopped", Data: step}))
+	require.NoError(t, fire(reporter, logEntry{Level: logging.LevelDebug, Data: map[string]any{"jobResult": "cancelled"}}))
+	assert.Equal(t, runnerv1.Result_RESULT_FAILURE, reporter.Result())
+	require.NoError(t, reporter.ReportState(false))
+	require.NoError(t, reporter.Close(fmt.Errorf("run: %w", context.Cause(reporter.ctx))))
+	assert.Equal(t, runnerv1.Result_RESULT_FAILURE, lastState.Result)
+	assert.EqualValues(t, 3, lastState.Steps[0].LogLength)
 }
 
 func TestReporter_CloseReportsCancelledOnCanceledCtx(t *testing.T) {
@@ -522,16 +489,15 @@ func TestReporter_CloseReportsCancelledOnCanceledCtx(t *testing.T) {
 		},
 	)
 
-	ctx, cancel := context.WithCancel(t.Context())
 	cfg, _ := config.LoadDefault("")
-	reporter := NewReporter(ctx, cancel, client, &runnerv1.Task{Context: &structpb.Struct{}}, cfg)
+	reporter := newTestReporter(t, client, cfg)
 	reporter.ResetSteps(newTestSteps(1))
 
-	cancel()
+	reporter.cancel(nil)
 
 	close(reporter.daemon)
 
-	require.NoError(t, reporter.Close(""))
+	require.NoError(t, reporter.Close(nil))
 
 	got := finalState.Load()
 	require.NotNil(t, got, "Close() must send a final UpdateTask")
@@ -607,7 +573,7 @@ func TestReporter_StopHeartbeats(t *testing.T) {
 		assert.Equal(t, beforeStop, updateTaskCalls.Load(),
 			"UpdateTask must not be called after StopHeartbeats")
 
-		require.NoError(t, reporter.Close(""))
+		require.NoError(t, reporter.Close(nil))
 		assert.Greater(t, updateTaskCalls.Load(), beforeStop,
 			"Close() must still send a final UpdateTask after StopHeartbeats")
 	})
@@ -646,12 +612,12 @@ func TestReporter_SetOutputs(t *testing.T) {
 	r.SetOutputs(map[string]string{"foo": "baz"})
 	assert.Equal(t, "bar", r.outputs["foo"].value)
 
-	longKey := strings.Repeat("k", maxOutputKeyLen+1)
+	longKey := strings.Repeat("k", protocol.MaxOutputKeyLength+1)
 	r.SetOutputs(map[string]string{longKey: "v"})
 	_, ok = r.outputs[longKey]
 	assert.False(t, ok)
 
-	longValue := strings.Repeat("v", maxOutputValueLen+1)
+	longValue := strings.Repeat("v", protocol.MaxOutputValueLength+1)
 	r.SetOutputs(map[string]string{"big": longValue})
 	_, ok = r.outputs["big"]
 	assert.False(t, ok)
@@ -665,10 +631,10 @@ func TestReporter_SetOutputs(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, "caf\xff", got.value)
 
-	r.SetOutputs(map[string]string{"atlimit": longValue[:maxOutputValueLen]})
+	r.SetOutputs(map[string]string{"atlimit": longValue[:protocol.MaxOutputValueLength]})
 	got, ok = r.outputs["atlimit"]
 	require.True(t, ok)
-	assert.Len(t, got.value, maxOutputValueLen)
+	assert.Len(t, got.value, protocol.MaxOutputValueLength)
 }
 
 func TestReporter_DebugSettingsAreNotMasked(t *testing.T) {
@@ -733,8 +699,7 @@ func TestReporter_ParseResult(t *testing.T) {
 		wantOk bool
 	}{
 		{"job result string", "success", runnerv1.Result_RESULT_SUCCESS, true},
-		{"failure string", "failure", runnerv1.Result_RESULT_FAILURE, true},
-		{"step result stringer", runnerv1.Result_RESULT_SKIPPED, runnerv1.Result_RESULT_UNSPECIFIED, false},
+		{"step result stringer", model.StepStatusSkipped, runnerv1.Result_RESULT_SKIPPED, true},
 		{"unknown string", "bogus", runnerv1.Result_RESULT_UNSPECIFIED, false},
 		{"unsupported type", 123, runnerv1.Result_RESULT_UNSPECIFIED, false},
 	}
@@ -840,37 +805,8 @@ func TestReporter_CloseWithStuckDaemon(t *testing.T) {
 		case <-time.After(5 * time.Second):
 			t.Fatal("daemon never reached UpdateLog")
 		}
-		require.NoError(t, reporter.Close(""))
+		require.NoError(t, reporter.Close(nil))
 	})
-}
-
-func TestReporter_ServerFailureResultIsReportedAsFailure(t *testing.T) {
-	var lastState *runnerv1.TaskState
-	client := mocks.NewClient(t)
-	client.On("UpdateTask", mock.Anything, mock.Anything).Return(func(_ context.Context, req *runnerv1.UpdateTaskRequest) (*runnerv1.UpdateTaskResponse, error) {
-		lastState = req.State
-		return &runnerv1.UpdateTaskResponse{
-			State: &runnerv1.TaskState{Result: runnerv1.Result_RESULT_FAILURE},
-		}, nil
-	})
-	client.On("UpdateLog", mock.Anything, mock.Anything).Return(func(_ context.Context, req *runnerv1.UpdateLogRequest) (*runnerv1.UpdateLogResponse, error) {
-		return &runnerv1.UpdateLogResponse{
-			AckIndex: req.Index + int64(len(req.Rows)),
-		}, nil
-	}).Maybe()
-
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	cfg, _ := config.LoadDefault("")
-	reporter := NewReporter(ctx, cancel, client, &runnerv1.Task{Context: &structpb.Struct{}}, cfg)
-	close(reporter.daemon)
-
-	require.NoError(t, reporter.ReportState(false))
-	require.ErrorIs(t, ctx.Err(), context.Canceled)
-	require.NoError(t, reporter.Close(""))
-
-	require.NotNil(t, lastState)
-	assert.Equal(t, runnerv1.Result_RESULT_FAILURE, lastState.Result)
 }
 
 func TestReporter_NoteReport(t *testing.T) {
@@ -904,25 +840,19 @@ func TestReporter_CloseMasksLastWords(t *testing.T) {
 			}, nil
 		},
 	)
-	client.On("UpdateTask", mock.Anything, mock.Anything).Return(
-		func(_ context.Context, _ *runnerv1.UpdateTaskRequest) (*runnerv1.UpdateTaskResponse, error) {
-			return &runnerv1.UpdateTaskResponse{}, nil
-		},
-	)
+	client.On("UpdateTask", mock.Anything, mock.Anything).Return(&runnerv1.UpdateTaskResponse{}, nil)
 
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
 	const idToken = "id-token-request-secret"
 	taskCtx, err := structpb.NewStruct(map[string]any{"actions_id_token_request_token": idToken})
 	require.NoError(t, err)
 	cfg, _ := config.LoadDefault("")
-	reporter := NewReporter(ctx, cancel, client, &runnerv1.Task{
+	reporter := NewReporter(t.Context(), nil, client, &runnerv1.Task{
 		Context: taskCtx,
 		Secrets: map[string]string{"TOKEN": secret},
 	}, cfg)
 	close(reporter.daemon)
 
-	require.NoError(t, reporter.Close("could not get job matrix: "+secret+" "+idToken))
+	require.NoError(t, reporter.Close(fmt.Errorf("could not get job matrix: %s %s", secret, idToken)))
 
 	require.Len(t, rows, 1)
 	assert.Equal(t, "could not get job matrix: *** ***", rows[0].Content)
@@ -983,7 +913,7 @@ func TestReporter_StepRangeCoversAckedRows(t *testing.T) {
 	reporter.ResetSteps(newTestSteps(1))
 	reporter.RunDaemon()
 	defer func() {
-		_ = reporter.Close("")
+		_ = reporter.Close(nil)
 	}()
 
 	stepData := map[string]any{"stage": "Main", "stepNumber": 0, "raw_output": true}
@@ -1027,8 +957,8 @@ func TestReporter_FlushWithoutAckedRowsSkipsState(t *testing.T) {
 
 func newTestReporter(t *testing.T, client *mocks.Client, cfg *config.Config) *Reporter {
 	t.Helper()
-	ctx, cancel := context.WithCancel(t.Context())
-	t.Cleanup(cancel)
+	ctx, cancel := context.WithCancelCause(t.Context())
+	t.Cleanup(func() { cancel(nil) })
 	return NewReporter(ctx, cancel, client, &runnerv1.Task{Context: &structpb.Struct{}}, cfg)
 }
 
@@ -1041,14 +971,14 @@ func newTestSteps(n int) []*model.Step {
 }
 
 func TestReporter_ReportedSteps(t *testing.T) {
-	newReporter := func(t *testing.T, steps []*model.Step) (*Reporter, context.CancelFunc) {
+	newReporter := func(t *testing.T, steps []*model.Step) (*Reporter, context.CancelCauseFunc) {
 		client := mocks.NewClient(t)
 		client.On("UpdateLog", mock.Anything, mock.Anything).Maybe().Return(func(_ context.Context, req *runnerv1.UpdateLogRequest) (*runnerv1.UpdateLogResponse, error) {
 			return &runnerv1.UpdateLogResponse{AckIndex: req.Index + int64(len(req.Rows))}, nil
 		})
 		client.On("UpdateTask", mock.Anything, mock.Anything).Maybe().Return(&runnerv1.UpdateTaskResponse{}, nil)
 		cfg, _ := config.LoadDefault("")
-		ctx, cancel := context.WithCancel(t.Context())
+		ctx, cancel := context.WithCancelCause(t.Context())
 		reporter := NewReporter(ctx, cancel, client, &runnerv1.Task{Context: &structpb.Struct{}, Secrets: map[string]string{"TOKEN": "s3cr3t"}}, cfg)
 		reporter.RunDaemon()
 		reporter.Logf("runner version")
@@ -1123,7 +1053,7 @@ func TestReporter_ReportedSteps(t *testing.T) {
 		assert.Equal(t, want, reportedOf(t, reporter))
 
 		send(t, reporter, logging.LevelInfo, "Removing images", map[string]any{"stage": runner.StageComplete})
-		require.NoError(t, reporter.Close(""))
+		require.NoError(t, reporter.Close(nil))
 		want[5].result, want[5].logLen = success, 3
 		assert.Equal(t, want, reportedOf(t, reporter))
 
@@ -1156,8 +1086,8 @@ func TestReporter_ReportedSteps(t *testing.T) {
 		send(t, reporter, logging.LevelInfo, "main output", map[string]any{"stage": runner.StageMain, "stepNumber": 1, "raw_output": true})
 		send(t, reporter, logging.LevelInfo, "Run Post echo 0", started(runner.StagePost, 0))
 		send(t, reporter, logging.LevelInfo, "Failure - Post echo 0", result(runner.StagePost, 0, model.StepStatusFailure))
-		cancel()
-		require.NoError(t, reporter.Close(""))
+		cancel(nil)
+		require.NoError(t, reporter.Close(nil))
 
 		results := make(map[string]runnerv1.Result)
 		for _, v := range reportedOf(t, reporter) {
@@ -1184,7 +1114,7 @@ func TestReporter_ReportedSteps(t *testing.T) {
 		reporter, _ := newReporter(t, newTestSteps(1))
 		reporter.Logf("workflow prepared")
 		send(t, reporter, logging.LevelInfo, "Job failed", map[string]any{"jobResult": model.StepStatusFailure})
-		require.NoError(t, reporter.Close(""))
+		require.NoError(t, reporter.Close(nil))
 
 		assert.Equal(t, []reported{
 			{setup, 0, "Set up job", failure, 0, 3},
@@ -1199,7 +1129,7 @@ func TestReporter_ReportedSteps(t *testing.T) {
 		send(t, reporter, logging.LevelError, "##[error]unable to clone 'invalid-owner/invalid-action'", nil)
 		send(t, reporter, logging.LevelInfo, "Cleaning up container", map[string]any{"stage": runner.StageComplete})
 		send(t, reporter, logging.LevelInfo, "Job failed", map[string]any{"stage": runner.StageComplete, "jobResult": model.StepStatusFailure})
-		require.NoError(t, reporter.Close(""))
+		require.NoError(t, reporter.Close(nil))
 
 		got := reportedOf(t, reporter)
 		assert.Equal(t, []runnerv1.Result{failure, skipped, success}, []runnerv1.Result{got[0].result, got[1].result, got[2].result})
@@ -1209,7 +1139,7 @@ func TestReporter_ReportedSteps(t *testing.T) {
 		reporter, _ := newReporter(t, newTestSteps(1))
 		send(t, reporter, logging.LevelError, "##[error]job completed hook failed", map[string]any{"stage": runner.StageComplete})
 		send(t, reporter, logging.LevelInfo, "Job failed", map[string]any{"stage": runner.StageComplete, "jobResult": model.StepStatusFailure})
-		require.NoError(t, reporter.Close(""))
+		require.NoError(t, reporter.Close(nil))
 
 		step := reporter.state.ReportedSteps[len(reporter.state.ReportedSteps)-1]
 		assert.Equal(t, failure, step.Result)
@@ -1220,7 +1150,7 @@ func TestReporter_ReportedSteps(t *testing.T) {
 	t.Run("step not reached in a succeeding job", func(t *testing.T) {
 		reporter, _ := newReporter(t, newTestSteps(1))
 		send(t, reporter, logging.LevelInfo, "Job succeeded", map[string]any{"stage": runner.StageComplete, "jobResult": model.StepStatusSuccess})
-		require.NoError(t, reporter.Close(""))
+		require.NoError(t, reporter.Close(nil))
 		assert.Equal(t, skipped, reportedOf(t, reporter)[1].result)
 	})
 
@@ -1231,7 +1161,7 @@ func TestReporter_ReportedSteps(t *testing.T) {
 		reporter, _ := newReporter(t, steps)
 		send(t, reporter, logging.LevelDebug, "Run Main", map[string]any{"stage": runner.StageMain, "stepNumber": 0, "step": "echo linux\necho more"})
 		send(t, reporter, logging.LevelDebug, "Run Main", map[string]any{"stage": runner.StageMain, "stepNumber": 1, "step": "Deploy with s3cr3t"})
-		require.NoError(t, reporter.Close(""))
+		require.NoError(t, reporter.Close(nil))
 
 		names := []string{}
 		for _, v := range reportedOf(t, reporter) {
@@ -1244,7 +1174,7 @@ func TestReporter_ReportedSteps(t *testing.T) {
 		reporter, _ := newReporter(t, nil)
 		send(t, reporter, logging.LevelInfo, "Cleaning up container", map[string]any{"stage": runner.StageComplete})
 		send(t, reporter, logging.LevelInfo, "Job succeeded", map[string]any{"stage": runner.StageComplete, "jobResult": model.StepStatusSuccess})
-		require.NoError(t, reporter.Close(""))
+		require.NoError(t, reporter.Close(nil))
 		assert.Empty(t, reportedOf(t, reporter))
 	})
 }

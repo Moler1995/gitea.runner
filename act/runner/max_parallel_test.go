@@ -10,31 +10,11 @@ import (
 	"gitea.dev/actionslib/pkg/model"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.yaml.in/yaml/v4"
 )
 
 func TestMaxParallelStrategy(t *testing.T) {
-	for _, tt := range []struct {
-		name                string
-		maxParallelString   string
-		expectedMaxParallel int
-	}{
-		{"max-parallel-1", "1", 1},
-		{"max-parallel-2", "2", 2},
-		{"max-parallel-default", "", 4},
-		{"max-parallel-10-clamped-to-combinations", "10", 5},
-		{"max-parallel-invalid-falls-back-to-default", "tow", 4},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			var rawMatrix yaml.Node
-			require.NoError(t, rawMatrix.Encode(map[string][]any{"version": {1, 2, 3, 4, 5}}))
-			job := &model.Job{Strategy: &model.Strategy{MaxParallelString: tt.maxParallelString, RawMatrix: rawMatrix}}
-
-			matrixes, err := job.GetMatrixes()
-			require.NoError(t, err)
-			require.Len(t, matrixes, 5)
-			assert.Equal(t, tt.expectedMaxParallel, maxParallelFor(job.Strategy, len(matrixes)))
-		})
+	for limit, want := range map[string]int{"1": 1, "": 4, "10": 5, "tow": 4} {
+		assert.Equal(t, want, maxParallelFor(&model.Strategy{MaxParallelString: limit}, 5), limit)
 	}
 
 	t.Run("deferred strategy", func(t *testing.T) {
@@ -59,29 +39,20 @@ jobs:
 }
 
 func TestNewPlanExecutorInvalidMatrix(t *testing.T) {
-	var rawMatrix yaml.Node
-	require.NoError(t, rawMatrix.Encode(map[string]any{
-		"config": map[string]any{"nested": "value"},
-	}))
-
-	plan := &model.Plan{Stages: []*model.Stage{{Runs: []*model.Run{{
-		Workflow: &model.Workflow{Jobs: map[string]*model.Job{
-			"test": {Strategy: &model.Strategy{RawMatrix: rawMatrix}},
-		}},
-		JobID: "test",
-	}}}}}
 	runner := &runnerImpl{config: &Config{Env: testCheckoutEnv()}}
-
-	require.ErrorContains(t, runner.NewPlanExecutor(plan)(t.Context()), "could not get job matrix:")
-
-	for _, strategy := range []string{
-		`${{ fromJSON('invalid') }}`,
-		`${{ '${{ inputs.unresolved }}' }}`,
+	for strategy, want := range map[string]string{
+		`{matrix: {config: {nested: value}}}`:               "could not get job matrix:",
+		`${{ fromJSON('invalid') }}`:                        "job strategy",
+		`${{ '${{ inputs.unresolved }}' }}`:                 "job strategy",
+		`{matrix: {x: [a, "${{ fromJSON('not json') }}"]}}`: "Error when evaluating 'strategy' for job 'job1'.",
 	} {
 		t.Run(strategy, func(t *testing.T) {
-			workflow, err := model.ReadWorkflow(strings.NewReader("jobs:\n  test:\n    strategy: " + strategy))
+			workflow, err := model.ReadWorkflow(strings.NewReader("jobs:\n  job1:\n    strategy: " + strategy))
 			require.NoError(t, err)
-			require.Error(t, runner.NewPlanExecutor(&model.Plan{Stages: []*model.Stage{{Runs: []*model.Run{{Workflow: workflow, JobID: "test"}}}}})(t.Context()))
+			plan, err := model.CombineWorkflowPlanner(workflow).PlanAll()
+			require.NoError(t, err)
+			require.ErrorContains(t, runner.NewPlanExecutor(plan)(t.Context()), want)
+			assert.Equal(t, "failure", workflow.Jobs["job1"].Result)
 		})
 	}
 }

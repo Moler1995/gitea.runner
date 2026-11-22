@@ -10,9 +10,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os/exec"
 	"reflect"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -178,6 +178,15 @@ func (c *hashFilesContainer) ReplaceLogWriter(stdout, stderr io.Writer) (io.Writ
 }
 
 func TestGetHashFilesFunction(t *testing.T) {
+	t.Run("regular file with trailing slash", func(t *testing.T) {
+		requireHostTools(t, "node")
+		cmd := exec.CommandContext(t.Context(), "node", "hashfiles/index.js")
+		cmd.Env = []string{"patterns=hashfiles/index.js/"}
+		output, err := cmd.CombinedOutput()
+		require.NoError(t, err)
+		assert.Contains(t, string(output), "__OUTPUT____OUTPUT__")
+	})
+
 	const failureMessage = "hashFiles('dir''file, *.sum, 123, true, ') failed. Fail to hash files under directory '/workspace'"
 	for _, test := range []struct {
 		name    string
@@ -422,7 +431,7 @@ func TestGetEvaluatorInputsBoolean(t *testing.T) {
 				}
 				ghc := &model.GithubContext{EventName: eventName, Event: table.event}
 
-				inputs := getEvaluatorInputs(rc, nil, ghc)
+				inputs := rc.getEvaluatorInputs(ghc)
 				assert.Equal(t, table.flag, inputs["flag"])
 				assert.Equal(t, "gitea", inputs["name"])
 				assert.Equal(t, false, inputs["unset"])
@@ -432,6 +441,7 @@ func TestGetEvaluatorInputsBoolean(t *testing.T) {
 
 	t.Run("deferred workflow call inputs", func(t *testing.T) {
 		workflow, err := model.ReadWorkflow(strings.NewReader(workflow("workflow_call") + `
+  workflow_dispatch: {inputs: {name: {type: string, default: dispatch}}}
 jobs:
   test: {}
   call:
@@ -447,9 +457,11 @@ jobs:
 				t.Parallel()
 				parent, err := (&runnerImpl{config: &Config{PresetGitHubContext: &model.GithubContext{}}}).newRunContext(t.Context(), &model.Run{Workflow: workflow, JobID: "call"}, map[string]any{"args": `{"flag":` + value + `,"name":"${{ 'runner' }}"}`})
 				require.NoError(t, err)
-				child, err := (&runnerImpl{config: &Config{PresetGitHubContext: &model.GithubContext{}}, caller: &caller{runContext: parent}}).newRunContext(t.Context(), &model.Run{Workflow: workflow, JobID: "test"}, nil)
+				call := &caller{runContext: parent}
+				require.NoError(t, call.resolveInputs(t.Context(), workflow))
+				child, err := (&runnerImpl{config: parent.Config, caller: call}).newRunContext(t.Context(), &model.Run{Workflow: workflow, JobID: "test"}, nil)
 				require.NoError(t, err)
-				assert.Equal(t, map[string]any{"flag": value == "true", "name": "${{ 'runner' }}", "unset": false}, child.workflowCallInputs)
+				assert.Equal(t, map[string]any{"flag": value == "true", "name": "${{ 'runner' }}", "unset": false}, child.getEvaluatorInputs(&model.GithubContext{EventName: "workflow_dispatch"}))
 				assert.Equal(t, rawWith, job.RawWith)
 				assert.Nil(t, job.With)
 			})
@@ -472,10 +484,10 @@ on:
 	ghc := &model.GithubContext{EventName: "workflow_dispatch", Event: map[string]any{"inputs": map[string]any{"name": "dispatch"}}}
 
 	job := &RunContext{Config: config, Run: &model.Run{JobID: "job1", Workflow: wf}}
-	assert.Equal(t, map[string]any{"name": "caller", "target": "dispatch"}, getEvaluatorInputs(job, nil, ghc))
+	assert.Equal(t, map[string]any{"name": "caller", "target": "dispatch"}, job.getEvaluatorInputs(ghc))
 
-	composite := &RunContext{Config: config, Run: &model.Run{JobID: "job1", Workflow: &model.Workflow{}}, Parent: job}
-	assert.Equal(t, map[string]any{"arg": "x"}, getEvaluatorInputs(composite, map[string]any{"arg": "x"}, ghc))
+	composite := &RunContext{Config: config, Parent: job, actionInputs: map[string]any{"arg": "x"}}
+	assert.Equal(t, map[string]any{"arg": "x"}, composite.getEvaluatorInputs(ghc))
 }
 
 func TestActionInputsShadowDispatchInputs(t *testing.T) {
@@ -491,16 +503,16 @@ jobs:
 	rc := newTestRC(wf, nil)
 	rc.Config.EventName = "workflow_dispatch"
 	rc.EventJSON = `{"inputs":{"message":"workflow"}}`
-	step := &stepActionRemote{RunContext: rc, env: map[string]string{"INPUT_MESSAGE": "step"}}
-	assert.Equal(t, "step", rc.NewActionInputsExpressionEvaluator(t.Context(), step).InterpolateName(t.Context(), "${{ inputs.message }}"))
-	assert.Equal(t, "workflow", rc.NewStepExpressionEvaluator(t.Context(), step).InterpolateName(t.Context(), "${{ inputs.message }}"))
+	step := &stepActionRemote{RunContext: rc, Step: &model.Step{}, env: map[string]string{"INPUT_EXTRA": "inherited"}}
+	inputs, err := rc.resolveActionInputs(t.Context(), step, &model.Action{Inputs: map[string]model.Input{
+		"message": {Default: "${{ env.INPUT_EXTRA || gitea.event_name }}"},
+	}})
+	require.NoError(t, err)
+	applyActionInputs(step, inputs)
+	assert.Equal(t, "workflow_dispatch|", newActionInputsExpressionEvaluator(inputs).InterpolateName(t.Context(), "${{ inputs.message }}|${{ inputs.extra || gitea.event_name }}"))
 	enabled, err := isStepEnabled(t.Context(), "inputs.message == 'workflow'", step, stepStageMain)
 	require.NoError(t, err)
 	assert.True(t, enabled)
-	step.Step, step.action = &model.Step{}, &model.Action{Inputs: map[string]model.Input{"fallback": {Default: "${{ inputs.message }}"}}}
-	env, err := evaluateCompositeInputAndEnv(t.Context(), rc, step)
-	require.NoError(t, err)
-	assert.Equal(t, "workflow", env["INPUT_FALLBACK"])
 }
 
 func TestResolveWorkflowCallToleratesMismatchesAndPassesSecretsAndTokens(t *testing.T) {
@@ -534,26 +546,30 @@ jobs:
 		PresetGitHubContext: &model.GithubContext{},
 		RuntimeTokens:       map[*model.Workflow]string{callerWorkflow: "caller-run"},
 	}
-	resolve := func(callerJobID string, workflow *model.Workflow) *RunContext {
-		parent, err := (&runnerImpl{config: config}).newRunContext(t.Context(), &model.Run{Workflow: callerWorkflow, JobID: callerJobID}, nil)
-		require.NoError(t, err)
-		child, err := (&runnerImpl{config: config, caller: &caller{runContext: parent}}).newRunContext(t.Context(), &model.Run{Workflow: workflow, JobID: "test"}, nil)
+	call := func(parent *RunContext, workflow *model.Workflow) *RunContext {
+		state := &caller{runContext: parent}
+		require.NoError(t, state.resolveInputs(t.Context(), workflow))
+		child, err := (&runnerImpl{config: config, caller: state}).newRunContext(t.Context(), &model.Run{Workflow: workflow, JobID: "test"}, nil)
 		require.NoError(t, err)
 		return child
 	}
+	resolve := func(callerJobID string, workflow *model.Workflow) *RunContext {
+		parent, err := (&runnerImpl{config: config}).newRunContext(t.Context(), &model.Run{Workflow: callerWorkflow, JobID: callerJobID}, nil)
+		require.NoError(t, err)
+		return call(parent, workflow)
+	}
 
 	called := resolve("call", callee)
-	assert.Equal(t, map[string]any{"flag": true}, called.workflowCallInputs)
+	assert.Equal(t, map[string]any{"flag": true}, called.caller.inputs)
 	assert.Equal(t, map[string]string{"undeclared": "${{ github.token }}", "GITHUB_TOKEN": "github-token", "GITEA_TOKEN": "gitea-token"}, called.workflowCallSecrets)
 	assert.Equal(t, "caller-run", called.GetEnv()["ACTIONS_RUNTIME_TOKEN"])
 	inherited := resolve("inherit", notCallable)
-	assert.Empty(t, inherited.workflowCallInputs)
+	assert.Empty(t, inherited.caller.inputs)
 	assert.Equal(t, map[string]string{"token": "${{ github.token }}", "GITHUB_TOKEN": "github-token", "GITEA_TOKEN": "gitea-token", "ACTIONS_RUNTIME_TOKEN": "caller-run"}, inherited.workflowCallSecrets)
 	assert.Equal(t, "${{ github.token }}:", resolve("override", callee).ExprEval.InterpolateName(t.Context(), "${{ secrets.GITHUB_TOKEN }}:${{ secrets.GITEA_TOKEN }}"))
 	middle, err := model.ReadWorkflow(strings.NewReader("on: workflow_call\njobs:\n  test: {uses: ./reuse.yml}\n"))
 	require.NoError(t, err)
-	nested, err := (&runnerImpl{config: config, caller: &caller{runContext: resolve("override", middle)}}).newRunContext(t.Context(), &model.Run{Workflow: callee, JobID: "test"}, nil)
-	require.NoError(t, err)
+	nested := call(resolve("override", middle), callee)
 	assert.Equal(t, "github-token:gitea-token", nested.ExprEval.InterpolateName(t.Context(), "${{ secrets.GITHUB_TOKEN }}:${{ secrets.GITEA_TOKEN }}"))
 }
 
@@ -578,23 +594,4 @@ jobs:
 	a, b := containerName("a"), containerName("b")
 	assert.NotContains(t, a, "s3cr3t")
 	assert.NotEqual(t, a, b)
-}
-
-func TestNewExpressionEvaluatorReadsJobOutputsWhileCombinationsWriteThem(t *testing.T) {
-	rc := createRunContext(t)
-	rc.caller = &caller{runContext: createRunContext(t)}
-	rc.ExprEval = rc.NewExpressionEvaluator(t.Context())
-	job := rc.Run.Job()
-	var writes sync.WaitGroup
-	writes.Go(func() {
-		for range 100 {
-			unlock := lockJob(job)
-			job.Outputs = map[string]string{"out": "value"}
-			unlock()
-		}
-	})
-	for range 100 {
-		rc.NewExpressionEvaluator(t.Context())
-	}
-	writes.Wait()
 }

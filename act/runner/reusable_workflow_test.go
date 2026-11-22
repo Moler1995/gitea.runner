@@ -8,118 +8,95 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
-	"time"
+	"testing/synctest"
 
+	"gitea.com/gitea/runner/act/common"
 	"gitea.com/gitea/runner/act/common/git"
+	"gitea.com/gitea/runner/act/common/logging"
+	"gitea.com/gitea/runner/act/common/logging/logtest"
 
 	"gitea.dev/actionslib/pkg/model"
 	"github.com/stretchr/testify/require"
 )
 
-// Regression test for go-gitea/gitea#37483: a remote reusable workflow at a moving
-// ref (branch/tag) must reflect the new tip on every invocation, not stay pinned
-// to the cache populated on the first run.
-func TestReusableWorkflowCachedBranchRefRefreshes(t *testing.T) {
-	t.Parallel()
-	if _, err := exec.LookPath("git"); err != nil {
-		t.Skip("git not available in PATH")
-	}
-
+func TestReusableWorkflowCacheRefreshesBranchRefAndIsolatesSameRepoCalls(t *testing.T) {
+	requireHostTools(t, "git")
 	remoteDir := t.TempDir()
+	const instance = "https://workflows.example"
+	const cloneURL = instance + "/org/repo"
+	t.Setenv("GIT_CONFIG_GLOBAL", filepath.Join(t.TempDir(), "gitconfig"))
+	gitMust(t, "", "config", "--global", "url."+remoteDir+".insteadOf", cloneURL)
+	gitMust(t, "", "config", "--global", "core.longpaths", "true")
 	gitMust(t, "", "init", "--template=", "--initial-branch=master", remoteDir)
 
 	const workflowPath = ".gitea/workflows/reusable.yml"
-	tmpl := func(tag string) string {
-		return "name: reusable\non:\n  workflow_call:\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo " + tag + "\n"
-	}
-
 	require.NoError(t, os.MkdirAll(filepath.Join(remoteDir, ".gitea/workflows"), 0o755))
-	require.NoError(t, os.WriteFile(filepath.Join(remoteDir, workflowPath), []byte(tmpl("v1")), 0o644))
-	gitMust(t, remoteDir, "add", workflowPath)
-	gitMust(t, remoteDir, "commit", "-m", "v1")
-
-	rc := &RunContext{
-		Config: &Config{Env: testCheckoutEnv()},
-		Run: &model.Run{
-			JobID: "j1",
-			Workflow: &model.Workflow{
-				Name: "wf",
-				Jobs: map[string]*model.Job{"j1": {}},
-			},
-		},
+	rc := workflowCaller(t, &Config{ActionCacheDir: t.TempDir(), PresetGitHubContext: &model.GithubContext{Repository: "root/project"}}, "./"+workflowPath)
+	commit := func(version string) *caller {
+		t.Helper()
+		require.NoError(t, os.WriteFile(filepath.Join(remoteDir, workflowPath), []byte(`on:
+  workflow_call:
+    outputs: {version: {value: "`+version+`@${{ github.repository }}"}}
+jobs:
+  skip: {if: false, uses: ./unused.yml}
+`), 0o644))
+		gitMust(t, remoteDir, "add", workflowPath)
+		gitMust(t, remoteDir, "commit", "-m", version)
+		call := &caller{runContext: rc}
+		_, err := call.loadReusableWorkflow(t.Context(), instance, "org/repo/"+workflowPath+"@master")
+		require.NoError(t, err)
+		return call
 	}
-	cacheDir := t.TempDir()
 
-	require.NoError(t, cloneRemoteReusableWorkflow(rc, remoteDir, "master", cacheDir)(t.Context()))
-	got, err := os.ReadFile(filepath.Join(cacheDir, workflowPath))
+	first := commit("v1")
+	commit("v2")
+	cacheDir := filepath.Join(rc.ActionCacheDir(), "workflows", model.UsesHash(cloneURL+"@master"))
+	got, err := os.ReadFile(filepath.Join(cacheDir, "git", workflowPath))
 	require.NoError(t, err)
-	require.Equal(t, tmpl("v1"), string(got))
-
-	// Branch tip moves; cache key (cacheDir) does not.
-	require.NoError(t, os.WriteFile(filepath.Join(remoteDir, workflowPath), []byte(tmpl("v2")), 0o644))
-	gitMust(t, remoteDir, "commit", "-am", "v2")
-
-	require.NoError(t, cloneRemoteReusableWorkflow(rc, remoteDir, "master", cacheDir)(t.Context()))
-	got, err = os.ReadFile(filepath.Join(cacheDir, workflowPath))
+	require.Contains(t, string(got), "v2@")
+	sameRepo := workflowCaller(t, &Config{ActionCacheDir: rc.ActionCacheDir(), PresetGitHubContext: &model.GithubContext{Repository: "org/repo", Sha: "master"}}, "./"+workflowPath)
+	sameRepoCall := &caller{runContext: sameRepo}
+	_, err = sameRepoCall.loadReusableWorkflow(t.Context(), instance, "./"+workflowPath)
 	require.NoError(t, err)
-	require.Equal(t, tmpl("v2"), string(got), "cached workflow file must reflect the updated branch tip")
-}
+	require.NotEqual(t, cacheDir, filepath.Dir(sameRepoCall.checkout.Dir))
 
-func TestNewReusableWorkflowExecutorHoldsCloneLock(t *testing.T) {
-	workflowDir := t.TempDir()
-	require.NoError(t, os.WriteFile(filepath.Join(workflowDir, "reusable.yml"), []byte("["), 0o644))
+	require.NoError(t, os.RemoveAll(remoteDir))
+	require.NoError(t, first.resolveInputs(t.Context(), rc.Run.Workflow))
+	call := (&runnerImpl{config: rc.Config, caller: first}).NewPlanExecutor(&model.Plan{Stages: []*model.Stage{{Runs: []*model.Run{rc.Run}}}})
+	require.NoError(t, call(t.Context()))
+	require.Equal(t, "v1@root/project", rc.Run.Job().Outputs["version"])
 
-	unlock, err := git.AcquireCloneLock(t.Context(), workflowDir)
-	require.NoError(t, err)
-	unlockOnce := sync.OnceFunc(unlock)
-	defer unlockOnce()
-
-	rc := &RunContext{
-		Config: &Config{},
-		Run:    &model.Run{Workflow: &model.Workflow{Jobs: map[string]*model.Job{}}},
-	}
-	exec := newReusableWorkflowExecutor(rc, workflowDir, "reusable.yml", true)
-
-	done := make(chan error, 1)
-	go func() { done <- exec(context.Background()) }()
-
-	select {
-	case err := <-done:
-		t.Fatalf("executor returned while clone lock was held: %v", err)
-	case <-time.After(50 * time.Millisecond):
-	}
-
-	unlockOnce()
-
-	select {
-	case err := <-done:
-		require.Error(t, err)
-	case <-time.After(time.Second):
-		t.Fatal("executor did not return after lock was released")
-	}
+	synctest.Test(t, func(t *testing.T) {
+		unlock, err := git.AcquireCloneLock(t.Context(), cacheDir)
+		require.NoError(t, err)
+		defer unlock()
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan error, 1)
+		go func() { done <- call(ctx) }()
+		synctest.Wait()
+		cancel()
+		require.ErrorIs(t, <-done, context.Canceled)
+		require.Equal(t, "cancelled", rc.Run.Job().Result)
+	})
 }
 
 func TestNewLocalReusableWorkflowExecutorFindsSameRepositoryPaths(t *testing.T) {
-	workdir := filepath.Join(t.TempDir(), "workspace")
-	require.NoError(t, os.MkdirAll(filepath.Join(workdir, ".gitea", "workflows"), 0o755))
-	require.NoError(t, os.Mkdir(workdir+".lock", 0o755))
-	require.NoError(t, os.WriteFile(filepath.Join(workdir, ".gitea", "workflows", "reusable.yml"), []byte("["), 0o644))
+	workdir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(workdir, ".gitea/workflows"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(workdir, ".gitea/workflows/reusable.yml"), []byte("on: workflow_call\njobs:\n  skip: {if: false, uses: ./unused.yml}\n"), 0o644))
 
 	for _, uses := range []string{"./.gitea/workflows/reusable.yml", "$/.gitea/workflows/reusable.yml"} {
-		rc := &RunContext{
-			Config: &Config{Workdir: workdir, NoSkipCheckout: true},
-			Run:    &model.Run{JobID: "job", Workflow: &model.Workflow{Jobs: map[string]*model.Job{"job": {Uses: uses}}}},
-		}
-		err := newLocalReusableWorkflowExecutor(rc)(t.Context())
-		require.ErrorContains(t, err, "workflow is not valid")
+		rc := workflowCaller(t, &Config{Workdir: workdir, Env: testCheckoutEnv()}, uses)
+		require.NoError(t, rc.runReusableWorkflow(t.Context()))
+		require.Equal(t, "success", rc.Run.Job().Result)
 	}
 }
 
@@ -141,19 +118,17 @@ func TestCloneRemoteReusableWorkflowSendsInstanceTokenAndClientCertTrustingCA(t 
 	certFile, keyFile := filepath.Join(dir, "client.crt"), filepath.Join(dir, "client.key")
 	require.NoError(t, os.WriteFile(certFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: pair.Certificate[0]}), 0o600))
 	require.NoError(t, os.WriteFile(keyFile, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}), 0o600))
-	rc := &RunContext{
-		Config: &Config{
-			Env:            testCheckoutEnv(),
-			GitHubInstance: server.URL,
-			Secrets:        map[string]string{"GITEA_TOKEN": "token"},
-			ClientCertFile: certFile,
-			ClientKeyFile:  keyFile,
-			CAFile:         certFile,
-		},
-		Run: &model.Run{JobID: "j1", Workflow: &model.Workflow{Jobs: map[string]*model.Job{"j1": {}}}},
-	}
+	rc := workflowCaller(t, &Config{
+		ActionCacheDir: t.TempDir(),
+		Env:            testCheckoutEnv(),
+		GitHubInstance: server.URL,
+		Secrets:        map[string]string{"GITEA_TOKEN": "token"},
+		ClientCertFile: certFile,
+		ClientKeyFile:  keyFile,
+		CAFile:         certFile,
+	}, server.URL+"/owner/repo/.gitea/workflows/test.yml@main")
 
-	err = cloneRemoteReusableWorkflow(rc, server.URL+"/owner/repo", "main", t.TempDir())(t.Context())
+	err = rc.runReusableWorkflow(t.Context())
 	require.Error(t, err)
 	require.True(t, gotCert, "clone failed before receiving a client certificate: %v", err)
 	require.Equal(t, "token", gotToken)
@@ -176,6 +151,8 @@ func TestInstanceAuthAndTransportOnlyApplyToTheInstance(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			conf := Config{
 				GitHubInstance:                    tt.instanceURL,
+				ActionCloneDepth:                  3,
+				ActionOfflineMode:                 true,
 				DefaultActionInstance:             tt.trustedActionInstance,
 				DefaultActionInstanceIsSelfHosted: tt.trustedActionInstance != "",
 				InsecureSkipTLS:                   true,
@@ -184,7 +161,7 @@ func TestInstanceAuthAndTransportOnlyApplyToTheInstance(t *testing.T) {
 				CAFile:                            "/ca",
 				InstanceTransport:                 &http.Transport{},
 			}
-			want := git.NewGitCloneExecutorInput{URL: tt.cloneURL, InsecureSkipTLS: tt.insecure}
+			want := git.NewGitCloneExecutorInput{URL: tt.cloneURL, Depth: 3, OfflineMode: true, InsecureSkipTLS: tt.insecure}
 			if tt.insecure {
 				want.CAFile, want.Transport = conf.CAFile, conf.InstanceTransport
 			}
@@ -215,16 +192,69 @@ func gitMust(t *testing.T, dir string, args ...string) {
 	require.NoError(t, err, "git %v: %s", args, string(out))
 }
 
-func TestSetReusedWorkflowCallerResultFailsOnBadOutputs(t *testing.T) {
-	callerWorkflow, err := model.ReadWorkflow(strings.NewReader("jobs:\n  call: {uses: ./reuse.yml}\n"))
+func workflowCaller(t *testing.T, config *Config, uses string) *RunContext {
+	t.Helper()
+	rc, err := (&runnerImpl{config: config}).newRunContext(t.Context(), &model.Run{
+		JobID: "call", Workflow: &model.Workflow{Jobs: map[string]*model.Job{"call": {Uses: uses}}},
+	}, nil)
 	require.NoError(t, err)
-	called, err := model.ReadWorkflow(strings.NewReader("on:\n  workflow_call:\n    outputs:\n      bad: {value: \"${{ fromJSON('not-json') }}\"}\njobs:\n  inner: {uses: ./leaf.yml}\n"))
+	return rc
+}
+
+func TestReusableWorkflowBadOutputFailsCallerAndKeepsLastNonemptyMatrixOutput(t *testing.T) {
+	workdir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(workdir, "callee.yml"), []byte(`on:
+  workflow_call:
+    inputs: {value: {type: string}}
+    outputs: {result: {value: "${{ fromJSON(inputs.value) }}"}}
+jobs:
+  skipped: {if: false, uses: ./unused.yml}
+`), 0o644))
+	root, err := model.ReadWorkflow(strings.NewReader(`on: push
+jobs:
+  call:
+    strategy: {max-parallel: 1, matrix: {value: [bad, '"one"', '"two"', '""']}}
+    uses: ./callee.yml
+    with: {value: "${{ matrix.value }}"}
+`))
 	require.NoError(t, err)
-	config := &Config{PresetGitHubContext: &model.GithubContext{}}
-	parent, err := (&runnerImpl{config: config}).newRunContext(t.Context(), &model.Run{Workflow: callerWorkflow, JobID: "call"}, nil)
+	plan, err := model.CombineWorkflowPlanner(root).PlanEvent("push")
 	require.NoError(t, err)
-	rc, err := (&runnerImpl{config: config, caller: &caller{runContext: parent, reusedWorkflowJobResults: map[string]string{}}}).newRunContext(t.Context(), &model.Run{Workflow: called, JobID: "inner"}, nil)
+	runner, err := New(&Config{Workdir: workdir, Env: testCheckoutEnv()})
 	require.NoError(t, err)
-	require.NoError(t, setReusedWorkflowCallerResult(rc, &runnerImpl{caller: &caller{reusedWorkflowJobResults: map[string]string{"leaf": "success"}}})(t.Context()))
+	require.ErrorContains(t, runner.NewPlanExecutor(plan)(t.Context()), "job 'call' failed")
+	require.Equal(t, "two", root.Jobs["call"].Outputs["result"])
+}
+
+func TestReusableWorkflowKeepsCompletedOutputsOnChildErrorWithoutLoggingThem(t *testing.T) {
+	workdir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(workdir, "callee.yml"), []byte(`on:
+  workflow_call:
+    outputs:
+      result: {value: "${{ jobs.first.outputs.value }}"}
+      unrun: {value: "${{ jobs.third.outputs.value }}"}
+jobs:
+  placeholder: {result: cancelled}
+  first: {runs-on: ubuntu-latest, outputs: {value: from-first}, steps: [{run: echo first}]}
+  second: {needs: first, runs-on: ubuntu-latest, container: {image: node, ports: [invalid]}, steps: [{run: echo second}]}
+  third: {needs: second, runs-on: ubuntu-latest, outputs: {value: from-third}, steps: [{run: echo third}]}
+`), 0o644))
+	rc := workflowCaller(t, &Config{Workdir: workdir, Env: testCheckoutEnv(), PlatformPicker: mapPlatformPicker(platforms)}, "./callee.yml")
+	hook := logtest.NewWithLevel(logging.LevelDebug)
+	ctx := common.WithLogger(common.WithDryrun(t.Context(), true), logging.New(hook))
+	require.ErrorContains(t, rc.runReusableWorkflow(ctx), "failed to parse container ports")
 	require.Equal(t, "failure", rc.Run.Job().Result)
+	require.Equal(t, map[string]string{"result": "from-first"}, rc.Run.Job().Outputs)
+	for _, record := range hook.AllRecords() {
+		require.NotContains(t, record.Message, "from-first")
+	}
+}
+
+func TestReusableWorkflowNestingLimit(t *testing.T) {
+	workdir := t.TempDir()
+	for level := 2; level <= model.MaxWorkflowCallDepth; level++ {
+		require.NoError(t, os.WriteFile(filepath.Join(workdir, fmt.Sprintf("%d.yml", level)), []byte(fmt.Sprintf("on: workflow_call\njobs:\n  next: {uses: ./%d.yml}\n", level+1)), 0o644))
+	}
+	rc := workflowCaller(t, &Config{Workdir: workdir, Env: testCheckoutEnv()}, "./2.yml")
+	require.ErrorContains(t, rc.runReusableWorkflow(t.Context()), fmt.Sprintf(`"%d.yml" exceeds the limit of %d`, model.MaxWorkflowCallDepth+1, model.MaxWorkflowCallDepth))
 }

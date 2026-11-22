@@ -79,6 +79,8 @@ func TestFetchAction(t *testing.T) {
 		case archives == "redirect" && request.Host != mirror.Listener.Addr().String():
 			http.Redirect(writer, request, mirror.URL+request.URL.Path, http.StatusFound)
 			return
+		case archives == "wrong commit":
+			ref = "main.tar.gz"
 		}
 		sha, ok := revisions[ref]
 		if !ok {
@@ -192,7 +194,7 @@ func TestFetchAction(t *testing.T) {
 		}
 	})
 
-	t.Run("downloads, revalidates and follows a moved tag", func(t *testing.T) {
+	t.Run("revalidates a moved tag and rejects mismatched cached and archived commits", func(t *testing.T) {
 		serve("prefixed", 0)
 		input := newInput("v1")
 		tree, sha, err := FetchAction(t.Context(), input)
@@ -244,12 +246,29 @@ func TestFetchAction(t *testing.T) {
 		assert.Empty(t, headers[0].Get("If-None-Match"))
 		assert.Equal(t, fmt.Sprintf(`W/"%s-tar.gz-true"`, sha), headers[1].Get("If-None-Match"))
 		assert.Equal(t, headers[1].Get("If-None-Match"), headers[2].Get("If-None-Match"))
+
+		require.NoError(t, gitCmd("-C", remote, "tag", "-a", "pinned", "-m", "release", sha))
+		input.Ref = gitRevParse(t, remote, "pinned")
+		for range 2 {
+			_, got, err := FetchAction(t.Context(), input)
+			require.NoError(t, err)
+			assert.Equal(t, sha, got)
+		}
+		_, headers = served()
+		require.Len(t, headers, 5)
+
+		serve("wrong commit", 0)
+		input = newInput(sha)
+		_, _, err = FetchAction(t.Context(), input)
+		require.ErrorContains(t, err, sha)
+		require.ErrorContains(t, err, movedSha)
+		assert.NoDirExists(t, filepath.Join(input.Dir, movedSha))
 	})
 
 	t.Run("downloads a pinned commit once and rejects a short one", func(t *testing.T) {
 		serve("prefixed", 0)
 		sha := expectedSha
-		input := newInput(sha)
+		input := newInput(strings.ToUpper(sha))
 		for range 2 {
 			tree, got, err := FetchAction(t.Context(), input)
 			require.NoError(t, err)
@@ -270,6 +289,9 @@ func TestFetchAction(t *testing.T) {
 			input := newInput(sha)
 			tree, _, err := FetchAction(t.Context(), input)
 			require.NoError(t, err, mode)
+			if mode == "none" {
+				require.NoError(t, gitCmd("-C", filepath.Join(input.Dir, "git"), "replace", sha+":action.yml", sha+":run.sh"))
+			}
 			yml := filepath.Join(tree, "action.yml")
 			require.NoError(t, os.WriteFile(filepath.Join(tree, "trampoline.js"), nil, 0o644)) // the runner's own, no damage
 			_, _, err = FetchAction(t.Context(), input)
@@ -398,7 +420,7 @@ func TestExtractTreeConfinesEntries(t *testing.T) {
 			require.NoError(t, writer.Close())
 
 			dir := t.TempDir()
-			_, err := extractTree(t.Context(), &archive, dir, false)
+			_, err := extractTree(t.Context(), &archive, dir, "", false)
 			require.Error(t, err)
 			assert.NoFileExists(t, filepath.Join(dir, "escape"))
 			assert.NoFileExists(t, filepath.Join(outside, "escape"))
@@ -448,7 +470,7 @@ func TestExtractTreeCopiesDeferredLinks(t *testing.T) {
 			require.NoError(t, writer.Close())
 
 			dir := t.TempDir()
-			_, err := extractTree(t.Context(), &archive, dir, false)
+			_, err := extractTree(t.Context(), &archive, dir, sha, false)
 			require.NoError(t, err)
 			assert.True(t, treeIntact(dir, sha))
 			if test.text {
@@ -493,7 +515,7 @@ func TestTreeIntactFindsNamesThatAreNotUTF8(t *testing.T) {
 	require.NoError(t, writer.Close())
 
 	dir := t.TempDir()
-	_, err = extractTree(t.Context(), &archive, dir, false)
+	_, err = extractTree(t.Context(), &archive, dir, sha, false)
 	require.NoError(t, err)
 	require.FileExists(t, filepath.Join(dir, sha, "caf\xe9.js"))
 	assert.True(t, treeIntact(dir, sha))
@@ -534,7 +556,7 @@ func TestExtractTreeCreatesLinksInPlatformOrder(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			symlinkFallback = test.fallback
 			created = nil
-			_, err := extractTree(t.Context(), bytes.NewReader(archive.Bytes()), t.TempDir(), false)
+			_, err := extractTree(t.Context(), bytes.NewReader(archive.Bytes()), t.TempDir(), "", false)
 			require.NoError(t, err)
 			assert.Equal(t, test.want, created)
 		})

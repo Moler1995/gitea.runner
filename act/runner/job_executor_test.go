@@ -13,11 +13,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -30,17 +31,15 @@ import (
 	"gitea.com/gitea/runner/act/container"
 
 	"gitea.dev/actionslib/pkg/model"
+	"gitea.dev/actionslib/pkg/protocol"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	yaml "go.yaml.in/yaml/v4"
-	"golang.org/x/text/encoding"
-	"golang.org/x/text/encoding/unicode"
 )
 
 func TestJobExecutor(t *testing.T) {
 	t.Parallel()
-	// Dryrun only checks syntax/planning; all cases resolve locally, so this runs offline.
 	tables := []TestJobFileInfo{
 		{workdir, "uses-and-run-in-one-step", "push", "Invalid run/uses syntax for job:test step:Test", platforms, secrets},
 		{workdir, "uses-github-empty", "push", "Expected format {org}/{repo}[/path]@ref", platforms, secrets},
@@ -49,7 +48,6 @@ func TestJobExecutor(t *testing.T) {
 		{workdir, "uses-docker-url", "push", "", platforms, secrets},
 		{workdir, "job-nil-step", "push", "invalid Step 0: missing run or uses key", platforms, secrets},
 	}
-	// These tests are sufficient to only check syntax.
 	ctx := common.WithDryrun(t.Context(), true)
 	for _, table := range tables {
 		t.Run(table.workflowPath, func(t *testing.T) {
@@ -61,11 +59,6 @@ func TestJobExecutor(t *testing.T) {
 
 type jobInfoMock struct {
 	mock.Mock
-}
-
-func (jim *jobInfoMock) matrix() map[string]any {
-	args := jim.Called()
-	return args.Get(0).(map[string]any)
 }
 
 func (jim *jobInfoMock) steps() []*model.Step {
@@ -98,10 +91,6 @@ func (jim *jobInfoMock) interpolateOutputs() common.Executor {
 	return args.Get(0).(func(context.Context) error)
 }
 
-func (jim *jobInfoMock) result(result string) {
-	jim.Called(result)
-}
-
 type jobContainerMock struct {
 	container.Container
 	linuxEnvironment
@@ -120,7 +109,6 @@ func (sfm *stepFactoryMock) newStep(model *model.Step, rc *RunContext) (step, er
 	return args.Get(0).(step), args.Error(1)
 }
 
-// actionPreparerMock stands in for a step whose action is downloaded before the job's first step.
 type actionPreparerMock struct {
 	reference string
 	sha       string
@@ -229,34 +217,13 @@ func TestPrintPrepareActionsSkipsWithoutActions(t *testing.T) {
 	assert.Empty(t, buf.String())
 }
 
-func TestNewStepsExecutorSkipsStepsAfterSetupFailure(t *testing.T) {
-	for name, tt := range map[string]struct {
-		preErr  error
-		mainRan bool
-	}{
-		"setup failure":    {preErr: setupError{assert.AnError}},
-		"pre step failure": {preErr: assert.AnError, mainRan: true}, // always() steps still run, as on GitHub
-	} {
-		t.Run(name, func(t *testing.T) {
-			ctx := common.WithJobErrorContainer(common.WithLogger(context.Background(), logging.New(logtest.New())))
-			mainRan := false
-			err := newStepsExecutor(&RunContext{},
-				[]common.Executor{func(context.Context) error { return tt.preErr }},
-				[]common.Executor{func(context.Context) error { mainRan = true; return nil }},
-			)(ctx)
-			require.ErrorIs(t, err, assert.AnError)
-			assert.Equal(t, tt.mainRan, mainRan)
-		})
-	}
-}
-
 func TestPrintCompleteJobName(t *testing.T) {
 	for name, tt := range map[string]struct {
 		rc   *RunContext
 		want string
 	}{
-		"job name":            {rc: &RunContext{JobName: "lint", Name: "lint-1"}, want: "lint"},
-		"falls back to name":  {rc: &RunContext{Name: "lint-1"}, want: "lint-1"},
+		"job name":            {rc: &RunContext{Run: &model.Run{JobID: "id"}, JobName: "lint", Name: "lint-1"}, want: "lint"},
+		"falls back to name":  {rc: &RunContext{Run: &model.Run{JobID: "id"}, Name: "lint-1"}, want: "lint-1"},
 		"falls back to jobID": {rc: &RunContext{Run: &model.Run{JobID: "lint"}}, want: "lint"},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -271,41 +238,26 @@ func TestPrintCompleteJobName(t *testing.T) {
 	}
 }
 
-// actionStepMock is a step whose action has to be downloaded before it can run.
 type actionStepMock struct {
 	*stepMock
 	*actionPreparerMock
 }
 
-// TestNewJobExecutorDownloadsAllActionsBeforeTheFirstStep pins the shape of the setup section:
-// every action is downloaded before any step runs, and the job name closes the section. A pre
-// step that downloaded its own action would leave the log interleaved with the downloads.
 func TestNewJobExecutorDownloadsAllActionsBeforeTheFirstStep(t *testing.T) {
 	ctx := common.WithJobErrorContainer(t.Context())
 	jim := &jobInfoMock{}
 	sfm := &stepFactoryMock{}
-	rc := &RunContext{
-		JobContainer: &jobContainerMock{},
-		Run: &model.Run{
-			JobID: "test",
-			Workflow: &model.Workflow{
-				Jobs: map[string]*model.Job{"test": {}},
-			},
-		},
-		Config: &Config{PresetGitHubContext: &model.GithubContext{}},
-	}
-	rc.ExprEval = rc.NewExpressionEvaluator(ctx)
+	rc := makeTestRC(t, "{}")
+	rc.JobContainer = &jobContainerMock{}
 
 	steps := []*model.Step{{ID: "1"}, {ID: "2"}}
 	executorOrder := make([]string, 0)
 
 	jim.On("steps").Return(steps)
-	jim.On("matrix").Return(map[string]any{})
 	jim.On("startContainer").Return(func(context.Context) error { return nil })
 	jim.On("stopContainer").Return(func(context.Context) error { return nil })
 	jim.On("closeContainer").Return(func(context.Context) error { return nil })
 	jim.On("interpolateOutputs").Return(func(context.Context) error { return nil })
-	jim.On("result", "success")
 
 	for _, stepModel := range steps {
 		sm := &stepMock{}
@@ -330,9 +282,9 @@ func TestNewJobExecutorDownloadsAllActionsBeforeTheFirstStep(t *testing.T) {
 	err := newJobExecutor(jim, sfm, rc)(common.WithLogger(ctx, logger.With("job", "test")))
 	require.NoError(t, err)
 
+	assert.Equal(t, "success", rc.Run.Job().Result)
 	assert.Equal(t, []string{"pre1", "pre2", "step1", "step2"}, executorOrder)
 
-	// the setup is logged ahead of the pre steps and the cleanup is tagged, so the reporter can show both as steps of their own
 	setup := make([]string, 0)
 	for _, entry := range hook.AllRecords() {
 		if strings.HasPrefix(entry.Message, "Prepare all required actions") || strings.HasPrefix(entry.Message, "Download action") ||
@@ -348,181 +300,82 @@ func TestNewJobExecutorDownloadsAllActionsBeforeTheFirstStep(t *testing.T) {
 		"Prepare all required actions",
 		"Download action repository 'actions/checkout@v1' (SHA:sha1)",
 		"Download action repository 'actions/checkout@v2' (SHA:sha2)",
-		"Complete job name: test",
+		"Complete job name: job1",
 		"Run Pre 1",
 		"Run Pre 2",
 	}, setup)
 }
 
 func TestNewJobExecutor(t *testing.T) {
+	completed := []string{"startContainer", "step1", "interpolateOutputs", "stopContainer", "closeContainer"}
+	completedWithPost := []string{"startContainer", "step1", "post1", "interpolateOutputs", "stopContainer", "closeContainer"}
 	table := []struct {
 		name          string
-		steps         []*model.Step
-		preSteps      []bool
-		postSteps     []bool
+		steps         int
+		preSteps      []int
+		postSteps     []int
 		executedSteps []string
 		result        string
-		hasError      bool
+		stepFails     bool
 		output        string
 		startError    error
 		cancelOnStart bool
+		cancelOnClose bool
 		timeout       bool
 	}{
 		{
-			name:          "zeroSteps",
-			steps:         []*model.Step{},
-			preSteps:      []bool{},
-			postSteps:     []bool{},
+			name:          "no steps leaves the result unset",
 			executedSteps: []string{},
+		},
+		{
+			name:          "step failure still cleans up",
+			steps:         1,
+			executedSteps: completed,
+			result:        "failure",
+			stepFails:     true,
+		},
+		{
+			name:          "post steps run in reverse order",
+			steps:         3,
+			preSteps:      []int{1, 3},
+			postSteps:     []int{2, 3},
+			executedSteps: []string{"startContainer", "pre1", "pre3", "step1", "step2", "step3", "post3", "post2", "interpolateOutputs", "stopContainer", "closeContainer"},
 			result:        "success",
-			hasError:      false,
 		},
 		{
-			name: "stepWithoutPrePost",
-			steps: []*model.Step{{
-				ID: "1",
-			}},
-			preSteps:  []bool{false},
-			postSteps: []bool{false},
-			executedSteps: []string{
-				"startContainer",
-				"step1",
-				"interpolateOutputs",
-				"stopContainer",
-				"closeContainer",
-			},
-			result:   "success",
-			hasError: false,
-		},
-		{
-			name: "stepWithFailure",
-			steps: []*model.Step{{
-				ID: "1",
-			}},
-			preSteps:  []bool{false},
-			postSteps: []bool{false},
-			executedSteps: []string{
-				"startContainer",
-				"step1",
-				"interpolateOutputs",
-				"stopContainer",
-				"closeContainer",
-			},
-			result:   "failure",
-			hasError: true,
-		},
-		{
-			name: "stepWithPre",
-			steps: []*model.Step{{
-				ID: "1",
-			}},
-			preSteps:  []bool{true},
-			postSteps: []bool{false},
-			executedSteps: []string{
-				"startContainer",
-				"pre1",
-				"step1",
-				"interpolateOutputs",
-				"stopContainer",
-				"closeContainer",
-			},
-			result:   "success",
-			hasError: false,
-		},
-		{
-			name: "stepWithPost",
-			steps: []*model.Step{{
-				ID: "1",
-			}},
-			preSteps:  []bool{false},
-			postSteps: []bool{true},
-			executedSteps: []string{
-				"startContainer",
-				"step1",
-				"post1",
-				"interpolateOutputs",
-				"stopContainer",
-				"closeContainer",
-			},
-			result:   "success",
-			hasError: false,
-		},
-		{
-			name: "stepWithPreAndPost",
-			steps: []*model.Step{{
-				ID: "1",
-			}},
-			preSteps:  []bool{true},
-			postSteps: []bool{true},
-			executedSteps: []string{
-				"startContainer",
-				"pre1",
-				"step1",
-				"post1",
-				"interpolateOutputs",
-				"stopContainer",
-				"closeContainer",
-			},
-			result:   "success",
-			hasError: false,
-		},
-		{
-			name: "stepsWithPreAndPost",
-			steps: []*model.Step{{
-				ID: "1",
-			}, {
-				ID: "2",
-			}, {
-				ID: "3",
-			}},
-			preSteps:  []bool{true, false, true},
-			postSteps: []bool{false, true, true},
-			executedSteps: []string{
-				"startContainer",
-				"pre1",
-				"pre3",
-				"step1",
-				"step2",
-				"step3",
-				"post3",
-				"post2",
-				"interpolateOutputs",
-				"stopContainer",
-				"closeContainer",
-			},
-			result:   "success",
-			hasError: false,
-		},
-		{
-			name:          "jobOutputExpressionFailure",
-			steps:         []*model.Step{{ID: "1"}},
-			preSteps:      []bool{false},
-			postSteps:     []bool{false},
-			executedSteps: []string{"startContainer", "step1", "interpolateOutputs", "stopContainer", "closeContainer"},
+			name:          "invalid job output fails the job",
+			steps:         1,
+			executedSteps: completed,
 			result:        "failure",
 			output:        "${{ 'test' != test }}",
 		},
 		{
-			name:          "start failure",
-			steps:         []*model.Step{{ID: "1"}},
+			name:          "start failure still closes the container",
+			steps:         1,
 			executedSteps: []string{"startContainer", "closeContainer"},
 			startError:    errors.New("start failed"),
+			result:        "failure",
+		},
+		{
+			name:          "cancelled while closing the container",
+			steps:         1,
+			executedSteps: completed,
+			cancelOnClose: true,
+			result:        "cancelled",
 		},
 		{
 			name:          "cancelled at startup boundary",
-			steps:         []*model.Step{{ID: "1"}},
-			preSteps:      []bool{false},
-			postSteps:     []bool{true},
-			executedSteps: []string{"startContainer", "step1", "post1", "interpolateOutputs", "stopContainer", "closeContainer"},
+			steps:         1,
+			postSteps:     []int{1},
+			executedSteps: completedWithPost,
 			result:        "cancelled",
 			cancelOnStart: true,
 		},
 		{
-			name:          "post steps run after timeout",
-			steps:         []*model.Step{{ID: "1"}},
-			preSteps:      []bool{false},
-			postSteps:     []bool{true},
-			executedSteps: []string{"startContainer", "step1", "post1", "interpolateOutputs", "stopContainer", "closeContainer"},
+			name:          "post steps run after the parent deadline",
+			steps:         1,
+			postSteps:     []int{1},
+			executedSteps: completedWithPost,
 			result:        "failure",
 			timeout:       true,
 		},
@@ -542,27 +395,20 @@ func TestNewJobExecutor(t *testing.T) {
 			defer cancel()
 			jim := &jobInfoMock{}
 			sfm := &stepFactoryMock{}
-			rc := &RunContext{
-				JobContainer: &jobContainerMock{},
-				Run: &model.Run{
-					JobID: "test",
-					Workflow: &model.Workflow{
-						Jobs: map[string]*model.Job{
-							"test": {},
-						},
-					},
-				},
-				Config: &Config{PresetGitHubContext: &model.GithubContext{}},
-			}
+			rc := makeTestRC(t, "{}")
+			rc.JobContainer = &jobContainerMock{}
 			if tt.output != "" {
 				require.NoError(t, rc.Run.Job().RawOutputs.Encode(map[string]string{"bad": tt.output}))
 			}
-			rc.ExprEval = rc.NewExpressionEvaluator(ctx)
 			executorOrder := make([]string, 0)
 
-			jim.On("steps").Return(tt.steps)
+			steps := make([]*model.Step, tt.steps)
+			for i := range steps {
+				steps[i] = &model.Step{ID: strconv.Itoa(i + 1)}
+			}
+			jim.On("steps").Return(steps)
 
-			if len(tt.steps) > 0 {
+			if tt.steps > 0 {
 				jim.On("startContainer").Return(func(_ context.Context) error {
 					executorOrder = append(executorOrder, "startContainer")
 					if tt.cancelOnStart {
@@ -572,13 +418,13 @@ func TestNewJobExecutor(t *testing.T) {
 				})
 			}
 
-			for i, stepModel := range tt.steps {
+			for i, stepModel := range steps {
 				sm := &stepMock{}
 
 				sfm.On("newStep", stepModel, rc).Return(sm, nil)
 
 				sm.On("pre").Return(func(_ctx context.Context) error {
-					if tt.preSteps[i] {
+					if slices.Contains(tt.preSteps, i+1) {
 						executorOrder = append(executorOrder, "pre"+stepModel.ID)
 					}
 					return nil
@@ -590,14 +436,14 @@ func TestNewJobExecutor(t *testing.T) {
 						expire()
 						return ctx.Err()
 					}
-					if tt.hasError {
+					if tt.stepFails {
 						return errors.New("error")
 					}
 					return nil
 				})
 
 				sm.On("post").Return(func(ctx context.Context) error {
-					if tt.postSteps[i] {
+					if slices.Contains(tt.postSteps, i+1) {
 						executorOrder = append(executorOrder, "post"+stepModel.ID)
 					}
 					if tt.timeout {
@@ -609,9 +455,7 @@ func TestNewJobExecutor(t *testing.T) {
 				defer sm.AssertExpectations(t)
 			}
 
-			if len(tt.steps) > 0 && tt.startError == nil {
-				jim.On("matrix").Return(map[string]any{})
-
+			if tt.steps > 0 && tt.startError == nil {
 				jim.On("interpolateOutputs").Return(func(ctx context.Context) error {
 					executorOrder = append(executorOrder, "interpolateOutputs")
 					if tt.output != "" {
@@ -620,28 +464,26 @@ func TestNewJobExecutor(t *testing.T) {
 					return nil
 				})
 
-				if slices.Contains(tt.executedSteps, "stopContainer") {
-					jim.On("stopContainer").Return(func(ctx context.Context) error {
-						executorOrder = append(executorOrder, "stopContainer")
-						require.NoError(t, ctx.Err())
-						_, bounded := ctx.Deadline()
-						require.True(t, bounded)
-						return nil
-					})
-				}
-
-				jim.On("result", tt.result)
-			}
-
-			if len(tt.steps) > 0 {
-				jim.On("closeContainer").Return(func(_ctx context.Context) error {
-					executorOrder = append(executorOrder, "closeContainer")
+				jim.On("stopContainer").Return(func(ctx context.Context) error {
+					executorOrder = append(executorOrder, "stopContainer")
+					require.NoError(t, ctx.Err())
+					_, bounded := ctx.Deadline()
+					require.True(t, bounded)
 					return nil
 				})
 			}
 
-			executor := newJobExecutor(jim, sfm, rc)
-			err := executor(ctx)
+			if tt.steps > 0 {
+				jim.On("closeContainer").Return(func(_ctx context.Context) error {
+					executorOrder = append(executorOrder, "closeContainer")
+					if tt.cancelOnClose {
+						cancel()
+					}
+					return nil
+				})
+			}
+
+			err := newJobExecutor(jim, sfm, rc)(ctx)
 			switch {
 			case tt.startError != nil:
 				require.ErrorIs(t, err, tt.startError)
@@ -650,7 +492,10 @@ func TestNewJobExecutor(t *testing.T) {
 			default:
 				require.NoError(t, err)
 			}
-			assert.Empty(t, rc.Run.Job().Outputs["bad"])
+			assert.Equal(t, tt.result, rc.Run.Job().Result)
+			if tt.output != "" {
+				assert.Empty(t, rc.Run.Job().Outputs["bad"])
+			}
 			assert.Equal(t, tt.executedSteps, executorOrder)
 
 			jim.AssertExpectations(t)
@@ -688,27 +533,55 @@ func (ctx *controllableDeadlineContext) expire() {
 func TestSetJobResultMatrixContinueOnError(t *testing.T) {
 	ctx := t.Context()
 	for name, tolerated := range map[string]bool{
-		"one tolerated and one firm failure fails the run": false,
-		"all tolerated failures do not fail the run":       true,
+		"one tolerated and one firm failure fails the run and its caller": false,
+		"all tolerated failures fail neither the run nor its caller":      true,
 	} {
 		t.Run(name, func(t *testing.T) {
-			var job *model.Job
-			require.NoError(t, yaml.Unmarshal([]byte("continue-on-error: ${{ matrix.experimental }}\nruns-on: ubuntu-latest"), &job))
-			workflow := &model.Workflow{Name: "workflow1", Jobs: map[string]*model.Job{"job1": job}}
+			run := makeTestRC(t, "continue-on-error: ${{ matrix.experimental }}").Run
+			job := run.Job()
+			var siblings sync.WaitGroup
 			for _, experimental := range []bool{true, tolerated} {
-				rc := newTestRC(workflow, map[string]any{"experimental": experimental})
+				rc := newTestRC(run.Workflow, map[string]any{"experimental": experimental})
 				rc.Config.PresetGitHubContext = &model.GithubContext{}
-				setJobResult(ctx, rc, rc, false)
+				rc.jobTotal = 2
+				siblings.Go(func() { rc.setJobResult(ctx, false) })
 			}
+			siblings.Wait()
 
 			assert.Equal(t, "failure", job.Result)
 			assert.Equal(t, tolerated, job.ContinueOnError)
-			err := handleFailure(&model.Plan{Stages: []*model.Stage{{Runs: []*model.Run{{Workflow: workflow, JobID: "job1"}}}}})(ctx)
+			err := handleFailure(&model.Plan{Stages: []*model.Stage{{Runs: []*model.Run{run}}}})(ctx)
 			if tolerated {
 				require.NoError(t, err)
 			} else {
 				require.Error(t, err)
 			}
+			callerRC := makeTestRC(t, "{}")
+			callerRC.Config.PresetGitHubContext = &model.GithubContext{}
+			(&caller{runContext: callerRC, reportedRuns: []*model.Run{run}}).finishWorkflowCall(ctx, nil)
+			assert.Equal(t, map[bool]string{true: "success", false: "failure"}[tolerated], callerRC.Run.Job().Result)
+		})
+	}
+}
+
+func TestSkippedMatrixCombinationsPreserveJobResult(t *testing.T) {
+	for _, test := range []struct{ prior, afterSkip, afterRun string }{
+		{"", "skipped", "success"},
+		{"failure", "failure", "failure"},
+		{"cancelled", "cancelled", "cancelled"},
+	} {
+		t.Run(test.afterSkip, func(t *testing.T) {
+			rc := makeTestRC(t, "if: false")
+			rc.jobTotal = 3
+			rc.caller = &caller{reportedRuns: []*model.Run{nil}}
+			rc.Run.Job().Result = test.prior
+			enabled, err := rc.isEnabled(t.Context())
+			require.NoError(t, err)
+			assert.False(t, enabled)
+			require.Same(t, rc.Run, rc.caller.reportedRuns[0])
+			assert.Equal(t, test.afterSkip, rc.Run.Job().Result)
+			rc.setJobResult(t.Context(), test.prior != "cancelled")
+			assert.Equal(t, test.afterRun, rc.Run.Job().Result)
 		})
 	}
 }
@@ -719,212 +592,144 @@ func TestHasJobSummaryCapability(t *testing.T) {
 	assert.False(t, hasJobSummaryCapability("not-job-summary,job-summary-v2"))
 }
 
-// fakeRuntimeToken builds a JWT-shaped string whose middle (claims) segment encodes
-// the given JobID. The header and signature segments are filler — the runner does not
-// verify the signature; the server does.
 func fakeRuntimeToken(jobID int64) string {
-	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
-	claims := base64.RawURLEncoding.EncodeToString(fmt.Appendf(nil, `{"JobID":%d}`, jobID))
-	sig := base64.RawURLEncoding.EncodeToString([]byte("sig"))
-	return header + "." + claims + "." + sig
+	return "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9." + base64.RawURLEncoding.EncodeToString(fmt.Appendf(nil, `{"JobID":%d}`, jobID)) + ".c2ln"
 }
 
-func newJobSummaryRC(env map[string]string, jobContainer container.ExecutionsEnvironment, stepCount int) *RunContext {
-	steps := make([]*model.Step, stepCount)
-	for i := range steps {
-		steps[i] = &model.Step{ID: strconv.Itoa(i)}
-	}
-	return &RunContext{
-		Config:       &Config{},
-		JobContainer: jobContainer,
-		Env:          env,
-		Run: &model.Run{
-			JobID: "test",
-			Workflow: &model.Workflow{
-				Jobs: map[string]*model.Job{
-					"test": {Steps: steps},
-				},
-			},
-		},
-	}
+func newJobSummaryRC(t *testing.T, transport summaryTransport) *RunContext {
+	t.Helper()
+	const runtimeURL = "https://runtime.example"
+	rc := makeTestRC(t, "{}")
+	rc.JobContainer = &container.HostEnvironment{ActPath: t.TempDir()}
+	rc.Config.GitHubInstance, rc.Config.InstanceTransport = runtimeURL, transport
+	rc.Env["GITEA_ACTIONS_CAPABILITIES"] = "job-summary"
+	rc.Env["ACTIONS_RUNTIME_URL"] = runtimeURL
+	rc.Env["ACTIONS_RUNTIME_TOKEN"] = fakeRuntimeToken(34)
+	rc.Env["GITEA_RUN_ID"] = "12"
+	return rc
 }
 
-func TestTryUploadJobSummaryRetriesTransientFailure(t *testing.T) {
-	oldDelay := jobSummaryUploadRetryDelay
-	jobSummaryUploadRetryDelay = 0
-	defer func() {
-		jobSummaryUploadRetryDelay = oldDelay
-	}()
+type summaryTransport func(*http.Request) (*http.Response, error)
 
-	runtimeToken := fakeRuntimeToken(34)
+func (transport summaryTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	return transport(request)
+}
 
-	requests := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requests++
+func TestStepSummaryRetriesWithinPhaseTimeout(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		start := time.Now()
+		var attempts []string
+		started := make(chan struct{})
+		var finished time.Time
+		rc := newJobSummaryRC(t, func(request *http.Request) (*http.Response, error) {
+			defer request.Body.Close()
+			body, err := io.ReadAll(request.Body)
+			if err != nil {
+				return nil, err
+			}
+			attempts = append(attempts, string(body))
+			if len(attempts) == 1 {
+				close(started)
+			}
+			<-request.Context().Done()
+			finished = time.Now()
+			return nil, request.Context().Err()
+		})
+		summaryPath := container.JoinPath(rc.JobContainer.GetActPath(), "summary.md")
+		steps := []*model.Step{{ID: "first"}, {ID: "second"}}
+		job := &jobInfoMock{}
+		job.On("steps").Return(steps)
+		for _, method := range []string{"startContainer", "interpolateOutputs", "stopContainer", "closeContainer"} {
+			job.On(method).Return(noopExecutor)
+		}
+		step := &stepMock{}
+		step.On("pre").Return(noopExecutor)
+		step.On("post").Return(noopExecutor)
+		step.On("main").Return(func(ctx context.Context) error {
+			require.NoError(t, os.WriteFile(summaryPath, []byte(steps[rc.CurrentStepIndex].ID), 0o600))
+			processStepSummary(ctx, rc, summaryPath)
+			<-started
+			assert.Zero(t, time.Since(start))
+			return nil
+		})
+		factory := &stepFactoryMock{}
+		factory.On("newStep", mock.Anything, rc).Return(step, nil)
+		require.NoError(t, newJobExecutor(job, factory, rc)(t.Context()))
+		assert.Equal(t, jobSummaryUploadPhaseTimeout, time.Since(start))
+		synctest.Wait()
+		assert.Equal(t, []string{"first", "first", "second"}, attempts)
+		assert.Equal(t, "success", rc.Run.Job().Result)
+		assert.Equal(t, time.Now(), finished)
+	})
+}
+
+func TestStepSummaryUploadsAfterEachOuterPhase(t *testing.T) {
+	type upload struct{ path, body string }
+	var got []upload
+	rc := newJobSummaryRC(t, func(r *http.Request) (*http.Response, error) {
+		defer r.Body.Close()
 		assert.Equal(t, http.MethodPut, r.Method)
-		assert.Equal(t, "/_apis/pipelines/workflows/12/jobs/34/steps/0/summary", r.URL.Path)
-		assert.Equal(t, "Bearer "+runtimeToken, r.Header.Get("Authorization"))
+		assert.Equal(t, "Bearer "+fakeRuntimeToken(34), r.Header.Get("Authorization"))
 		assert.Equal(t, "text/markdown; charset=utf-8", r.Header.Get("Content-Type"))
 		body, err := io.ReadAll(r.Body)
-		assert.NoError(t, err)
-		assert.Equal(t, []byte("# summary"), body)
-		if requests == 1 {
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	defer server.Close()
-
-	ctx := t.Context()
-	cm := &containerMock{}
-	cm.On("GetContainerArchive", mock.Anything, "/var/run/act/workflow/step-summary-0.md").Return(
-		io.NopCloser(bytes.NewReader(tarArchive(t, tarEntry{name: "step-summary-0.md", body: "# summary"}))),
-		nil,
-	).Once()
-
-	rc := newJobSummaryRC(map[string]string{
-		"GITEA_ACTIONS_CAPABILITIES": "cache, job-summary",
-		"ACTIONS_RUNTIME_URL":        server.URL,
-		"ACTIONS_RUNTIME_TOKEN":      runtimeToken,
-		"GITEA_RUN_ID":               "12",
-	}, cm, 1)
-
-	tryUploadJobSummary(ctx, rc)
-
-	assert.Equal(t, 2, requests)
-	cm.AssertExpectations(t)
-}
-
-func TestTryUploadJobSummaryStopsAtPhaseTimeout(t *testing.T) {
-	oldPhase := jobSummaryUploadPhaseTimeout
-	jobSummaryUploadPhaseTimeout = 100 * time.Millisecond
-	defer func() {
-		jobSummaryUploadPhaseTimeout = oldPhase
-	}()
-
-	runtimeToken := fakeRuntimeToken(34)
-
-	// The server blocks until either the request context is cancelled (the behaviour
-	// under test: the phase timeout aborts the in-flight upload) or the test tears it
-	// down. Without the phase timeout the upload would hang until the 30s client
-	// timeout instead of releasing the cleanup budget. The release channel guarantees
-	// the handler always returns so server.Close() cannot itself hang.
-	release := make(chan struct{})
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		select {
-		case <-r.Context().Done():
-		case <-release:
-		}
-	}))
-	defer server.Close()
-	defer close(release)
-
-	ctx := t.Context()
-	cm := &containerMock{}
-	cm.On("GetContainerArchive", mock.Anything, "/var/run/act/workflow/step-summary-0.md").Return(
-		io.NopCloser(bytes.NewReader(tarArchive(t, tarEntry{name: "step-summary-0.md", body: "# summary"}))),
-		nil,
-	).Once()
-
-	rc := newJobSummaryRC(map[string]string{
-		"GITEA_ACTIONS_CAPABILITIES": "job-summary",
-		"ACTIONS_RUNTIME_URL":        server.URL,
-		"ACTIONS_RUNTIME_TOKEN":      runtimeToken,
-		"GITEA_RUN_ID":               "12",
-	}, cm, 1)
-
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		tryUploadJobSummary(ctx, rc)
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("tryUploadJobSummary did not honour the phase timeout")
-	}
-	cm.AssertExpectations(t)
-}
-
-func TestTryUploadJobSummaryUploadsEachStepIndependentlyWithInstanceTransport(t *testing.T) {
-	runtimeToken := fakeRuntimeToken(34)
-
-	type upload struct {
-		path string
-		body string
-	}
-	var got []upload
-	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, err := io.ReadAll(r.Body)
-		assert.NoError(t, err)
 		got = append(got, upload{r.URL.Path, string(body)})
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	defer server.Close()
-
+		return &http.Response{StatusCode: http.StatusNoContent, Body: http.NoBody}, err
+	})
 	ctx := t.Context()
-	cm := &containerMock{}
-	// Three steps: 0 has content, 1 has empty content (skipped), 2 has content.
-	cm.On("GetContainerArchive", mock.Anything, "/var/run/act/workflow/step-summary-0.md").Return(
-		io.NopCloser(bytes.NewReader(tarArchive(t, tarEntry{name: "step-summary-0.md", body: "first"}))),
-		nil,
-	).Once()
-	cm.On("GetContainerArchive", mock.Anything, "/var/run/act/workflow/step-summary-1.md").Return(
-		io.NopCloser(bytes.NewReader(tarArchive(t, tarEntry{name: "step-summary-1.md", body: ""}))),
-		nil,
-	).Once()
-	cm.On("GetContainerArchive", mock.Anything, "/var/run/act/workflow/step-summary-2.md").Return(
-		io.NopCloser(bytes.NewReader(tarArchive(t, tarEntry{name: "step-summary-2.md", body: "third"}))),
-		nil,
-	).Once()
+	rc.summaryUploads = newStepSummaryUploads(ctx)
+	outer := &stepRun{RunContext: rc, Step: &model.Step{ID: "outer"}, env: map[string]string{}}
+	childRC := &RunContext{Parent: rc, Run: rc.Run, Config: rc.Config, JobContainer: rc.JobContainer}
+	childRC.ExprEval = childRC.NewExpressionEvaluator(ctx)
+	child := &stepRun{RunContext: childRC, Step: &model.Step{ID: "child"}, env: map[string]string{}}
 
-	rc := newJobSummaryRC(map[string]string{
-		"GITEA_ACTIONS_CAPABILITIES": "job-summary",
-		"ACTIONS_RUNTIME_URL":        server.URL,
-		"ACTIONS_RUNTIME_TOKEN":      runtimeToken,
-		"GITEA_RUN_ID":               "12",
-	}, cm, 3)
-	rc.Config.GitHubInstance, rc.Config.InstanceTransport = server.URL, server.Client().Transport
+	rc.CurrentStepIndex = 1
+	require.NoError(t, runStepExecutor(outer, stepStagePre, runStepExecutor(child, stepStagePre, func(ctx context.Context) error {
+		childRC.AddMask(ctx, "private")
+		return os.WriteFile(child.env["GITHUB_STEP_SUMMARY"], []byte("pre private"), 0o600)
+	}))(ctx))
 
-	tryUploadJobSummary(ctx, rc)
+	rc.CurrentStepIndex = 0
+	first := &stepRun{RunContext: rc, Step: &model.Step{ID: "first"}, env: map[string]string{}}
+	require.NoError(t, runStepExecutor(first, stepStageMain, func(context.Context) error {
+		return os.WriteFile(first.env["GITHUB_STEP_SUMMARY"], []byte("first"), 0o600)
+	})(ctx))
 
-	assert.Equal(t, []upload{
-		{"/_apis/pipelines/workflows/12/jobs/34/steps/0/summary", "first"},
-		{"/_apis/pipelines/workflows/12/jobs/34/steps/2/summary", "third"},
-	}, got)
-	cm.AssertExpectations(t)
-}
+	rc.CurrentStepIndex = 1
+	require.NoError(t, runStepExecutor(outer, stepStageMain, func(context.Context) error {
+		content, err := os.ReadFile(outer.env["GITHUB_STEP_SUMMARY"])
+		require.NoError(t, err)
+		return os.WriteFile(outer.env["GITHUB_STEP_SUMMARY"], append(content, " main"...), 0o600)
+	})(ctx))
 
-func TestTryUploadJobSummarySkipsUnsupportedUploads(t *testing.T) {
-	for name, tt := range map[string]struct {
-		capabilities string
-		runtimeToken string
-	}{
-		"requires exact capability": {"not-job-summary,job-summary-v2", fakeRuntimeToken(34)},
-		"requires job ID":           {"job-summary", "not-a-jwt"},
-	} {
-		t.Run(name, func(t *testing.T) {
-			requests := 0
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _r *http.Request) {
-				requests++
-				w.WriteHeader(http.StatusNoContent)
-			}))
-			defer server.Close()
+	rc.CurrentStepIndex = 2
+	empty := &stepRun{RunContext: rc, Step: &model.Step{ID: "empty"}, env: map[string]string{}}
+	require.NoError(t, runStepExecutor(empty, stepStageMain, func(context.Context) error {
+		return os.Remove(first.env["GITHUB_STEP_SUMMARY"])
+	})(ctx))
 
-			rc := newJobSummaryRC(map[string]string{
-				"GITEA_ACTIONS_CAPABILITIES": tt.capabilities,
-				"ACTIONS_RUNTIME_URL":        server.URL,
-				"ACTIONS_RUNTIME_TOKEN":      tt.runtimeToken,
-				"GITEA_RUN_ID":               "12",
-			}, &containerMock{}, 1)
+	rc.CurrentStepIndex = 1
+	postCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	require.ErrorIs(t, runStepExecutor(outer, stepStagePost, func(context.Context) error {
+		require.NoError(t, os.WriteFile(outer.env["GITHUB_STEP_SUMMARY"], []byte("post private"), 0o600))
+		cancel()
+		return postCtx.Err()
+	})(postCtx), context.Canceled)
 
-			tryUploadJobSummary(t.Context(), rc)
-
-			assert.Zero(t, requests)
-		})
+	for key, invalid := range map[string]string{"GITEA_ACTIONS_CAPABILITIES": "not-job-summary,job-summary-v2", "ACTIONS_RUNTIME_TOKEN": "not-a-jwt"} {
+		saved := rc.Env[key]
+		rc.Env[key] = invalid
+		processStepSummary(ctx, rc, outer.env["GITHUB_STEP_SUMMARY"])
+		rc.Env[key] = saved
 	}
+	rc.summaryUploads.wait(ctx)
+	const base = "/_apis/pipelines/workflows/12/jobs/34/steps/"
+	assert.Equal(t, []upload{
+		{base + "1/summary", "pre ***"},
+		{base + "0/summary", "first"},
+		{base + "1/summary", "pre *** main"},
+		{base + "1/summary", "post ***"},
+	}, got)
 }
 
 func TestExtractJobIDFromRuntimeToken(t *testing.T) {
@@ -944,7 +749,8 @@ func TestReadSingleFileFromContainerArchive(t *testing.T) {
 		"truncates oversized summary without reading entire file": {strings.Repeat("a", 100000), 200, strings.Repeat("a", 200-len(jobSummaryTruncationMarker)) + jobSummaryTruncationMarker},
 		"keeps exact limit":               {"abc", 3, "abc"},
 		"strips UTF-8 BOM before limit":   {"\xef\xbb\xbfabc", 3, "abc"},
-		"decodes UTF-16 before limit":     {"\xff\xfea\x00b\x00c\x00", 3, "abc"},
+		"decodes UTF-16LE before limit":   {"\xff\xfea\x00b\x00c\x00", 3, "abc"},
+		"decodes UTF-16BE before limit":   {"\xfe\xff\x00a\x00b\x00c", 3, "abc"},
 		"limits expanded UTF-16":          {"\xff\xfe" + strings.Repeat("\x2d\x4e", 150), 200, strings.Repeat("中", retainedBytes/3) + jobSummaryTruncationMarker},
 		"keeps complete UTF-8 characters": {strings.Repeat("a", retainedBytes-1) + "€" + strings.Repeat("a", 200), 200, strings.Repeat("a", retainedBytes-1) + jobSummaryTruncationMarker},
 	} {
@@ -1042,25 +848,25 @@ func makeTestRC(t *testing.T, jobYAML string) *RunContext {
 }
 
 func TestApplyJobTimeout(t *testing.T) {
-	cases := []struct {
-		name string
-		yaml string
-		want time.Duration
-	}{
-		{"empty", "runs-on: ubuntu-latest", 0},
-		{"integer", "timeout-minutes: 5\nruns-on: ubuntu-latest", 5 * time.Minute},
-		{"zero ignored", "timeout-minutes: 0\nruns-on: ubuntu-latest", 0},
-		{"non-numeric ignored", "timeout-minutes: abc\nruns-on: ubuntu-latest", 0},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			rc := makeTestRC(t, tc.yaml)
-			newCtx, cancel := applyJobTimeout(t.Context(), rc, rc.Run.Job())
+	for input, want := range map[string]time.Duration{"": 0, "5": 5 * time.Minute, "0": 0} {
+		synctest.Test(t, func(t *testing.T) {
+			rc := makeTestRC(t, "runs-on: ubuntu-latest")
+			rc.Run.Job().TimeoutMinutes = input
+			logger, hook := logtest.NewLogger()
+			ctx, cancel, err := applyJobTimeout(common.WithLogger(t.Context(), logger), rc, rc.Run.Job())
+			require.NoError(t, err)
 			defer cancel()
-			deadline, hasDeadline := newCtx.Deadline()
-			assert.Equal(t, tc.want != 0, hasDeadline)
-			if hasDeadline {
-				assert.WithinDuration(t, time.Now().Add(tc.want), deadline, time.Minute)
+			deadline, ok := ctx.Deadline()
+			require.Equal(t, want > 0, ok)
+			if ok {
+				assert.Equal(t, want, time.Until(deadline))
+				<-ctx.Done()
+				reportStepError(ctx, rc, ctx.Err())
+				rc.markJobInterrupted(ctx)
+				require.Len(t, hook.AllRecords(), 1)
+				assert.Equal(t, "##[error]The job has exceeded the maximum execution time of 5m0s", hook.LastRecord().Message)
+				rc.setJobResult(ctx, true)
+				assert.Equal(t, "cancelled", rc.Run.Job().Result)
 			}
 		})
 	}
@@ -1108,76 +914,49 @@ func TestJobSetContinueOnError(t *testing.T) {
 	}
 }
 
-func TestTryUploadJobSummaryMasksSecrets(t *testing.T) {
+func TestStepSummaryMasksSecrets(t *testing.T) {
 	const prefix = "deployed true with s3cr3t and runtime-added via pr0xypw 😀"
 	const maskedPrefix = "deployed true with *** and *** via *** 😀"
-	padding := strings.Repeat("a", maxJobSummaryBytes-len(jobSummaryTruncationMarker)-len(prefix)-2)
+	padding := strings.Repeat("a", protocol.MaxStepSummarySize-len(jobSummaryTruncationMarker)-len(prefix)-2)
 	content := prefix + padding + "s3cr3t" + strings.Repeat("中", 100)
 	want := maskedPrefix + padding + "***" + strings.Repeat("中", (len(prefix)-len(maskedPrefix)-1)/3) + jobSummaryTruncationMarker
 	longSecret := "PREFIX" + strings.Repeat("xy", 100) + "Z"
-	readLimit := maxJobSummaryBytes + base64.StdEncoding.EncodedLen(len(longSecret)) + 1
+	readLimit := protocol.MaxStepSummarySize + base64.StdEncoding.EncodedLen(len(longSecret)) + 1
 	shrinkingPrefix := strings.Repeat(longSecret, (readLimit-len(longSecret)+1)/len(longSecret))
 	for name, testcase := range map[string]struct {
-		encoding      encoding.Encoding
 		content, want string
 		masks         []string
 	}{
-		"UTF-8":                    {unicode.UTF8, content, want, nil},
-		"UTF-8 BOM":                {unicode.UTF8BOM, content, want, nil},
-		"UTF-16LE BOM":             {unicode.UTF16(unicode.LittleEndian, unicode.UseBOM), content, want, nil},
-		"UTF-16BE BOM":             {unicode.UTF16(unicode.BigEndian, unicode.UseBOM), content, want, nil},
-		"secret split by the read": {unicode.UTF8, strings.Repeat("s3cr3t", maxJobSummaryBytes/3), "", nil},
+		"mask before truncation":   {content, want, nil},
+		"secret split by the read": {strings.Repeat("s3cr3t", protocol.MaxStepSummarySize/3), "", nil},
 		"split read keeps every masked secret before the limit": {
-			unicode.UTF8,
 			"# public\n" + strings.Repeat(longSecret, readLimit/len(longSecret)+1),
-			"# public\n" + strings.Repeat("***", (maxJobSummaryBytes-len("# public\n"))/len(longSecret)) + jobSummaryTruncationMarker,
+			"# public\n" + strings.Repeat("***", (protocol.MaxStepSummarySize-len("# public\n"))/len(longSecret)) + jobSummaryTruncationMarker,
 			[]string{longSecret},
 		},
 		"nested secret expands the split tail": {
-			unicode.UTF8,
 			shrinkingPrefix + strings.Repeat("*", readLimit-len(shrinkingPrefix)-len(longSecret)+1) + longSecret,
 			"",
 			[]string{"xy", longSecret},
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			var got string
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				body, err := io.ReadAll(r.Body)
-				assert.NoError(t, err)
-				got = string(body)
-				w.WriteHeader(http.StatusNoContent)
-			}))
-			defer server.Close()
-
-			content, err := testcase.encoding.NewEncoder().String(testcase.content)
-			require.NoError(t, err)
-			cm := &containerMock{}
-			cm.On("GetContainerArchive", mock.Anything, "/var/run/act/workflow/step-summary-0.md").Return(
-				io.NopCloser(bytes.NewReader(tarArchive(t, tarEntry{
-					name: "step-summary-0.md", body: content,
-				}))),
-				nil,
-			).Once()
-
-			rc := newJobSummaryRC(map[string]string{
-				"GITEA_ACTIONS_CAPABILITIES": "job-summary",
-				"ACTIONS_RUNTIME_URL":        server.URL,
-				"ACTIONS_RUNTIME_TOKEN":      fakeRuntimeToken(34),
-				"GITEA_RUN_ID":               "12",
-			}, cm, 1)
-			rc.Config.Secrets = map[string]string{"TOK": "s3cr3t", "ACTIONS_STEP_DEBUG": "true"}
-			rc.Config.ExtraMasks = append([]string{"pr0xypw"}, testcase.masks...)
-			rc.Masks = []string{"runtime-added"}
-
-			tryUploadJobSummary(t.Context(), rc)
-
+			summaryPath := container.JoinPath(t.TempDir(), "summary.md")
+			require.NoError(t, os.WriteFile(summaryPath, []byte(testcase.content), 0o600))
+			rc := &RunContext{
+				Config: &Config{
+					Secrets:    map[string]string{"TOK": "s3cr3t", "ACTIONS_STEP_DEBUG": "true"},
+					ExtraMasks: append([]string{"pr0xypw"}, testcase.masks...),
+				},
+				JobContainer: &container.HostEnvironment{},
+				Masks:        []string{"runtime-added"},
+			}
+			got := string(readStepSummary(t.Context(), rc, summaryPath))
 			if testcase.want == "" {
 				assert.Equal(t, jobSummaryTruncationMarker, strings.TrimLeft(got, "*"))
 			} else {
 				assert.Equal(t, testcase.want, got)
 			}
-			cm.AssertExpectations(t)
 		})
 	}
 }

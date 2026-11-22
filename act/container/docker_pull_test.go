@@ -8,7 +8,10 @@ package container
 
 import (
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -92,6 +95,41 @@ func TestGetImagePullOptions(t *testing.T) {
 func TestIsPinnedImage(t *testing.T) {
 	assert.True(t, isPinnedImage("alpine@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b"))
 	assert.False(t, isPinnedImage("alpine:latest"))
+}
+
+func TestDockerPullFallsBackToLocalPlatform(t *testing.T) {
+	t.Setenv("DOCKER_API_VERSION", "1.49")
+	t.Setenv("DOCKER_CONFIG", t.TempDir())
+	t.Setenv("DOCKER_AUTH_CONFIG", "")
+	for _, image := range []string{"multiarch", "foreign", "no-version"} {
+		pulled := false
+		daemon := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			switch path.Base(request.URL.Path) {
+			case "version":
+				if image == "no-version" {
+					writer.WriteHeader(http.StatusForbidden)
+				}
+				_, _ = io.WriteString(writer, `{"Os":"linux","Arch":"s390x"}`)
+			case "json":
+				if platform := request.URL.Query().Get("platform"); platform == "" {
+					_, _ = io.WriteString(writer, `{"Os":"linux","Architecture":"arm64"}`)
+				} else if image == "multiarch" {
+					assert.JSONEq(t, `{"os":"linux","architecture":"s390x"}`, platform)
+					_, _ = io.WriteString(writer, `{"Os":"linux","Architecture":"s390x"}`)
+				} else {
+					writer.WriteHeader(http.StatusNotFound)
+				}
+			case "create":
+				pulled = true
+				writer.WriteHeader(http.StatusServiceUnavailable)
+			}
+		}))
+		t.Setenv("DOCKER_HOST", daemon.URL)
+		err := NewDockerPullExecutor(NewDockerPullExecutorInput{Image: image})(t.Context())
+		daemon.Close()
+		require.NoError(t, err, image)
+		assert.Equal(t, image == "foreign", pulled, image)
+	}
 }
 
 // The pull path reports a failure the daemon sent mid-stream, so it must carry the reason

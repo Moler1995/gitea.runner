@@ -28,7 +28,9 @@ var _ ExecutionsEnvironment = &HostEnvironment{}
 
 func TestActionPlatformNames(t *testing.T) {
 	assert.Equal(t, []string{"Linux", "macOS", "Windows", "FreeBSD"}, []string{goOsToActionOs("linux"), goOsToActionOs("darwin"), goOsToActionOs("windows"), goOsToActionOs("freebsd")})
-	assert.Equal(t, []string{"X86", "X64", "ARM", "ARM64"}, []string{goArchToActionArch("386"), goArchToActionArch("amd64"), goArchToActionArch("arm"), goArchToActionArch("arm64")})
+	for arch, want := range map[string]string{"386": "X86", "i686": "X86", "amd64": "X64", "arm": "ARM", "armv6l": "ARM", "arm64": "ARM64", "riscv64": "riscv64"} {
+		assert.Equal(t, want, goArchToActionArch(arch), arch)
+	}
 }
 
 func TestCopyDir(t *testing.T) {
@@ -122,6 +124,12 @@ func TestHostEnvironmentExecExitCode(t *testing.T) {
 			})
 		})
 	}
+}
+
+func TestHostEnvironmentExecDeadline(t *testing.T) {
+	ctx, cancel := context.WithTimeoutCause(t.Context(), 0, assert.AnError)
+	defer cancel()
+	require.ErrorIs(t, (&HostEnvironment{}).Exec([]string{os.Args[0], "-test.run=^$"}, nil, "", "")(ctx), assert.AnError)
 }
 
 func TestHostEnvironmentAllocatePTY(t *testing.T) {

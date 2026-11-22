@@ -144,7 +144,7 @@ func TestRegisterInputsAssignToNext(t *testing.T) {
 
 	t.Run("labels from config skip the labels stage", func(t *testing.T) {
 		cfg := &config.Config{}
-		cfg.Runner.Labels = []string{"ubuntu:host", "", "pool:e57e18d4"}
+		cfg.Runner.Labels = []string{" ubuntu:host ", " ", "pool:e57e18d4"}
 		inputs := &registerInputs{}
 		require.Equal(t, StageWaitingForRegistration, inputs.assignToNext(StageInputRunnerName, "runner", cfg))
 		require.Equal(t, []string{"ubuntu:host", "pool:e57e18d4"}, inputs.Labels)
@@ -158,13 +158,13 @@ func TestRegisterInputsAssignToNext(t *testing.T) {
 
 	t.Run("invalid labels input loops back", func(t *testing.T) {
 		inputs := &registerInputs{}
-		require.Equal(t, StageInputLabels, inputs.assignToNext(StageInputLabels, "ubuntu:host,,bad", emptyCfg))
+		require.Equal(t, StageInputLabels, inputs.assignToNext(StageInputLabels, "ubuntu:host, ,bad", emptyCfg))
 		require.Nil(t, inputs.Labels)
 	})
 
 	t.Run("labels containing a colon are accepted", func(t *testing.T) {
 		inputs := &registerInputs{}
-		require.Equal(t, StageWaitingForRegistration, inputs.assignToNext(StageInputLabels, "pool:e57e18d4,ubuntu:host", emptyCfg))
+		require.Equal(t, StageWaitingForRegistration, inputs.assignToNext(StageInputLabels, "pool:e57e18d4 , ubuntu:host", emptyCfg))
 		require.Equal(t, []string{"pool:e57e18d4", "ubuntu:host"}, inputs.Labels)
 	})
 
@@ -245,7 +245,7 @@ func TestInitInputs(t *testing.T) {
 			require.Equal(t, tc.wantToken, inputs.Token)
 			require.Equal(t, "runner", inputs.RunnerName)
 			require.True(t, inputs.Ephemeral)
-			require.Equal(t, []string{"ubuntu:host ", " ubuntu:docker://node:18"}, inputs.Labels)
+			require.Equal(t, []string{"ubuntu:host", "ubuntu:docker://node:18"}, inputs.Labels)
 		})
 	}
 

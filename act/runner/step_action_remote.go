@@ -46,11 +46,9 @@ var stepActionRemoteFetch = git.FetchAction
 func (sar *stepActionRemote) fetchAction(ctx context.Context, remote *remoteAction, token string) (string, string, error) {
 	cloneURL := remote.CloneURL(sar.RunContext.Config.DefaultActionURL())
 	return stepActionRemoteFetch(ctx, sar.RunContext.Config.withInstanceAuth(git.NewGitCloneExecutorInput{
-		URL:         cloneURL,
-		Ref:         remote.Ref,
-		Dir:         filepath.Join(sar.RunContext.ActionCacheDir(), model.UsesHash(remote.downloadKey(sar.RunContext.Config.DefaultActionURL()))),
-		OfflineMode: sar.RunContext.Config.ActionOfflineMode,
-		Depth:       sar.RunContext.Config.ActionCloneDepth,
+		URL: cloneURL,
+		Ref: remote.Ref,
+		Dir: filepath.Join(sar.RunContext.ActionCacheDir(), model.UsesHash(remote.downloadKey(sar.RunContext.Config.DefaultActionURL()))),
 	}, token))
 }
 
@@ -145,7 +143,7 @@ func (sar *stepActionRemote) pre() common.Executor {
 		sar.prepareActionExecutor(),
 		runStepExecutor(sar, stepStagePre, func(ctx context.Context) error {
 			sar.preStepStarted = true
-			return runPreStep(sar)(ctx)
+			return runActionHook(sar, stepStagePre)(ctx)
 		}).If(hasPreStep(sar)).If(shouldRunPreStep(sar)))
 }
 
@@ -164,13 +162,13 @@ func (sar *stepActionRemote) main() common.Executor {
 				return sar.RunContext.JobContainer.CopyDir(copyToPath, sar.RunContext.Config.Workdir+string(filepath.Separator)+".", sar.RunContext.Config.UseGitIgnore, false)(ctx)
 			}
 
-			return sar.runAction(sar, sar.actionDir, sar.remoteAction)(ctx)
+			return sar.runAction(sar)(ctx)
 		}),
 	)
 }
 
 func (sar *stepActionRemote) post() common.Executor {
-	return runStepExecutor(sar, stepStagePost, runPostStep(sar)).If(hasPostStep(sar)).If(shouldRunPostStep(sar))
+	return runStepExecutor(sar, stepStagePost, runActionHook(sar, stepStagePost)).If(hasPostStep(sar)).If(shouldRunPostStep(sar))
 }
 
 func (sar *stepActionRemote) containerKey() string {
@@ -217,16 +215,11 @@ func (sar *stepActionRemote) getActionModel() *model.Action {
 	return sar.action
 }
 
-func (sar *stepActionRemote) getCompositeRunContext(ctx context.Context) (*RunContext, error) {
+func (sar *stepActionRemote) getCompositeRunContext(ctx context.Context, inputs map[string]string) *RunContext {
 	if sar.compositeRunContext == nil {
 		_, containerActionDir := getContainerActionPaths(sar)
-
-		compositeRunContext, err := newCompositeRunContext(ctx, sar.RunContext, sar, containerActionDir)
-		if err != nil {
-			return nil, err
-		}
-		sar.compositeRunContext = compositeRunContext
-		sar.compositeSteps = compositeRunContext.compositeExecutor(sar.action)
+		sar.compositeRunContext = newCompositeRunContext(ctx, sar.RunContext, sar, containerActionDir, inputs)
+		sar.compositeSteps = sar.compositeRunContext.compositeExecutor(sar.action)
 	} else {
 		// Re-evaluate environment here. For remote actions the environment
 		// need to be re-created for every stage (pre, main, post) as there
@@ -234,14 +227,10 @@ func (sar *stepActionRemote) getCompositeRunContext(ctx context.Context) (*RunCo
 		// stages are executed. (e.g. the output of another action is the
 		// input for this action during the main stage, but the env
 		// was already created during the pre stage)
-		env, err := evaluateCompositeInputAndEnv(ctx, sar.RunContext, sar)
-		if err != nil {
-			return nil, err
-		}
-		sar.compositeRunContext.setCompositeActionEnv(env)
+		sar.compositeRunContext.setCompositeActionEnv(sar.env, inputs)
 		sar.compositeRunContext.ExtraPath = sar.RunContext.ExtraPath
 	}
-	return sar.compositeRunContext, nil
+	return sar.compositeRunContext
 }
 
 func (sar *stepActionRemote) getCompositeSteps() *compositeSteps {

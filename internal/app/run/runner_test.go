@@ -124,6 +124,7 @@ func TestRunnerReclaimsVolumesAfterReporting(t *testing.T) {
 				if response, ok := map[string]string{
 					"/_ping":                  "OK",
 					"/info":                   `{"Architecture":"amd64","OSType":"linux"}`,
+					"/version":                `{"Os":"linux","Arch":"amd64"}`,
 					"/containers/json":        "[]",
 					"/networks":               "[]",
 					"/volumes":                `{"Volumes":[]}`,
@@ -163,7 +164,7 @@ func TestRunnerReclaimsVolumesAfterReporting(t *testing.T) {
 			t.Cleanup(daemon.Close)
 			t.Setenv("DOCKER_HOST", daemon.URL)
 			require.NoError(t, r.Run(t.Context(), &runnerv1.Task{
-				Context:         &structpb.Struct{},
+				Context:         &structpb.Struct{Fields: map[string]*structpb.Value{"gitea_runtime_token": structpb.NewStringValue("runtime-token")}},
 				WorkflowPayload: []byte("jobs:\n  job:\n    runs-on: ubuntu\n    steps:\n      - run: exit 0\n        if: false\n"),
 			}))
 			assert.True(t, reported.Load())

@@ -5,197 +5,152 @@
 package runner
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"net/url"
-	"path"
+	"os"
+	"path/filepath"
 	"regexp"
 
 	"gitea.com/gitea/runner/act/common"
 	"gitea.com/gitea/runner/act/common/git"
 
+	"gitea.dev/actionslib/pkg/expreval"
+	"gitea.dev/actionslib/pkg/exprparser"
 	"gitea.dev/actionslib/pkg/model"
 )
 
-func newLocalReusableWorkflowExecutor(rc *RunContext) common.Executor {
-	localWorkflow, err := model.ParseReusableWorkflowUses(rc.Run.Job().Uses)
-	if err != nil {
-		return common.NewErrorExecutor(err)
-	}
-
-	preset := rc.Config.PresetGitHubContext
-	if preset == nil {
-		// resolve the local workflow against the workspace root, not the process
-		// working directory, so it is found regardless of where the runner is invoked
-		return newReusableWorkflowExecutor(rc, rc.Config.Workdir, localWorkflow.Path, false)
-	}
-
-	uses := fmt.Sprintf("%s/%s@%s", preset.Repository, localWorkflow.Path, preset.Sha)
-
-	remoteReusableWorkflow, err := newRemoteReusableWorkflow(rc.Config.GitHubInstance, uses)
-	if err != nil {
-		return common.NewErrorExecutor(err)
-	}
-
-	workflowDir := fmt.Sprintf("%s/%s", rc.ActionCacheDir(), safeFilename(uses))
-
-	return common.NewPipelineExecutor(
-		cloneRemoteReusableWorkflow(rc, remoteReusableWorkflow.CloneURL(), remoteReusableWorkflow.Ref, workflowDir),
-		newReusableWorkflowExecutor(rc, workflowDir, remoteReusableWorkflow.Path, true),
-	)
-}
-
-func newRemoteReusableWorkflowExecutor(rc *RunContext) common.Executor {
-	remoteReusableWorkflow, err := newRemoteReusableWorkflow(rc.Config.GitHubInstance, rc.Run.Job().Uses)
-	if err != nil {
-		return common.NewErrorExecutor(err)
-	}
-
-	// uses with safe filename makes the target directory look something like this {owner}-{repo}-.github-workflows-{filename}@{ref}
-	// instead we will just use {owner}-{repo}@{ref} as our target directory. This should also improve performance when we are using
-	// multiple reusable workflows from the same repository and ref since for each workflow we won't have to clone it again
-	filename := fmt.Sprintf("%s/%s@%s", remoteReusableWorkflow.Owner, remoteReusableWorkflow.Repo, remoteReusableWorkflow.Ref)
-	workflowDir := fmt.Sprintf("%s/%s", rc.ActionCacheDir(), safeFilename(filename))
-
-	return common.NewPipelineExecutor(
-		cloneRemoteReusableWorkflow(rc, remoteReusableWorkflow.CloneURL(), remoteReusableWorkflow.Ref, workflowDir),
-		newReusableWorkflowExecutor(rc, workflowDir, remoteReusableWorkflow.Path, true),
-	)
-}
-
-// cloneRemoteReusableWorkflow always invokes the clone executor — moving refs
-// (branches, tags) must be re-resolved each run, matching GitHub Actions.
-//
-// Callers must not change remoteReusableWorkflow.URL, because:
-//  1. Gitea doesn't support specifying GithubContext.ServerURL by the GITHUB_SERVER_URL env
-//  2. Gitea has already full URL with rc.Config.GitHubInstance when calling newRemoteReusableWorkflow
-//
-// remoteReusableWorkflow.URL = rc.getGithubContext(ctx).ServerURL
-func cloneRemoteReusableWorkflow(rc *RunContext, cloneURL, ref, targetDirectory string) common.Executor {
-	return func(ctx context.Context) error {
-		interpolatedURL, err := rc.NewExpressionEvaluator(ctx).Interpolate(ctx, cloneURL)
-		if err != nil {
-			return fmt.Errorf("unable to interpolate the workflow clone URL: %w", err)
-		}
-		return git.NewGitCloneExecutor(rc.Config.withInstanceAuth(git.NewGitCloneExecutorInput{
-			URL:         interpolatedURL,
-			Ref:         ref,
-			Dir:         targetDirectory,
-			OfflineMode: rc.Config.ActionOfflineMode,
-			Depth:       rc.Config.ActionCloneDepth,
-		}, rc.Config.GetToken()))(ctx)
-	}
-}
-
-func newReusableWorkflowExecutor(rc *RunContext, directory, workflow string, cached bool) common.Executor {
-	return func(ctx context.Context) error {
-		planner, err := func() (model.WorkflowPlanner, error) {
-			if cached {
-				unlock, err := git.AcquireCloneLock(ctx, directory)
-				if err != nil {
-					return nil, err
-				}
-				defer unlock()
-			}
-			return model.NewWorkflowPlanner(path.Join(directory, workflow), true)
-		}()
-		if err != nil {
-			return err
-		}
-
-		plan, err := planner.PlanEvent("workflow_call")
-		if err != nil {
-			return err
-		}
-
-		runner, err := (&runnerImpl{
-			config: rc.Config,
-			caller: &caller{
-				runContext:               rc,
-				reusedWorkflowJobResults: map[string]string{},
-			},
-		}).configure()
-		if err != nil {
-			return err
-		}
-
-		return common.NewPipelineExecutor( // For Gitea
-			runner.NewPlanExecutor(plan),
-			setReusedWorkflowCallerResult(rc, runner),
-		)(ctx)
-	}
-}
-
-type remoteReusableWorkflow struct {
-	*model.ReusableWorkflowUses
-	URL string
-}
-
-func (r *remoteReusableWorkflow) CloneURL() string {
-	return fmt.Sprintf("%s/%s/%s", withHTTPS(r.URL), r.Owner, r.Repo)
-}
-
 var absoluteReusableWorkflowURLRegex = regexp.MustCompile(`^(https?://.*)/([^/]+/[^/]+/\.[^/]+/workflows/[^@]+@.*)$`)
 
-// For Gitea
-// newRemoteReusableWorkflow parses a remote `uses`, an absolute URL up to `{owner}/{repo}/.{git_platform}/workflows/` replaces baseURL
-func newRemoteReusableWorkflow(baseURL, uses string) (*remoteReusableWorkflow, error) {
+func (c *caller) loadReusableWorkflow(ctx context.Context, instance, uses string) (*model.Plan, error) {
+	rc := c.runContext
 	if matches := absoluteReusableWorkflowURLRegex.FindStringSubmatch(uses); matches != nil {
-		baseURL, uses = matches[1], matches[2]
+		instance, uses = matches[1], matches[2]
 	}
-	parsed, err := model.ParseReusableWorkflowUses(uses)
+	workflow, err := model.ParseReusableWorkflowUses(uses)
 	if err != nil {
 		return nil, err
 	}
-	if parsed.IsLocal() {
-		return nil, fmt.Errorf("expected a remote reusable workflow, got %q", uses)
+	depth := 1
+	for parent := rc.caller; parent != nil; parent = parent.runContext.caller {
+		depth++
 	}
-	return &remoteReusableWorkflow{ReusableWorkflowUses: parsed, URL: baseURL}, nil
+	if depth >= model.MaxWorkflowCallDepth {
+		return nil, fmt.Errorf("reusable workflow %q exceeds the limit of %d workflows including the root", workflow.Path, model.MaxWorkflowCallDepth)
+	}
+
+	if rc.caller != nil {
+		c.checkout = rc.caller.checkout
+	}
+	cacheDir := "workflows"
+	if preset := rc.Config.PresetGitHubContext; workflow.IsLocal() && c.checkout.Dir == "" && preset != nil {
+		cacheDir = "local-workflows" // a same-repository checkout must never answer another repository's call unauthenticated
+		workflow, err = model.ParseReusableWorkflowUses(fmt.Sprintf("%s/%s@%s", preset.Repository, workflow.Path, preset.Sha))
+		if err != nil {
+			return nil, err
+		}
+	}
+	if !workflow.IsLocal() {
+		cloneURL, err := rc.ExprEval.Interpolate(ctx, withHTTPS(instance)+"/"+workflow.Owner+"/"+workflow.Repo)
+		if err != nil {
+			return nil, fmt.Errorf("unable to interpolate the workflow clone URL: %w", err)
+		}
+		c.checkout = rc.Config.withInstanceAuth(git.NewGitCloneExecutorInput{
+			URL: cloneURL,
+			Ref: workflow.Ref,
+			Dir: filepath.Join(rc.ActionCacheDir(), cacheDir, model.UsesHash(cloneURL+"@"+workflow.Ref), "git"),
+		}, rc.Config.GetToken())
+	}
+
+	if c.checkout.Dir != "" {
+		unlock, err := git.AcquireCloneLock(ctx, filepath.Dir(c.checkout.Dir))
+		if err != nil {
+			return nil, err
+		}
+		defer unlock()
+		if err := git.NewGitCloneExecutor(c.checkout)(ctx); err != nil {
+			return nil, err
+		}
+		if !workflow.IsLocal() {
+			c.checkout.Ref, err = git.FindGitRevision(ctx, c.checkout.Dir)
+			if err != nil {
+				return nil, err
+			}
+			c.checkout.OfflineMode = true
+		}
+	}
+	file, err := os.Open(filepath.Join(cmp.Or(c.checkout.Dir, rc.Config.Workdir), workflow.Path))
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	planner, err := model.NewSingleWorkflowPlanner(filepath.Base(workflow.Path), file)
+	if err != nil {
+		return nil, err
+	}
+	return planner.PlanEvent("workflow_call")
 }
 
-// For Gitea
-func setReusedWorkflowCallerResult(rc *RunContext, runner *runnerImpl) common.Executor {
-	return func(ctx context.Context) error {
-		hasFailure := false
-		for _, result := range runner.caller.reusedWorkflowJobResults {
-			if result == "pending" {
-				return nil
-			}
-			if result == "failure" {
-				hasFailure = true
-			}
+func (rc *RunContext) runReusableWorkflow(ctx context.Context) error {
+	call := &caller{runContext: rc}
+	plan, err := call.loadReusableWorkflow(ctx, rc.Config.GitHubInstance, rc.Run.Job().Uses)
+	if err == nil && len(plan.Stages) > 0 {
+		if err = call.resolveInputs(ctx, plan.Stages[0].Runs[0].Workflow); err == nil {
+			err = (&runnerImpl{config: rc.Config, eventJSON: rc.EventJSON, caller: call}).NewPlanExecutor(plan)(ctx)
 		}
-		if err := setJobOutputs(ctx, rc); err != nil { // a bad output fails this job, as for ordinary jobs
-			common.Logger(ctx).Errorf("##[error]%s", EscapeCommandData(err.Error()))
-			hasFailure = true
-		}
-
-		reusedWorkflowJobResult := "success"
-		reusedWorkflowJobResultMessage := "succeeded"
-		if hasFailure {
-			reusedWorkflowJobResult = "failure"
-			reusedWorkflowJobResultMessage = "failed"
-		}
-
-		// Serialize this shared Job.Result write against the other matrix combos
-		// and setJobResult (same lockJob key).
-		unlock := lockJob(rc.Run.Job())
-		rc.result(reusedWorkflowJobResult)
-		unlock()
-
-		if rc.caller != nil {
-			rc.caller.setReusedWorkflowJobResult(rc.Run.JobID, reusedWorkflowJobResult)
-		} else {
-			common.Logger(ctx).With("jobResult", reusedWorkflowJobResult).Infof("Job %s", reusedWorkflowJobResultMessage)
-		}
-
-		return nil
 	}
+	call.finishWorkflowCall(ctx, err)
+	return cmp.Or(ctx.Err(), err)
+}
+
+func (c *caller) finishWorkflowCall(ctx context.Context, planErr error) {
+	rc := c.runContext
+	config := c.workflowCallConfig
+	var jobs map[string]*model.WorkflowCallResult
+	if config != nil && len(config.Outputs) > 0 && (planErr == nil || len(c.reportedRuns) > 0) {
+		jobs = make(map[string]*model.WorkflowCallResult, len(c.reportedRuns))
+	}
+	failed := planErr != nil
+	for _, run := range c.reportedRuns {
+		if run == nil {
+			failed = true
+			continue
+		}
+		job := run.Job()
+		switch job.NeedsResult() {
+		case "failure":
+			failed = true
+		case "cancelled":
+			rc.markCancelled()
+		}
+		if jobs != nil {
+			jobs[run.JobID] = &model.WorkflowCallResult{Outputs: job.Outputs}
+		}
+	}
+	if jobs != nil {
+		interpreter := exprparser.NewInterpeter(&exprparser.EvaluationEnvironment{
+			Github: rc.getGithubContext(ctx),
+			Vars:   rc.Config.Vars,
+			Jobs:   &jobs,
+			Inputs: c.inputs,
+		}, exprparser.Config{})
+		outputs, err := expreval.New(interpreter.Evaluate).EvaluateWorkflowCallOutputs(config) // unlogged, the caller's log lacks the called jobs' masks
+		if err != nil {
+			common.Logger(ctx).Errorf("##[error]unable to interpolate workflow %s", EscapeCommandData(err.Error()))
+			failed = true
+		} else if len(rc.Matrix) == 0 || (!failed && !rc.jobCancelled) {
+			mergeJobOutputs(rc.Run.Job(), outputs)
+		}
+	}
+	rc.markJobInterrupted(ctx)
+	rc.setJobResult(ctx, !failed)
 }
 
 // For Gitea
 // withInstanceAuth passes instance credentials only to clones from this Gitea instance, and runner.insecure only to its registered address.
 func (c Config) withInstanceAuth(input git.NewGitCloneExecutorInput, token string) git.NewGitCloneExecutorInput {
+	input.Depth, input.OfflineMode = c.ActionCloneDepth, c.ActionOfflineMode
 	u, err := url.Parse(input.URL)
 	if err != nil || !onInstanceHost(u.Host, c.GitHubInstance, c.trustedActionInstance()) {
 		return input

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"gitea.com/gitea/runner/act/common"
+	"gitea.com/gitea/runner/act/common/git"
 	"gitea.com/gitea/runner/act/common/logging"
 	"gitea.com/gitea/runner/act/container"
 	"gitea.com/gitea/runner/act/ghcontext"
@@ -117,10 +118,11 @@ func (c Config) DefaultActionURL() string {
 }
 
 type caller struct {
-	runContext *RunContext
-
-	updateResultLock         sync.Mutex        // For Gitea
-	reusedWorkflowJobResults map[string]string // For Gitea
+	runContext         *RunContext
+	checkout           git.NewGitCloneExecutorInput
+	workflowCallConfig *model.WorkflowCall
+	inputs             map[string]any
+	reportedRuns       []*model.Run
 }
 
 type runnerImpl struct {
@@ -216,6 +218,10 @@ func (runner *runnerImpl) NewPlanExecutor(plan *model.Plan) common.Executor {
 				logging.Debugf("Job.With: %v", job.With)
 				logging.Debugf("Job.Result: %v", job.Result)
 
+				failStrategy := func(err error) error {
+					job.Result = "failure"
+					return fmt.Errorf("Error when evaluating 'strategy' for job '%s'. %w", run.JobID, err)
+				}
 				if job.Strategy != nil || job.RawStrategy.Kind == yaml.ScalarNode {
 					strategyRc, err := runner.newRunContext(ctx, run, nil)
 					if err != nil {
@@ -223,28 +229,29 @@ func (runner *runnerImpl) NewPlanExecutor(plan *model.Plan) common.Executor {
 					}
 					if job.RawStrategy.Kind == yaml.ScalarNode {
 						if err := model.DecodeEvaluated("job strategy", job.RawStrategy, strategyRc.ExprEval.shared(ctx).EvaluateYamlNode, &job.Strategy); err != nil {
-							return err
+							return failStrategy(err)
 						}
 					} else {
 						logging.Debugf("Job.Strategy.FailFast: %v", job.Strategy.GetFailFast())
 						logging.Debugf("Job.Strategy.FailFastString: %v", job.Strategy.FailFastString)
 						logging.Debugf("Job.Strategy.MaxParallelString: %v", job.Strategy.MaxParallelString)
 						logging.Debugf("Job.Strategy.RawMatrix: %v", job.Strategy.RawMatrix)
-						// An unevaluated expression is left in place, which GetMatrixes below rejects.
-						if err := strategyRc.NewExpressionEvaluator(ctx).EvaluateYamlNode(ctx, &job.Strategy.RawMatrix); err != nil {
-							logging.Errorf("Error while evaluating matrix: %v", err)
+						if err := strategyRc.ExprEval.EvaluateYamlNode(ctx, &job.Strategy.RawMatrix); err != nil {
+							return failStrategy(err)
 						}
 						for _, value := range []*string{&job.Strategy.FailFastString, &job.Strategy.MaxParallelString} {
-							if evaluated, err := strategyRc.ExprEval.Interpolate(ctx, *value); err == nil {
-								*value = evaluated
+							evaluated, err := strategyRc.ExprEval.Interpolate(ctx, *value)
+							if err != nil {
+								return failStrategy(err)
 							}
+							*value = evaluated
 						}
 					}
 				}
 
 				matrixes, err := job.GetMatrixes()
 				if err != nil {
-					return fmt.Errorf("could not get job matrix: %w", err)
+					return failStrategy(fmt.Errorf("could not get job matrix: %w", err))
 				}
 				logging.Debugf("Job Matrices: %v", matrixes)
 
@@ -252,6 +259,7 @@ func (runner *runnerImpl) NewPlanExecutor(plan *model.Plan) common.Executor {
 
 				logging.Infof("Running job with maxParallel=%d for %d matrix combinations", maxParallel, len(matrixes))
 
+				var callerRunIndex int
 				for i, matrix := range matrixes {
 					index, total := i, len(matrixes)
 					if runner.caller == nil && runner.config.PresetGitHubContext != nil && len(matrix) > 0 {
@@ -271,20 +279,19 @@ func (runner *runnerImpl) NewPlanExecutor(plan *model.Plan) common.Executor {
 						rc.Name = fmt.Sprintf("%s-%d", rc.Name, i+1)
 					}
 					maxJobNameLen = max(maxJobNameLen, len(rc.String()))
-					if rc.caller != nil { // For Gitea
-						rc.caller.setReusedWorkflowJobResult(rc.Run.JobID, "pending")
+					if i == 0 && runner.caller != nil {
+						callerRunIndex = len(runner.caller.reportedRuns)
+						runner.caller.reportedRuns = append(runner.caller.reportedRuns, nil)
 					}
+					rc.callerRunIndex = callerRunIndex
 					stageExecutor = append(stageExecutor, func(ctx context.Context) error {
-						jobName := fmt.Sprintf("%-*s", maxJobNameLen, rc.String())
 						executor, err := rc.Executor()
 						if err != nil {
 							return err
 						}
 
-						jobCtx := common.WithJobErrorContainer(WithJobLogger(ctx, rc.Run.JobID, jobName, rc.Config, &rc.Masks, matrix))
-						jobCtx, cancelTimeout := applyJobTimeout(jobCtx, rc, job)
-						defer cancelTimeout()
-						return executor(jobCtx)
+						ctx = WithJobLogger(ctx, rc.Run.JobID, fmt.Sprintf("%-*s", maxJobNameLen, rc.String()), rc.Config, &rc.Masks, matrix)
+						return executor(common.WithJobErrorContainer(ctx))
 					})
 				}
 				// Run all matrix combinations of this job, then drop its aggregation mutex: the
@@ -336,15 +343,20 @@ func (runner *runnerImpl) NewPlanExecutor(plan *model.Plan) common.Executor {
 }
 
 func handleFailure(plan *model.Plan) common.Executor {
-	return func(ctx context.Context) error {
+	return func(_ctx context.Context) error {
+		var failure error
 		for _, stage := range plan.Stages {
 			for _, run := range stage.Runs {
-				if run.Job().Result == "failure" && !run.Job().ContinueOnError {
-					return fmt.Errorf("job '%s' failed", run.String())
+				job := run.Job()
+				if job.Result == "cancelled" && (len(job.Steps) > 0 || job.Uses != "") {
+					return jobTimeoutCancellation{}
+				}
+				if failure == nil && job.NeedsResult() == "failure" {
+					failure = fmt.Errorf("job '%s' failed", run.String())
 				}
 			}
 		}
-		return nil
+		return failure
 	}
 }
 
@@ -378,12 +390,4 @@ func (runner *runnerImpl) newCombinationRunContext(ctx context.Context, run *mod
 	}
 
 	return rc, nil
-}
-
-// For Gitea
-// Keyed by job id, not name: only the values are read, and masking can collapse two names into one.
-func (c *caller) setReusedWorkflowJobResult(jobID, result string) {
-	c.updateResultLock.Lock()
-	defer c.updateResultLock.Unlock()
-	c.reusedWorkflowJobResults[jobID] = result
 }

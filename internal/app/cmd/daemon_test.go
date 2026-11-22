@@ -39,9 +39,9 @@ func TestResolveLabels(t *testing.T) {
 		reg  []string
 		want []string
 	}{
-		{"flag wins", "flag:host,other", cfgLabels, regLabels, []string{"flag:host", "other"}},
-		{"config wins over registration", "", cfgLabels, regLabels, cfgLabels},
-		{"registration is the fallback", "", nil, regLabels, regLabels},
+		{"flag wins", "flag:host, , other", cfgLabels, regLabels, []string{"flag:host", "other"}},
+		{"config wins over registration", "", []string{" cfg:host "}, regLabels, cfgLabels},
+		{"registration is the fallback", "", nil, []string{" reg:host "}, regLabels},
 		{"blank flag is ignored", " , ", cfgLabels, regLabels, cfgLabels},
 		{"nothing configured", "", nil, nil, nil},
 	}

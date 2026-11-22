@@ -88,27 +88,23 @@ func (sr *stepRun) printRunScriptActionDetails(ctx context.Context) {
 // printRunActionHeader mirrors actions/runner's "Run <action>" header for `uses:` steps,
 // including the with: inputs and the step-level env: block.
 func printRunActionHeader(ctx context.Context, step *model.Step, action *model.Action, env map[string]string, rc *RunContext) {
-	if step == nil {
-		return
-	}
-	rawLogger := common.Logger(ctx).With(rawOutputField, true)
-
-	rawLogger.Infof("::group::Run %s", EscapeCommandData(step.Uses))
-
-	inputs := map[string]string{}
-	maps.Copy(inputs, step.With)
-	if action != nil {
+	inputs := step.With
+	if action != nil && len(action.Inputs) != 0 {
+		inputs = mergeMaps(inputs)
 		for name := range action.Inputs {
 			if _, provided := common.LookupFold(step.With, name, true); !provided {
 				inputs[name] = env[inputEnvKey(name)]
 			}
 		}
 	}
-	maps.DeleteFunc(inputs, func(_name, value string) bool { return value == "" })
-	if len(inputs) > 0 {
-		rawLogger.Infof("with:")
-		for _, k := range slices.Sorted(maps.Keys(inputs)) {
-			logKeyedValue(rawLogger, k, inputs[k])
+	rawLogger := common.Logger(ctx).With(rawOutputField, true)
+	rawLogger.Infof("::group::Run %s", EscapeCommandData(step.Uses))
+
+	names := slices.DeleteFunc(slices.Sorted(maps.Keys(inputs)), func(name string) bool { return inputs[name] == "" })
+	if len(names) > 0 {
+		rawLogger.Info("with:")
+		for _, name := range names {
+			logKeyedValue(rawLogger, name, inputs[name])
 		}
 	}
 

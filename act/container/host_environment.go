@@ -349,15 +349,8 @@ func (e *HostEnvironment) Exec(command []string, env map[string]string, _user, w
 
 func (e *HostEnvironment) ExecWithCmdLine(command []string, cmdline string, env map[string]string, workdir string) common.Executor {
 	return func(ctx context.Context) error {
-		if err := e.exec(ctx, command, cmdline, env, workdir); err != nil {
-			select {
-			case <-ctx.Done():
-				return fmt.Errorf("this step has been cancelled: %w", err)
-			default:
-				return err
-			}
-		}
-		return nil
+		err := e.exec(ctx, command, cmdline, env, workdir)
+		return cmp.Or(context.Cause(ctx), err)
 	}
 }
 
@@ -483,12 +476,10 @@ func (*HostEnvironment) JoinPathVariable(paths ...string) string {
 // https://docs.github.com/en/actions/learn-github-actions/contexts#runner-context
 func goArchToActionArch(arch string) string {
 	return cmp.Or(map[string]string{
-		"x86_64":  "X64",
-		"amd64":   "X64",
-		"386":     "X86",
-		"arm":     "ARM",
-		"aarch64": "ARM64",
-		"arm64":   "ARM64",
+		"386": "X86", "i386": "X86", "i686": "X86",
+		"amd64": "X64", "x86_64": "X64",
+		"arm": "ARM", "armv6l": "ARM", "armv7l": "ARM",
+		"arm64": "ARM64", "aarch64": "ARM64",
 	}[arch], arch)
 }
 

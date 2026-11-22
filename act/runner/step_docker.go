@@ -6,6 +6,8 @@ package runner
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 
 	"gitea.com/gitea/runner/act/common"
@@ -26,7 +28,7 @@ func (sd *stepDocker) pre() common.Executor { return common.NewPipelineExecutor(
 func (sd *stepDocker) main() common.Executor {
 	sd.env = map[string]string{}
 
-	return runStepExecutor(sd, stepStageMain, sd.runUsesContainer())
+	return runStepExecutor(sd, stepStageMain, sd.runUsesContainer)
 }
 
 func (sd *stepDocker) post() common.Executor { return common.NewPipelineExecutor() }
@@ -47,37 +49,38 @@ func (sd *stepDocker) getIfExpression(_ context.Context, _ stepStage) string {
 	return sd.Step.If.Value
 }
 
-func (sd *stepDocker) runUsesContainer() common.Executor {
+func (sd *stepDocker) runUsesContainer(ctx context.Context) error {
 	rc := sd.RunContext
-	step := sd.Step
-
-	return func(ctx context.Context) error {
-		if rc.isWindowsHost() {
-			return errWindowsHostContainer
-		}
-		if rc.kubernetes {
-			return errKubernetesDocker
-		}
-		image := strings.TrimPrefix(step.Uses, "docker://")
-		cmd, err := shellquote.Split(stepInput(step, "args"))
-		if err != nil {
-			return err
-		}
-
-		var entrypoint []string
-		if entry := stepInput(step, "entrypoint"); entry != "" {
-			entrypoint = []string{entry}
-		}
-
-		stepContainer := newStepContainer(ctx, sd, image, cmd, entrypoint, "")
-
-		return common.NewPipelineExecutor(
-			stepContainer.Pull(rc.Config.ForcePull),
-			stepContainer.Remove(),
-			stepContainer.Create(rc.Config.ContainerCapAdd, rc.Config.ContainerCapDrop),
-			stepContainer.Start(true),
-		).Finally(stepContainer.Close())(ctx)
+	if rc.isWindowsHost() {
+		return errWindowsHostContainer
 	}
+	if rc.kubernetes {
+		return errKubernetesDocker
+	}
+	cmd, err := shellquote.Split(stepInput(sd.Step, "args"))
+	if err != nil {
+		return err
+	}
+
+	var entrypoint []string
+	if entry := stepInput(sd.Step, "entrypoint"); entry != "" {
+		entrypoint = []string{entry}
+	}
+	input := stepContainerInput(ctx, sd, strings.TrimPrefix(sd.Step.Uses, "docker://"), cmd, entrypoint, "")
+	return rc.runStepContainer(ctx, ContainerNewContainer(input), nil, rc.Config.ForcePull)
+}
+
+func (rc *RunContext) runStepContainer(ctx context.Context, stepContainer container.Container, prepImage common.Executor, forcePull bool) error {
+	if stepContainer == nil {
+		return fmt.Errorf("running a Docker action: %w", errors.ErrUnsupported)
+	}
+	return common.NewPipelineExecutor(
+		prepImage,
+		stepContainer.Pull(forcePull),
+		stepContainer.Remove(),
+		stepContainer.Create(rc.Config.ContainerCapAdd, rc.Config.ContainerCapDrop),
+		stepContainer.Start(true),
+	).Finally(stepContainer.Close())(ctx)
 }
 
 var ContainerNewContainer = container.NewContainer
