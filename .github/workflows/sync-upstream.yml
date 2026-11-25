@@ -17,30 +17,24 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      SYNC_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
     steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: main
-          fetch-depth: 0
-          # Set SYNC_TOKEN if main is protected against github-actions[bot].
-          token: ${{ secrets.SYNC_TOKEN || github.token }}
-
-      - name: Configure git
+      - name: Sync
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          set -euo pipefail
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Fetch upstream
-        run: |
-          git remote add upstream https://gitea.com/gitea/runner.git 2>/dev/null || git remote set-url upstream https://gitea.com/gitea/runner.git
+          git clone --quiet --no-tags "https://x-access-token:${SYNC_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" repo
+          cd repo
+          git checkout main
+
+          git remote add upstream https://gitea.com/gitea/runner.git
           git fetch upstream --tags --force
 
-      - name: Merge upstream/main
-        id: merge
-        run: |
           if git merge-base --is-ancestor upstream/main HEAD; then
             echo "Already up to date."
-            echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           if ! git merge --no-edit upstream/main; then
@@ -48,11 +42,6 @@ jobs:
             echo "::error::Merge conflict with upstream/main. Resolve it locally, push, then rerun this workflow."
             exit 1
           fi
-          echo "changed=true" >> "$GITHUB_OUTPUT"
 
-      - name: Push main
-        if: steps.merge.outputs.changed == 'true'
-        run: git push origin HEAD:main
-
-      - name: Push tags
-        run: git push origin --tags --force
+          git push origin HEAD:main
+          git push origin --tags --force
