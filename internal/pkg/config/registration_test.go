@@ -6,6 +6,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -25,6 +26,14 @@ func TestSaveAndLoadRegistration(t *testing.T) {
 	}
 
 	require.NoError(t, SaveRegistration(file, reg))
+	require.NoError(t, os.Chmod(file, 0o644))
+	reg.Name = "new"
+	require.NoError(t, SaveRegistration(file, reg))
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(file)
+		require.NoError(t, err)
+		require.Equal(t, os.FileMode(0o600), info.Mode().Perm())
+	}
 	// SaveRegistration stamps the warning onto the in-memory struct
 	require.Equal(t, registrationWarning, reg.Warning)
 

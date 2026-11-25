@@ -725,7 +725,7 @@ func (h *Handler) lookupCache(db *cacheDB, cred JobCredential, keys []string, ve
 			h.touch(db, cache)
 			return cache, nil
 		}
-		if !h.deleteCache(db, cache) {
+		if !h.removeBlob(cache) || !h.deleteEntries(db, cache) {
 			return nil, nil //nolint:nilnil // absence is not an error here
 		}
 	}
@@ -900,16 +900,12 @@ func (h *Handler) commitCache(cache *Cache) error {
 	if err != nil {
 		return err
 	}
-	defer db.Close()
-	if err := db.save(cache); err != nil {
-		return err
+	err = db.save(cache)
+	db.Close()
+	if err == nil && h.s3 == nil { // lifecycle rules on the bucket bound its size
+		h.evictOversized(&cache.Repo)
 	}
-	if h.s3 != nil {
-		return nil // lifecycle rules on the bucket bound its size
-	}
-	h.evictRepo(db, cache.Repo)
-	h.evictTotal(db)
-	return nil
+	return err
 }
 
 // GET /_apis/artifactcache/artifacts/:id
@@ -1243,6 +1239,7 @@ const (
 	miB = 1024 * 1024
 
 	defaultSweepInterval = time.Hour
+	evictionBatchSize    = 8
 
 	touchStale = time.Minute // how stale a completed entry's UsedAt may get before an access rewrites it, sparing hits the fsync
 
@@ -1298,144 +1295,163 @@ func (h *Handler) gcCache() {
 	if err != nil {
 		return
 	}
-	defer db.Close()
-
 	if err := db.dropLegacyIndexes(); err != nil {
 		h.logger.Warnf("drop legacy indexes: %v", err)
 	}
-	h.evictIncomplete(db)
+	db.Close()
+
+	stalled := h.gcAt.Add(-uploadStallTimeout).Unix()
+	expired := h.gcAt.Add(-max(h.policy.Retention+touchStale, inUseGrace)).Unix() // never below inUseGrace, or a short retention would outrun a signed URL already issued
+	h.evictBatches(func(batch *evictionBatch) {
+		for _, cache := range h.caches(batch.db, func(cache *Cache) bool {
+			return !cache.Complete && cache.UsedAt < stalled ||
+				h.s3 == nil && h.policy.Retention > 0 && cache.UsedAt < expired
+		}) {
+			h.deleteCache(batch, cache)
+		}
+	})
 	if h.s3 != nil {
 		return // lifecycle rules on the bucket expire its entries
 	}
-	h.evictExpired(db)
-	h.evictSuperseded(db)
-	h.evictOversized(db)
-	_ = db.Close()
+	h.evictBatches(h.evictSuperseded)
+	h.evictOversized(nil)
 	h.makeRoom(0)
+}
+
+type evictionBatch struct {
+	db         *cacheDB
+	failed     map[uint64]bool
+	removed    []*Cache
+	candidates int
+}
+
+func (h *Handler) evictBatches(evict func(*evictionBatch)) {
+	failed := make(map[uint64]bool)
+	for {
+		db, err := h.openDB()
+		if err != nil {
+			return
+		}
+		batch := evictionBatch{db: db, failed: failed}
+		evict(&batch)
+		deleted := len(batch.removed) == 0 || h.deleteEntries(db, batch.removed...)
+		db.Close()
+		if !deleted || batch.candidates <= evictionBatchSize {
+			return
+		}
+	}
+}
+
+func (h *Handler) deleteCache(batch *evictionBatch, cache *Cache) bool {
+	if batch.failed[cache.ID] {
+		return false
+	}
+	batch.candidates++
+	if batch.candidates > evictionBatchSize {
+		return false
+	}
+	if !h.removeBlob(cache) {
+		batch.failed[cache.ID] = true
+		return false
+	}
+	batch.removed = append(batch.removed, cache)
+	return true
+}
+
+func (h *Handler) diskShortfall(need int64) int64 {
+	free, err := h.freeDisk(h.dir)
+	if err != nil {
+		h.logger.Debugf("free disk check: %v", err) // unsupported platform, treat as unavailable rather than full
+		return 0
+	}
+	return max(h.policy.MinFreeDisk+max(need, 0)-int64(free), 0)
 }
 
 // makeRoom evicts the least recently used entries to keep need bytes above the floor, as GitHub saves new over old.
 func (h *Handler) makeRoom(need int64) {
-	free, err := h.freeDisk(h.dir)
-	if err != nil {
-		h.logger.Debugf("free disk check: %v", err) // unsupported platform, treat as unavailable rather than full
+	if h.s3 != nil || h.diskShortfall(need) == 0 {
 		return
 	}
-	shortfall := h.policy.MinFreeDisk + max(need, 0) - int64(free)
-	if h.s3 != nil || shortfall <= 0 {
-		return
-	}
-	db, err := h.openDB()
-	if err != nil {
-		return
-	}
-	defer db.Close()
-
-	caches := h.completedByUse(db)
-	total := totalSize(caches)
-	if total <= shortfall {
-		// Say so, or shedding everything and still being short reads as the backstop working.
-		h.logger.Warnf("cache volume is %d MiB short of the free space floor with only %d MiB of cache on it; something else is filling it", shortfall/miB, total/miB)
-	}
-	h.evictTo(db, caches, total-shortfall, "the cache volume")
-}
-
-// evictIncomplete removes uploads that stopped part way, which are most likely broken.
-func (h *Handler) evictIncomplete(db *cacheDB) {
-	stalled := time.Now().Add(-uploadStallTimeout).Unix()
-	h.sweep(db, func(cache *Cache) bool { return cache.UsedAt < stalled && !cache.Complete })
-}
-
-func (h *Handler) evictExpired(db *cacheDB) {
-	if h.policy.Retention <= 0 {
-		return
-	}
-	// Never below inUseGrace, or a short retention would outrun a signed URL already issued.
-	expired := time.Now().Add(-max(h.policy.Retention+touchStale, inUseGrace)).Unix()
-	h.sweep(db, func(cache *Cache) bool { return cache.UsedAt < expired })
+	h.evictBatches(func(batch *evictionBatch) {
+		shortfall := h.diskShortfall(need)
+		if shortfall == 0 {
+			return
+		}
+		caches := h.cachesByUse(batch.db, func(cache *Cache) bool { return cache.Complete })
+		total := totalSize(caches)
+		if total <= shortfall { // say so, or shedding everything and still being short reads as the backstop working
+			h.logger.Warnf("cache volume is %d MiB short of the free space floor with only %d MiB of cache on it. Something else is filling it", shortfall/miB, total/miB)
+		}
+		h.evictTo(batch, caches, total-shortfall, "the cache volume")
+	})
 }
 
 // evictSuperseded removes entries a newer one with the same repo, ref, key and version replaced.
-func (h *Handler) evictSuperseded(db *cacheDB) {
+func (h *Handler) evictSuperseded(batch *evictionBatch) {
 	type entry struct{ repo, ref, key, version string }
 	groups := make(map[entry][]*Cache)
-	for _, cache := range h.caches(db, func(cache *Cache) bool { return cache.Complete }) {
+	for _, cache := range h.caches(batch.db, func(cache *Cache) bool { return cache.Complete }) {
 		group := entry{cache.Repo, cache.Ref, cache.Key, cache.Version}
 		groups[group] = append(groups[group], cache)
 	}
 	for _, caches := range groups {
-		slices.SortFunc(caches, func(left, right *Cache) int {
-			return cmp.Or(cmp.Compare(left.createdAtNano(), right.createdAtNano()), cmp.Compare(left.ID, right.ID))
-		})
-		for _, cache := range caches[:len(caches)-1] {
-			if inUse(cache) {
-				continue
+		newest := latest(caches, (*Cache).createdAtNano)
+		for _, cache := range caches {
+			if cache != newest && !inUse(cache) {
+				h.deleteCache(batch, cache)
 			}
-			h.deleteCache(db, cache)
 		}
 	}
 }
 
 // evictOversized applies the per-repository limit, then the whole-store one. Only completed
 // entries count, since only those carry a size measured at commit rather than claimed.
-func (h *Handler) evictOversized(db *cacheDB) {
-	if h.policy.RepoSizeLimit > 0 {
-		byRepo := make(map[string][]*Cache)
-		for _, cache := range h.completedByUse(db) {
-			byRepo[cache.Repo] = append(byRepo[cache.Repo], cache)
-		}
-		for repo, caches := range byRepo {
-			h.evictTo(db, caches, h.policy.RepoSizeLimit, "repository "+repo)
-		}
-	}
-	h.evictTotal(db)
-}
-
-// evictTotal caps the store as a whole. It re-queries because the per-repo pass may have
-// deleted rows an earlier result still holds.
-func (h *Handler) evictTotal(db *cacheDB) {
-	if h.policy.SizeLimit <= 0 {
+func (h *Handler) evictOversized(repo *string) {
+	if h.policy.RepoSizeLimit <= 0 && h.policy.SizeLimit <= 0 {
 		return
 	}
-	h.evictTo(db, h.completedByUse(db), h.policy.SizeLimit, "the cache")
-}
-
-// evictRepo reclaims space when a commit pushes a repo over, rather than at the next sweep.
-func (h *Handler) evictRepo(db *cacheDB, repo string) {
-	if h.policy.RepoSizeLimit <= 0 {
-		return
-	}
-	h.evictTo(db, h.cachesByUse(db, func(cache *Cache) bool { return cache.Repo == repo && cache.Complete }), h.policy.RepoSizeLimit, "repository "+repo)
+	h.evictBatches(func(batch *evictionBatch) {
+		caches := h.cachesByUse(batch.db, func(cache *Cache) bool { return cache.Complete })
+		overTotal := h.policy.SizeLimit > 0 && totalSize(caches) > h.policy.SizeLimit
+		if h.policy.RepoSizeLimit > 0 {
+			byRepo := make(map[string][]*Cache)
+			for _, cache := range caches {
+				if overTotal || repo == nil || cache.Repo == *repo {
+					byRepo[cache.Repo] = append(byRepo[cache.Repo], cache)
+				}
+			}
+			for repo, caches := range byRepo {
+				h.evictTo(batch, caches, h.policy.RepoSizeLimit, "repository "+repo)
+			}
+		}
+		if overTotal {
+			caches = slices.DeleteFunc(caches, func(cache *Cache) bool { return slices.Contains(batch.removed, cache) })
+			h.evictTo(batch, caches, h.policy.SizeLimit, "the cache")
+		}
+	})
 }
 
 // evictTo deletes until caches fit limit. caches must be ordered by UsedAt ascending.
-func (h *Handler) evictTo(db *cacheDB, caches []*Cache, limit int64, scope string) {
+func (h *Handler) evictTo(batch *evictionBatch, caches []*Cache, limit int64, scope string) {
 	// An entry bigger than the limit never fits, so it goes on its own account instead of
 	// dragging every neighbour out first and then following them next sweep.
-	fits := caches[:0]
+	var total int64
 	for _, cache := range caches {
 		if cache.Size <= limit {
-			fits = append(fits, cache)
-			continue
-		}
-		if !inUse(cache) {
+			total += cache.Size
+		} else if !inUse(cache) && h.deleteCache(batch, cache) {
 			h.logger.Warnf("cache %q is %d MiB on its own, over the limit for %s; dropping it", cache.Key, cache.Size/miB, scope)
-			h.deleteCache(db, cache)
 		}
 	}
-	caches = fits
 
-	total := totalSize(caches)
 	var freed int64
 	for _, cache := range caches {
-		if total <= limit {
+		if total-freed <= limit {
 			break
 		}
-		if inUse(cache) || !h.deleteCache(db, cache) {
-			continue
+		if cache.Size <= limit && !inUse(cache) && h.deleteCache(batch, cache) {
+			freed += cache.Size
 		}
-		total -= cache.Size
-		freed += cache.Size
 	}
 	if freed > 0 {
 		h.logger.Warnf("evicted %d MiB from %s, least recently used first", freed/miB, scope)
@@ -1466,12 +1482,6 @@ func (h *Handler) touch(db *cacheDB, cache *Cache) {
 	}
 }
 
-func (h *Handler) sweep(db *cacheDB, match func(*Cache) bool) {
-	for _, cache := range h.caches(db, match) {
-		h.deleteCache(db, cache)
-	}
-}
-
 func (h *Handler) caches(db *cacheDB, match func(*Cache) bool) []*Cache {
 	caches, err := db.find(match)
 	if err != nil {
@@ -1486,11 +1496,6 @@ func (h *Handler) cachesByUse(db *cacheDB, match func(*Cache) bool) []*Cache {
 	return caches
 }
 
-// completedByUse returns every entry the size limits count, least recently accessed first.
-func (h *Handler) completedByUse(db *cacheDB) []*Cache {
-	return h.cachesByUse(db, func(cache *Cache) bool { return cache.Complete })
-}
-
 func totalSize(caches []*Cache) int64 {
 	var total int64
 	for _, cache := range caches {
@@ -1499,9 +1504,7 @@ func totalSize(caches []*Cache) int64 {
 	return total
 }
 
-// deleteCache drops an entry and its bytes, reporting whether it went fully. The blob goes
-// first, so a failed unlink leaves the row for the next sweep instead of orphaning bytes.
-func (h *Handler) deleteCache(db *cacheDB, cache *Cache) bool {
+func (h *Handler) removeBlob(cache *Cache) bool {
 	storage := h.storage
 	if h.s3 != nil && !cache.Complete {
 		storage = h.s3.Storage // an upload not yet committed has nothing in the bucket
@@ -1510,11 +1513,24 @@ func (h *Handler) deleteCache(db *cacheDB, cache *Cache) bool {
 		h.logger.Warnf("remove cache blob: %v", err)
 		return false
 	}
-	if err := db.update(func(bucket *bbolt.Bucket) error { return db.delete(bucket, cache.ID) }); err != nil {
+	return true
+}
+
+func (h *Handler) deleteEntries(db *cacheDB, caches ...*Cache) bool {
+	if err := db.update(func(bucket *bbolt.Bucket) error {
+		for _, cache := range caches {
+			if err := db.delete(bucket, cache.ID); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
 		h.logger.Warnf("delete cache: %v", err)
 		return false
 	}
-	h.logger.Infof("deleted cache: %+v", cache)
+	for _, cache := range caches {
+		h.logger.Infof("deleted cache: %+v", cache)
+	}
 	return true
 }
 

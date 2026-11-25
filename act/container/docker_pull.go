@@ -7,6 +7,7 @@
 package container
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"strings"
@@ -77,7 +78,7 @@ func NewDockerPullExecutor(input NewDockerPullExecutorInput) common.Executor {
 			return nil
 		}
 		// a registry that is down should not fail a job whose image is already here
-		if exists, existsErr := ImageExistsLocally(ctx, input.Image, input.Platform); existsErr == nil && exists {
+		if exists, existsErr := ImageExistsLocally(ctx, input.Image, cmp.Or(input.Platform, "any")); existsErr == nil && exists {
 			logger.Warnf("could not update image '%s' (%s), continuing with the local copy: %v", imageRef, input.Platform, err)
 			return nil
 		}

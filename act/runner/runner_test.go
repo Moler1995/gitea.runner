@@ -7,7 +7,6 @@ package runner
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,10 +14,13 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"gitea.com/gitea/runner/act/common"
 	"gitea.com/gitea/runner/act/common/logging"
+	"gitea.com/gitea/runner/act/common/logging/logtest"
+	"gitea.com/gitea/runner/act/container"
 	"gitea.com/gitea/runner/act/ghcontext"
 
 	"gitea.dev/actionslib/pkg/model"
@@ -33,7 +35,6 @@ var (
 	logLevel         = logging.LevelDebug
 	workdir          = "testdata"
 	secrets          map[string]string
-	testRunID        = strings.ToLower(rand.Text()[:8]) // keeps docker names apart from concurrent test processes on one daemon
 	testCheckoutPins sync.Map
 )
 
@@ -170,6 +171,51 @@ func TestNewPlanExecutorRequiresRunsOnBeforeRunningAnyJob(t *testing.T) {
 	assert.Equal(t, "success", workflow.Jobs["build"].Result)
 }
 
+func TestLocalPlanContinuesAfterCancellationAndInvalidJobTimeout(t *testing.T) {
+	workflow, err := model.ReadWorkflow(strings.NewReader(`
+jobs:
+  upstream: {}
+  timed: {needs: upstream, if: always(), runs-on: ubuntu-latest, timeout-minutes: 1, steps: [run: exit 1]}
+  skipped:
+    needs: timed
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJSON('invalid') }}
+    steps: [run: exit 1]
+  unsupported: {needs: timed, if: always(), runs-on: unknown, steps: [run: exit 1]}
+  invalid:
+    needs: timed
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJSON('"abc"') }}
+    steps: [run: exit 1]
+  downstream: {needs: invalid, runs-on: ubuntu-latest, steps: [run: exit 1]}
+`))
+	require.NoError(t, err)
+	workflow.Jobs["upstream"].Result = "failure"
+	plan, err := model.CombineWorkflowPlanner(workflow).PlanAll()
+	require.NoError(t, err)
+	slow := &containerMock{}
+	slow.On("Pull", false).Return(func(ctx context.Context) error {
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	slow.On("Remove").Return(noopExecutor)
+	slow.On("Close").Return(noopExecutor)
+	original := newContainer
+	newContainer = func(_input *container.NewContainerInput) container.ExecutionsEnvironment { return slow }
+	t.Cleanup(func() { newContainer = original })
+	runner := &runnerImpl{config: &Config{Env: testCheckoutEnv(), PlatformPicker: mapPlatformPicker(platforms)}}
+	hook := logtest.NewWithLevel(logging.LevelError)
+	synctest.Test(t, func(t *testing.T) {
+		ctx := common.WithLoggerHandler(common.WithDryrun(t.Context(), true), hook)
+		require.ErrorIs(t, runner.NewPlanExecutor(plan)(ctx), context.Canceled)
+	})
+	for jobID, want := range map[string]string{"timed": "cancelled", "skipped": "skipped", "unsupported": "skipped", "invalid": "failure", "downstream": "skipped"} {
+		assert.Equal(t, want, workflow.Jobs[jobID].Result, jobID)
+	}
+	assert.Contains(t, hook.LastRecord().Message, "Error when evaluating 'timeout-minutes' for job 'invalid'. Unexpected value 'abc'")
+}
+
 func TestGraphEvent(t *testing.T) {
 	planner, err := model.NewWorkflowPlanner("testdata/basic", true)
 	assert.NoError(t, err) //nolint:testifylint // pre-existing issue from nektos/act
@@ -237,8 +283,6 @@ func (j *TestJobFileInfo) runTest(ctx context.Context, t *testing.T, cfg *Config
 		EventName:      j.eventName,
 		EventPath:      cfg.EventPath,
 		PlatformPicker: mapPlatformPicker(j.platforms),
-		// fixtures reuse workflow and job names, so parallel tests would collide without this
-		ContainerNamePrefix: strings.ReplaceAll(t.Name(), "/", "-") + "-" + testRunID,
 		// 0 would run jobs runtime.NumCPU()-wide, making the network peak machine-dependent
 		MaxParallel:           2,
 		Env:                   cfg.Env,
@@ -367,7 +411,7 @@ func TestRunEvent(t *testing.T) {
 
 			config := &Config{
 				Secrets: table.secrets,
-				Env:     map[string]string{"GITHUB_REPOSITORY": t.Name() + "-" + testRunID},
+				Env:     map[string]string{"GITHUB_REPOSITORY": t.Name()},
 			}
 
 			eventFile := filepath.Join(workdir, table.workflowPath, "event.json")

@@ -300,11 +300,12 @@ func (r *Runner) Run(ctx context.Context, task *runnerv1.Task) (err error) {
 
 	start := time.Now()
 
-	ctx, cancel := context.WithTimeout(ctx, r.cfg.Runner.Timeout)
+	ctx, cancel := context.WithTimeoutCause(ctx, r.cfg.Runner.Timeout, fmt.Errorf("job exceeded runner.timeout of %s", r.cfg.Runner.Timeout))
 	defer cancel()
+	ctx, cancelJob := context.WithCancelCause(ctx)
 	ctx, endJob := telemetry.StartJob(ctx, task)
 	// A proxy URL may carry credentials, and every job is given it; keep them out of the log.
-	reporter := report.NewReporter(ctx, cancel, r.client, task, r.cfg, proxyPasswords(r.envs)...)
+	reporter := report.NewReporter(ctx, cancelJob, r.client, task, r.cfg, proxyPasswords(r.envs)...)
 	var volumeCleanup []common.Executor
 	var volumeCleanupMu sync.Mutex
 	if r.cfg.Runner.PostTaskScript == "" {
@@ -316,11 +317,7 @@ func (r *Runner) Run(ctx context.Context, task *runnerv1.Task) (err error) {
 	}
 	var runErr error
 	defer func() {
-		lastWords := ""
-		if runErr != nil {
-			lastWords = runErr.Error()
-		}
-		err = reporter.Close(lastWords)
+		err = reporter.Close(runErr)
 		if err := cleanupJobVolumes(ctx, volumeCleanup); err != nil {
 			logging.Warnf("task %d volume cleanup after reporting: %v", task.Id, err)
 		}
@@ -331,6 +328,9 @@ func (r *Runner) Run(ctx context.Context, task *runnerv1.Task) (err error) {
 	}()
 	reporter.RunDaemon()
 	runErr = r.run(ctx, task, reporter)
+	if ctx.Err() != nil && errors.Is(runErr, ctx.Err()) {
+		runErr = context.Cause(ctx)
+	}
 
 	return nil
 }
@@ -519,6 +519,9 @@ func (r *Runner) run(ctx context.Context, task *runnerv1.Task, reporter *report.
 	preset := model.GithubContextFromMap(task.Context.AsMap())
 	preset.Token = cmp.Or(task.Secrets["GITEA_TOKEN"], task.Secrets["GITHUB_TOKEN"], preset.Token)
 
+	if task.Secrets == nil {
+		task.Secrets = make(map[string]string)
+	}
 	if actionsIDTokenRequestURL := taskContext["actions_id_token_request_url"].GetStringValue(); actionsIDTokenRequestURL != "" {
 		envs["ACTIONS_ID_TOKEN_REQUEST_URL"] = actionsIDTokenRequestURL
 		envs["ACTIONS_ID_TOKEN_REQUEST_TOKEN"] = taskContext["actions_id_token_request_token"].GetStringValue()
@@ -627,6 +630,7 @@ func (r *Runner) run(ctx context.Context, task *runnerv1.Task, reporter *report.
 		DefaultActionInstance:             r.getDefaultActionsURL(task),
 		DefaultActionInstanceIsSelfHosted: r.isSelfHostedActionsURL(task),
 		PlatformPicker:                    platformPicker,
+		ReplaceUses:                       r.cfg.Runner.ReplaceUses,
 		JobStartedHook:                    r.cfg.Runner.Hooks.JobStarted,
 		JobCompletedHook:                  r.cfg.Runner.Hooks.JobCompleted,
 		Vars:                              task.Vars,
@@ -647,8 +651,6 @@ func (r *Runner) run(ctx context.Context, task *runnerv1.Task, reporter *report.
 	if err != nil {
 		return err
 	}
-	executor := rr.NewPlanExecutor(plan)
-
 	reporter.Logf("workflow prepared")
 
 	// add logger recorders
@@ -658,7 +660,7 @@ func (r *Runner) run(ctx context.Context, task *runnerv1.Task, reporter *report.
 		ctx = runner.WithJobLoggerFactory(ctx, NullLogger{})
 	}
 
-	execErr := executor(ctx)
+	execErr := rr.NewPlanExecutor(plan)(ctx)
 	reporter.SetOutputs(job.Outputs)
 
 	if r.cfg.Container.BindWorkdir {

@@ -83,12 +83,12 @@ func (sal *stepActionLocal) main() common.Executor {
 
 		sal.action = actionModel
 
-		return sal.runAction(sal, actionDir, nil)(ctx)
+		return sal.runAction(sal)(ctx)
 	})
 }
 
 func (sal *stepActionLocal) post() common.Executor {
-	return runStepExecutor(sal, stepStagePost, runPostStep(sal)).If(hasPostStep(sal)).If(shouldRunPostStep(sal))
+	return runStepExecutor(sal, stepStagePost, runActionHook(sal, stepStagePost)).If(hasPostStep(sal)).If(shouldRunPostStep(sal))
 }
 
 func (sal *stepActionLocal) getRunContext() *RunContext {
@@ -117,18 +117,13 @@ func (sal *stepActionLocal) getActionModel() *model.Action {
 	return sal.action
 }
 
-func (sal *stepActionLocal) getCompositeRunContext(ctx context.Context) (*RunContext, error) {
+func (sal *stepActionLocal) getCompositeRunContext(ctx context.Context, inputs map[string]string) *RunContext {
 	if sal.compositeRunContext == nil {
 		_, containerActionDir := getContainerActionPaths(sal)
-
-		compositeRunContext, err := newCompositeRunContext(ctx, sal.RunContext, sal, containerActionDir)
-		if err != nil {
-			return nil, err
-		}
-		sal.compositeRunContext = compositeRunContext
-		sal.compositeSteps = compositeRunContext.compositeExecutor(sal.action)
+		sal.compositeRunContext = newCompositeRunContext(ctx, sal.RunContext, sal, containerActionDir, inputs)
+		sal.compositeSteps = sal.compositeRunContext.compositeExecutor(sal.action)
 	}
-	return sal.compositeRunContext, nil
+	return sal.compositeRunContext
 }
 
 func (sal *stepActionLocal) getCompositeSteps() *compositeSteps {

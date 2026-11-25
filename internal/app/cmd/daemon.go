@@ -295,21 +295,19 @@ type daemonArgs struct {
 // resolveLabels picks the labels to run with: --labels/GITEA_RUNNER_LABELS > config > .runner.
 // The flag lets a registered runner change its labels without deleting the .runner file.
 func resolveLabels(argLabels string, cfgLabels, regLabels []string) []string {
-	if lbls := splitLabels(argLabels); len(lbls) > 0 {
+	lbls := trimLabels(strings.Split(argLabels, ","))
+	if lbls = slices.DeleteFunc(lbls, func(label string) bool { return label == "" }); len(lbls) > 0 {
 		return lbls
 	}
 	if len(cfgLabels) > 0 {
-		return cfgLabels
+		regLabels = cfgLabels
 	}
-	return regLabels
+	return trimLabels(slices.Clone(regLabels))
 }
 
-func splitLabels(s string) []string {
-	var lbls []string
-	for l := range strings.SplitSeq(s, ",") {
-		if l = strings.TrimSpace(l); l != "" {
-			lbls = append(lbls, l)
-		}
+func trimLabels(lbls []string) []string {
+	for i := range lbls {
+		lbls[i] = strings.TrimSpace(lbls[i])
 	}
 	return lbls
 }

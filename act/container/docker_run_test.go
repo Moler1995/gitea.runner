@@ -204,7 +204,7 @@ func (m *mockConn) Close() (err error) {
 }
 
 func TestDockerExecAbort(t *testing.T) {
-	ctx, cancel := context.WithCancel(t.Context())
+	ctx, cancel := context.WithCancelCause(t.Context())
 
 	reader := &interruptReader{started: make(chan struct{}), interrupted: make(chan struct{}), stopped: make(chan struct{})}
 	conn := &mockConn{}
@@ -213,30 +213,25 @@ func TestDockerExecAbort(t *testing.T) {
 		Return(1, nil)
 
 	client := &mockDockerClient{}
+	client.On("ContainerInspect", ctx, "123", mobyclient.ContainerInspectOptions{}).Return(mobyclient.ContainerInspectResult{}, nil)
 	client.On("ExecCreate", ctx, "123", mock.AnythingOfType("client.ExecCreateOptions")).Return(mobyclient.ExecCreateResult{ID: "id"}, nil)
 	client.On("ExecAttach", ctx, "id", mock.AnythingOfType("client.ExecAttachOptions")).Return(mobyclient.ExecAttachResult{
 		Conn:   conn,
 		Reader: bufio.NewReader(reader),
 	}, nil)
 
-	cr := &containerReference{
-		id:    "123",
-		cli:   client,
-		input: &NewContainerInput{},
-	}
-
+	run := (&containerReference{id: "123", cli: client, input: &NewContainerInput{}}).Exec(nil, nil, "", "")
 	channel := make(chan error)
-
 	go func() {
-		channel <- cr.exec([]string{""}, map[string]string{}, "user", "workdir")(ctx)
+		channel <- run(ctx)
 	}()
 
 	<-reader.started
-	cancel()
+	cancel(assert.AnError)
 
-	err := <-channel
+	require.ErrorIs(t, <-channel, assert.AnError)
 	<-reader.stopped
-	assert.ErrorIs(t, err, context.Canceled) //nolint:testifylint // pre-existing issue from nektos/act
+	require.ErrorIs(t, run(ctx), assert.AnError)
 
 	conn.AssertExpectations(t)
 	client.AssertExpectations(t)
@@ -521,7 +516,7 @@ func TestRunnerArchCachedPerRun(t *testing.T) {
 		writer.Header().Set("API-Version", "1.47")
 		if strings.HasSuffix(request.URL.Path, "/info") {
 			infos.Add(1)
-			_, _ = io.WriteString(writer, `{"Architecture":"aarch64"}`)
+			_, _ = io.WriteString(writer, `{"Architecture":"armv7l"}`)
 		}
 	}))
 	t.Cleanup(daemon.Close)
@@ -530,10 +525,10 @@ func TestRunnerArchCachedPerRun(t *testing.T) {
 	run := WithRunnerArch(t.Context())
 	var lookups sync.WaitGroup
 	for range 4 {
-		lookups.Go(func() { assert.Equal(t, "ARM64", extensions.GetRunnerContext(run)["arch"]) })
+		lookups.Go(func() { assert.Equal(t, "ARM", extensions.GetRunnerContext(run)["arch"]) })
 	}
 	lookups.Wait()
-	assert.Equal(t, "ARM64", extensions.GetRunnerContext(t.Context())["arch"])
+	assert.Equal(t, "ARM", extensions.GetRunnerContext(t.Context())["arch"])
 	assert.EqualValues(t, 2, infos.Load())
 }
 

@@ -32,14 +32,17 @@ func testFailurePaths(t *testing.T, m mode) {
 
 func testJobTimeout(t *testing.T) {
 	t.Parallel()
-	api, repo, _ := startIsolatedScenario(t, "timeout.yml", "e2e-timeout", runnerOptions{timeout: 15 * time.Second})
+	const timeout = 15 * time.Second
+	api, repo, _ := startIsolatedScenario(t, "timeout.yml", "e2e-timeout", runnerOptions{timeout: timeout})
 	wfRun := waitForRun(t, api, repo)
 	completed, err := api.WaitForRunConclusion(t.Context(), repo, wfRun.ID, runTimeout)
 	if err != nil {
 		dumpRunLogs(t, api, repo, wfRun.ID)
 		t.Fatalf("wait for run: %v", err)
 	}
-	if logs := runLogs(t, api, repo, wfRun.ID); completed.Conclusion != "failure" || commandRow(logs, "e2e-timeout-started") == "" {
-		t.Errorf("run concluded %q, want failure after the job started, logs:\n%s", completed.Conclusion, logs)
+	logs := runLogs(t, api, repo, wfRun.ID)
+	if completed.Conclusion != "failure" || commandRow(logs, "e2e-timeout-started") == "" ||
+		commandRow(logs, "job exceeded runner.timeout of "+timeout.String()) == "" {
+		t.Errorf("run concluded %q, want failure after the job started and exceeded runner.timeout, logs:\n%s", completed.Conclusion, logs)
 	}
 }

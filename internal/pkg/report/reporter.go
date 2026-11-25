@@ -22,6 +22,7 @@ import (
 
 	"connectrpc.com/connect/v2"
 	"gitea.dev/actionslib/pkg/model"
+	"gitea.dev/actionslib/pkg/protocol"
 	runnerv1 "gitea.dev/actionslib/runner/v1"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -29,12 +30,6 @@ import (
 
 // errOutputsNotSent travels the same return path as transport failures but is not one.
 var errOutputsNotSent = errors.New("there are still outputs that have not been sent")
-
-// Size limits for the outputs reported to the server.
-const (
-	maxOutputKeyLen   = 255
-	maxOutputValueLen = 1024 * 1024 // 1 MiB
-)
 
 // jobOutput is a job output on its way to the server, sent once the server has acknowledged it.
 type jobOutput struct {
@@ -44,7 +39,7 @@ type jobOutput struct {
 
 type Reporter struct {
 	ctx    context.Context
-	cancel context.CancelFunc
+	cancel context.CancelCauseFunc
 
 	closed  bool
 	client  client.Client
@@ -68,10 +63,8 @@ type Reporter struct {
 	currentReportedStep *runnerv1.StepState
 	stepModels          []*model.Step
 	// reportFailing keeps an outage to one log line at each end.
-	reportFailing map[string]bool
-	// serverResult is what the server decided, e.g. the zombie reaper failing
-	// the task. Guarded by stateMu.
-	serverResult      runnerv1.Result
+	reportFailing     map[string]bool
+	serverEndErr      error
 	stateMu           sync.RWMutex
 	outputsMu         sync.Mutex
 	outputs           map[string]jobOutput
@@ -102,7 +95,7 @@ type Reporter struct {
 
 // extraMasks are values known before the job starts that are not among its secrets, such as
 // the password in the runner's proxy URL.
-func NewReporter(ctx context.Context, cancel context.CancelFunc, client client.Client, task *runnerv1.Task, cfg *config.Config, extraMasks ...string) *Reporter {
+func NewReporter(ctx context.Context, cancel context.CancelCauseFunc, client client.Client, task *runnerv1.Task, cfg *config.Config, extraMasks ...string) *Reporter {
 	var oldnew []string
 	for _, v := range extraMasks {
 		oldnew = runner.AppendSecretMasker(oldnew, v)
@@ -174,7 +167,7 @@ func (r *Reporter) ResetSteps(steps []*model.Step) {
 	setup.LogLength = int64(r.logOffset + len(r.logRows)) // the runner's own lines logged before the job was parsed
 	r.currentReportedStep = setup
 	for i, step := range steps {
-		r.addReportedStep(len(r.state.ReportedSteps), runnerv1.StepStage_STEP_STAGE_MAIN, i, r.mask(stepDisplayName(step, "")))
+		r.addReportedStep(len(r.state.ReportedSteps), runnerv1.StepStage_STEP_STAGE_MAIN, i, r.mask(model.StepDisplayName(step, "")))
 	}
 	r.addReportedStep(len(r.state.ReportedSteps), runnerv1.StepStage_STEP_STAGE_CLEANUP, 0, "Complete job")
 }
@@ -182,16 +175,6 @@ func (r *Reporter) ResetSteps(steps []*model.Step) {
 type reportedStepKey struct {
 	stage  runnerv1.StepStage
 	number int
-}
-
-// stepDisplayName names a workflow step like Gitea and GitHub do, prefixing an unnamed one with "Run".
-// evaluated is step.String() with its expressions evaluated, empty while the step has not run yet.
-func stepDisplayName(step *model.Step, evaluated string) string {
-	if step.Name != "" {
-		return cmp.Or(evaluated, step.Name)
-	}
-	first, _, _ := strings.Cut(strings.TrimSpace(cmp.Or(evaluated, step.String())), "\n")
-	return "Run " + cmp.Or(strings.TrimSpace(first), step.String())
 }
 
 // addReportedStep inserts a step at pos of the reported steps. Caller holds stateMu.
@@ -233,7 +216,7 @@ func (r *Reporter) reportedStepOf(entry logging.Record) (*runnerv1.StepState, bo
 	main := r.reportedSteps[reportedStepKey{runnerv1.StepStage_STEP_STAGE_MAIN, number}]
 	if evaluated, _ := recordAttr[string](entry, "step"); evaluated != "" {
 		// evaluated as GitHub shows it, and masked as an expression can name a secret
-		main.Name = r.mask(stepDisplayName(r.stepModels[number], evaluated))
+		main.Name = r.mask(model.StepDisplayName(r.stepModels[number], evaluated))
 	}
 	if step, ok := r.reportedSteps[key]; ok {
 		return step, true
@@ -332,13 +315,17 @@ func (h *reporterHandler) WithAttrs(attrs []logging.Attr) logging.Handler {
 func (r *Reporter) appendLogRow(row *runnerv1.LogRow) {
 	row.Content = r.mask(row.Content)
 	if step := r.currentReportedStep; step != nil {
-		if step.LogLength == 0 {
-			step.LogIndex = int64(r.logOffset + len(r.logRows))
-		}
-		step.LogLength++
+		r.extendStepLog(step)
 	}
 	r.logRows = append(r.logRows, row)
 	r.jobLog.write(row.Time.AsTime(), row.Content)
+}
+
+func (r *Reporter) extendStepLog(step *runnerv1.StepState) {
+	if step.LogLength == 0 {
+		step.LogIndex = int64(r.logOffset + len(r.logRows))
+	}
+	step.LogLength++
 }
 
 func attrArgs(attrs []logging.Attr) []any {
@@ -420,7 +407,9 @@ func (r *Reporter) Handle(_ context.Context, entry logging.Record) error {
 		if v, ok := entry.Attr("jobResult"); ok {
 			if jobResult, ok := parseResult(v); ok {
 				// We need to ensure log upload before this upload
-				r.state.Result = jobResult
+				if r.serverEndErr == nil {
+					r.state.Result = jobResult
+				}
 				r.state.StoppedAt = timestamppb.New(timestamp)
 				for _, s := range r.state.Steps {
 					if s.Result == runnerv1.Result_RESULT_UNSPECIFIED {
@@ -464,10 +453,7 @@ func (r *Reporter) Handle(_ context.Context, entry logging.Record) error {
 	v, hasRawOutput := entry.Attr("raw_output")
 	rawOutput, _ := v.(bool)
 	if entry.Level >= logging.LevelError || rawOutput {
-		if step.LogLength == 0 {
-			step.LogIndex = int64(r.logOffset + len(r.logRows))
-		}
-		step.LogLength++
+		r.extendStepLog(step)
 		r.appendLogRow(logRow(entry))
 	} else if !hasRawOutput && r.shouldAppendLogRow(entry) {
 		r.appendLogRow(logRow(entry))
@@ -624,19 +610,18 @@ func (r *Reporter) SetOutputs(outputs map[string]string) {
 		r.outputs = map[string]jobOutput{}
 	}
 	for k, v := range outputs {
-		if l := len(k); l > maxOutputKeyLen {
-			logging.Warnf("ignore output %q because the key is too long: %d > %d", k, l, maxOutputKeyLen)
-			r.logf("ignore output %q because the key is too long: %d > %d", k, l, maxOutputKeyLen)
-			continue
+		var reason string
+		switch {
+		case len(k) > protocol.MaxOutputKeyLength:
+			reason = fmt.Sprintf("the key is too long: %d > %d", len(k), protocol.MaxOutputKeyLength)
+		case len(v) > protocol.MaxOutputValueLength:
+			reason = fmt.Sprintf("the value is too long: %d > %d", len(v), protocol.MaxOutputValueLength)
+		case r.logReplacer.Replace(v) != v: // GitHub skips an output that may carry a secret rather than masking it
+			reason = "it may contain a secret"
 		}
-		if l := len(v); l > maxOutputValueLen {
-			logging.Warnf("ignore output %q because the value is too long: %d > %d", k, l, maxOutputValueLen)
-			r.logf("ignore output %q because the value is too long: %d > %d", k, l, maxOutputValueLen)
-			continue
-		}
-		if r.logReplacer.Replace(v) != v { // GitHub skips an output that may carry a secret rather than masking it
-			logging.Warnf("ignore output %q because it may contain a secret", k)
-			r.logf("ignore output %q because it may contain a secret", k)
+		if reason != "" {
+			logging.Warnf("ignore output %q because %s", k, reason)
+			r.logf("ignore output %q because %s", k, reason)
 			continue
 		}
 		if _, ok := r.outputs[k]; !ok {
@@ -645,34 +630,32 @@ func (r *Reporter) SetOutputs(outputs map[string]string) {
 	}
 }
 
-func (r *Reporter) Close(lastWords string) error {
+func (r *Reporter) Close(runErr error) error {
 	defer deregisterGlobalMasks(r) // deferred so a panic below cannot strand this task's masks
 	r.stateMu.Lock()
 	r.closed = true
+	var lastWords string
 	if r.state.Result == runnerv1.Result_RESULT_UNSPECIFIED {
-		// No result of its own, so say why it stopped.
-		result, words := runnerv1.Result_RESULT_FAILURE, "Early termination"
-		switch {
-		case r.serverResult != runnerv1.Result_RESULT_UNSPECIFIED:
-			result, words = r.serverResult, "Ended by the server"
-		case errors.Is(r.ctx.Err(), context.Canceled):
-			result, words = runnerv1.Result_RESULT_CANCELLED, "Cancelled"
+		if r.ctx.Err() == context.Canceled {
+			r.state.Result = runnerv1.Result_RESULT_CANCELLED
+			lastWords = "Cancelled"
+		} else {
+			r.state.Result = runnerv1.Result_RESULT_FAILURE
+			lastWords = "Early termination"
 		}
-		if lastWords == "" {
-			lastWords = words
-		}
+	}
+	if r.state.StoppedAt == nil {
 		for _, v := range r.state.Steps {
 			if v.Result == runnerv1.Result_RESULT_UNSPECIFIED {
 				v.Result = runnerv1.Result_RESULT_CANCELLED
 			}
 		}
-		r.state.Result = result
-		r.appendLogRow(&runnerv1.LogRow{
-			Time:    timestamppb.Now(),
-			Content: lastWords,
-		})
 		r.state.StoppedAt = timestamppb.Now()
-	} else if lastWords != "" {
+	}
+	if runErr != nil && (r.serverEndErr == nil || runErr != context.Canceled && !errors.Is(runErr, r.serverEndErr)) {
+		lastWords = cmp.Or(runErr.Error(), lastWords)
+	}
+	if lastWords != "" {
 		r.appendLogRow(&runnerv1.LogRow{
 			Time:    timestamppb.Now(),
 			Content: lastWords,
@@ -888,11 +871,18 @@ func (r *Reporter) ReportState(reportResult bool) error {
 
 	// A terminal result means the server is done with this task; keep running and
 	// the job holds a capacity slot until runner.timeout.
-	if state := resp.State; state != nil && state.Result != runnerv1.Result_RESULT_UNSPECIFIED {
+	if result := resp.GetState().GetResult(); result != runnerv1.Result_RESULT_UNSPECIFIED {
 		r.stateMu.Lock()
-		r.serverResult = state.Result
+		if !r.closed && r.serverEndErr == nil {
+			r.serverEndErr = errors.New("Ended by the server: " + metrics.ResultToStatusLabel(result))
+			r.state.Result = result
+			if step := r.currentReportedStep; step != nil && step.Stage == runnerv1.StepStage_STEP_STAGE_MAIN && step.StoppedAt == nil {
+				r.extendStepLog(r.state.Steps[step.Number])
+			}
+			r.appendLogRow(&runnerv1.LogRow{Time: timestamppb.Now(), Content: r.serverEndErr.Error()})
+			r.cancel(r.serverEndErr)
+		}
 		r.stateMu.Unlock()
-		r.cancel()
 	}
 	if len(noSent) > 0 {
 		return fmt.Errorf("%w: %v", errOutputsNotSent, noSent)
@@ -919,23 +909,12 @@ func (r *Reporter) shouldAppendLogRow(entry logging.Record) bool {
 	return !r.duringSteps() && entry.Level >= r.logReportLevel
 }
 
-var stringToResult = map[string]runnerv1.Result{
-	"success":   runnerv1.Result_RESULT_SUCCESS,
-	"failure":   runnerv1.Result_RESULT_FAILURE,
-	"skipped":   runnerv1.Result_RESULT_SKIPPED,
-	"cancelled": runnerv1.Result_RESULT_CANCELLED,
-}
-
 func parseResult(result any) (runnerv1.Result, bool) {
-	str := ""
-	if v, ok := result.(string); ok { // for jobResult
-		str = v
-	} else if v, ok := result.(fmt.Stringer); ok { // for stepResult
-		str = v.String()
+	if stringer, ok := result.(fmt.Stringer); ok {
+		result = stringer.String()
 	}
-
-	ret, ok := stringToResult[str]
-	return ret, ok
+	conclusion, _ := result.(string)
+	return runnerv1.ParseConclusion(conclusion)
 }
 
 func logRow(entry logging.Record) *runnerv1.LogRow {

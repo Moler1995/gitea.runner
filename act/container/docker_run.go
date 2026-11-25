@@ -334,12 +334,16 @@ func (cr *containerReference) UpdateFromImageEnv(env *map[string]string) common.
 }
 
 func (cr *containerReference) Exec(command []string, env map[string]string, user, workdir string) common.Executor {
-	return common.NewPipelineExecutor(
+	run := common.NewPipelineExecutor(
 		common.NewInfoExecutor("docker exec cmd=[%s] user=%s workdir=%s", strings.Join(command, " "), user, workdir),
 		cr.connect(),
 		cr.find(),
 		cr.exec(command, env, user, workdir),
-	).IfNot(common.Dryrun)
+	)
+	return common.Executor(func(ctx context.Context) error {
+		err := run(ctx)
+		return cmp.Or(context.Cause(ctx), err)
+	}).IfNot(common.Dryrun)
 }
 
 func (cr *containerReference) Remove() common.Executor {
@@ -436,17 +440,7 @@ func RunnerArch(ctx context.Context) string {
 		return ""
 	}
 
-	archMapper := map[string]string{
-		"x86_64":  "X64",
-		"amd64":   "X64",
-		"386":     "X86",
-		"aarch64": "ARM64",
-		"arm64":   "ARM64",
-	}
-	if arch, ok := archMapper[info.Architecture]; ok {
-		return arch
-	}
-	return info.Architecture
+	return goArchToActionArch(info.Architecture)
 }
 
 func (cr *containerReference) targetOS(ctx context.Context) string {

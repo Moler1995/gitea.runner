@@ -23,7 +23,7 @@ func TestCompositeActionParity(t *testing.T) {
 		for _, uses := range []string{"./action", "own/action@v2"} {
 			t.Run(uses, func(t *testing.T) {
 				rc := &RunContext{
-					Config: &Config{PresetGitHubContext: &model.GithubContext{}},
+					Config: &Config{PresetGitHubContext: &model.GithubContext{}, Secrets: map[string]string{"key": "secret"}, Vars: map[string]string{"key": "var"}},
 					Run:    &model.Run{JobID: "job", Workflow: &model.Workflow{Jobs: map[string]*model.Job{"job": {}}}},
 					Env:    map[string]string{"GITHUB_ACTION_REPOSITORY": "other/composite", "GITHUB_ACTION_REF": "v1"},
 				}
@@ -34,16 +34,17 @@ func TestCompositeActionParity(t *testing.T) {
 					want = "own/action|v2"
 				}
 				action := &model.Action{
-					Inputs: map[string]model.Input{"identity": {Default: "${{ github.action_repository }}|${{ github.action_ref }}"}},
-					Runs:   model.ActionRuns{Env: map[string]string{"GITHUB_WORKFLOW_SHA": "runs-sha"}},
+					Inputs: map[string]model.Input{"identity": {Default: "${{ secrets.key || vars.key || env.GITHUB_JOB || github.action_repository }}|${{ gitea.action_ref }}"}},
+					Runs:   model.ActionRuns{Env: map[string]string{"GITHUB_WORKFLOW_SHA": "${{ env.GITHUB_JOB || inputs.identity }}"}},
 				}
 				require.NoError(t, setupEnv(t.Context(), currentStep))
-				require.NoError(t, populateEnvsFromInput(t.Context(), currentStep, action))
-				assert.Equal(t, want, (*currentStep.getEnv())["INPUT_IDENTITY"])
-				_, err := evalDockerEnv(t.Context(), currentStep, action)
+				inputs, err := rc.resolveActionInputs(t.Context(), currentStep, action)
+				require.NoError(t, err)
+				assert.Equal(t, want, inputs["identity"])
+				_, err = evalDockerArgsAndEnv(t.Context(), currentStep, action, inputs)
 				require.NoError(t, err)
 				assert.Equal(t, want, (*currentStep.getEnv())["identity"])
-				assert.Equal(t, "runs-sha", (*currentStep.getEnv())["GITEA_WORKFLOW_SHA"])
+				assert.Equal(t, want, (*currentStep.getEnv())["GITEA_WORKFLOW_SHA"])
 			})
 		}
 	})
@@ -51,12 +52,19 @@ func TestCompositeActionParity(t *testing.T) {
 	t.Run("inherits contexts without leaking inputs", func(t *testing.T) {
 		hook := logtest.NewWithLevel(logging.LevelWarn)
 		ctx := common.WithLogger(t.Context(), logging.New(hook))
+		hashCalls := 0
 		strategy := &model.Strategy{MaxParallelString: "3", RawMatrix: yaml.Node{Kind: yaml.MappingNode}}
 		parent := &RunContext{
-			Config:        &Config{PresetGitHubContext: &model.GithubContext{}},
-			Matrix:        map[string]any{"os": "linux"},
-			Run:           &model.Run{JobID: "job", Workflow: &model.Workflow{Name: "workflow", Jobs: map[string]*model.Job{"job": {Strategy: strategy}}}},
-			JobContainer:  &jobContainerMock{},
+			Config: &Config{PresetGitHubContext: &model.GithubContext{}},
+			Matrix: map[string]any{"os": "linux"},
+			Run:    &model.Run{JobID: "job", Workflow: &model.Workflow{Name: "workflow", Jobs: map[string]*model.Job{"job": {Strategy: strategy}}}},
+			JobContainer: &hashFilesContainer{
+				ExecutionsEnvironment: &jobContainerMock{},
+				execute: func(_command []string, _env map[string]string, _user, _workdir string) common.Executor {
+					hashCalls++
+					return noopExecutor
+				},
+			},
 			platformImage: "-self-hosted",
 			jobIndex:      1,
 			jobTotal:      4,
@@ -64,27 +72,23 @@ func TestCompositeActionParity(t *testing.T) {
 		step := &stepActionLocal{
 			Step:       &model.Step{Uses: "./action", With: map[string]string{"SHARED": "outer", "extra": "literal${{ github.job }}"}},
 			RunContext: parent,
-			action:     &model.Action{Inputs: map[string]model.Input{"shared": {Default: "outer-default"}}, Runs: model.ActionRuns{Using: "composite"}},
-			env:        map[string]string{"INPUT_SHARED": "outer"},
+			action:     &model.Action{Inputs: map[string]model.Input{"shared": {}, "target region": {Default: "${{ hashFiles('region') || 'local' }}"}}, Runs: model.ActionRuns{Using: "composite"}},
+			env:        map[string]string{"INPUT_TARGET_REGION": "inherited"},
 		}
-		require.NoError(t, runActionImpl(step, "/action", nil)(ctx))
+		require.NoError(t, runActionImpl(step)(ctx))
+		assert.Equal(t, 1, hashCalls)
 		require.Len(t, hook.AllRecords(), 1)
-		assert.Equal(t, "##[warning]Unexpected input(s) 'extra', valid inputs are ['shared']", hook.LastRecord().Message)
-		composite, err := step.getCompositeRunContext(ctx)
-		require.NoError(t, err)
+		assert.Equal(t, "##[warning]Unexpected input(s) 'extra', valid inputs are ['shared', 'target region']", hook.LastRecord().Message)
+		composite := step.compositeRunContext
 
 		assert.Same(t, strategy, composite.Run.Job().Strategy)
 		assert.True(t, composite.IsHostEnv())
 		interpolated, err := composite.NewExpressionEvaluator(ctx).Interpolate(ctx,
-			"${{ matrix.os }}|${{ strategy.max-parallel }}|${{ strategy.job-index }}|${{ inputs.shared }}|${{ inputs.extra }}")
+			"${{ matrix.os }}|${{ strategy.max-parallel }}|${{ strategy.job-index }}|${{ inputs.shared }}|${{ inputs.target_region }}|${{ inputs.extra }}")
 		require.NoError(t, err)
-		assert.Equal(t, "linux|3|1|outer|literal${{ github.job }}", interpolated)
+		assert.Equal(t, "linux|3|1|outer|local|literal${{ github.job }}", interpolated)
 		assert.NotContains(t, composite.Env, "INPUT_SHARED")
 		assert.NotContains(t, composite.Env, "INPUT_EXTRA")
-
-		nestedEnv := composite.GetEnv()
-		require.NoError(t, populateEnvsFromInput(ctx, &stepActionLocal{RunContext: composite, env: nestedEnv}, &model.Action{Inputs: map[string]model.Input{"shared": {Default: "inner-default"}}}))
-		assert.Equal(t, "inner-default", nestedEnv["INPUT_SHARED"])
 	})
 
 	t.Run("propagates pre failures", func(t *testing.T) {
@@ -186,12 +190,10 @@ func TestCompositeStepIfReadsJobStatusExceptInItsOwnMainSteps(t *testing.T) {
 }
 
 func newTestCompositeRunContext(t *testing.T, parent *RunContext) *RunContext {
-	composite, err := newCompositeRunContext(t.Context(), parent, &stepActionRemote{
+	return newCompositeRunContext(t.Context(), parent, &stepActionRemote{
 		Step:       &model.Step{},
 		RunContext: parent,
 		action:     &model.Action{},
 		env:        map[string]string{},
-	}, "/action")
-	require.NoError(t, err)
-	return composite
+	}, "/action", nil)
 }

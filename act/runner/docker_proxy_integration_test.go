@@ -62,26 +62,18 @@ func TestDockerProxyMountedJob(t *testing.T) {
 		plan, err = planner.PlanJob("proxy")
 	}
 	require.NoError(t, err)
-	runContext, err := runner.newRunContext(ctx, plan.Stages[0].Runs[0], nil)
-	require.NoError(t, err)
-	jobName := runContext.jobContainerName()
-	jobNetwork, _ := runContext.networkNameForGitea()
 	t.Cleanup(func() {
 		cleanCtx, cleanCancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		defer cleanCancel()
-		if _, err := dockerClient.ContainerRemove(cleanCtx, jobName, client.ContainerRemoveOptions{Force: true, RemoveVolumes: true}); !cerrdefs.IsNotFound(err) {
+		containers, err := dockerClient.ContainerList(cleanCtx, client.ContainerListOptions{All: true, Filters: make(client.Filters).Add("name", resourceName)})
+		assert.NoError(t, err)
+		assert.Empty(t, containers.Items, "job container survived cleanup")
+		for _, leftover := range containers.Items {
+			_, err := dockerClient.ContainerRemove(cleanCtx, leftover.ID, client.ContainerRemoveOptions{Force: true, RemoveVolumes: true})
 			assert.NoError(t, err)
 		}
-		for _, name := range []string{resourceName, jobNetwork} {
-			if _, err := dockerClient.NetworkRemove(cleanCtx, name, client.NetworkRemoveOptions{}); !cerrdefs.IsNotFound(err) {
-				assert.NoError(t, err)
-			}
-		}
-		for _, name := range []string{resourceName, jobName, jobName + "-env"} {
-			if _, err := dockerClient.VolumeRemove(cleanCtx, name, client.VolumeRemoveOptions{}); !cerrdefs.IsNotFound(err) {
-				assert.NoError(t, err)
-			}
-		}
+		assert.NoError(t, container.NewDockerNetworkRemoveExecutor(resourceName)(cleanCtx))
+		assert.NoError(t, container.NewDockerVolumeRemoveExecutor(resourceName, false)(cleanCtx))
 	})
 
 	hook := logtest.New()
@@ -94,8 +86,6 @@ func TestDockerProxyMountedJob(t *testing.T) {
 	if mode == "proxy" {
 		require.Contains(t, messages, "docker binds verified")
 	}
-	_, err = dockerClient.ContainerInspect(ctx, jobName, client.ContainerInspectOptions{})
-	assert.True(t, cerrdefs.IsNotFound(err), "job container survived cleanup: %v", err)
 	_, err = dockerClient.NetworkInspect(ctx, resourceName, client.NetworkInspectOptions{})
 	if mode == "proxy" {
 		assert.True(t, cerrdefs.IsNotFound(err), "labelled network survived cleanup: %v", err)

@@ -15,6 +15,7 @@ import (
 	"testing/synctest"
 
 	"gitea.com/gitea/runner/act/common"
+	"gitea.com/gitea/runner/act/common/logging"
 	"gitea.com/gitea/runner/act/common/logging/logtest"
 	"gitea.com/gitea/runner/act/container"
 	"gitea.com/gitea/runner/internal/pkg/telemetry"
@@ -179,7 +180,7 @@ func TestSetupEnv(t *testing.T) {
 		"GITHUB_JOB":               "1",
 		"GITHUB_REF_PROTECTED":     "false",
 		"GITHUB_RETENTION_DAYS":    "0",
-		"GITHUB_RUN_ATTEMPT":       "",
+		"GITHUB_RUN_ATTEMPT":       "1",
 		"GITHUB_RUN_ID":            "runId",
 		"GITHUB_RUN_NUMBER":        "1",
 		"GITHUB_WORKFLOW":          "",
@@ -235,7 +236,7 @@ jobs:
 					t.Parallel()
 					rc, err := (&runnerImpl{config: &Config{PresetGitHubContext: &model.GithubContext{}}}).newRunContext(t.Context(), &model.Run{Workflow: workflow, JobID: "test"}, map[string]any{"env": `{"WORKFLOW":"` + value + `${{ github.job }}","PRIORITY":"workflow"}`, "priority": "${{ github.job }}", "defaults": `{"shell":"` + value + `"}`})
 					require.NoError(t, err)
-					rc.workflowCallInputs = map[string]any{"args": `{"name":"` + value + `${{ github.job }}","fetch-depth":1234567}`}
+					rc.Config.WorkflowCallInputs = map[string]any{"args": `{"name":"` + value + `${{ github.job }}","fetch-depth":1234567}`}
 					enabled, err := rc.isEnabled(t.Context())
 					require.NoError(t, err)
 					require.True(t, enabled)
@@ -263,7 +264,7 @@ jobs:
 		require.NoError(t, err)
 		rc, err := (&runnerImpl{config: &Config{PresetGitHubContext: &model.GithubContext{}}}).newRunContext(t.Context(), &model.Run{Workflow: workflow, JobID: "test"}, nil)
 		require.NoError(t, err)
-		rc.workflowCallInputs = map[string]any{"args": "${{ inputs.unresolved }}"}
+		rc.Config.WorkflowCallInputs = map[string]any{"args": "${{ inputs.unresolved }}"}
 		require.ErrorContains(t, setupInputs(t.Context(), &stepRun{RunContext: rc, Step: workflow.Jobs["test"].Steps[0].Clone(), env: map[string]string{}}), "with:")
 	})
 
@@ -541,11 +542,13 @@ func TestRunStepExecutorParity(t *testing.T) {
 
 	t.Run("file commands survive a job timeout", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
-			step := newStep(t, &model.Step{ID: "interrupted"})
-			ctx, cancel := applyJobTimeout(t.Context(), step.RunContext, &model.Job{TimeoutMinutes: "1"})
+			step := newStep(t, &model.Step{ID: "interrupted", RawContinueOnError: "true"})
+			logger, hook := logtest.NewLogger()
+			ctx, cancel, err := applyJobTimeout(common.WithLogger(t.Context(), logger), step.RunContext, &model.Job{TimeoutMinutes: "1"})
+			require.NoError(t, err)
 			defer cancel()
 			step.RunContext.JobContainer = &fileCommandTestContainer{step.RunContext.JobContainer.(*container.HostEnvironment)}
-			err := runStepExecutor(step, stepStageMain, func(execCtx context.Context) error {
+			err = runStepExecutor(step, stepStageMain, func(execCtx context.Context) error {
 				for name, content := range map[string]string{
 					"GITHUB_ENV": "KEPT_ENV=value\n", "GITHUB_STATE": "saved=value\n",
 					"GITHUB_OUTPUT": "kept=value\n", "GITHUB_PATH": "/kept/bin\n",
@@ -556,6 +559,7 @@ func TestRunStepExecutorParity(t *testing.T) {
 				return execCtx.Err()
 			})(ctx)
 			require.ErrorIs(t, err, context.DeadlineExceeded)
+			assert.Equal(t, "cancelled", lastRecordAttr(hook, "stepResult"))
 			assert.Equal(t, "value", step.RunContext.Env["KEPT_ENV"])
 			assert.Equal(t, "value", step.RunContext.IntraActionState[step.Step.ID]["saved"])
 			assert.Equal(t, "value", step.RunContext.StepResults[step.Step.ID].Outputs["kept"])
@@ -612,23 +616,43 @@ func TestRunStepExecutorParity(t *testing.T) {
 		assert.Contains(t, ended[3].Attributes(), semconv.CICDPipelineTaskRunResultFailure)
 	})
 
-	t.Run("timeout must be positive", func(t *testing.T) {
-		for timeout, wantDeadline := range map[string]bool{"-1": false, "0": false, "1": true} {
-			ctx, cancel := evaluateStepTimeout(t.Context(), newStep(t, &model.Step{TimeoutMinutes: timeout}))
+	t.Run("nonpositive or invalid timeouts leave the step deadline unset", func(t *testing.T) {
+		for timeout, wantError := range map[string]string{
+			"-1":         "",
+			"0":          "",
+			`${{ '1' }}`: "##[error]Unexpected value '1'",
+		} {
+			hook := logtest.NewWithLevel(logging.LevelError)
+			ctx, cancel := evaluateStepTimeout(common.WithLogger(t.Context(), logging.New(hook)),
+				newStep(t, &model.Step{TimeoutMinutes: timeout}), stepStageMain, "")
 			_, hasDeadline := ctx.Deadline()
 			cancel()
-			assert.Equal(t, wantDeadline, hasDeadline, timeout)
+			assert.False(t, hasDeadline, timeout)
+			records := hook.AllRecords()
+			if wantError == "" {
+				assert.Empty(t, records, timeout)
+			} else {
+				require.Len(t, records, 2)
+				assert.Equal(t, "##[error]An error occurred when attempting to determine the step timeout.", records[0].Message)
+				assert.Equal(t, wantError, records[1].Message)
+			}
 		}
 	})
 
 	t.Run("timeout reads step environment", func(t *testing.T) {
-		step := newStep(t, &model.Step{ID: "timeout", TimeoutMinutes: "${{ fromJSON(env.STEP_TIMEOUT) }}"})
-		require.NoError(t, step.Step.Env.Encode(map[string]string{"STEP_TIMEOUT": "1"}))
-		require.NoError(t, runStepExecutor(step, stepStageMain, func(ctx context.Context) error {
-			_, hasDeadline := ctx.Deadline()
-			assert.True(t, hasDeadline)
-			return nil
-		})(t.Context()))
+		synctest.Test(t, func(t *testing.T) {
+			step := newStep(t, &model.Step{ID: "timeout", Run: "echo first\necho second", TimeoutMinutes: "${{ fromJSON(env.STEP_TIMEOUT) }}"})
+			require.NoError(t, step.Step.Env.Encode(map[string]string{"STEP_TIMEOUT": "1"}))
+			err := runStepExecutor(step, stepStageMain, func(ctx context.Context) error {
+				_, ok := ctx.Deadline()
+				require.True(t, ok)
+				<-ctx.Done()
+				return nil
+			})(t.Context())
+			require.EqualError(t, err, "The action 'Run echo first' has timed out after 1 minutes.")
+			require.ErrorIs(t, err, context.DeadlineExceeded)
+			assert.Equal(t, model.StepStatusFailure, step.RunContext.StepResults[step.Step.ID].Conclusion)
+		})
 	})
 }
 

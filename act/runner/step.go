@@ -5,6 +5,7 @@
 package runner
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	maps0 "maps"
@@ -163,7 +164,8 @@ func runStepExecutor(step step, stage stepStage, executor common.Executor) commo
 		topRC := rc.topLevelRunContext()
 		stepSummaryIndex := topRC.CurrentStepIndex
 		summaryFileCommand := path.Join("workflow", "step-summary-"+strconv.Itoa(stepSummaryIndex)+".md")
-		(*step.getEnv())["GITHUB_STEP_SUMMARY"] = container.JoinPath(actPath, summaryFileCommand)
+		summaryPath := container.JoinPath(actPath, summaryFileCommand)
+		(*step.getEnv())["GITHUB_STEP_SUMMARY"] = summaryPath
 		aliasGiteaEnv(*step.getEnv())
 
 		// Reset the per-phase file-command files. GITHUB_STEP_SUMMARY is intentionally
@@ -188,11 +190,12 @@ func runStepExecutor(step step, stage stepStage, executor common.Executor) commo
 			fileCommandInitErr = rc.JobContainer.Copy(actPath, files...)(ctx) // a broken summary must not block the resets
 		}
 
-		timeoutctx, cancelTimeOut := evaluateStepTimeout(ctx, step)
-		defer cancelTimeOut()
+		timeoutCtx, cancelTimeout := evaluateStepTimeout(ctx, step, stage, stepString)
+		defer cancelTimeout()
 		err = fileCommandInitErr
 		if err == nil {
-			err = rc.runWithCommands(timeoutctx, *step.getEnv(), executor)
+			err = rc.runWithCommands(timeoutCtx, *step.getEnv(), executor)
+			err = cmp.Or(context.Cause(timeoutCtx), err)
 		}
 		fileCommandCtx := ctx
 		if ctx.Err() != nil { // an interrupted step still records its file commands, a live deadline stays in force
@@ -213,11 +216,15 @@ func runStepExecutor(step step, stage stepStage, executor common.Executor) commo
 			if fileErr := rc.UpdateExtraPath(fileCommandCtx, container.JoinPath(actPath, pathFileCommand)); fileErr != nil && err == nil {
 				err = fileErr
 			}
+			processStepSummary(fileCommandCtx, rc, summaryPath)
 		}
 		_ = rc.JobContainer.Copy(actPath, files...)(fileCommandCtx)
 
 		if err == nil {
 			logger.With("stepResult", stepResult.Conclusion).Infof("Success - %s %s", stage, stepString)
+		} else if _, timedOut := context.Cause(ctx).(jobTimeout); timedOut || ctx.Err() == context.Canceled {
+			stepResult.Outcome, stepResult.Conclusion = model.StepStatusFailure, model.StepStatusFailure
+			logger.With("stepResult", "cancelled").Infof("Cancelled - %s %s", stage, stepString)
 		} else {
 			stepResult.Outcome = model.StepStatusFailure
 
@@ -245,16 +252,24 @@ func runStepExecutor(step step, stage stepStage, executor common.Executor) commo
 	}
 }
 
-func evaluateStepTimeout(ctx context.Context, step step) (context.Context, context.CancelFunc) {
-	if step.getStepModel().TimeoutMinutes == "" {
-		return ctx, func() {}
-	}
-	timeout, err := step.getRunContext().NewStepExpressionEvaluator(ctx, step).Interpolate(ctx, step.getStepModel().TimeoutMinutes)
-	if err != nil {
-		common.Logger(ctx).Errorf("An error occurred when attempting to determine the step timeout: %s", err)
-	} else if timeout != "" {
-		if timeOutMinutes, err := strconv.ParseInt(timeout, 10, 64); err == nil && timeOutMinutes > 0 {
-			return context.WithTimeout(ctx, time.Duration(timeOutMinutes)*time.Minute)
+type stepTimeout string
+
+func (timeout stepTimeout) Error() string { return string(timeout) }
+func (stepTimeout) Unwrap() error         { return context.DeadlineExceeded }
+
+func evaluateStepTimeout(ctx context.Context, step step, stage stepStage, name string) (context.Context, context.CancelFunc) {
+	if raw := step.getStepModel().TimeoutMinutes; raw != "" {
+		minutes, err := step.getRunContext().NewStepExpressionEvaluator(ctx, step).shared(ctx).EvaluateTimeoutMinutes(raw)
+		if err != nil {
+			logger := common.Logger(ctx)
+			logger.Error("##[error]An error occurred when attempting to determine the step timeout.")
+			logger.Errorf("##[error]%s", EscapeCommandData(err.Error()))
+		} else if minutes > 0 {
+			name = model.StepDisplayName(step.getStepModel(), name)
+			if stage != stepStageMain {
+				name = stage.String() + " " + name
+			}
+			return context.WithTimeoutCause(ctx, time.Duration(minutes)*time.Minute, stepTimeout(fmt.Sprintf("The action '%s' has timed out after %d minutes.", name, minutes)))
 		}
 	}
 	return ctx, func() {}
@@ -315,7 +330,7 @@ func isStepEnabled(ctx context.Context, expr string, step step, stage stepStage)
 	if rc.Parent != nil && stage == stepStageMain && jobContext.Status != "cancelled" {
 		jobContext.Status = rc.ownStatus()
 	}
-	runStep, err := EvalBool(ctx, rc.newStepExpressionEvaluator(ctx, step, rc.actionInputs, jobContext, rc.getGithubContext(ctx)), expr, defaultStatusCheck)
+	runStep, err := EvalBool(ctx, rc.newExpressionEvaluator(ctx, *step.getEnv(), jobContext, rc.getGithubContext(ctx), "step"), expr, defaultStatusCheck)
 	if err != nil {
 		return false, fmt.Errorf("if-expression %q evaluation failed: %s", expr, err)
 	}

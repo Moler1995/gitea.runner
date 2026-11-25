@@ -42,10 +42,8 @@ func TestJobLog_MirrorsUploadedRows(t *testing.T) {
 	require.NoError(t, err)
 	cfg.Log.Job.Dir = t.TempDir()
 
-	ctx, cancel := context.WithCancel(t.Context())
-	t.Cleanup(cancel)
 	task := &runnerv1.Task{Id: 41, Context: &structpb.Struct{}, Secrets: map[string]string{"TOKEN": "s3cret-value"}}
-	reporter := NewReporter(ctx, cancel, client, task, cfg)
+	reporter := NewReporter(t.Context(), nil, client, task, cfg)
 	require.NotNil(t, reporter.jobLog)
 	reporter.RunDaemon()
 	reporter.ResetSteps(newTestSteps(1))
@@ -60,7 +58,7 @@ func TestJobLog_MirrorsUploadedRows(t *testing.T) {
 	fire("the token is s3cret-value")
 	reporter.AddMask("dyn4mic-value")
 	fire("and dyn4mic-value too")
-	require.NoError(t, reporter.Close(""))
+	require.NoError(t, reporter.Close(nil))
 
 	job := readJobLog(t, reporter.jobLog)
 	assert.Contains(t, job, "the token is ***")

@@ -100,7 +100,7 @@ func fetchAction(ctx context.Context, input NewGitCloneExecutorInput) (string, s
 	data, _ := os.ReadFile(record)
 	sha, etag, _ := strings.Cut(string(data), "\n")
 	switch {
-	case !isFullObjectID(sha):
+	case !isFullObjectID(sha) || verifyPin(ctx, filepath.Join(input.Dir, "git"), input.Ref, sha) != nil:
 		sha, etag = "", ""
 	case input.OfflineMode && exists(tree(sha)) && !exists(tree(sha)+treeSizes):
 		return tree(sha), sha, nil // from an older runner, with no sizes to check, so offline mode uses it as before
@@ -114,7 +114,7 @@ func fetchAction(ctx context.Context, input NewGitCloneExecutorInput) (string, s
 	if err != nil && ctx.Err() == nil {
 		common.Logger(ctx).Debugf("Cloning %s@%s: %v", input.URL, input.Ref, err)
 		newEtag = ""
-		newSha, err = exportClone(ctx, input)
+		newSha, err = exportClone(ctx, input, err)
 	}
 	if err != nil {
 		return "", "", err
@@ -151,7 +151,7 @@ func downloadArchive(ctx context.Context, input NewGitCloneExecutorInput, sha, e
 		return nil
 	}}
 	for attempt := 1; ; attempt++ {
-		newSha, newEtag, retryAfter, err := downloadArchiveOnce(ctx, client, archive.String(), input.Token, sha, etag, input.Dir)
+		newSha, newEtag, retryAfter, err := downloadArchiveOnce(ctx, client, archive.String(), input, sha, etag)
 		if retryAfter == 0 || attempt == 3 || ctx.Err() != nil {
 			return newSha, newEtag, err
 		}
@@ -164,7 +164,7 @@ func downloadArchive(ctx context.Context, input NewGitCloneExecutorInput, sha, e
 	}
 }
 
-func downloadArchiveOnce(ctx context.Context, client *http.Client, archive, token, sha, etag, dir string) (string, string, time.Duration, error) {
+func downloadArchiveOnce(ctx context.Context, client *http.Client, archive string, input NewGitCloneExecutorInput, sha, etag string) (string, string, time.Duration, error) {
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, archive, nil)
 	if err != nil {
 		return "", "", 0, err
@@ -172,8 +172,8 @@ func downloadArchiveOnce(ctx context.Context, client *http.Client, archive, toke
 	if etag != "" {
 		request.Header.Set("If-None-Match", etag)
 	}
-	if token != "" {
-		request.SetBasicAuth("token", token)
+	if input.Token != "" {
+		request.SetBasicAuth("token", input.Token)
 	}
 	response, err := client.Do(request)
 	if err != nil {
@@ -191,7 +191,7 @@ func downloadArchiveOnce(ctx context.Context, client *http.Client, archive, toke
 		newEtag := response.Header.Get("ETag")
 		gz, err := gzip.NewReader(response.Body)
 		if err == nil {
-			sha, err = extractTree(ctx, gz, dir, !strings.HasSuffix(newEtag, `-false"`)) // Gitea's mark of an unprefixed archive
+			sha, err = extractTree(ctx, gz, input.Dir, input.Ref, !strings.HasSuffix(newEtag, `-false"`)) // Gitea's mark of an unprefixed archive
 		}
 		var netErr net.Error
 		if errors.Is(err, io.ErrUnexpectedEOF) || errors.As(err, &netErr) {
@@ -205,10 +205,13 @@ func downloadArchiveOnce(ctx context.Context, client *http.Client, archive, toke
 	}
 }
 
-func exportClone(ctx context.Context, input NewGitCloneExecutorInput) (string, error) {
+func exportClone(ctx context.Context, input NewGitCloneExecutorInput, archiveErr error) (string, error) {
 	clone := input
 	clone.Dir = filepath.Join(input.Dir, "git")
 	sha, _, err := resolveClone(ctx, clone)
+	if mismatch, ok := archiveErr.(*Error); ok && !strings.EqualFold(sha, mismatch.commit) {
+		return "", errors.Join(err, mismatch)
+	}
 	if err != nil || treeIntact(input.Dir, sha) {
 		return sha, err
 	}
@@ -216,11 +219,10 @@ func exportClone(ctx context.Context, input NewGitCloneExecutorInput) (string, e
 	if err != nil {
 		return "", err
 	}
-	_, err = extractTree(ctx, bytes.NewReader(archive), input.Dir, false)
-	return sha, err
+	return extractTree(ctx, bytes.NewReader(archive), input.Dir, sha, false)
 }
 
-func extractTree(ctx context.Context, archive io.Reader, dir string, strip bool) (string, error) { // into dir/<commit of the pax header>, strip dropping the directory wrapping the files
+func extractTree(ctx context.Context, archive io.Reader, dir, ref string, strip bool) (string, error) { // into dir/<commit of the pax header>, strip dropping the directory wrapping the files
 	temp, err := os.MkdirTemp(dir, "tmp-")
 	if err != nil {
 		return "", err
@@ -246,8 +248,13 @@ func extractTree(ctx context.Context, archive io.Reader, dir string, strip bool)
 			return "", err
 		}
 		if header.Typeflag == tar.TypeXGlobalHeader {
-			if sha = header.PAXRecords["comment"]; isFullObjectID(sha) && treeIntact(dir, sha) {
-				return sha, nil
+			if sha = header.PAXRecords["comment"]; isFullObjectID(sha) {
+				if err := verifyPin(ctx, "", ref, sha); err != nil {
+					return "", err
+				}
+				if treeIntact(dir, sha) {
+					return sha, nil
+				}
 			}
 			continue
 		}

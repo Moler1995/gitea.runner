@@ -330,6 +330,7 @@ jobs:
 	redis, job := inputs[0], inputs[1]
 
 	require.Equal(t, "redis:latest", redis.Image)
+	require.Empty(t, job.NetworkAliases)
 	require.Equal(t, map[string]string{"data": "/data"}, redis.Mounts)
 	require.Equal(t, []string{"TITLE=${{ github.job }}"}, redis.Env)
 	require.Equal(t, "${{ github.job }}", redis.Password)
@@ -358,6 +359,7 @@ jobs:
         env: {TEXT: "${{ env.TEXT }}"}
         options: --volumes-from ${{ env.JOB_CONTAINER_NAME }}
 `, &Config{Vars: map[string]string{"REG_USER": "user", "TEXT": "${{ 'literal' }}"}})
+	require.NotEqual(t, job.Name, inputs[1].Name)
 	redis, job = inputs[0], inputs[1]
 	require.Equal(t, "user", job.Username)
 	require.Equal(t, "8080", job.PortBindings["80/tcp"][0].HostPort)
@@ -969,7 +971,10 @@ func TestGetGitHubContext(t *testing.T) {
 			EventName: "push",
 			Workdir:   cwd,
 			Env: map[string]string{
-				"GITHUB_REPOSITORY": "nektos/act",
+				"GITHUB_REPOSITORY":   "nektos/act",
+				"GITHUB_RUN_ATTEMPT":  "2",
+				"GITHUB_WORKFLOW_REF": "owner/repo/.github/workflows/build.yml@refs/heads/main",
+				"GITHUB_WORKFLOW_SHA": "local-workflow-sha",
 			},
 		},
 		Run: &model.Run{
@@ -1006,6 +1011,9 @@ func TestGetGitHubContext(t *testing.T) {
 
 	assert.Equal(t, "1", ghc.RunID)
 	assert.Equal(t, "1", ghc.RunNumber)
+	assert.Equal(t, "2", ghc.RunAttempt)
+	assert.Equal(t, rc.Config.Env["GITHUB_WORKFLOW_REF"], ghc.WorkflowRef)
+	assert.Equal(t, "local-workflow-sha", ghc.WorkflowSha)
 	assert.Equal(t, "0", ghc.RetentionDays)
 	assert.Equal(t, actor, ghc.Actor)
 	assert.Equal(t, repo, ghc.Repository)
@@ -1144,7 +1152,7 @@ func createJob(t *testing.T, input, result string) *model.Job {
 	return job
 }
 
-func TestRunContextRunsOnPlatformNames(t *testing.T) {
+func TestResolvePlatformImagePassesEvaluatedRunsOnLabelsToPicker(t *testing.T) {
 	for _, testcase := range []struct {
 		job  string
 		want []string
@@ -1153,14 +1161,18 @@ func TestRunContextRunsOnPlatformNames(t *testing.T) {
 		{"runs-on: ${{ 'ubuntu-latest' }}", []string{"ubuntu-latest"}},
 		{"runs-on: [self-hosted, my-runner]", []string{"self-hosted", "my-runner"}},
 		{`runs-on: [self-hosted, "${{ 'my-runner' }}"]`, []string{"self-hosted", "my-runner"}},
-		{`runs-on: ${{ fromJSON('["ubuntu-latest"]') }}`, []string{"ubuntu-latest"}},
-		{"name: something", []string{}},
-		{"runs-on: {mapping: value}", []string{}},
-		{"runs-on: ${{ invalid expression }}", []string{}},
+		{`runs-on: ${{ fromJSON('["self-hosted","my-runner"]') }}`, []string{"self-hosted", "my-runner"}},
+		{"name: something", nil},
+		{"runs-on: {mapping: value}", nil},
 	} {
 		t.Run(testcase.job, func(t *testing.T) {
-			rc := createIfTestRunContext(map[string]*model.Job{"job1": createJob(t, testcase.job, "")})
-			assert.Equal(t, testcase.want, rc.runsOnPlatformNames(t.Context()))
+			rc := makeTestRC(t, testcase.job)
+			rc.Config.PlatformPicker = func(labels []string) string {
+				assert.Equal(t, testcase.want, labels)
+				return "ubuntu-latest"
+			}
+			require.NoError(t, rc.resolvePlatformImage(t.Context()))
+			assert.Equal(t, "ubuntu-latest", rc.platformImage)
 		})
 	}
 }
@@ -1757,53 +1769,30 @@ func TestRunContextContainerImageCannotSelectBackend(t *testing.T) {
 
 func TestRunContextImageOS(t *testing.T) {
 	ctx := t.Context()
-
-	t.Run("keeps an ImageOS from the image, the job env or the job's Ubuntu release", func(t *testing.T) {
-		ubuntu := tarArchive(t, tarEntry{name: "os-release", body: "ID=ubuntu\nVERSION_ID=\"22.04\"\n"})
-		for _, tc := range []struct {
-			imageEnv  map[string]string
-			jobEnv    string
-			osRelease []byte
-			want      string
-		}{
-			{imageEnv: map[string]string{"ImageOS": "ubuntu24-arm64"}, osRelease: ubuntu, want: "ubuntu24-arm64"},
-			{imageEnv: map[string]string{"ImageOS": "ubuntu24-arm64"}, jobEnv: "ImageOS: ubuntu20", want: "ubuntu20"},
-			{osRelease: ubuntu, want: "ubuntu22"},
-			{osRelease: tarArchive(t, tarEntry{name: "os-release", body: "ID=debian\nVERSION_ID=\"12\"\n"}), want: "ubuntu24"},
-		} {
-			rc := createRunsOnRunContext(t, "ubuntu-latest\nenv: {"+tc.jobEnv+"}")
-			rc.platformImage = "docker.gitea.com/runner-images:ubuntu-latest"
-			rc.JobContainer = imageEnvContainer{&container.HostEnvironment{ActPath: t.TempDir()}, tc.imageEnv, tc.osRelease}
-			require.NoError(t, rc.copyWorkflowFiles()(ctx))
-			require.NoError(t, evaluateJobEnvAndDefaults(ctx, rc))
-			env := map[string]string{}
-			require.NoError(t, setupEnv(ctx, &stepRun{RunContext: rc, Step: &model.Step{}, env: env}))
-			assert.Equal(t, tc.want, env["ImageOS"])
-		}
-	})
-
-	t.Run("prefers the release in the resolved image tag", func(t *testing.T) {
-		rc := createRunsOnRunContext(t, "ubuntu-latest")
-		rc.Config.PlatformPicker = func([]string) string { return "docker.gitea.com/runner-images:ubuntu-24.04" }
-		require.NoError(t, rc.resolvePlatformImage(ctx))
-		assert.Equal(t, "ubuntu24", rc.imageOS(ctx))
-	})
-
-	t.Run("falls back to the runs-on label", func(t *testing.T) {
-		rc := createRunsOnRunContext(t, "ubuntu-22.04")
-		rc.Config.PlatformPicker = func([]string) string { return "some-image" }
-		require.NoError(t, rc.resolvePlatformImage(ctx))
-		assert.Equal(t, "ubuntu22", rc.imageOS(ctx))
-	})
-
-	t.Run("reports the current release for the rolling ubuntu-latest label", func(t *testing.T) {
-		assert.Equal(t, "ubuntu24", createRunsOnRunContext(t, "ubuntu-latest").imageOS(ctx))
-	})
-
-	t.Run("is empty for the synthetic job of a composite action", func(t *testing.T) {
-		rc := createIfTestRunContext(map[string]*model.Job{"job1": {}})
-		assert.Empty(t, rc.imageOS(ctx))
-	})
+	ubuntu := tarArchive(t, tarEntry{name: "os-release", body: "ID=ubuntu\nVERSION_ID=\"22.04\"\n"})
+	debian := tarArchive(t, tarEntry{name: "os-release", body: "ID=debian\nVERSION_ID=\"12\"\n"})
+	for _, tc := range []struct {
+		image     string
+		imageEnv  map[string]string
+		jobEnv    string
+		osRelease []byte
+		want      string
+	}{
+		{imageEnv: map[string]string{"ImageOS": "ubuntu24-arm64"}, osRelease: ubuntu, want: "ubuntu24-arm64"},
+		{imageEnv: map[string]string{"ImageOS": "ubuntu24-arm64"}, jobEnv: "ImageOS: ubuntu20", want: "ubuntu20"},
+		{osRelease: ubuntu, want: "ubuntu22"},
+		{image: "docker.gitea.com/runner-images:ubuntu-24.04", osRelease: debian, want: "ubuntu24"},
+		{image: "docker.gitea.com/runner-images:ubuntu-latest-slim", osRelease: debian},
+	} {
+		rc := createRunsOnRunContext(t, "ubuntu-latest\nenv: {"+tc.jobEnv+"}")
+		rc.platformImage = tc.image
+		rc.JobContainer = imageEnvContainer{&container.HostEnvironment{ActPath: t.TempDir()}, tc.imageEnv, tc.osRelease}
+		require.NoError(t, rc.copyWorkflowFiles()(ctx))
+		require.NoError(t, evaluateJobEnvAndDefaults(ctx, rc))
+		env := map[string]string{}
+		require.NoError(t, setupEnv(ctx, &stepRun{RunContext: rc, Step: &model.Step{}, env: env}))
+		assert.Equal(t, tc.want, env["ImageOS"])
+	}
 }
 
 func TestRunContextGetRunnerContext(t *testing.T) {

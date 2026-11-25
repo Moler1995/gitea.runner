@@ -202,6 +202,28 @@ func TestLoadDefault_RejectsInvalidLogReportLevel(t *testing.T) {
 	require.ErrorContains(t, err, "runner.log_report_level")
 }
 
+func TestLoadDefault_ActionReplacementsMatchWholeUsesAndChainInOrder(t *testing.T) {
+	cfg, err := LoadDefault(write(t, `
+runner:
+  action_replacements:
+    - regex: 'actions/checkout@v4'
+      replacement: actions/checkout@v6
+    - regex: 'actions/(.+)'
+      replacement: https://mirror.example/actions/${1}
+`))
+	require.NoError(t, err)
+	for uses, want := range map[string]string{
+		"actions/checkout@v4":     "https://mirror.example/actions/checkout@v6",
+		"actions/checkout@v4.1.0": "https://mirror.example/actions/checkout@v4.1.0",
+		"my/actions/checkout@v4":  "my/actions/checkout@v4",
+	} {
+		assert.Equal(t, want, cfg.Runner.ReplaceUses(uses), uses)
+	}
+
+	_, err = LoadDefault(write(t, "runner:\n  action_replacements:\n    - regex: 'checkout)|(?:x'\n"))
+	require.ErrorContains(t, err, "runner.action_replacements[0].regex")
+}
+
 func TestLoadDefault_LoadsExtraHeaders(t *testing.T) {
 	path := write(t, "runner:\n  extra_headers:\n    X-Proxy-Token: proxy-token\n")
 	cfg, err := LoadDefault(path)

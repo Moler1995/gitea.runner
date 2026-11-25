@@ -255,10 +255,10 @@ func resolveClone(ctx context.Context, input NewGitCloneExecutorInput) (string, 
 		return "", false, err
 	}
 	resolved, err := resolveRef(ctx, input.Dir, input.Ref)
-	if errors.Is(err, ErrShortRef) || (err != nil && input.OfflineMode) {
-		return "", false, err
+	if _, invalidRef := errors.AsType[*Error](err); invalidRef || input.OfflineMode {
+		return resolved, reused, err
 	}
-	if !input.OfflineMode && (err != nil || (reused && !isFullHash(input.Ref, resolved))) {
+	if err != nil || (reused && !isFullObjectID(input.Ref)) {
 		if err := fetch(ctx, input); err != nil {
 			return "", false, err
 		}
@@ -340,18 +340,37 @@ func resolveRef(ctx context.Context, dir, ref string) (string, error) {
 		}
 	}
 	sha, err := gitOutput(ctx, dir, "rev-parse", "--verify", ref+"^{commit}")
-	if err == nil && hexRefRegex.MatchString(ref) && len(sha) != len(ref) {
+	if err != nil {
+		return "", err
+	}
+	if err := verifyPin(ctx, dir, ref, sha); err != nil {
+		return "", err
+	}
+	if len(sha) != len(ref) && hexRefRegex.MatchString(ref) {
 		return "", &Error{err: ErrShortRef, commit: sha}
 	}
-	return sha, err
+	return sha, nil
+}
+
+func verifyPin(ctx context.Context, gitDir, ref, sha string) error {
+	if strings.EqualFold(ref, sha) || !isFullObjectID(ref) {
+		return nil
+	}
+	if gitDir != "" && len(ref) == len(sha) {
+		objects, err := gitOutput(ctx, gitDir, "rev-parse", ref+"^{tag}", ref+"^{commit}")
+		if err == nil && strings.EqualFold(objects, ref+"\n"+sha) {
+			return nil
+		}
+	}
+	err := fmt.Errorf("action pinned to %s, got commit %s", ref, sha)
+	if gitDir != "" && len(ref) < len(sha) && strings.EqualFold(ref, sha[:len(ref)]) {
+		err = fmt.Errorf("%w: %w", err, ErrShortRef)
+	}
+	return &Error{err: err, commit: sha}
 }
 
 func isFullObjectID(ref string) bool {
 	return ObjectFormat(ref) != ""
-}
-
-func isFullHash(ref, resolved string) bool {
-	return isFullObjectID(ref) && len(ref) == len(resolved)
 }
 
 // ObjectFormat returns the object format of a full commit hash, empty for anything else.
@@ -476,7 +495,7 @@ func runGitWithStdin(ctx context.Context, dir string, input *NewGitCloneExecutor
 	for key, value := range ConfigEnv(config...) {
 		cmd.Env = append(cmd.Env, key+"="+value)
 	}
-	cmd.Env = append(cmd.Env, "GIT_TERMINAL_PROMPT=0")
+	cmd.Env = append(cmd.Env, "GIT_TERMINAL_PROMPT=0", "GIT_NO_REPLACE_OBJECTS=1")
 	var treeKill *process.TreeKill
 	if runtime.GOOS == "windows" {
 		treeKill = process.NewTreeKill(cmd) // a cancelled git leaves its remote helper holding the repository otherwise

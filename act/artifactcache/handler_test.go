@@ -731,40 +731,61 @@ func TestHandler_makeRoom(t *testing.T) {
 	}
 }
 
-func TestHandler_SweepKeepsEntryWhenBlobSurvives(t *testing.T) {
+func TestHandler_SweepKeepsEntriesWhenBlobsSurviveAcrossBatches(t *testing.T) {
 	t.Parallel()
-	cache := &Cache{Key: "stuck", Complete: true, UsedAt: time.Now().Add(-(testRetention + time.Hour)).Unix()}
-	handler := newTestHandler(t, Policy{Retention: testRetention}, cache)
-
-	blob := handler.storage.(*Storage).filename(cache.ID)
-	require.NoError(t, os.MkdirAll(blob, 0o755))
-	require.NoError(t, os.WriteFile(filepath.Join(blob, "held"), []byte("x"), 0o600))
+	var caches []*Cache
+	for range evictionBatchSize + 1 {
+		caches = append(caches, &Cache{Key: "stuck", Complete: true, UsedAt: time.Now().Add(-(testRetention + time.Hour)).Unix()})
+	}
+	handler := newTestHandler(t, Policy{Retention: testRetention}, caches...)
+	for _, cache := range caches {
+		blob := handler.storage.(*Storage).filename(cache.ID)
+		require.NoError(t, os.MkdirAll(blob, 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(blob, "held"), []byte("x"), 0o600))
+	}
 
 	handler.gcAt = time.Time{}
 	handler.gcCache()
 
-	assert.Equal(t, []string{"stuck"}, keptKeys(t, handler, []*Cache{cache}), "the entry must outlive a blob that could not be removed")
+	assert.Len(t, keptKeys(t, handler, caches), len(caches), "an entry must outlive a blob that could not be removed")
 }
 
-func TestHandler_FindProtectsFromEviction(t *testing.T) {
+func TestHandler_EvictionRechecksLookupsAndRepoLimitsBetweenBatches(t *testing.T) {
 	t.Parallel()
-	wanted := &Cache{Repo: testRepo, Key: "wanted", Version: "v", Complete: true, Size: 4 * miB, UsedAt: time.Now().Add(-3 * time.Hour).Unix()}
-	other := &Cache{Repo: testRepo, Key: "other", Version: "v", Complete: true, Size: 4 * miB, UsedAt: time.Now().Add(-2 * time.Hour).Unix()}
-	newest := &Cache{Repo: testRepo, Key: "newest", Version: "v", Complete: true, Size: 4 * miB, UsedAt: time.Now().Add(-time.Hour).Unix()}
-	handler := newTestHandler(t, Policy{RepoSizeLimit: 10 * miB}, wanted, other, newest)
-	writeBlob(t, handler, wanted.ID)
+	synctest.Test(t, func(t *testing.T) {
+		wanted := &Cache{Repo: testRepo, Key: "wanted", Complete: true, Size: 1, UsedAt: 1}
+		entries := []*Cache{
+			wanted,
+			{Key: "other", Complete: true, Size: 3, UsedAt: 2},
+			{Repo: "o/b", Key: "old", Complete: true, Size: 2, UsedAt: 3},
+		}
+		for range 8 {
+			entries = append(entries, &Cache{Complete: true, Size: 1})
+		}
+		handler := newTestHandler(t, Policy{RepoSizeLimit: 3, SizeLimit: 5}, entries...)
+		require.NoError(t, handler.Close())
+		writeBlob(t, handler, wanted.ID)
 
-	resp, err := testClient.Get(fmt.Sprintf("%s%s/cache?keys=wanted&version=v", handler.ExternalURL(), apiPath))
-	require.NoError(t, err)
-	defer resp.Body.Close()
-	require.Equal(t, 200, resp.StatusCode)
+		locked, err := handler.openDB()
+		require.NoError(t, err)
+		go handler.evictOversized(&wanted.Repo)
+		synctest.Wait()
+		go func() {
+			synctest.Wait()
+			locked.Close()
+		}()
 
-	db, err := handler.openDB()
-	require.NoError(t, err)
-	handler.evictOversized(db)
-	require.NoError(t, db.Close())
+		db, err := handler.openDB()
+		require.NoError(t, err)
+		require.Len(t, handler.caches(db, func(*Cache) bool { return true }), 3)
+		_, err = handler.lookupCache(db, JobCredential{Repo: testRepo}, []string{"wanted"}, "")
+		require.NoError(t, err)
+		require.NoError(t, handler.insertCache(db, &Cache{Repo: "o/b", Complete: true, Size: 2, UsedAt: time.Now().Unix()}))
+		require.NoError(t, db.Close())
+		synctest.Wait()
 
-	assert.Equal(t, []string{wanted.Key}, keptKeys(t, handler, []*Cache{wanted, other}), "the entry just promised to a job survives, the next least recently used goes instead")
+		assert.Equal(t, []string{"wanted"}, keptKeys(t, handler, entries))
+	})
 }
 
 func TestHandler_PrefixUsesNewestReservationWithinSecond(t *testing.T) {

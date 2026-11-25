@@ -11,6 +11,7 @@ import (
 
 	cerrdefs "github.com/containerd/errdefs"
 	"github.com/moby/moby/client"
+	"github.com/moby/moby/client/pkg/versions"
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
@@ -23,22 +24,30 @@ func ImageExistsLocally(ctx context.Context, imageName, platform string) (bool, 
 	}
 	defer cli.Close()
 
-	inspectImage, err := cli.ImageInspect(ctx, imageName)
+	var requested *specs.Platform
+	if platform == "" {
+		if version, err := cli.ServerVersion(ctx, client.ServerVersionOptions{}); err == nil {
+			requested = &specs.Platform{OS: version.Os, Architecture: version.Arch}
+		}
+	} else if platform != "any" {
+		requested, err = parsePlatform(platform)
+		if err != nil {
+			return false, err
+		}
+	}
+
+	inspectPlatform := requested
+	if versions.LessThan(cli.ClientVersion(), "1.49") {
+		inspectPlatform = nil
+	}
+	inspectImage, err := cli.ImageInspect(ctx, imageName, client.ImageInspectWithPlatform(inspectPlatform))
 	if cerrdefs.IsNotFound(err) {
 		return false, nil
 	} else if err != nil {
 		return false, err
 	}
 
-	if platform == "" || platform == "any" {
-		return true, nil
-	}
-
-	requested, err := parsePlatform(platform)
-	if err != nil {
-		return false, err
-	}
-	return platformMatches(requested, &specs.Platform{OS: inspectImage.Os, Architecture: inspectImage.Architecture, Variant: inspectImage.Variant}), nil
+	return requested == nil || platformMatches(requested, &specs.Platform{OS: inspectImage.Os, Architecture: inspectImage.Architecture, Variant: inspectImage.Variant}), nil
 }
 
 func platformMatches(requested, image *specs.Platform) bool {
@@ -49,8 +58,6 @@ func platformMatches(requested, image *specs.Platform) bool {
 	return image.OS == requested.OS && image.Architecture == requested.Architecture && (requested.Variant == "" || requested.Variant == variant)
 }
 
-// RemoveImage removes image from local store, the function is used to run different
-// container image architectures
 func RemoveImage(ctx context.Context, imageName string, force, pruneChildren bool) (bool, error) {
 	cli, err := GetDockerClient(ctx)
 	if err != nil {

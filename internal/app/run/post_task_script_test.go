@@ -49,14 +49,12 @@ func TestRunPostTaskScriptNonZeroExitDoesNotPanic(t *testing.T) {
 	cfg.Runner.PostTaskScript = scriptPath
 
 	r := &Runner{cfg: cfg}
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
 
 	task := &runnerv1.Task{Id: 1, Context: &structpb.Struct{}}
-	reporter := report.NewReporter(ctx, cancel, nil, task, cfg)
+	reporter := report.NewReporter(t.Context(), nil, nil, task, cfg)
 
 	require.NotPanics(t, func() {
-		r.runPostTaskScript(ctx, reporter, task, "/workspace/owner/repo")
+		r.runPostTaskScript(t.Context(), reporter, task, "/workspace/owner/repo")
 	})
 	require.NotNil(t, hook.LastRecord())
 	assert.Contains(t, hook.LastRecord().Message, "exited with code 2")
@@ -92,16 +90,13 @@ func TestPostTaskScriptEnv(t *testing.T) {
 		envs: map[string]string{"BASE": "1"},
 	}
 
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-
 	taskCtx, err := structpb.NewStruct(map[string]any{
 		"run_id":     "99",
 		"repository": "acme/widget",
 	})
 	require.NoError(t, err)
 	task := &runnerv1.Task{Id: 3, Context: taskCtx}
-	reporter := report.NewReporter(ctx, cancel, nil, task, cfg)
+	reporter := report.NewReporter(t.Context(), nil, nil, task, cfg)
 	setReporterJobResult(t, reporter, runnerv1.Result_RESULT_FAILURE)
 
 	env := r.postTaskScriptEnv(reporter, task, "/tmp/workspace")
@@ -134,14 +129,11 @@ func TestRunPostTaskScriptIntegration(t *testing.T) {
 		envs: map[string]string{"CUSTOM": "runner-env"},
 	}
 
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-
 	task := &runnerv1.Task{Id: 11, Context: &structpb.Struct{}}
-	reporter := report.NewReporter(ctx, cancel, nil, task, cfg)
+	reporter := report.NewReporter(t.Context(), nil, nil, task, cfg)
 	setReporterJobResult(t, reporter, runnerv1.Result_RESULT_SUCCESS)
 
-	r.runPostTaskScript(ctx, reporter, task, "/workspace/acme/repo")
+	r.runPostTaskScript(t.Context(), reporter, task, "/workspace/acme/repo")
 
 	content, err := os.ReadFile(outFile)
 	require.NoError(t, err)

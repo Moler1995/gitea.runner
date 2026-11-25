@@ -32,54 +32,25 @@ func (rc *RunContext) NewExpressionEvaluator(ctx context.Context) *ExpressionEva
 }
 
 func (rc *RunContext) NewExpressionEvaluatorWithEnv(ctx context.Context, env map[string]string) *ExpressionEvaluator {
-	var workflowCallResult map[string]*model.WorkflowCallResult
+	return rc.newExpressionEvaluator(ctx, env, rc.getJobContext(), rc.getGithubContext(ctx), "job")
+}
 
-	// todo: cleanup EvaluationEnvironment creation
-	strategy := make(map[string]any)
-	if rc.Run != nil {
-		strategy = exprparser.StrategyContext(rc.Run.Job().Strategy, rc.jobIndex, rc.jobTotal)
-
-		// only setup jobs context in case of workflow_call
-		// and existing expression evaluator (this means, jobs are at
-		// least ready to run)
-		if rc.caller != nil && rc.ExprEval != nil {
-			workflowCallResult = map[string]*model.WorkflowCallResult{}
-
-			for jobName, job := range rc.Run.Workflow.Jobs {
-				result := model.WorkflowCallResult{
-					Outputs: map[string]string{},
-				}
-				unlock := lockJob(job)
-				maps.Copy(result.Outputs, job.Outputs)
-				unlock()
-				workflowCallResult[jobName] = &result
-			}
-		}
+func (rc *RunContext) newExpressionEvaluator(ctx context.Context, env map[string]string, jobContext *model.JobContext, github *model.GithubContext, scope string) *ExpressionEvaluator {
+	ee := rc.actionDefaultEnvironment(ctx, github, jobContext)
+	if scope == "job" {
+		ee.Jobs = new(map[string]*model.WorkflowCallResult)
 	}
-
-	ghc := rc.getGithubContext(ctx)
-	ee := &exprparser.EvaluationEnvironment{
-		Github: ghc,
-		Env:    env,
-		Job:    rc.getJobContext(),
-		Jobs:   &workflowCallResult,
-		// todo: should be unavailable
-		// but required to interpolate/evaluate the step outputs on the job
-		Steps:     rc.StepResults,
-		Secrets:   getWorkflowSecrets(rc),
-		Vars:      rc.Config.Vars,
-		Strategy:  strategy,
-		Matrix:    rc.Matrix,
-		Needs:     exprparser.NeedsContext(rc.Run),
-		Inputs:    getEvaluatorInputs(rc, rc.actionInputs, ghc),
-		HashFiles: getHashFilesFunction(ctx, rc),
-	}
-	ee.Runner = rc.getRunnerContext(ctx)
+	ee.Env = env
+	ee.Steps = rc.StepResults
+	ee.Secrets = getWorkflowSecrets(rc)
+	ee.Vars = rc.Config.Vars
+	ee.Needs = exprparser.NeedsContext(rc.Run)
+	ee.Inputs = rc.getEvaluatorInputs(github)
 	return &expressionEvaluator{
 		interpreter: exprparser.NewInterpeter(ee, exprparser.Config{
 			Run:        rc.Run,
 			WorkingDir: rc.Config.Workdir,
-			Context:    "job",
+			Context:    scope,
 		}),
 	}
 }
@@ -89,39 +60,26 @@ var hashfiles string
 
 // NewStepExpressionEvaluator creates a new evaluator with the `inputs` of the enclosing workflow or composite action
 func (rc *RunContext) NewStepExpressionEvaluator(ctx context.Context, step step) *ExpressionEvaluator {
-	return rc.newStepExpressionEvaluator(ctx, step, rc.actionInputs, rc.getJobContext(), getStepGithubContext(ctx, step))
+	return rc.newExpressionEvaluator(ctx, *step.getEnv(), rc.getJobContext(), getStepGithubContext(ctx, step), "step")
 }
 
-// NewActionInputsExpressionEvaluator creates a new evaluator with the step's own with: values as `inputs`
-func (rc *RunContext) NewActionInputsExpressionEvaluator(ctx context.Context, step step) *ExpressionEvaluator {
-	return rc.newStepExpressionEvaluator(ctx, step, inputsFromEnv(*step.getEnv()), rc.getJobContext(), getStepGithubContext(ctx, step))
-}
-
-func (rc *RunContext) newStepExpressionEvaluator(ctx context.Context, step step, stepInputs map[string]any, jobContext *model.JobContext, github *model.GithubContext) *ExpressionEvaluator {
-	// todo: cleanup EvaluationEnvironment creation
-	ee := &exprparser.EvaluationEnvironment{
-		Github:   github,
-		Env:      *step.getEnv(),
-		Job:      jobContext,
-		Steps:    rc.StepResults,
-		Secrets:  getWorkflowSecrets(rc),
-		Vars:     rc.Config.Vars,
-		Strategy: exprparser.StrategyContext(rc.Run.Job().Strategy, rc.jobIndex, rc.jobTotal),
-		Matrix:   rc.Matrix,
-		Needs:    exprparser.NeedsContext(rc.Run),
-		// todo: should be unavailable
-		// but required to interpolate/evaluate the inputs in actions/composite
-		Inputs:    getEvaluatorInputs(rc, stepInputs, github),
+func (rc *RunContext) actionDefaultEnvironment(ctx context.Context, github *model.GithubContext, job *model.JobContext) *exprparser.EvaluationEnvironment {
+	return &exprparser.EvaluationEnvironment{
+		Github:    github,
+		Strategy:  exprparser.StrategyContext(rc.Run.Job().Strategy, rc.jobIndex, rc.jobTotal),
+		Matrix:    rc.Matrix,
+		Job:       job,
+		Runner:    rc.getRunnerContext(ctx),
 		HashFiles: getHashFilesFunction(ctx, rc),
 	}
-	ee.Runner = rc.getRunnerContext(ctx)
-	return &expressionEvaluator{
-		interpreter: exprparser.NewInterpeter(ee, exprparser.Config{
-			Run:        rc.Run,
-			WorkingDir: rc.Config.Workdir,
-			Context:    "step",
-		}),
+}
+
+func newActionInputsExpressionEvaluator(inputs map[string]string) *ExpressionEvaluator {
+	values := make(map[string]any, len(inputs))
+	for name, value := range inputs {
+		values[name] = value
 	}
+	return &expressionEvaluator{interpreter: exprparser.NewInterpeter(&exprparser.EvaluationEnvironment{Inputs: values}, exprparser.Config{Context: "step"})}
 }
 
 func getHashFilesFunction(ctx context.Context, rc *RunContext) func(v []reflect.Value) (any, error) {
@@ -160,18 +118,17 @@ func getHashFilesFunction(ctx context.Context, rc *RunContext) func(v []reflect.
 				Mode: 0o644,
 				Body: hashfiles,
 			}).Then(rc.JobContainer.Exec([]string{"node", container.JoinPath(rc.JobContainer.GetActPath(), name)}, env, "", ""))(timeoutCtx)
-			quotedPatterns := expressionStringEscape(strings.Join(patterns, ", "))
 			switch {
 			case err == nil:
 			case ctx.Err() != nil:
 				return "", ctx.Err()
 			case timeoutCtx.Err() != nil || errors.Is(err, context.DeadlineExceeded):
-				return "", fmt.Errorf("hashFiles('%s') couldn't finish within 120 seconds", quotedPatterns)
+				return "", fmt.Errorf("hashFiles('%s') couldn't finish within 120 seconds", expressionStringEscape(strings.Join(patterns, ", ")))
 			case hashFilesNodeMissing(err):
 				common.Logger(ctx).With(rawOutputField, true).Warnf("##[warning]hashFiles could not run because node is unavailable in the job environment. Returning an empty string.")
 				return "", nil
 			default:
-				return "", fmt.Errorf("hashFiles('%s') failed. Fail to hash files under directory '%s'", quotedPatterns, rc.githubWorkspace())
+				return "", fmt.Errorf("hashFiles('%s') failed. Fail to hash files under directory '%s'", expressionStringEscape(strings.Join(patterns, ", ")), rc.githubWorkspace())
 			}
 			for line := range strings.Lines(hout.String() + "\n" + herr.String()) {
 				if hash, ok := strings.CutPrefix(strings.TrimRight(line, "\r\n"), "__OUTPUT__"); ok {
@@ -253,9 +210,12 @@ func inputsFromEnv(env map[string]string) map[string]any {
 	return inputs
 }
 
-func getEvaluatorInputs(rc *RunContext, stepInputs map[string]any, ghc *model.GithubContext) map[string]any {
-	if stepInputs != nil { // an action's own inputs, which workflow inputs must not shadow
-		return maps.Clone(stepInputs)
+func (rc *RunContext) getEvaluatorInputs(ghc *model.GithubContext) map[string]any {
+	if rc.actionInputs != nil {
+		return maps.Clone(rc.actionInputs)
+	}
+	if rc.caller != nil {
+		return maps.Clone(rc.caller.inputs)
 	}
 	// only a called workflow's job itself takes the inputs Gitea resolved,
 	// composite actions copy its Config but have their own `inputs`
@@ -264,7 +224,6 @@ func getEvaluatorInputs(rc *RunContext, stepInputs map[string]any, ghc *model.Gi
 	}
 
 	inputs := map[string]any{}
-	maps.Copy(inputs, rc.workflowCallInputs)
 
 	switch ghc.EventName {
 	case "workflow_dispatch":
@@ -292,36 +251,39 @@ func setEvaluatorInput(inputs map[string]any, ghc *model.GithubContext, name str
 	inputs[name] = model.CoerceInputValue(value, input.Type)
 }
 
-// resolveWorkflowCall evaluates the caller's with: and secrets: once, as the server does before dispatching a called workflow.
+func (c *caller) resolveInputs(ctx context.Context, workflow *model.Workflow) error {
+	rc := c.runContext
+	callerEval := rc.ExprEval.shared(ctx)
+	var callerWith map[string]any
+	if err := model.DecodeEvaluated("workflow inputs", rc.Run.Job().RawWith, callerEval.EvaluateYamlNode, &callerWith); err != nil {
+		return err
+	}
+	c.workflowCallConfig = workflow.WorkflowCallConfig()
+	var err error
+	if c.inputs, err = callerEval.ResolveWorkflowCallInputs(c.workflowCallConfig, callerWith); err != nil {
+		common.Logger(ctx).Warn(err)
+	}
+	return nil
+}
+
 func (rc *RunContext) resolveWorkflowCall(ctx context.Context) error {
 	if rc.caller == nil {
 		return nil
 	}
 	logger := common.Logger(ctx)
-	callerJob := rc.caller.runContext.Run.Job()
-	callerEval := rc.caller.runContext.ExprEval.shared(ctx)
-	var callerWith map[string]any
-	if err := model.DecodeEvaluated("workflow inputs", callerJob.RawWith, callerEval.EvaluateYamlNode, &callerWith); err != nil {
-		return err
-	}
-	if !rc.Run.Workflow.IsWorkflowCall() {
-		logger.Warn("workflow_call key is not defined in the referenced workflow")
-	}
-	config := rc.Run.Workflow.WorkflowCallConfig()
-	var err error
-	if rc.workflowCallInputs, err = callerEval.ResolveWorkflowCallInputs(config, callerWith); err != nil {
-		logger.Warn(err)
-	}
+	caller := rc.caller.runContext
+	callerJob := caller.Run.Job()
 
 	if callerJob.InheritSecrets() {
-		rc.workflowCallSecrets = getWorkflowSecrets(rc.caller.runContext)
+		rc.workflowCallSecrets = getWorkflowSecrets(caller)
 		return nil
 	}
 	secrets := callerJob.Secrets()
-	if err := config.ValidateSecrets(secrets); err != nil {
+	if err := rc.caller.workflowCallConfig.ValidateSecrets(secrets); err != nil {
 		logger.Warn(err)
 	}
-	if rc.workflowCallSecrets, err = callerEval.EvaluateCallerSecrets(secrets); err != nil {
+	var err error
+	if rc.workflowCallSecrets, err = caller.ExprEval.shared(ctx).EvaluateCallerSecrets(secrets); err != nil {
 		return fmt.Errorf("unable to interpolate %w", err)
 	}
 	for _, name := range []string{"GITHUB_TOKEN", "GITEA_TOKEN"} {
