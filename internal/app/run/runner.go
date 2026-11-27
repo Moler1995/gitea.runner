@@ -636,6 +636,8 @@ func (r *Runner) run(ctx context.Context, task *runnerv1.Task, reporter *report.
 		Vars:                              task.Vars,
 		ValidVolumes:                      r.cfg.Container.ValidVolumes,
 		ContainerVolumes:                  r.cfg.Container.Volumes,
+		NoNodeDownload:                    r.cfg.Runner.NodeDownload != nil && !*r.cfg.Runner.NodeDownload,
+		NodeVersion:                       r.cfg.Runner.NodeVersion,
 		SharedToolCache:                   r.cfg.Runner.ToolCacheMode == config.ToolCacheModeShared,
 		ToolCacheSlot:                     toolCacheSlot(r.cfg.Runner.ToolCacheMode, slot),
 		StableHostWorkdir:                 r.cfg.Host.StableWorkdir,

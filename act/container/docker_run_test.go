@@ -11,6 +11,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -23,6 +24,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"gitea.com/gitea/runner/act/common"
 	"gitea.com/gitea/runner/act/common/logging"
@@ -69,6 +71,58 @@ func TestDockerEnvironmentUsesContainerPath(t *testing.T) {
 	require.NoError(t, cr.UpdateFromImageEnv(&pathEnv)(t.Context()))
 	assert.Equal(t, "/opt/node/x64/bin:/usr/bin:/bin", pathEnv["PATH"])
 	client.AssertExpectations(t)
+}
+
+func TestDockerSeedVolume(t *testing.T) {
+	requireDocker(t)
+	ctx := t.Context()
+	cleanupCtx := context.WithoutCancel(ctx)
+	require.NoError(t, NewDockerPullExecutor(NewDockerPullExecutorInput{Image: "alpine"})(ctx))
+	cr := &containerReference{input: &NewContainerInput{Image: "alpine"}}
+	require.NoError(t, cr.connect()(ctx))
+	t.Cleanup(func() { assert.NoError(t, cr.Close()(cleanupCtx)) })
+
+	prefix := "node-seed-test-" + strings.ToLower(rand.Text()) + "-"
+	volume, oldVolume := prefix+"current", prefix+"old"
+	t.Cleanup(func() {
+		assert.NoError(t, NewDockerVolumeRemoveExecutor(volume, false)(cleanupCtx))
+		assert.NoError(t, NewDockerVolumeRemoveExecutor(oldVolume, false)(cleanupCtx))
+	})
+	_, err := cr.cli.VolumeCreate(ctx, mobyclient.VolumeCreateOptions{Name: oldVolume})
+	require.NoError(t, err)
+
+	for _, body := range []string{"seeded", "reseeded"} {
+		require.NoError(t, cr.SeedVolume(volume, prefix, "node", func(out io.Writer) error {
+			return writeFilesTar(ctx, out, 0, 0, &FileEntry{Name: "node", Mode: 0o755, Body: body})
+		})(ctx))
+	}
+	_, err = cr.cli.VolumeInspect(ctx, oldVolume, mobyclient.VolumeInspectOptions{})
+	require.NoError(t, err)
+	pruneSeedVolumes(ctx, cr.cli, volume, prefix, time.Now().Add(time.Minute))
+	_, err = cr.cli.VolumeInspect(ctx, oldVolume, mobyclient.VolumeInspectOptions{})
+	require.ErrorIs(t, err, cerrdefs.ErrNotFound)
+
+	readback, err := cr.cli.ContainerCreate(ctx, mobyclient.ContainerCreateOptions{
+		Config: &container.Config{Image: "alpine"},
+		HostConfig: &container.HostConfig{
+			NetworkMode: "none",
+			Mounts:      []mount.Mount{{Type: mount.TypeVolume, Source: volume, Target: "/readback", ReadOnly: true}},
+		},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, err := cr.cli.ContainerRemove(cleanupCtx, readback.ID, mobyclient.ContainerRemoveOptions{RemoveVolumes: true})
+		assert.NoError(t, err)
+	})
+	archive, err := cr.cli.CopyFromContainer(ctx, readback.ID, mobyclient.CopyFromContainerOptions{SourcePath: "/readback/node"})
+	require.NoError(t, err)
+	defer archive.Content.Close()
+	reader := tar.NewReader(archive.Content)
+	_, err = reader.Next()
+	require.NoError(t, err)
+	content, err := io.ReadAll(reader)
+	require.NoError(t, err)
+	assert.Equal(t, "seeded", string(content))
 }
 
 type mockDockerClient struct {

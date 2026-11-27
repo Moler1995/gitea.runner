@@ -56,12 +56,20 @@ func TestTransferServer(t *testing.T) {
 	loopback := []net.IP{net.ParseIP("127.0.0.1")}
 	nothing := func(io.Writer) error { return nil }
 
-	t.Run("serves an offer gzipped once to an IP of its job pod", func(t *testing.T) {
-		request, done := server.offer([]net.IP{net.ParseIP("fd00::1"), loopback[0]}, nothing)
+	t.Run("serves gzipped bytes unchanged and only once to an IP of its job pod", func(t *testing.T) {
+		var archive bytes.Buffer
+		require.NoError(t, writeGzip(&archive, nothing))
+		request, done := server.offer([]net.IP{net.ParseIP("fd00::1"), loopback[0]}, func(writer io.Writer) error {
+			_, err := writer.Write(archive.Bytes())
+			return err
+		})
 		client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, DisableCompression: true}}
 		response, err := client.Get(request.URL)
 		require.NoError(t, err)
+		body, err := io.ReadAll(response.Body)
 		require.NoError(t, response.Body.Close())
+		require.NoError(t, err)
+		assert.Equal(t, archive.Bytes(), body)
 		assert.Equal(t, "gzip", response.Header.Get("Content-Encoding"))
 		require.ErrorContains(t, fetch(t, request), "404")
 		taken, _ := done()
@@ -76,10 +84,12 @@ func TestTransferServer(t *testing.T) {
 	})
 
 	t.Run("a failed write fails the fetch even past the end blocks tar stops at, and done reports it", func(t *testing.T) {
-		request, done := server.offer(loopback, func(w io.Writer) error {
-			_, _ = w.Write(make([]byte, 1024))
-			_, _ = io.CopyN(w, rand.Reader, 1<<20)
-			return errors.New("source gone")
+		request, done := server.offer(loopback, func(writer io.Writer) error {
+			return writeGzip(writer, func(compressed io.Writer) error {
+				_, _ = compressed.Write(make([]byte, 1024))
+				_, _ = io.CopyN(compressed, rand.Reader, 1<<20)
+				return errors.New("source gone")
+			})
 		})
 		require.Error(t, fetch(t, request))
 		taken, err := done()
@@ -164,6 +174,13 @@ func TestKubernetesPodCopiesLargeFilesOverPodNetwork(t *testing.T) {
 	assert.Contains(t, lastExec(), "command="+KubernetesTransferCommand)
 	assert.NotContains(t, lastExec(), "127.0.0.1")
 
+	archive := kubernetesTestTarGz(t, large)
+	require.NoError(t, pod.job.ExtractTarGz(filepath.Join(workdir, "cached"), archive)(ctx))
+	assert.Contains(t, lastExec(), "command="+KubernetesTransferCommand)
+	content, err = os.ReadFile(filepath.Join(workdir, "cached", "large"))
+	require.NoError(t, err)
+	assert.Equal(t, large.Body, string(content))
+
 	require.NoError(t, job.Copy(workdir+"/act/", &FileEntry{Name: "event.json", Mode: 0o644, Body: `{}`})(ctx))
 	assert.NotContains(t, lastExec(), "command="+KubernetesTransferCommand)
 
@@ -179,7 +196,7 @@ func TestKubernetesPodCopiesLargeFilesOverPodNetwork(t *testing.T) {
 	assert.NoFileExists(t, filepath.Join(workdir, "direct", "large"))
 
 	pod.options.Transfer.Fallback = true
-	require.NoError(t, copyLarge("auto"))
+	require.NoError(t, pod.job.ExtractTarGz(filepath.Join(workdir, "auto"), archive)(ctx))
 	assert.FileExists(t, filepath.Join(workdir, "auto", "large"))
 	assert.Empty(t, pod.transferHelper)
 }

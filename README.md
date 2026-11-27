@@ -14,7 +14,6 @@ Gitea Runner runs the jobs of Gitea Actions workflows. Register it with a Gitea 
 In the job image, or on the host for host jobs:
 
 - `bash` or `sh`, or `pwsh` or `powershell` on Windows.
-- `node` for JavaScript actions and `hashFiles()`.
 
 Kubernetes mode needs [a few more tools](docs/kubernetes.md) in job images.
 
@@ -322,6 +321,13 @@ A regex must match the whole `uses`, and the replacement can insert its capture 
 ### Secret masking
 
 Secrets and `::add-mask::` values are hidden in job logs, [local job logs](#local-job-logs-logjobdir), job summaries and container names. As on GitHub, a job output containing one is dropped with a warning.
+
+### Node.js
+
+JavaScript actions and `hashFiles()` run on either:
+
+- Node.js 24, downloaded by the runner from nodejs.org (or `NODEJS_ORG_MIRROR`), and from GitHub for Alpine. `runner.node_version` can be used to use a different version. If the download fails or doesn't run in the job's image, the `node` on `PATH` is used.
+- The `node` on `PATH`, with `runner.node_download: false`.
 
 ## Operation
 

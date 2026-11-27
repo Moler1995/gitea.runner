@@ -205,7 +205,7 @@ func runActionScript(ctx context.Context, step actionStep, actionDir, script str
 	env := step.getEnv()
 	rc.ApplyExtraPath(ctx, env)
 	if step.getActionModel().Runs.Using.IsNode() {
-		args := nodeActionCommand(container.JoinPath(actionDir, script))
+		args := nodeActionCommand(rc.node(ctx), container.JoinPath(actionDir, script))
 		common.Logger(ctx).Debugf("executing remote job container: %s", args)
 		return rc.JobContainer.Exec(args, *env, "", "")(ctx)
 	}
@@ -217,8 +217,8 @@ func runActionScript(ctx context.Context, step actionStep, actionDir, script str
 }
 
 // /var/run is a symlink, so without the flag node's import.meta.url differs from argv[1], which ESM actions compare.
-func nodeActionCommand(script string) []string {
-	return []string{"node", "--preserve-symlinks-main", script}
+func nodeActionCommand(node, script string) []string {
+	return []string{node, "--preserve-symlinks-main", script}
 }
 
 // dockerActionImageTag derives the local docker image tag used when an action

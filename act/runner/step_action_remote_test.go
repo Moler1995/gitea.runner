@@ -236,8 +236,8 @@ func TestStepActionRemotePreCleanup(t *testing.T) {
 				_, actionDir := getContainerActionPaths(sar)
 				expectStepFileCommands(t, cm)
 				cm.On("CopyDir", actionDir+"/", sar.actionDir+"/", false, true).Return(noopExecutor)
-				cm.On("Exec", nodeActionCommand(path.Join(actionDir, "pre.js")), mock.Anything, "", "").Return(func(_ctx context.Context) error { return test.preError }).Once()
-				cm.On("Exec", nodeActionCommand(path.Join(actionDir, "post.js")), mock.Anything, "", "").Return(noopExecutor).Once()
+				cm.On("Exec", nodeActionCommand("node", path.Join(actionDir, "pre.js")), mock.Anything, "", "").Return(func(_ctx context.Context) error { return test.preError }).Once()
+				cm.On("Exec", nodeActionCommand("node", path.Join(actionDir, "post.js")), mock.Anything, "", "").Return(noopExecutor).Once()
 			}
 
 			assert.Equal(t, test.preError, sar.pre()(t.Context()))

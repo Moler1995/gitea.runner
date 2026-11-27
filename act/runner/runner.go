@@ -85,6 +85,8 @@ type Config struct {
 	JobLoggerLevel                    *logging.Level // the level of job logger
 	ValidVolumes                      []string       // only volumes (and bind mounts) in this slice can be mounted on the job container or service containers
 	ContainerVolumes                  []string       // mounted into every job, service and docker action container
+	NoNodeDownload                    bool           // run JavaScript actions and hashFiles with the node on PATH, never one the runner downloads
+	NodeVersion                       string         // the Node.js version to download instead of the pinned one, checked against its published SHA-256
 	SharedToolCache                   bool           // keeps the tool cache across jobs instead of one per job
 	ToolCacheSlot                     string         // keeps concurrent tasks' tool caches apart, empty for slot 0 and in exec
 	StableHostWorkdir                 bool           // host jobs run at a stable path per repository, see HostEnvironment.UseWorkspace

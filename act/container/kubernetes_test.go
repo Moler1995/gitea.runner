@@ -6,6 +6,7 @@ package container
 import (
 	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -109,7 +110,7 @@ func fakeKubernetes(t *testing.T, podStatus string, env ...string) (string, *fak
 			if failure := cluster.nextExecFailure(); failure != nil {
 				failure(w, r)
 			} else {
-				serveLocalExec(t, w, r, env)
+				serveLocalExec(t, w, r, env, cluster)
 			}
 		case strings.HasSuffix(r.URL.Path, "/log"):
 			_, _ = io.WriteString(w, "log of "+r.URL.Query().Get("container"))
@@ -132,7 +133,7 @@ users: [{name: test, user: {tokenFile: token}}]
 	return kubeconfig, cluster
 }
 
-func serveLocalExec(t *testing.T, w http.ResponseWriter, r *http.Request, env []string) {
+func serveLocalExec(t *testing.T, w http.ResponseWriter, r *http.Request, env []string, cluster *fakeCluster) {
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{Subprotocols: []string{execProtocol}})
 	if err != nil {
 		t.Error(err)
@@ -153,6 +154,7 @@ func serveLocalExec(t *testing.T, w http.ResponseWriter, r *http.Request, env []
 		}
 		stdin.Write(frame[1:])
 	}
+	cluster.record("exec-stdin", stdin.String())
 	cmd := exec.Command(command[0], command[1:]...)
 	cmd.Env = append(append(os.Environ(), "COPYFILE_DISABLE=1"), env...)
 	var stdout, stderr bytes.Buffer
@@ -167,6 +169,17 @@ func serveLocalExec(t *testing.T, w http.ResponseWriter, r *http.Request, env []
 	for _, frame := range [][]byte{append([]byte{1}, stdout.Bytes()...), append([]byte{2}, stderr.Bytes()...), append([]byte{3}, status...)} {
 		_ = conn.Write(r.Context(), websocket.MessageBinary, frame)
 	}
+}
+
+func kubernetesTestTarGz(t *testing.T, file *FileEntry) string {
+	t.Helper()
+	var compressed bytes.Buffer
+	writer := gzip.NewWriter(&compressed)
+	require.NoError(t, writeFilesTar(t.Context(), writer, 0, 0, file))
+	require.NoError(t, writer.Close())
+	archive := filepath.Join(t.TempDir(), "archive.tar.gz")
+	require.NoError(t, os.WriteFile(archive, compressed.Bytes(), 0o600))
+	return archive
 }
 
 func TestKubernetesServiceHostnames(t *testing.T) {
@@ -309,6 +322,17 @@ func TestKubernetesPodRunsJobThroughAPI(t *testing.T) {
 	assert.Contains(t, lastExec(), "command="+url.QueryEscape(workdir+"/act/actions/sha/"))
 	assert.Contains(t, lastExec(), url.QueryEscape("gzip -dc |"))
 
+	gzipArchive := kubernetesTestTarGz(t, &FileEntry{Name: "index.js", Mode: 0o644, Body: "main()"})
+	require.NoError(t, pod.job.ExtractTarGz(workdir+"/act/cached", gzipArchive)(ctx))
+	assert.Contains(t, lastExec(), url.QueryEscape("gzip -dc |"))
+	compressed, err := os.ReadFile(gzipArchive)
+	require.NoError(t, err)
+	inputs := cluster.requests["exec-stdin"]
+	assert.Equal(t, string(compressed), inputs[len(inputs)-1])
+	script, err = os.ReadFile(workdir + "/act/cached/index.js")
+	require.NoError(t, err)
+	assert.Equal(t, "main()", string(script))
+
 	imageEnv := map[string]string{}
 	require.NoError(t, job.UpdateFromImageEnv(&imageEnv)(ctx))
 	assert.Equal(t, map[string]string{"PATH": path, "ImageOS": "ubuntu24-arm64"}, imageEnv)
@@ -361,6 +385,16 @@ func TestKubernetesCopiesUncompressedWithoutGzip(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "main()", string(script))
 	assert.NotContains(t, cluster.requests["exec"][len(cluster.requests["exec"])-1], "gzip")
+
+	gzipArchive := kubernetesTestTarGz(t, &FileEntry{Name: "index.js", Mode: 0o644, Body: "main()"})
+	require.NoError(t, pod.job.ExtractTarGz(workdir+"/act/cached", gzipArchive)(ctx))
+	inputs := cluster.requests["exec-stdin"]
+	header, err := tar.NewReader(strings.NewReader(inputs[len(inputs)-1])).Next()
+	require.NoError(t, err)
+	assert.Equal(t, "index.js", header.Name)
+	script, err = os.ReadFile(workdir + "/act/cached/index.js")
+	require.NoError(t, err)
+	assert.Equal(t, "main()", string(script))
 }
 
 func TestKubernetesPodFailsBeforeSteps(t *testing.T) {

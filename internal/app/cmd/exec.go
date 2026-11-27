@@ -67,6 +67,7 @@ type executeArgs struct {
 	artifactServerAddr    string
 	artifactServerPort    string
 	noSkipCheckout        bool
+	noNodeDownload        bool
 	debug                 bool
 	dryrun                bool
 	image                 string
@@ -387,6 +388,7 @@ func (i *executeArgs) runnerConfig(eventName string, env, proxyEnv map[string]st
 		ArtifactServerPort:                i.artifactServerPort,
 		ArtifactServerAddr:                i.artifactServerAddr,
 		NoSkipCheckout:                    i.noSkipCheckout,
+		NoNodeDownload:                    i.noNodeDownload,
 		EventName:                         eventName,
 		EventJSON:                         eventJSON,
 		ContainerNamePrefix:               "GITEA-ACTIONS-TASK-" + eventName,
@@ -587,6 +589,7 @@ func loadExecCmd(ctx context.Context) *cobra.Command {
 	execCmd.PersistentFlags().StringVarP(&execArg.artifactServerPort, "artifact-server-port", "", "34567", "Defines the port where the artifact server listens")
 	execCmd.PersistentFlags().StringVarP(&execArg.defaultActionsURL, "default-actions-url", "", "https://github.com", "Defines the default url of action instance.")
 	execCmd.PersistentFlags().BoolVarP(&execArg.noSkipCheckout, "no-skip-checkout", "", false, "Do not skip actions/checkout")
+	execCmd.PersistentFlags().BoolVarP(&execArg.noNodeDownload, "no-node-download", "", false, "Run JavaScript actions and hashFiles() with the node on PATH instead of a downloaded Node.js")
 	execCmd.PersistentFlags().BoolVarP(&execArg.debug, "debug", "d", false, "enable debug log")
 	execCmd.PersistentFlags().BoolVarP(&execArg.dryrun, "dryrun", "n", false, "dryrun mode")
 	execCmd.PersistentFlags().StringVarP(&execArg.image, "image", "i", config.DefaultImage, "Docker image to use. Use \"kubernetes://<image>\" to run it as a pod, \"-self-hosted\" to run directly on the host.")

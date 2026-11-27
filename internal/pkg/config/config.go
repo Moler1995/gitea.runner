@@ -40,6 +40,8 @@ const DefaultPostTaskScriptTimeout = 5 * time.Minute
 
 var environmentReference = regexp.MustCompile(`\$?\$\{[A-Za-z_][A-Za-z0-9_]*\}`)
 
+var nodeVersionPattern = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`)
+
 // Minimal is the smallest config file that runs the runner: options it does not
 // name keep their default, and it names none.
 const Minimal = `# Minimal config file. Every option it does not set keeps its default.
@@ -88,6 +90,8 @@ type Runner struct {
 	ActionReplacements    []ActionReplacement `yaml:"action_replacements"`      // ActionReplacements rewrite the `uses` of steps, see ReplaceUses.
 	ActionShallowClone    *bool               `yaml:"action_shallow_clone"`     // ActionShallowClone clones only the requested ref at depth 1 instead of every branch's full history, for reusable workflows and actions without an archive. It is a pointer to distinguish between false and not set; if not set, it defaults to true.
 	SetActEnv             *bool               `yaml:"set_act_env"`              // SetActEnv controls whether the ACT=true environment variable is injected into jobs. It is a pointer to distinguish between false and not set; if not set, it defaults to true. Set it to false so workflows gated on `if: ${{ !env.ACT }}` behave like on GitHub.
+	NodeDownload          *bool               `yaml:"node_download"`            // NodeDownload sets whether to download Node.js for JavaScript actions and hashFiles(). Unset means true, false uses the node on PATH.
+	NodeVersion           string              `yaml:"node_version"`             // NodeVersion is an exact Node.js version to download instead of the pinned one, checked against its published SHA-256.
 	PatchActions          *bool               `yaml:"patch_actions"`            // PatchActions applies compatibility patches to the actions a job runs, so actions written for GitHub work against Gitea, see act/runner/patch_actions.go. It is a pointer to distinguish between false and not set; if not set, it defaults to true. Set it to false to run every action exactly as published, at the price of the artifact actions refusing.
 	AllocatePTY           bool                `yaml:"allocate_pty"`             // AllocatePTY allocates a pseudo-TTY for each step's process. Default is false, matching GitHub's actions/runner. Enable only for jobs that need an interactive terminal; tools like docker build emit redrawing progress frames into the captured log when a TTY is present. Applies to both host and docker backends.
 	DefaultImage          string              `yaml:"default_image"`            // DefaultImage is the image a job runs in when its runs-on matches none of the runner's labels. A runner without docker runs such a job on the host instead.
@@ -406,6 +410,9 @@ func LoadDefault(file string) (*Config, error) {
 	}
 	if cfg.Runner.ToolCacheMode == "" {
 		cfg.Runner.ToolCacheMode = ToolCacheModeNone
+	}
+	if cfg.Runner.NodeVersion != "" && !nodeVersionPattern.MatchString(cfg.Runner.NodeVersion) {
+		return nil, fmt.Errorf("invalid runner.node_version %q: must be an exact version like 24.22.3", cfg.Runner.NodeVersion)
 	}
 	if !slices.Contains(ToolCacheModes, cfg.Runner.ToolCacheMode) {
 		return nil, fmt.Errorf("invalid runner.tool_cache_mode %q: must be one of %q", cfg.Runner.ToolCacheMode, ToolCacheModes)

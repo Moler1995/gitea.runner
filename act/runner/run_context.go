@@ -91,6 +91,7 @@ type RunContext struct {
 	jobEnv             map[string]string          // workflow and job env as evaluated for the container and service specs
 	dockerActionImages map[*model.Step]string     // Dockerfile action images built for this job, removed when it ends
 	actionDownloads    map[string]*actionDownload // remote action repositories by clone URL and ref, fetched once per job
+	nodePath           string
 
 	// summaryFileInitialized tracks which per-step summary files (workflow/step-summary-N.md)
 	// have already been created on the JobContainer. The runner sets up file-command files
@@ -266,6 +267,9 @@ func (rc *RunContext) validVolumes() []string {
 		volumes = append(volumes, rc.dockerProxy.Socket)
 	}
 	volumes = append(volumes, rc.Config.containerVolumeSources()...)
+	if !rc.Config.NoNodeDownload {
+		volumes = append(volumes, rc.Config.nodeVolume()+":ro")
+	}
 	// TODO: add a new configuration to control whether the docker daemon can be mounted
 	return append(volumes, name, name+"-env",
 		getDockerDaemonSocketMountPath(rc.containerDaemonSocket()))
@@ -686,6 +690,9 @@ func (rc *RunContext) startJobContainer() common.Executor {
 		rc.startDockerProxy(ctx)
 		var taskWorkspace string
 		containerInput.Binds, containerInput.Mounts, taskWorkspace = rc.GetBindsAndMounts(ctx)
+		if !rc.Config.NoNodeDownload {
+			containerInput.Binds = append(containerInput.Binds, rc.Config.nodeVolume()+":"+ext.GetActPath()+"/node:ro,nocopy")
+		}
 		containerInput.ValidVolumes = rc.validVolumes()
 
 		rc.jobNetworkName = networkName

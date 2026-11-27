@@ -51,7 +51,7 @@ Job pods mount no service account token unless the template sets `automountServi
 
 ## Copying files over the pod network
 
-The runner copies files into the job container, such as the actions a step uses, with `tar` over `pods/exec`. That data goes through the API server, which on a managed cluster often sits in other zones than the nodes, so each byte can cross zones twice. With `transfer.mode` set to `auto` or `direct`, the job container instead fetches directories, such as actions and workspaces, and other copies of 64 KiB or more gzipped from the runner pod. Smaller ones, like step scripts, stay on `pods/exec`, as do copies out of the job container and step output.
+The runner copies files into the job container, such as the actions a step uses, with `tar` over `pods/exec`. That data goes through the API server, which on a managed cluster often sits in other zones than the nodes, so each byte can cross zones twice. With `transfer.mode` set to `auto` or `direct`, the job container instead fetches directories, such as actions and workspaces, and other copies of 64 KiB or more gzipped from the runner pod. Smaller ones, like step scripts, stay on `pods/exec`, as do copies out of the job container and step output. The runner's Node.js is copied the same way.
 
 ```yaml
 kubernetes:
