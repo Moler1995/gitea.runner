@@ -805,7 +805,8 @@ func TestMergeContainerConfigsStripsDangerousOptionsWhenUnprivileged(t *testing.
 	// OS-independent options only, --device and --gpus need a linux/windows server OS
 	const dangerousOptions = "--pid=host --ipc=host --uts=host --cgroupns=host " +
 		"--userns=host --cap-add=ALL --security-opt seccomp=unconfined " +
-		"--security-opt apparmor=unconfined --volumes-from other --isolation process " +
+		"--security-opt apparmor=unconfined --security-opt systempaths=unconfined " +
+		"--volumes-from other --isolation process " +
 		"--runtime runc --cgroup-parent /custom --sysctl net.ipv4.ip_forward=1 " +
 		"--log-driver=syslog --log-opt syslog-address=tcp://169.254.169.254:514 " +
 		"--oom-score-adj=-1000 --oom-kill-disable"
@@ -825,6 +826,8 @@ func TestMergeContainerConfigsStripsDangerousOptionsWhenUnprivileged(t *testing.
 	assert.Equal(t, []string{"ALL"}, kept.CapAdd)
 	assert.Equal(t, "runc", kept.Runtime)
 	assert.Equal(t, "host", string(kept.UsernsMode))
+	assert.Equal(t, []string{}, kept.MaskedPaths)
+	assert.Equal(t, []string{}, kept.ReadonlyPaths)
 	assert.False(t, kept.Privileged)
 
 	// privileged is the administrator opting in, so the workflow's options are honored

@@ -104,6 +104,25 @@ func TestCompositeActionParity(t *testing.T) {
 		require.ErrorIs(t, rc.compositeExecutor(&model.Action{Runs: model.ActionRuns{Using: "composite", Steps: []model.Step{{ID: "nested", Uses: "org/action@v1"}}}}).pre(t.Context()), assert.AnError)
 	})
 
+	t.Run("composite steps of every stage share masks with the job", func(t *testing.T) {
+		parent := makeTestRC(t, "runs-on: ubuntu-latest")
+		parent.JobContainer, parent.Masks = &jobContainerMock{}, make([]string, 0, 2)
+		step := &stepActionRemote{Step: &model.Step{Uses: "own/action@v1"}, RunContext: parent, action: &model.Action{Runs: model.ActionRuns{Using: "composite"}}, remoteAction: mustNewRemoteAction(t, "own/action@v1")}
+		composite := step.getCompositeRunContext(t.Context(), nil)
+		require.NoError(t, composite.newCompositeCommandExecutor(func(ctx context.Context) error {
+			composite.AddMask(ctx, "composite-pre")
+			return nil
+		})(t.Context()))
+		parent.AddMask(t.Context(), "job-first")
+		parent.AddMask(t.Context(), "job-later")
+		require.NoError(t, composite.newCompositeCommandExecutor(func(ctx context.Context) error {
+			assert.Contains(t, composite.Masks, "job-later")
+			composite.AddMask(ctx, "composite-post")
+			return nil
+		})(t.Context()))
+		assert.ElementsMatch(t, []string{"composite-pre", "job-first", "job-later", "composite-post"}, parent.Masks)
+	})
+
 	t.Run("post steps log under their own step ids", func(t *testing.T) {
 		hook := logtest.NewWithLevel(logging.LevelDebug)
 		rc := &RunContext{Config: &Config{}, JobContainer: &jobContainerMock{}}

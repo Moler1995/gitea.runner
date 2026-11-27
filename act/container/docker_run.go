@@ -661,6 +661,12 @@ func (cr *containerReference) mergeContainerConfigs(ctx context.Context, config 
 	overlay(reflect.ValueOf(hostConfig).Elem(), reflect.ValueOf(containerConfig.HostConfig).Elem(), false)
 	hostConfig.Binds = binds
 	hostConfig.Mounts = mounts
+	if containerConfig.HostConfig.MaskedPaths != nil {
+		hostConfig.MaskedPaths = containerConfig.HostConfig.MaskedPaths
+	}
+	if containerConfig.HostConfig.ReadonlyPaths != nil {
+		hostConfig.ReadonlyPaths = containerConfig.HostConfig.ReadonlyPaths
+	}
 	if cf.name != "" {
 		logger.Warn("--name in the options will be ignored.")
 	}
