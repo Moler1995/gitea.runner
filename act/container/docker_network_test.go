@@ -20,10 +20,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestIsolatedCacheContainer(t *testing.T) {
+func TestDetectCacheIsolation(t *testing.T) {
 	ctx := t.Context()
-	cache, lan := netip.MustParseAddr("172.18.0.3"), netip.MustParseAddr("192.168.1.20")
+	cache, lan, gateway := netip.MustParseAddr("172.18.0.3"), netip.MustParseAddr("192.168.1.20"), netip.MustParsePrefix("172.19.0.3/16")
 	client := &mockDockerClient{}
+	client.On("NetworkInspect", ctx, "docker_gwbridge", mobyclient.NetworkInspectOptions{}).Return(mobyclient.NetworkInspectResult{}, cerrdefs.ErrNotFound).Once()
 	client.On("ContainerList", ctx, mobyclient.ContainerListOptions{}).Return(mobyclient.ContainerListResult{Items: []container.Summary{{}, {
 		ID: "0123456789abcdef",
 		NetworkSettings: &container.NetworkSettingsSummary{Networks: map[string]*network.EndpointSettings{
@@ -31,26 +32,29 @@ func TestIsolatedCacheContainer(t *testing.T) {
 			"lan":     {NetworkID: "beef", IPAddress: lan},
 		}},
 	}}}, nil)
-	for ref, inspected := range map[string]network.Network{
-		"c0ffee": {ID: "c0ffee", Name: "compose", Driver: "bridge"},
-		"beef":   {ID: "beef", Name: "lan", Driver: "macvlan"},
-		"c0f":    {ID: "c0ffee"},
-		"jobs":   {ID: "f00d"},
+	for ref, inspected := range map[string]network.Inspect{
+		"c0ffee":          {Network: network.Network{ID: "c0ffee", Name: "compose", Driver: "bridge"}},
+		"beef":            {Network: network.Network{ID: "beef", Name: "lan", Driver: "macvlan"}},
+		"c0f":             {Network: network.Network{ID: "c0ffee"}},
+		"jobs":            {Network: network.Network{ID: "f00d"}},
+		"docker_gwbridge": {Containers: map[string]network.EndpointResource{"fedcba9876543210": {IPv4Address: gateway}}},
 	} {
 		client.On("NetworkInspect", ctx, ref, mobyclient.NetworkInspectOptions{}).
-			Return(mobyclient.NetworkInspectResult{Network: network.Inspect{Network: inspected}}, nil)
+			Return(mobyclient.NetworkInspectResult{Network: inspected}, nil)
 	}
-	check := func(addr netip.Addr, jobNetwork, want string) {
-		got, err := isolatedCacheContainer(ctx, client, addr, jobNetwork)
+	check := func(addr netip.Addr, jobNetwork string, want CacheIsolation) {
+		got, err := detectCacheIsolation(ctx, client, addr, jobNetwork)
 		require.NoError(t, err)
 		assert.Equal(t, want, got, jobNetwork)
 	}
-	check(cache, "", "0123456789ab")
-	check(cache, "jobs", "0123456789ab")
-	check(cache, "c0f", "")
-	check(cache, "host", "")
-	check(lan, "", "")
-	check(netip.MustParseAddr("10.0.0.5"), "", "")
+	check(cache, "", CacheIsolation{ContainerID: "0123456789ab"})
+	check(cache, "jobs", CacheIsolation{ContainerID: "0123456789ab"})
+	check(cache, "c0f", CacheIsolation{})
+	check(cache, "host", CacheIsolation{})
+	check(lan, "", CacheIsolation{})
+	check(gateway.Addr(), "jobs", CacheIsolation{})
+	check(gateway.Addr(), "jobs", CacheIsolation{GatewayBridge: true})
+	check(netip.MustParseAddr("10.0.0.5"), "", CacheIsolation{})
 }
 
 func TestIsAddressPoolExhausted(t *testing.T) {

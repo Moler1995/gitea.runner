@@ -27,6 +27,12 @@ var hostOS = runtime.GOOS // replaced in tests
 // DrainGracePeriod caps the wait for container output to drain so the log tail is not truncated
 const DrainGracePeriod = 2 * time.Second
 
+// CacheIsolation is how jobs reach a cache address on another network: attach ContainerID to theirs, or not at all on a docker_gwbridge gateway.
+type CacheIsolation struct {
+	ContainerID   string
+	GatewayBridge bool
+}
+
 // ExitCodeError reports a non-zero process exit code from a container command.
 type ExitCodeError int
 

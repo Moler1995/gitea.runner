@@ -23,8 +23,8 @@ func GetDockerClient(context.Context) (client.APIClient, error) {
 	return nil, errors.ErrUnsupported
 }
 
-func IsolatedCacheContainer(context.Context, netip.Addr, string) (string, error) {
-	return "", nil
+func DetectCacheIsolation(context.Context, netip.Addr, string) (CacheIsolation, error) {
+	return CacheIsolation{}, nil
 }
 
 // ImageExistsLocally returns a boolean indicating if an image with the

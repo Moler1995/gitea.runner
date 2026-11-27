@@ -73,8 +73,8 @@ type Runner struct {
 	cacheHandler *artifactcache.Handler
 	capabilities string
 
-	isolatedCacheContainer func(cacheURL string) string
-	instanceTransport      http.RoundTripper
+	cacheIsolation    func(cacheURL string) container.CacheIsolation
+	instanceTransport http.RoundTripper
 
 	runningTasks            sync.Map
 	runningCount            atomic.Int64
@@ -141,7 +141,7 @@ func NewRunner(cfg *config.Config, reg *config.Registration, cli client.Client) 
 		now:            time.Now,
 		runHealthCheck: executeHealthCheck,
 	}
-	runner.isolatedCacheContainer = lastResult(runner.detectIsolatedCacheContainer)
+	runner.cacheIsolation = lastResult(runner.detectCacheIsolation)
 	runner.instanceTransport = instanceTransport
 	return runner
 }
@@ -196,7 +196,7 @@ func (r *Runner) cleanupOrphanDockerResources(ctx context.Context) {
 		return
 	}
 	cutoff := r.now().Add(-orphanDockerResourceAge)
-	if err := removeOrphanNetworks(ctx, r.uuid, r.isolatedCacheContainer(r.cacheHandler.ExternalURL()), cutoff); err != nil {
+	if err := removeOrphanNetworks(ctx, r.uuid, r.cacheIsolation(r.cacheHandler.ExternalURL()).ContainerID, cutoff); err != nil {
 		logging.Warnf("failed to clean up networks left behind by earlier jobs: %v", err)
 	}
 	if err := removeOrphanJobVolumes(ctx, r.uuid, cutoff); err != nil {
@@ -676,13 +676,13 @@ func (r *Runner) run(ctx context.Context, task *runnerv1.Task, reporter *report.
 	return execErr
 }
 
-func lastResult(compute func(key string) (string, bool)) func(key string) string {
+func lastResult[T any](compute func(key string) (T, bool)) func(key string) T {
 	var (
 		mu      sync.Mutex
 		lastKey string
-		result  string
+		result  T
 	)
-	return func(key string) string {
+	return func(key string) T {
 		mu.Lock()
 		defer mu.Unlock()
 		if key == lastKey {
@@ -968,10 +968,16 @@ func (r *Runner) cacheForJob(job *model.Job, platform string, logf func(string, 
 	if cacheURL == "" || strings.HasPrefix(platform, labels.SchemeKubernetes+"://") || (jobContainer == nil || jobContainer.Image == "") && platform == labels.SelfHostedPlatform {
 		return cacheURL, ""
 	}
-	if cacheContainer := r.isolatedCacheContainer(cacheURL); cacheContainer != "" {
+	isolation := r.cacheIsolation(cacheURL)
+	if isolation.GatewayBridge {
+		logf("::warning::%s", runner.EscapeCommandData("Cache disabled for this job because it cannot reach the runner's docker_gwbridge address. "+
+			"Set cache.host to the host's address and publish a fixed cache.port on it in host mode."))
+		return "", ""
+	}
+	if isolation.ContainerID != "" {
 		isolatedURL, _ := url.Parse(cacheURL)
-		isolatedURL.Host = net.JoinHostPort(cacheContainer, isolatedURL.Port())
-		return isolatedURL.String(), cacheContainer
+		isolatedURL.Host = net.JoinHostPort(isolation.ContainerID, isolatedURL.Port())
+		return isolatedURL.String(), isolation.ContainerID
 	}
 	network, enableIPv6 := r.cfg.Container.Network, r.cfg.Container.NetworkCreateOptions.EnableIPv6
 	if addr, err := netip.ParseAddr(hostOf(cacheURL)); err == nil && addr.Is6() && r.cfg.Cache.Host == "" &&
@@ -982,19 +988,19 @@ func (r *Runner) cacheForJob(job *model.Job, platform string, logf func(string, 
 	return cacheURL, ""
 }
 
-func (r *Runner) detectIsolatedCacheContainer(cacheURL string) (string, bool) {
+func (r *Runner) detectCacheIsolation(cacheURL string) (container.CacheIsolation, bool) {
 	addr, err := netip.ParseAddr(hostOf(cacheURL))
 	if err != nil {
-		return "", true
+		return container.CacheIsolation{}, true
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	cacheContainer, err := container.IsolatedCacheContainer(ctx, addr, r.cfg.Container.Network)
+	isolation, err := container.DetectCacheIsolation(ctx, addr, r.cfg.Container.Network)
 	if err != nil {
 		logging.Warnf("cannot check whether jobs reach the cache server: %v", err)
-		return "", false
+		return container.CacheIsolation{}, false
 	}
-	return cacheContainer, true
+	return isolation, true
 }
 
 // taskLogFields returns key/value pairs for logging.With.
