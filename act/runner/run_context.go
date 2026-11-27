@@ -254,7 +254,7 @@ func (rc *RunContext) validVolumes() []string {
 	name := rc.jobContainerName()
 	volumes := slices.Clone(rc.Config.ValidVolumes)
 	if hostEnv, ok := rc.JobContainer.(*container.HostEnvironment); ok {
-		volumes = append(volumes, hostEnv.Path, hostEnv.GetActPath())
+		volumes = append(volumes, hostEnv.HostPath(hostEnv.Path), hostEnv.GetActPath())
 	}
 	if rc.Config.SharedToolCache {
 		volumes = append(volumes, rc.toolCacheVolume())
@@ -388,7 +388,7 @@ func (rc *RunContext) GetBindsAndMounts(ctx context.Context) ([]string, map[stri
 		}
 	}
 	if hostEnv, ok := rc.JobContainer.(*container.HostEnvironment); ok {
-		binds = append(binds, hostEnv.Path+":"+hostEnv.Path, hostEnv.GetActPath()+":"+hostEnv.GetActPath())
+		binds = append(binds, hostEnv.HostPath(hostEnv.Path)+":"+hostEnv.Path, hostEnv.GetActPath()+":"+hostEnv.GetActPath())
 	}
 	mounts[name+"-env"] = ext.GetActPath() // runner-internal, never overridable
 
@@ -451,7 +451,7 @@ func (rc *RunContext) startHostEnvironment() common.Executor {
 		if err := os.MkdirAll(toolCache, 0o777); err != nil {
 			return err
 		}
-		rc.JobContainer = &container.HostEnvironment{
+		hostEnv := &container.HostEnvironment{
 			Path:        path,
 			TmpDir:      runnerTmp,
 			ToolCache:   toolCache,
@@ -462,7 +462,13 @@ func (rc *RunContext) startHostEnvironment() common.Executor {
 			StdOut:      logWriter,
 			AllocatePTY: rc.Config.AllocatePTY,
 		}
-		rc.cleanUpJobContainer = rc.JobContainer.Remove()
+		rc.JobContainer = hostEnv
+		rc.cleanUpJobContainer = hostEnv.Remove()
+		if preset := rc.Config.PresetGitHubContext; rc.Config.StableHostWorkdir && preset != nil {
+			if err := hostEnv.UseWorkspace(filepath.Join(cacheDir, "workspaces"), preset.Repository); err != nil {
+				common.Logger(ctx).Warnf("host.stable_workdir needs Linux and CAP_SYS_ADMIN, using a random workspace path: %v", err)
+			}
+		}
 		rc.setRunnerContextEnv(ctx)
 		rc.importHostEnv(os.Environ())
 

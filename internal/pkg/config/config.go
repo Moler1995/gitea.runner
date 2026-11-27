@@ -226,6 +226,7 @@ type ContainerNetworkCreateOptions struct {
 // Host represents the configuration for the host.
 type Host struct {
 	WorkdirParent string `yaml:"workdir_parent"` // WorkdirParent specifies the parent directory for the host's working directory.
+	StableWorkdir bool   `yaml:"stable_workdir"` // StableWorkdir runs Linux host jobs at workspaces/<owner>/<repo>/<repo> in WorkdirParent, which needs CAP_SYS_ADMIN.
 }
 
 // Kubernetes configures the pods jobs run in.

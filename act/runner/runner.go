@@ -87,6 +87,7 @@ type Config struct {
 	ContainerVolumes                  []string       // mounted into every job, service and docker action container
 	SharedToolCache                   bool           // keeps the tool cache across jobs instead of one per job
 	ToolCacheSlot                     string         // keeps concurrent tasks' tool caches apart, empty for slot 0 and in exec
+	StableHostWorkdir                 bool           // host jobs run at a stable path per repository, see HostEnvironment.UseWorkspace
 	InsecureSkipTLS                   bool           // whether to skip verifying TLS certificate of the Gitea instance
 	ClientCertFile, ClientKeyFile     string         // PEM client certificate for the Gitea instance
 	CAFile                            string         // PEM CA certificates the Gitea instance's certificate chains to

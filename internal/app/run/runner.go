@@ -638,6 +638,7 @@ func (r *Runner) run(ctx context.Context, task *runnerv1.Task, reporter *report.
 		ContainerVolumes:                  r.cfg.Container.Volumes,
 		SharedToolCache:                   r.cfg.Runner.ToolCacheMode == config.ToolCacheModeShared,
 		ToolCacheSlot:                     toolCacheSlot(r.cfg.Runner.ToolCacheMode, slot),
+		StableHostWorkdir:                 r.cfg.Host.StableWorkdir,
 		InsecureSkipTLS:                   r.cfg.Runner.Insecure,
 		ClientCertFile:                    r.cfg.Runner.ClientCertFile,
 		ClientKeyFile:                     r.cfg.Runner.ClientKeyFile,

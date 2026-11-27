@@ -325,6 +325,9 @@ host:
   # The parent directory of a job's working directory.
   # If it's empty, $HOME/.cache/act/ will be used.
   #workdir_parent:
+  # Run Linux host jobs at workdir_parent/workspaces/<owner>/<repo>/<repo> instead of a random
+  # directory. Needs CAP_SYS_ADMIN, see docs/host-mode.md.
+  #stable_workdir: false
 
 # Jobs that run as Kubernetes pods, see docs/kubernetes.md.
 kubernetes:
