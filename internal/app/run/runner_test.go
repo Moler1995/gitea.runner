@@ -391,7 +391,9 @@ func TestNewRunnerCacheServiceV2(t *testing.T) {
 
 	workflow, err := model.ReadWorkflow(strings.NewReader(`jobs: {native: {runs-on: native}, linux: {runs-on: linux}, containerized: {runs-on: native, container: alpine}, empty: {runs-on: native, container: ""}}`))
 	require.NoError(t, err)
-	r.isolatedCacheContainer = func(_cacheURL string) string { return "a1b2c3d4e5f6" }
+	r.cacheIsolation = func(_cacheURL string) container.CacheIsolation {
+		return container.CacheIsolation{ContainerID: "a1b2c3d4e5f6"}
+	}
 	pickPlatform := func(runsOn []string) string { return map[string]string{"native": labels.SelfHostedPlatform}[runsOn[0]] }
 	for job, isolated := range map[string]bool{"native": false, "linux": true, "containerized": true, "empty": false} {
 		cacheURL, cacheContainer := r.cacheForJob(workflow.GetJob(job), pickPlatform(workflow.GetJob(job).RunsOn()), t.Logf)
@@ -405,14 +407,14 @@ func TestNewRunnerCacheServiceV2(t *testing.T) {
 	}
 }
 
-func TestCacheForJobIPv6WarningAndIsolationRecheck(t *testing.T) {
+func TestCacheForJobWarningsAndIsolationRecheck(t *testing.T) {
 	handler, err := artifactcache.StartHandler(artifactcache.Options{OutboundIP: "2001:db8::1", Upstream: "http://cache.invalid"})
 	require.NoError(t, err)
 	defer handler.Close()
 	var checked []string
-	r := &Runner{cfg: &config.Config{}, cacheHandler: handler, isolatedCacheContainer: lastResult(func(cacheURL string) (string, bool) {
+	r := &Runner{cfg: &config.Config{}, cacheHandler: handler, cacheIsolation: lastResult(func(cacheURL string) (container.CacheIsolation, bool) {
 		checked = append(checked, cacheURL)
-		return "", cacheURL != "http://unreachable"
+		return container.CacheIsolation{}, cacheURL != "http://unreachable"
 	})}
 	warnings := 0
 	logf := func(_format string, _args ...any) { warnings++ }
@@ -435,9 +437,15 @@ func TestCacheForJobIPv6WarningAndIsolationRecheck(t *testing.T) {
 	r.cacheForJob(workflow.GetJob("containerized"), labels.SelfHostedPlatform, logf)
 	assert.Equal(t, 3, warnings)
 
-	r.isolatedCacheContainer("http://unreachable")
-	r.isolatedCacheContainer("http://unreachable")
+	r.cacheIsolation("http://unreachable")
+	r.cacheIsolation("http://unreachable")
 	assert.Len(t, checked, 3)
+
+	r.cacheIsolation = func(_cacheURL string) container.CacheIsolation { return container.CacheIsolation{GatewayBridge: true} }
+	cacheURL, cacheContainer := r.cacheForJob(workflow.GetJob("containerized"), labels.SelfHostedPlatform, logf)
+	assert.Empty(t, cacheURL)
+	assert.Empty(t, cacheContainer)
+	assert.Equal(t, 4, warnings)
 }
 
 func TestRestoreCalledWorkflowContext(t *testing.T) {

@@ -53,7 +53,7 @@ func newCompositeRunContext(ctx context.Context, parent *RunContext, step action
 		JobContainer:  parent.JobContainer,
 		ActionPath:    actionPath,
 		GlobalEnv:     parent.GlobalEnv,
-		Masks:         parent.Masks,
+		Masks:         slices.Clip(parent.Masks),
 		ExtraPath:     parent.ExtraPath,
 		Parent:        parent,
 		EventJSON:     parent.EventJSON,
@@ -99,11 +99,6 @@ func execAsComposite(ctx context.Context, step actionStep, inputs map[string]str
 		rc.setOutput(ctx, map[string]string{"name": outputName}, value)
 	}
 
-	// compositeRC.Masks is seeded with rc.Masks (see newCompositeRunContext)
-	// and may have additional masks appended while the composite action runs.
-	// Only append masks that are not already present, otherwise nested or
-	// repeated composite actions grow rc.Masks exponentially.
-	rc.Masks = appendUniqueMasks(rc.Masks, compositeRC.Masks)
 	rc.ExtraPath = compositeRC.ExtraPath
 	// Propagate GlobalEnv only, so composite inputs and step-local values do not escape.
 	mergeIntoMap := mergeIntoMapCaseSensitive
@@ -178,6 +173,10 @@ func (rc *RunContext) compositeExecutor(action *model.Action) *compositeSteps {
 
 func (rc *RunContext) newCompositeCommandExecutor(executor common.Executor) common.Executor {
 	return func(ctx context.Context) error {
+		if parent := rc.Parent; parent != nil { // a composite context outlives the stage it was made in, so sync masks around every step
+			rc.Masks = appendUniqueMasks(rc.Masks, parent.Masks)
+			defer func() { parent.Masks = appendUniqueMasks(parent.Masks, rc.Masks) }()
+		}
 		return rc.withCommandLogWriter(WithCompositeLogger(ctx, &rc.Masks), executor)
 	}
 }

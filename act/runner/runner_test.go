@@ -341,7 +341,7 @@ func TestRunEvent(t *testing.T) {
 		{workdir, "local-action-docker-url", "push", "", platforms, secrets},
 		{workdir, "local-action-dockerfile", "push", "", platforms, secrets},
 		{workdir, "local-action-via-composite-dockerfile", "push", "", platforms, secrets},
-		{workdir, "local-action-js", "push", "", platforms, secrets},
+		{workdir, "local-action-js", "push", "", map[string]string{"ubuntu-latest": "ubuntu:24.04"}, secrets},
 
 		// Uses
 		{workdir, "uses-composite", "push", "", platforms, secrets},

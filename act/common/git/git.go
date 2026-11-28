@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/url"
 	"os"
@@ -192,7 +193,11 @@ type NewGitCloneExecutorInput struct {
 // CloneIfRequired reports whether an existing local clone was reused.
 func CloneIfRequired(ctx context.Context, input NewGitCloneExecutorInput, logger *logging.Logger) (bool, error) {
 	var origin string
-	_, err := os.Stat(filepath.Join(input.Dir, ".git")) // without it git would discover a repository around Dir
+	gitDir := filepath.Join(input.Dir, ".git")
+	_, err := os.Stat(gitDir) // without it git would discover a repository around Dir
+	if err == nil && !input.OfflineMode {
+		err = findStaleLock(gitDir)
+	}
 	if err == nil {
 		origin, err = findGitRemoteURL(ctx, input.Dir)
 	}
@@ -205,7 +210,7 @@ func CloneIfRequired(ctx context.Context, input NewGitCloneExecutorInput, logger
 	if err == nil {
 		logger.Debugf("Removing cached clone at %s because origin URL changed from %s to %s", input.Dir, origin, input.URL)
 	} else if _, statErr := os.Stat(input.Dir); statErr == nil {
-		logger.Debugf("Removing cached clone at %s because origin cannot be read: %v", input.Dir, err)
+		logger.Debugf("Removing cached clone at %s because it cannot be reused: %v", input.Dir, err)
 	}
 	if err := os.RemoveAll(input.Dir); err != nil {
 		return false, fmt.Errorf("remove cached clone %s: %w", input.Dir, err)
@@ -217,6 +222,21 @@ func CloneIfRequired(ctx context.Context, input NewGitCloneExecutorInput, logger
 		return false, err
 	}
 	return false, nil
+}
+
+// findStaleLock fails on a lock file a killed git left behind, which would fail every later fetch or checkout.
+func findStaleLock(gitDir string) error {
+	for _, name := range []string{"HEAD.lock", "config.lock", "index.lock", "packed-refs.lock", "shallow.lock"} {
+		if _, err := os.Lstat(filepath.Join(gitDir, name)); err == nil {
+			return fmt.Errorf("stale lock %s", name)
+		}
+	}
+	return filepath.WalkDir(filepath.Join(gitDir, "refs"), func(path string, _entry fs.DirEntry, err error) error {
+		if err == nil && strings.HasSuffix(path, ".lock") {
+			return fmt.Errorf("stale lock %s", path)
+		}
+		return nil
+	})
 }
 
 // NewGitCloneExecutor creates an executor to clone git repos

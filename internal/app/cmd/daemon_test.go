@@ -131,7 +131,7 @@ func TestDaemonRetriesDeclareOutagesAndRemovesOnlyConsumedEphemeralRegistration(
 	dir := t.TempDir()
 	regFile := filepath.Join(dir, "registration.json")
 	configFile := filepath.Join(dir, "config.yaml")
-	require.NoError(t, os.WriteFile(configFile, []byte("runner:\n  file: "+regFile+"\n  idle_cleanup_interval: 0s\ncache:\n  enabled: false\n"), 0o600))
+	require.NoError(t, os.WriteFile(configFile, []byte("runner:\n  file: "+regFile+"\n  idle_cleanup_interval: 0s\n  node_download: false\ncache:\n  enabled: false\n"), 0o600))
 
 	for _, tc := range []struct {
 		name                  string

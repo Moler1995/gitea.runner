@@ -275,7 +275,7 @@ func TestGitCloneExecutor(t *testing.T) {
 	clones.Wait()
 }
 
-func TestGitCloneExecutorReclonesWhenOriginURLChanges(t *testing.T) {
+func TestGitCloneExecutorReclonesWhenOriginURLChangesOrLockIsStale(t *testing.T) {
 	t.Parallel()
 	createRemote := func(message string) string {
 		dir := t.TempDir()
@@ -324,6 +324,13 @@ func TestGitCloneExecutorReclonesWhenOriginURLChanges(t *testing.T) {
 
 	_, err = os.Stat(markerPath)
 	require.True(t, os.IsNotExist(err), "stale cached directory should be removed before recloning")
+
+	lockPath := filepath.Join(cacheDir, ".git", "index.lock")
+	require.NoError(t, os.WriteFile(lockPath, nil, 0o644))
+	require.NoError(t, os.WriteFile(markerPath, nil, 0o644))
+	require.NoError(t, NewGitCloneExecutor(NewGitCloneExecutorInput{URL: newRemoteDir, Ref: "main", Dir: cacheDir})(t.Context()))
+	assert.NoFileExists(t, lockPath)
+	assert.NoFileExists(t, markerPath)
 }
 
 func TestGitCloneExecutorFollowsRemoteRefChanges(t *testing.T) {

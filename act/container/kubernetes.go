@@ -501,10 +501,13 @@ func (c *kubernetesContainer) Exec(command []string, env map[string]string, _, w
 // compressCopyMin is the size from which Copy compresses and uses the transfer helper: below it that saves next to nothing on the wire and costs a process in the pod.
 const compressCopyMin = 64 << 10
 
-// extract streams the tar write produces into destPath, gzipped with compress, as copied actions shrink about fivefold and API server traffic often crosses zones.
-func (c *kubernetesContainer) extract(ctx context.Context, destPath string, compress bool, write func(io.Writer) error) error {
+// extract streams the tar write produces into destPath, gzipped with compress or as writeGz has it, as copied actions shrink about fivefold and API server traffic often crosses zones.
+func (c *kubernetesContainer) extract(ctx context.Context, destPath string, compress bool, write, writeGz func(io.Writer) error) error {
+	if writeGz == nil {
+		writeGz = func(writer io.Writer) error { return writeGzip(writer, write) }
+	}
 	if compress && c.pod.transferHelper != "" {
-		request, done := c.pod.transfer.offer(c.pod.ips, write)
+		request, done := c.pod.transfer.offer(c.pod.ips, writeGz)
 		stdin, _ := json.Marshal(request)
 		var stderr bytes.Buffer
 		err := c.pod.client.exec(ctx, c.pod.name, c.name, []string{c.pod.transferHelper, KubernetesTransferCommand, "fetch", destPath}, bytes.NewReader(stdin), io.Discard, &stderr)
@@ -523,7 +526,7 @@ func (c *kubernetesContainer) extract(ctx context.Context, destPath string, comp
 	defer reader.Close()
 	go func() {
 		if compress {
-			writer.CloseWithError(writeGzip(writer, write))
+			writer.CloseWithError(writeGz(writer))
 		} else {
 			writer.CloseWithError(write(writer))
 		}
@@ -551,15 +554,41 @@ func (c *kubernetesContainer) Copy(destPath string, files ...*FileEntry) common.
 		for _, file := range files {
 			size += len(file.Body)
 		}
-		return c.extract(ctx, destPath, size >= compressCopyMin, func(writer io.Writer) error { return writeFilesTar(ctx, writer, 0, 0, files...) })
+		return c.extract(ctx, destPath, size >= compressCopyMin, func(writer io.Writer) error { return writeFilesTar(ctx, writer, 0, 0, files...) }, nil)
 	}
+}
+
+func (c *kubernetesContainer) ExtractTarGz(destPath, archive string) common.Executor {
+	return func(ctx context.Context) error {
+		return c.extract(ctx, destPath, true, func(writer io.Writer) error {
+			return copyArchive(writer, archive, true)
+		}, func(writer io.Writer) error {
+			return copyArchive(writer, archive, false)
+		})
+	}
+}
+
+func copyArchive(writer io.Writer, archive string, gunzip bool) error {
+	file, err := os.Open(archive)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	var reader io.Reader = file
+	if gunzip {
+		if reader, err = gzip.NewReader(file); err != nil {
+			return err
+		}
+	}
+	_, err = io.Copy(writer, reader)
+	return err
 }
 
 func (c *kubernetesContainer) CopyDir(destPath, srcPath string, useGitIgnore, skipGitDir bool) common.Executor {
 	return func(ctx context.Context) error {
 		return c.extract(ctx, destPath, true, func(writer io.Writer) error { // directories are actions and workspaces, megabytes of compressible sources
 			return writeDirTar(ctx, writer, "/", srcPath, useGitIgnore, skipGitDir, 0, 0, hostOS == "windows")
-		})
+		}, nil)
 	}
 }
 

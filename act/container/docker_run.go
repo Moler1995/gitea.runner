@@ -145,6 +145,47 @@ func (cr *containerReference) CopyDir(destPath, srcPath string, useGitIgnore, sk
 	).IfNot(common.Dryrun)
 }
 
+// SeedVolume writes volume unless it already holds marker, so a seeded volume is never rewritten under running jobs, and prunes old volumes named prefix*.
+func (cr *containerReference) SeedVolume(volume, prefix, marker string, write func(io.Writer) error) common.Executor {
+	return cr.connect().Then(func(ctx context.Context) (err error) {
+		platform, err := cr.containerPlatform(ctx)
+		if err != nil {
+			return err
+		}
+
+		const seedPath = "/gitea-runner-volume-seed"
+		created, err := cr.cli.ContainerCreate(ctx, client.ContainerCreateOptions{
+			Platform: platform,
+			Config:   &container.Config{Image: cr.input.Image, Cmd: []string{"true"}},
+			HostConfig: &container.HostConfig{
+				NetworkMode: "none",
+				Mounts: []mount.Mount{{
+					Type:          mount.TypeVolume,
+					Source:        volume,
+					Target:        seedPath,
+					VolumeOptions: &mount.VolumeOptions{NoCopy: true},
+				}},
+			},
+		})
+		if err != nil {
+			return fmt.Errorf("failed to create volume seed container: %w", err)
+		}
+		helper := &containerReference{cli: cr.cli, id: created.ID}
+		defer func() { err = errors.Join(err, helper.remove()(context.WithoutCancel(ctx))) }()
+		if _, err := cr.cli.ContainerStatPath(ctx, helper.id, client.ContainerStatPathOptions{Path: seedPath + "/" + marker}); err == nil {
+			return nil
+		}
+		reader, writer := io.Pipe()
+		defer reader.Close()
+		go func() { writer.CloseWithError(write(writer)) }()
+		if err := helper.upload(ctx, seedPath, reader); err != nil {
+			return err
+		}
+		pruneSeedVolumes(ctx, cr.cli, volume, prefix, time.Now().Add(-7*24*time.Hour))
+		return nil
+	}).IfNot(common.Dryrun)
+}
+
 func (cr *containerReference) GetContainerArchive(ctx context.Context, srcPath string) (io.ReadCloser, error) {
 	if common.Dryrun(ctx) {
 		return nil, errors.New("DRYRUN is not supported in GetContainerArchive")
@@ -661,6 +702,12 @@ func (cr *containerReference) mergeContainerConfigs(ctx context.Context, config 
 	overlay(reflect.ValueOf(hostConfig).Elem(), reflect.ValueOf(containerConfig.HostConfig).Elem(), false)
 	hostConfig.Binds = binds
 	hostConfig.Mounts = mounts
+	if containerConfig.HostConfig.MaskedPaths != nil {
+		hostConfig.MaskedPaths = containerConfig.HostConfig.MaskedPaths
+	}
+	if containerConfig.HostConfig.ReadonlyPaths != nil {
+		hostConfig.ReadonlyPaths = containerConfig.HostConfig.ReadonlyPaths
+	}
 	if cf.name != "" {
 		logger.Warn("--name in the options will be ignored.")
 	}
@@ -714,18 +761,9 @@ func (cr *containerReference) create(capAdd, capDrop []string) common.Executor {
 			})
 		}
 
-		var platSpecs *specs.Platform
-		if cr.input.Platform != "" {
-			// Dropping the platform silently would build for the host arch.
-			supported, err := supportsContainerImagePlatform(ctx, cr.cli)
-			if err != nil {
-				return err
-			}
-			if supported {
-				if platSpecs, err = parsePlatform(cr.input.Platform); err != nil {
-					return err
-				}
-			}
+		platform, err := cr.containerPlatform(ctx)
+		if err != nil {
+			return err
 		}
 
 		hostConfig := &container.HostConfig{
@@ -764,7 +802,7 @@ func (cr *containerReference) create(capAdd, capDrop []string) common.Executor {
 			Config:           config,
 			HostConfig:       hostConfig,
 			NetworkingConfig: networkingConfig,
-			Platform:         platSpecs,
+			Platform:         platform,
 			Name:             input.Name,
 		})
 		if err != nil {
@@ -777,6 +815,21 @@ func (cr *containerReference) create(capAdd, capDrop []string) common.Executor {
 		cr.id = resp.ID
 		return nil
 	}
+}
+
+func (cr *containerReference) containerPlatform(ctx context.Context) (*specs.Platform, error) {
+	platform := cr.input.Platform
+	if platform != "" {
+		// Dropping the platform silently would build for the host arch.
+		supported, err := supportsContainerImagePlatform(ctx, cr.cli)
+		if err != nil {
+			return nil, err
+		}
+		if !supported {
+			platform = ""
+		}
+	}
+	return parsePlatform(platform)
 }
 
 func (cr *containerReference) exec(cmd []string, env map[string]string, user, workdir string) common.Executor {

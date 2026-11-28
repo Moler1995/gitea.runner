@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"gitea.com/gitea/runner/act/common/logging"
+	actrunner "gitea.com/gitea/runner/act/runner"
 	"gitea.com/gitea/runner/internal/app/poll"
 	"gitea.com/gitea/runner/internal/app/run"
 	"gitea.com/gitea/runner/internal/pkg/client"
@@ -180,6 +181,12 @@ func runDaemon(ctx context.Context, daemArgs *daemonArgs, configFile *string) fu
 			cfg.Runner.ExtraHeaders,
 		)
 
+		if cfg.Runner.NodeDownload == nil || *cfg.Runner.NodeDownload {
+			has := func(scheme string) bool {
+				return slices.ContainsFunc(ls, func(label *labels.Label) bool { return label.Schema == scheme })
+			}
+			actrunner.PrefetchNode(filepath.FromSlash(cfg.Host.WorkdirParent), cfg.Runner.NodeVersion, has(labels.SchemeHost), has(labels.SchemeDocker), has(labels.SchemeKubernetes))
+		}
 		runner := run.NewRunner(cfg, reg, cli)
 		defer func() {
 			if err := runner.Close(); err != nil {

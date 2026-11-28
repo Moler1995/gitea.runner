@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"gitea.com/gitea/runner/act/common"
@@ -85,5 +86,18 @@ func NewDockerVolumeRemoveExecutor(volumeName string, force bool) common.Executo
 			return nil
 		}
 		return err
+	}
+}
+
+func pruneSeedVolumes(ctx context.Context, cli client.APIClient, current, prefix string, createdBefore time.Time) {
+	volumes, err := cli.VolumeList(ctx, client.VolumeListOptions{Filters: make(client.Filters).Add("dangling", "true")})
+	if err != nil {
+		return
+	}
+	for _, item := range volumes.Items {
+		created, err := time.Parse(time.RFC3339, item.CreatedAt)
+		if err == nil && created.Before(createdBefore) && item.Name != current && strings.HasPrefix(item.Name, prefix) {
+			_, _ = cli.VolumeRemove(ctx, item.Name, client.VolumeRemoveOptions{})
+		}
 	}
 }

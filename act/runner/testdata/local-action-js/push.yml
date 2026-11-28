@@ -6,6 +6,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
+    - run: test -n '${{ hashFiles('local-action-js/push.yml') }}'
     - uses: ./actions/node24
       with:
         who-to-greet: 'Mona the Octocat'

@@ -85,8 +85,6 @@ func newActionInputsExpressionEvaluator(inputs map[string]string) *ExpressionEva
 func getHashFilesFunction(ctx context.Context, rc *RunContext) func(v []reflect.Value) (any, error) {
 	return func(v []reflect.Value) (any, error) {
 		if rc.JobContainer != nil {
-			timeoutCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
-			defer cancel()
 			name := "workflow/hashfiles/index.js"
 			hout := &bytes.Buffer{}
 			herr := &bytes.Buffer{}
@@ -110,6 +108,9 @@ func getHashFilesFunction(ctx context.Context, rc *RunContext) func(v []reflect.
 			if followSymlink {
 				env["followSymbolicLinks"] = "true"
 			}
+			node := rc.node(ctx)
+			timeoutCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
+			defer cancel()
 
 			stdout, stderr := rc.JobContainer.ReplaceLogWriter(hout, herr)
 			defer rc.JobContainer.ReplaceLogWriter(stdout, stderr)
@@ -117,7 +118,7 @@ func getHashFilesFunction(ctx context.Context, rc *RunContext) func(v []reflect.
 				Name: name,
 				Mode: 0o644,
 				Body: hashfiles,
-			}).Then(rc.JobContainer.Exec([]string{"node", container.JoinPath(rc.JobContainer.GetActPath(), name)}, env, "", ""))(timeoutCtx)
+			}).Then(rc.JobContainer.Exec([]string{node, container.JoinPath(rc.JobContainer.GetActPath(), name)}, env, "", ""))(timeoutCtx)
 			switch {
 			case err == nil:
 			case ctx.Err() != nil:

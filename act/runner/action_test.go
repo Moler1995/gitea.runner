@@ -168,7 +168,7 @@ func TestActionRunner(t *testing.T) {
 			cm.On("CopyDir", containerActionDir, "dir/", false, true).Return(noopExecutor)
 
 			for _, script := range []string{"path/pre.js", "path/main.js", "path/post.js"} {
-				cm.On("Exec", nodeActionCommand(containerActionDir+script), mock.Anything, "", "").Return(noopExecutor).Once().Run(func(args mock.Arguments) {
+				cm.On("Exec", nodeActionCommand("node", containerActionDir+script), mock.Anything, "", "").Return(noopExecutor).Once().Run(func(args mock.Arguments) {
 					env := args.Get(1).(map[string]string)
 					for key, value := range tt.expectedEnv {
 						if script == "path/pre.js" && strings.HasPrefix(key, "STATE_") {
@@ -271,7 +271,7 @@ if (process.argv[1] !== self) {
 	require.NoError(t, os.Symlink(actionDir, symlinkedActionDir))
 	symlinkedEntrypoint := filepath.Join(symlinkedActionDir, "index.mjs")
 
-	args := nodeActionCommand(symlinkedEntrypoint)
+	args := nodeActionCommand("node", symlinkedEntrypoint)
 	output, err := exec.CommandContext(t.Context(), args[0], args[1:]...).CombinedOutput()
 	require.NoError(t, err, "%s", output)
 }

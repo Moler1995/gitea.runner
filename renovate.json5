@@ -3,4 +3,33 @@
   "extends": [
     "local>gitea/renovate-config"
   ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/^act/runner/node\\.go$/"],
+      "matchStrings": ['// renovate: datasource=(?<datasource>\\S+)\\s+\\{[^\\n]*"(?<depName>[a-z]+-[a-z0-9]+)", "(?<currentValue>[0-9.]+)", "(?<currentDigest>[a-f0-9]{64})"\\}'],
+    },
+  ],
+  "customDatasources": {
+    "nodejs": {
+      "format": "plain",
+      "defaultRegistryUrlTemplate": "https://nodejs.org/dist/latest-v{{replace '[.].+' '' currentValue}}.x/SHASUMS256.txt",
+      "transformTemplates": [
+        '{"releases": [{"version": $match(releases[0].version, /node-v([0-9.]+)-/).groups[0], "digest": $substringBefore(releases[$contains(version, /  (node-v[0-9.]+-)?{{packageName}}([.]tar[.]gz|[/]node[.]exe)$/)].version, " ")}]}',
+      ],
+    },
+    "alpine-nodejs": {
+      "defaultRegistryUrlTemplate": "https://api.github.com/repos/actions/alpine_nodejs/releases",
+      "transformTemplates": [
+        '{"releases": [$[$substringBefore(tag_name, ".") = "v{{replace "[.].+" "" currentValue}}"].{"version": $substring(tag_name, 1), "releaseTimestamp": published_at, "digest": $substringAfter(assets[$contains(name, /-{{packageName}}[.]tar[.]gz$/) and digest].digest, "sha256:")}]}',
+      ],
+    },
+  },
+  "packageRules": [
+    {
+      "description": "nodejs.org serves no release timestamps, so Node.js would be held back forever",
+      "matchDatasources": ["custom.nodejs"],
+      "minimumReleaseAge": "0",
+    },
+  ],
 }

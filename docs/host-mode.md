@@ -1,4 +1,12 @@
-# Host-mode background processes
+# Host mode
+
+## Stable workspace
+
+Host jobs run in a random `<host.workdir_parent>/<16 hex>/hostexecutor` directory. With `host.stable_workdir: true`, Linux host jobs run in `<host.workdir_parent>/workspaces/<owner>/<repo>/<repo>` instead, like GitHub's `_work/<repo>/<repo>`. This needs `CAP_SYS_ADMIN`, so run the runner as root or with `AmbientCapabilities=CAP_SYS_ADMIN` in its systemd unit. Steps don't get the capability. Without it, jobs keep the random directory and log a warning.
+
+Concurrent jobs of a repository use the same path, each with its own files, through a private mount namespace. On the host, the path shows the files of one of them, so processes started outside a job, like containers from `docker run -v "$PWD:/src"` or systemd services, only see the right files there in that job. Every job starts with an empty workspace.
+
+## Background processes
 
 Host jobs clean up background step processes at job completion. A step can opt out:
 

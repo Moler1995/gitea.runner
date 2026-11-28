@@ -341,7 +341,9 @@ func TestRunnerOnIdleRemovesOrphanNetworks(t *testing.T) {
 	require.NoError(t, err)
 
 	r := &Runner{uuid: "runner-1", cfg: cfg, labels: labels.Labels{kubernetesLabel}, now: func() time.Time { return now }}
-	r.isolatedCacheContainer = func(_cacheURL string) string { return "a1b2c3d4e5f6" }
+	r.cacheIsolation = func(_cacheURL string) container.CacheIsolation {
+		return container.CacheIsolation{ContainerID: "a1b2c3d4e5f6"}
+	}
 	r.OnIdle(t.Context())
 	assert.Equal(t, []string{"runner-1"}, swept)
 	assert.Equal(t, swept, sweptVolumes)
@@ -353,7 +355,7 @@ func TestRunnerOnIdleRemovesOrphanNetworks(t *testing.T) {
 	dockerReachable = func(context.Context) bool { return false }
 	t.Cleanup(func() { dockerReachable = origDockerReachable })
 	hostOnly := &Runner{uuid: "runner-2", cfg: &config.Config{Runner: cfg.Runner}, now: func() time.Time { return now }}
-	hostOnly.isolatedCacheContainer = func(_cacheURL string) string { return "" }
+	hostOnly.cacheIsolation = func(_cacheURL string) container.CacheIsolation { return container.CacheIsolation{} }
 	hostOnly.OnIdle(t.Context())
 	assert.Equal(t, []string{"runner-1"}, swept)
 	assert.Equal(t, swept, sweptVolumes)

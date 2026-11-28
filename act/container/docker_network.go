@@ -238,23 +238,23 @@ func removeNetwork(ctx context.Context, cli client.APIClient, name string) error
 	return errors.Join(errs...)
 }
 
-// IsolatedCacheContainer returns the container holding addr, when jobs on jobNetwork cannot reach it there.
-func IsolatedCacheContainer(ctx context.Context, addr netip.Addr, jobNetwork string) (string, error) {
+// DetectCacheIsolation finds what jobs on jobNetwork need to reach a cache address held by another container.
+func DetectCacheIsolation(ctx context.Context, addr netip.Addr, jobNetwork string) (CacheIsolation, error) {
 	cli, err := GetDockerClient(ctx)
 	if err != nil {
-		return "", err
+		return CacheIsolation{}, err
 	}
 	defer cli.Close()
-	return isolatedCacheContainer(ctx, cli, addr, jobNetwork)
+	return detectCacheIsolation(ctx, cli, addr, jobNetwork)
 }
 
-func isolatedCacheContainer(ctx context.Context, cli client.APIClient, addr netip.Addr, jobNetwork string) (string, error) {
+func detectCacheIsolation(ctx context.Context, cli client.APIClient, addr netip.Addr, jobNetwork string) (CacheIsolation, error) {
 	if jobNetwork == "host" || strings.HasPrefix(jobNetwork, "container:") {
-		return "", nil
+		return CacheIsolation{}, nil
 	}
 	containers, err := cli.ContainerList(ctx, client.ContainerListOptions{})
 	if err != nil {
-		return "", err
+		return CacheIsolation{}, err
 	}
 	var holderID, holderContainer string
 	for _, summary := range containers.Items {
@@ -268,18 +268,29 @@ func isolatedCacheContainer(ctx context.Context, cli client.APIClient, addr neti
 			}
 		}
 	}
-	if holderID == "" {
-		return "", nil
+	if holderID == "" { // ContainerList omits docker_gwbridge gateway endpoints, which attaching their container to a job network would remove
+		gateway, err := cli.NetworkInspect(ctx, "docker_gwbridge", client.NetworkInspectOptions{})
+		if cerrdefs.IsNotFound(err) {
+			return CacheIsolation{}, nil
+		} else if err != nil {
+			return CacheIsolation{}, err
+		}
+		for _, endpoint := range gateway.Network.Containers {
+			if endpoint.IPv4Address.Addr() == addr || endpoint.IPv6Address.Addr() == addr {
+				return CacheIsolation{GatewayBridge: true}, nil
+			}
+		}
+		return CacheIsolation{}, nil
 	}
 	holder, err := cli.NetworkInspect(ctx, holderID, client.NetworkInspectOptions{})
 	if err != nil || holder.Network.Driver != "bridge" {
-		return "", err
+		return CacheIsolation{}, err
 	}
 	if jobNetwork != "" {
 		job, err := cli.NetworkInspect(ctx, jobNetwork, client.NetworkInspectOptions{})
 		if err != nil || job.Network.ID == holderID {
-			return "", err
+			return CacheIsolation{}, err
 		}
 	}
-	return holderContainer, nil
+	return CacheIsolation{ContainerID: holderContainer}, nil
 }

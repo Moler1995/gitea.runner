@@ -45,6 +45,37 @@ type HostEnvironment struct {
 	// it while a step is still starting.
 	procGroupOnce sync.Once
 	procGroup     atomic.Pointer[process.Group]
+
+	thread                   *jobThread
+	mountTarget, mountSource string
+	undo                     func()
+}
+
+// jobThread runs calls on the OS thread whose children enter the job's mount namespace, a nil one runs them in place.
+type jobThread struct {
+	calls   chan func()
+	stopped chan struct{}
+}
+
+func (t *jobThread) run(call func()) {
+	if t != nil {
+		done := make(chan struct{})
+		select {
+		case t.calls <- func() { defer close(done); call() }:
+			<-done
+			return
+		case <-t.stopped:
+		}
+	}
+	call()
+}
+
+// HostPath maps a path the job's processes see to the one the runner sees.
+func (e *HostEnvironment) HostPath(path string) string {
+	if rest, ok := strings.CutPrefix(path, e.mountTarget); ok && (rest == "" || os.IsPathSeparator(rest[0])) {
+		return e.mountSource + rest
+	}
+	return path
 }
 
 // processGroup returns the job-scoped process group, creating it on first use.
@@ -70,6 +101,7 @@ func (e *HostEnvironment) Close() common.Executor {
 }
 
 func (e *HostEnvironment) Copy(destPath string, files ...*FileEntry) common.Executor {
+	destPath = e.HostPath(destPath)
 	return func(ctx context.Context) error {
 		for _, f := range files {
 			if err := os.MkdirAll(filepath.Dir(filepath.Join(destPath, f.Name)), 0o777); err != nil {
@@ -84,6 +116,7 @@ func (e *HostEnvironment) Copy(destPath string, files ...*FileEntry) common.Exec
 }
 
 func (e *HostEnvironment) CopyDir(destPath, srcPath string, useGitIgnore, skipGitDir bool) common.Executor {
+	destPath, srcPath = e.HostPath(destPath), e.HostPath(srcPath)
 	return func(ctx context.Context) error {
 		logger := common.Logger(ctx)
 		srcPrefix := filepath.Dir(srcPath)
@@ -113,7 +146,7 @@ func (e *HostEnvironment) Inspect(_ context.Context) (*Info, error) {
 }
 
 func (e *HostEnvironment) GetContainerArchive(ctx context.Context, srcPath string) (io.ReadCloser, error) {
-	srcPath = filepath.Clean(srcPath)
+	srcPath = e.HostPath(filepath.Clean(srcPath))
 	fi, err := os.Lstat(srcPath)
 	if err != nil {
 		return nil, err
@@ -258,7 +291,9 @@ func (e *HostEnvironment) exec(ctx context.Context, command []string, cmdline st
 	defer common.FlushWriter(e.StdOut)
 	process.UTF8Console()
 
-	f, err := lookupPathHost(command[0], env, e.StdOut)
+	var f string
+	var err error
+	e.thread.run(func() { f, err = lookupPathHost(command[0], env, e.StdOut) })
 	if err != nil {
 		return err
 	}
@@ -311,7 +346,8 @@ func (e *HostEnvironment) exec(ctx context.Context, command []string, cmdline st
 		}()
 		go writeKeepAlive(logctx, ppty)
 	}
-	if err := cmd.Start(); err != nil {
+	e.thread.run(func() { err = cmd.Start() })
+	if err != nil {
 		return err
 	}
 	if tracked {
@@ -419,6 +455,9 @@ func (e *HostEnvironment) Remove() common.Executor {
 			logger.Debugf("killing the job's leftover processes reported errors: %v", err)
 		} else if killed > 0 {
 			logger.Debugf("killed %d leftover process(es) of the job", killed)
+		}
+		if e.undo != nil {
+			e.undo()
 		}
 
 		// Detach: a cancelled ctx would skip removePathWithRetry's retries,

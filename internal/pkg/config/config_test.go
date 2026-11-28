@@ -184,6 +184,17 @@ func TestLoadDefault_ToolCacheMode(t *testing.T) {
 	assert.Contains(t, err.Error(), "tool_cache_mode")
 }
 
+func TestLoadDefault_NodeVersion(t *testing.T) {
+	path := write(t, "runner:\n  node_version: 24.21.0\n")
+	cfg, err := LoadDefault(path)
+	require.NoError(t, err)
+	assert.Equal(t, "24.21.0", cfg.Runner.NodeVersion)
+
+	require.NoError(t, os.WriteFile(path, []byte("runner:\n  node_version: \"24\"\n"), 0o600))
+	_, err = LoadDefault(path)
+	require.ErrorContains(t, err, "node_version")
+}
+
 func TestLoadDefault_KubernetesTransferMode(t *testing.T) {
 	cfg, err := LoadDefault(write(t, "kubernetes:\n  transfer:\n    host: 10.0.0.5\n"))
 	require.NoError(t, err)

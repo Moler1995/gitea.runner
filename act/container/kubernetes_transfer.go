@@ -110,7 +110,7 @@ func startTransferServer(host string, port uint16) (*transferServer, error) {
 	return server, nil
 }
 
-// offer serves write once to one of clients until done, which reports whether a client took it and what write failed with.
+// offer serves a gzip stream once to one of clients until done, which reports whether a client took it and what write failed with.
 func (s *transferServer) offer(clients []net.IP, write func(io.Writer) error) (request transferRequest, done func() (taken bool, err error)) {
 	token := rand.Text()
 	result := make(chan error, 1)
@@ -146,7 +146,7 @@ func (s *transferServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Encoding", "gzip")
-	err := writeGzip(w, offer.write)
+	err := offer.write(w)
 	offer.result <- err
 	if err != nil {
 		panic(http.ErrAbortHandler) // a cut-off body fails the fetch, a short tar might not
